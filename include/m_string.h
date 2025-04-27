@@ -95,6 +95,7 @@ static inline const char *strend(const char *s) {
   return s - 1;
 }
 
+// 会指向字符串末尾的 '\0'
 static inline char *strend(char *s) {
   while (*s++) {
   }

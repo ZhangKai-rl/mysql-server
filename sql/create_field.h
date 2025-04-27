@@ -127,7 +127,7 @@ class Create_field {
   Field::geometry_type geom_type;
   Field *field;  // For alter table
 
-  uint offset;
+  uint offset;  // 该列在pack中的起始字节。 见 calculate_field_offsets
 
   /**
     Indicate whether column is nullable, zerofill or unsigned.
@@ -166,7 +166,7 @@ class Create_field {
 
   /* Generated column expression information */
   Value_generator *gcol_info{nullptr};
-  /*
+  /* 生成列=false
     Indication that the field is phycically stored in tables
     rather than just generated on SQL queries.
     As of now, false can only be set for virtual generated columns.

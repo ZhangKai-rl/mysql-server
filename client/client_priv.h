@@ -54,7 +54,7 @@ enum options_client {
   OPT_DROP,
   OPT_LOCKS,
   OPT_KEYWORDS,
-  OPT_OPTIMIZE,
+  OPT_OPTIMIZE,  // 代表什么？
   OPT_FTB,
   OPT_LTB,
   OPT_ENC,

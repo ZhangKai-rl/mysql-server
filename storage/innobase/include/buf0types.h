@@ -100,7 +100,7 @@ enum buf_io_fix : uint8_t {
   /** no pending I/O */
   BUF_IO_NONE = 0,
 
-  /** read pending */
+  /** read pending. aio 正在异步读这个page， aio pending中 */
   BUF_IO_READ,
 
   /** write pending */
@@ -203,7 +203,7 @@ typedef BPageMutex BufPoolZipMutex;
 typedef rw_lock_t BPageLock;
 #endif /* !UNIV_HOTBACKUP */
 
-/** Page identifier. */
+/** space_id + page no. Page identifier. */
 class page_id_t {
  public:
   /**

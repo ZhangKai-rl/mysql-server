@@ -59,11 +59,11 @@ class Thd_charset_adapter {
   basically the context of the authentication session
 */
 struct MPVIO_EXT : public MYSQL_PLUGIN_VIO {
-  MYSQL_SERVER_AUTH_INFO auth_info;
+  MYSQL_SERVER_AUTH_INFO auth_info;// 存储 ./mysql --user=xxx --password=xxx
   const ACL_USER *acl_user;
   Restrictions *restrictions;
   plugin_ref plugin;  ///< what plugin we're under
-  LEX_STRING db;      ///< db name from the handshake packet
+  LEX_STRING db;      ///< 例如： ./mysql --db=db_a. 存储在这里。      db name from the handshake packet
   /** when restarting a plugin this caches the last client reply */
   struct {
     const char *plugin, *pkt;  ///< pointers into NET::buff
@@ -89,7 +89,7 @@ struct MPVIO_EXT : public MYSQL_PLUGIN_VIO {
   const char *ip;
   const char *host;
   Thd_charset_adapter *charset_adapter;
-  LEX_CSTRING acl_user_plugin;
+  LEX_CSTRING acl_user_plugin;// acl_user表中该user记录的auth plugin
   int vio_is_encrypted;
   bool can_authenticate();
 };

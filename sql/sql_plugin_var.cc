@@ -355,7 +355,7 @@ bool sys_var_pluginvar::session_update(THD *thd, set_var *var) {
 
   return rc;
 }
-
+// sql: set innodb_xxx = xxx。更新插件环境变量，innodb也是插件
 bool sys_var_pluginvar::global_update(THD *thd, set_var *var) {
   bool rc = false;
   assert(!is_readonly());

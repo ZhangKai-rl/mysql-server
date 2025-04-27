@@ -58,29 +58,33 @@ not acceptable for it to lead to mysterious memory corruption, but it
 is acceptable for the program to die with a clear assert failure. */
 constexpr uint32_t BTR_MAX_LEVELS = 100;
 
-/** Latching modes for btr_cur_search_to_nth_level(). */
+/** btr latch mode: 九种btr latch mode. Latching modes for btr_cur_search_to_nth_level(). */
 enum btr_latch_mode : size_t {
-  /** Search a record on a leaf page and S-latch it. */
+  /** 点查询。Search a record on a leaf page and S-latch it. */
   BTR_SEARCH_LEAF = RW_S_LATCH,
-  /** (Prepare to) modify a record on a leaf page and X-latch it. */
-  BTR_MODIFY_LEAF = RW_X_LATCH,
-  /** Obtain no latches. */
+  /** 乐观写。(Prepare to) modify a record on a leaf page and X-latch it. */
+  BTR_MODIFY_LEAF = RW_X_LATCH,// 值为2
+  /** Obtain no latches. 8 */
   BTR_NO_LATCHES = RW_NO_LATCH,
-  /** Start modifying the entire B-tree. */
+  /** 悲观写 SMO。Start modifying the entire B-tree. */
   BTR_MODIFY_TREE = 33,
   /** Continue modifying the entire B-tree. */
   BTR_CONT_MODIFY_TREE = 34,
-  /** Search the previous record. */
+
+  /* 特殊的 B-tree 搜索模式，用于同时锁定目标叶子页面和它的左兄弟页面（前一个页面) */
+
+  /** 搜索并对当前页面和前一个页面都加 S-latch? .Search the previous record. */
   BTR_SEARCH_PREV = 35,
   /** Modify the previous record. */
   BTR_MODIFY_PREV = 36,
-  /** Start searching the entire B-tree. */
+  /** 范围查询。Start searching the entire B-tree. */
   BTR_SEARCH_TREE = 37,
   /** Continue searching the entire B-tree. */
   BTR_CONT_SEARCH_TREE = 38
 };
 
 /* BTR_INSERT, BTR_DELETE and BTR_DELETE_MARK are mutually exclusive. */
+// 以上三个flag, /* 在 btr_latch_mode 中，表示 ibuf 相关操作 */
 
 /** If this is ORed to btr_latch_mode, it means that the search tuple
 will be inserted to the index, at the searched position.
@@ -108,6 +112,7 @@ constexpr size_t BTR_DELETE = 8192;
 already holding an S latch on the index tree */
 constexpr size_t BTR_ALREADY_S_LATCHED = 16384;
 
+// 下面这两个 是 intention. 看注释只用于smo(btr_modify_tree)时
 /** In the case of BTR_MODIFY_TREE, the caller specifies the intention
 to insert record only. It is used to optimize block->lock range.*/
 constexpr size_t BTR_LATCH_FOR_INSERT = 32768;
@@ -193,6 +198,7 @@ static inline buf_block_t *btr_block_get_func(
 @param page_id Tablespace/page identifier
 @param page_size Page size
 @param mode Latch mode
+// note: btr_block_get的同时上了 latch mode的
 @param[in]      location  Location from where this method is called.
 @param index Index tree, may be NULL if not the insert buffer tree
 @param mtr Mini-transaction handle

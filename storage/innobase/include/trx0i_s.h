@@ -165,6 +165,7 @@ struct i_s_trx_row_t {
   trx->lock_heap) */
   ulint trx_rows_locked;       /*!< lock_number_of_rows_locked() */
   uintmax_t trx_rows_modified; /*!< trx_t::undo_no */
+  // note
   ulint trx_concurrency_tickets;
   /*!< n_tickets_to_enter_innodb in
   trx_t */

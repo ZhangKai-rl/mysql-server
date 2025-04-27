@@ -155,6 +155,7 @@ struct MYSQL_XID {
   MYSQL_PLUGIN_EXPORT struct st_mysql_plugin _mysql_plugin_declarations_[] = {
 #endif
 
+// name的作用就是用于生成其他三个参数名字
 #define mysql_declare_plugin(NAME)                                        \
   __MYSQL_DECLARE_PLUGIN(NAME, builtin_##NAME##_plugin_interface_version, \
                          builtin_##NAME##_sizeof_struct_st_plugin,        \

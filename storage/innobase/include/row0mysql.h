@@ -452,6 +452,38 @@ row format which is presented to the table handler in ha_innobase.
 This template struct is used to speed up row transformations between
 Innobase and MySQL. */
 
+// https://zhuanlan.zhihu.com/p/649144461
+/** 
+ * create table t1 (a int,
+                 b int generated always as (-a) virtual,
+                 c int generated always as (-a) stored,
+                 index (c));
+ * 对于column a:普通列
+
+col_no = 0
+rec_field_no = 3
+clust_rec_field_no = 3
+mysql_col_offset = 1
+mysql_col_len = 4
+is_virtual = 0
+对于column b:virtual generated column
+
+// todo: 后续要解析下这里
+col_no = 14902075604643794638
+rec_field_no = 0
+clust_rec_field_no = 0
+mysql_col_offset = 9
+mysql_col_len = 4
+is_virtual = 1
+对于column c: stored generated column
+
+col_no = 1
+rec_field_no = 4
+clust_rec_field_no = 4
+mysql_col_offset = 5
+mysql_col_len = 4
+is_virtual = 0
+ */
 struct mysql_row_templ_t {
   ulint col_no;                 /*!< column number of the column */
   ulint rec_field_no;           /*!< field number of the column in an
@@ -521,6 +553,9 @@ struct row_prebuilt_t {
   dict_index_t *index;         /*!< current index for a search, if
                                any */
   trx_t *trx;                  /*!< current transaction handle */
+  // note: 见 ha_innobase::external_lock. 刚开始完了后就变成false?(in row_search_mvcc)
+  // todo: 和事务的隔离级别是不是有关系，如果rc则每个语句开始都是true，如果rr则第一个事务语句才是true? 这个要设置不同的隔离级别，然后看 sql_stat_start验证下
+  // @assign set to false in row_search_mvcc
   unsigned sql_stat_start : 1; /*!< true when we start processing of
                               an SQL statement: we may have to set
                               an intention lock on the table,
@@ -534,12 +569,20 @@ struct row_prebuilt_t {
   is set to true */
   unsigned index_usable : 1;               /*!< caches the value of
                                            index->is_usable(trx) */
+  // 对二级索引，是否不需要回表. 也叫 cover index scan: 覆盖索引扫描。
+  // 设置为1时，表示MySQL只需要读取索引列（不需要读取聚簇索引(回表)的完整记录）
+  // note: 也就是说是覆盖索引！ cover index
   unsigned read_just_key : 1;              /*!< set to 1 when MySQL calls
                                            ha_innobase::extra with the
                                            argument HA_EXTRA_KEYREAD; it is enough
                                            to read just columns defined in
                                            the index (i.e., no read of the
                                            clustered index record necessary) */
+  /** handler sql语句
+   *  HANDLER users READ PRIMARY = (123);     -- 保存位置
+      HANDLER users READ PRIMARY first;
+      HANDLER users READ PRIMARY NEXT;        -- 使用保存的位置继续
+      HANDLER users READ PRIMARY NEXT; */
   unsigned used_in_HANDLER : 1;            /*!< true if we have been using this
                                          handle in a MySQL HANDLER low level
                                          index cursor command: then we must
@@ -552,7 +595,7 @@ struct row_prebuilt_t {
                                            ROW_MYSQL_DUMMY_TEMPLATE, or
                                            ROW_MYSQL_NO_TEMPLATE */
   unsigned n_template : 10;                /*!< number of elements in the
-                                           template */
+                                           template 实际的表的行数, 这里是列数吧？ */
   unsigned null_bitmap_len : 10;           /*!< number of bytes in the SQL NULL
                                         bitmap at the start of a row in the
                                         MySQL format */
@@ -584,7 +627,9 @@ struct row_prebuilt_t {
   unsigned replace : 1;
 
   /** template used to transform rows fast between MySQL and Innobase formats;
-  memory for this template is not allocated from 'heap' */
+  memory for this template is not allocated from 'heap'
+   这是一个链表，包括表每个字段的mysql_row_template_t */
+  // @create: ha_innobase::build_template
   mysql_row_templ_t *mysql_template;
 
   /** memory heap from which these auxiliary structures are allocated when
@@ -598,7 +643,7 @@ struct row_prebuilt_t {
   ins_node_t *ins_node;
 
   /** buffer for storing data converted to the Innobase format from the MySQL
-  format */
+  format. innobase format的实际数据，最后直接存到compact行格式的列值中 */
   byte *ins_upd_rec_buff;
 
   /* buffer for converting data format for multi-value virtual columns */
@@ -627,11 +672,17 @@ struct row_prebuilt_t {
                           and updates */
   btr_pcur_t *clust_pcur; /*!< persistent cursor used in
                           some selects and updates */
+  // create in: pars_complete_graph_for_exec
   que_fork_t *sel_graph;  /*!< dummy query graph used in
                           selects */
+  // 见 ha_innobase::change_active_index -> init_search_tuple_types
+  // note: 这个就是 search tuple，如 select * from t where a = 1, 保存这个 a=1 这个 search tuple
+  // 比如在 show databases; 时，会检索 mysql.tables dd table, 同时走索引 schema_id(UNIQUE KEY `schema_id` (`schema_id`,`name`)); 此处的  n_fields = 2; n_fields_cmp = 2
   dtuple_t *search_tuple; /*!< prebuilt dtuple used in selects */
 
-  /** prebuilt dtuple used in selects where the end of range is known */
+  // note: [search_tuple, m_stop_tuple] 是一个select range.
+
+  /* note: 这个在dql很重要。prebuilt dtuple used in selects where the end of range is known */
   dtuple_t *m_stop_tuple;
 
   /** Set to true in row_search_mvcc when a row matching exactly the length and

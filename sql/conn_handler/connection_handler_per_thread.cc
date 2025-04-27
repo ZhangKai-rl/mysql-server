@@ -156,7 +156,7 @@ Channel_info *Per_thread_connection_handler::block_until_new_connection() {
     DBUG_POP();
     assert(!_db_is_pushed_());
 
-    // Block pthread
+    // Block pthread ???????
     blocked_pthread_count++;
     while (!connection_events_loop_aborted() && !wake_pthread && !shrink_cache)
       mysql_cond_wait(&COND_thread_cache, &LOCK_thread_cache);
@@ -296,10 +296,12 @@ static void *handle_connection(void *arg) {
     mysql_socket_set_thread_owner(socket);
     thd_manager->add_thd(thd);
 
+    // 鉴权，验证连接用户
     if (thd_prepare_connection(thd))
       handler_manager->inc_aborted_connects();
     else {
       while (thd_connection_alive(thd)) {
+          // 用户线程应该一直循环执行这个
         if (do_command(thd)) break;
       }
       end_connection(thd);
@@ -413,7 +415,7 @@ bool Per_thread_connection_handler::add_connection(Channel_info *channel_info) {
   channel_info->set_prior_thr_create_utime();
   error =
       mysql_thread_create(key_thread_one_connection, &id, &connection_attrib,
-                          handle_connection, (void *)channel_info);
+                          handle_connection, (void *)channel_info); // 此处为用户线程传入线程函数: handle_connection
 #ifndef NDEBUG
 handle_error:
 #endif  // !NDEBUG

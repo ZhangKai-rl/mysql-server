@@ -161,7 +161,7 @@ class ACL_ACCESS {
   ACL_ACCESS() : host(), sort(0), access(0) {}
   ACL_HOST_AND_IP host;
   ulong sort;
-  Access_bitmask access;
+  Access_bitmask access;  // 表示用户权限（位运算），如create user 'us'@'%' identified by 'pa'; 则access=0. 对应表mysql.user中权限都为N
 };
 
 /**
@@ -509,16 +509,16 @@ void rebuild_cached_acl_users_for_name(void);
 extern MEM_ROOT global_acl_memory;
 extern MEM_ROOT memex;
 const size_t ACL_PREALLOC_SIZE = 10U;
-extern Prealloced_array<ACL_USER, ACL_PREALLOC_SIZE> *acl_users;
+extern Prealloced_array<ACL_USER, ACL_PREALLOC_SIZE> *acl_users;  // grant全局权限会修改该内存ds 全局 表示所有用户 从mysql.user加载 用户登陆时会查询该数组得知用户权限并将其**拷贝到线程对象中**，后期关于用户全局权限的判断根据该对象进行。
 extern Prealloced_array<ACL_PROXY_USER, ACL_PREALLOC_SIZE> *acl_proxy_users;
-extern Prealloced_array<ACL_DB, ACL_PREALLOC_SIZE> *acl_dbs;
+extern Prealloced_array<ACL_DB, ACL_PREALLOC_SIZE> *acl_dbs;  // grant db权限会影响内存ds **用户的db权限**相关 对应mysql.db. 判断用户对数据库的读写权限时需要直接遍历acl_dbs数组
 extern Prealloced_array<ACL_HOST_AND_IP, ACL_PREALLOC_SIZE> *acl_wild_hosts;
 extern std::unique_ptr<malloc_unordered_multimap<
     std::string, unique_ptr_destroy_only<GRANT_TABLE>>>
-    column_priv_hash;
+    column_priv_hash;  // 保存mysql.tables_priv和mysql.column_priv
 extern std::unique_ptr<
     malloc_unordered_multimap<std::string, unique_ptr_destroy_only<GRANT_NAME>>>
-    proc_priv_hash, func_priv_hash;
+    proc_priv_hash, func_priv_hash;  // 这两个结构保存mysql.procs_priv
 extern collation_unordered_map<std::string, ACL_USER *> *acl_check_hosts;
 extern bool allow_all_hosts;
 extern uint grant_version; /* Version of priv tables */

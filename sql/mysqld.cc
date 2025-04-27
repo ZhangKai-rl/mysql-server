@@ -1305,6 +1305,7 @@ bool clone_startup = false;
 restart server again with old database files. */
 bool clone_recovery_error = false;
 
+// 这些都是global_var的定义
 ulong binlog_row_event_max_size;
 ulong binlog_checksum_options;
 ulong binlog_row_metadata;
@@ -3578,6 +3579,7 @@ void my_init_signals() {
   pthread_sigmask(SIG_SETMASK, &mysqld_signal_mask, nullptr);
 }
 
+// 设置并启动 signal handler thread
 static void start_signal_handler() {
   int error;
   my_thread_attr_t thr_attr;
@@ -6512,7 +6514,7 @@ static int init_server_components() {
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
-  /*Load early plugins */
+  /* note: Load early plugins */
   if (plugin_register_early_plugins(&remaining_argc, remaining_argv,
                                     (is_help_or_validate_option())
                                         ? PLUGIN_INIT_SKIP_INITIALIZATION
@@ -6521,7 +6523,7 @@ static int init_server_components() {
     unireg_abort(1);
   }
 
-  /* Load builtin plugins, initialize MyISAM, CSV and InnoDB */
+  /* note: Load builtin plugins, initialize MyISAM, CSV and InnoDB */
   if (plugin_register_builtin_and_init_core_se(&remaining_argc,
                                                remaining_argv)) {
     if (!opt_validate_config)
@@ -6925,6 +6927,7 @@ static int init_server_components() {
     mysql_mutex_t *log_lock = mysql_bin_log.get_log_lock();
     mysql_mutex_lock(log_lock);
 
+    /* create new binlog file when started here. */
     if (mysql_bin_log.open_binlog(opt_bin_logname, nullptr, max_binlog_size,
                                   false, true /*need_lock_index=true*/,
                                   true /*need_sid_lock=true*/, nullptr)) {
@@ -7136,6 +7139,8 @@ static void calculate_mysql_home_from_my_progname() {
     char progdir[FN_REFLEN];
     size_t dlen = 0;
     dirname_part(progdir, my_progname, &dlen);
+    // 开发构建路径： my_progname = /home/user/mysql-build/runtime_output_directory/Debug/mysqld
+    // → mysql_home = /home/user/mysql-build/
     if (dlen > runtime_output_directory_addon.length() &&
         !strcmp(progdir + (dlen - runtime_output_directory_addon.length()),
                 runtime_output_directory_addon.c_str())) {
@@ -7144,6 +7149,8 @@ static void calculate_mysql_home_from_my_progname() {
       dirname_part(cmake_binary_dir, progdir, &dlen);
       strmake(mysql_home, cmake_binary_dir, sizeof(mysql_home) - 1);
     } else {
+      // 标准安装： my_progname = /usr/local/mysql/bin/mysqld
+      //  → mysql_home = /usr/local/mysql/
       strcat(progdir, "/../");
       cleanup_dirname(mysql_home, progdir);
     }
@@ -7285,6 +7292,7 @@ int mysqld_main(int argc, char **argv)
     to be able to read defaults files and parse options.
   */
   my_progname = argv[0];
+  // mysql_home, mysql_home_ptr
   calculate_mysql_home_from_my_progname();
 
 #ifndef _WIN32
@@ -7292,9 +7300,11 @@ int mysqld_main(int argc, char **argv)
   pre_initialize_performance_schema();
 #endif /*WITH_PERFSCHEMA_STORAGE_ENGINE */
   // For windows, my_init() is called from the win specific mysqld_main
+  // note
   if (my_init())  // init my_sys library & pthreads
   {
     LogErr(ERROR_LEVEL, ER_MYINIT_FAILED);
+    // note
     flush_error_log_messages();
     return 1;
   }
@@ -7304,6 +7314,7 @@ int mysqld_main(int argc, char **argv)
   orig_argv = argv;
   my_getopt_use_args_separator = true;
   my_defaults_read_login_file = false;
+  // note
   if (load_defaults(MYSQL_CONFIG_NAME, load_default_groups, &argc, &argv,
                     &argv_alloc)) {
     flush_error_log_messages();
@@ -7385,6 +7396,7 @@ int mysqld_main(int argc, char **argv)
       pfs_param.m_hints.m_open_files_limit = requested_open_files;
       pfs_param.m_hints.m_max_prepared_stmt_count = max_prepared_stmt_count;
 
+      // note
       pfs_rc = initialize_performance_schema(
           &pfs_param, &psi_thread_hook, &psi_mutex_hook, &psi_rwlock_hook,
           &psi_cond_hook, &psi_file_hook, &psi_socket_hook, &psi_table_hook,
@@ -7399,6 +7411,7 @@ int mysqld_main(int argc, char **argv)
   }
 #endif /* WITH_PERFSCHEMA_STORAGE_ENGINE */
 
+// note: https://blog.csdn.net/sjc2870/article/details/109826235
 #ifdef WITH_LOCK_ORDER
   if (heo_error == 0) {
     if (lo_param.m_enabled && !opt_help && !opt_initialize) {
@@ -7429,6 +7442,7 @@ int mysqld_main(int argc, char **argv)
   /*
     Obtain the current performance schema instrumentation interface,
     if available.
+    初始化 PSI 接口
   */
 
   void *service;
@@ -7558,6 +7572,7 @@ int mysqld_main(int argc, char **argv)
     Now that we have parsed the command line arguments, and have initialized
     the performance schema itself, the next step is to register all the
     server instruments.
+    // 注册服务器监控点
   */
   init_server_psi_keys();
 
@@ -7679,6 +7694,7 @@ int mysqld_main(int argc, char **argv)
     exit(MYSQLD_ABORT_EXIT);
   }
 
+  // TODO
   if (init_common_variables()) {
     setup_error_log();
     unireg_abort(MYSQLD_ABORT_EXIT);  // Will do exit
@@ -7686,6 +7702,7 @@ int mysqld_main(int argc, char **argv)
 
   keyring_lockable_init();
 
+  // note
   my_init_signals();
   /*
     Install server's my_abort routine to assure my_aborts prints signal info
@@ -7879,12 +7896,17 @@ int mysqld_main(int argc, char **argv)
   /* Determine default TCP port and unix socket name */
   set_ports();
 
+  // xxxx: 非常重要！！
   if (init_server_components()) unireg_abort(MYSQLD_ABORT_EXIT);
 
   if (!server_id_supplied)
     LogErr(INFORMATION_LEVEL, ER_WARN_NO_SERVERID_SPECIFIED);
 
   /*
+
+    NOTE: GTID
+    TODO: 
+
     Add server_uuid to the sid_map.  This must be done after
     server_uuid has been initialized in init_server_auto_options and
     after the binary log (and sid_map file) has been initialized in
@@ -7905,7 +7927,7 @@ int mysqld_main(int argc, char **argv)
   if (gtid_ret) unireg_abort(MYSQLD_ABORT_EXIT);
 
   if (!opt_initialize && !opt_initialize_insecure) {
-    // Initialize executed_gtids from mysql.gtid_executed table.
+    // note: Initialize executed_gtids from mysql.gtid_executed table.
     if (gtid_state->read_gtid_executed_from_table() == -1) unireg_abort(1);
   }
 
@@ -8051,6 +8073,7 @@ int mysqld_main(int argc, char **argv)
   bool abort = false;
 
   /* Save pid of this process in a file */
+  // xxxx: create pid file
   if (!opt_initialize) {
     if (create_pid_file()) abort = true;
   }
@@ -8169,7 +8192,7 @@ int mysqld_main(int argc, char **argv)
     unireg_abort(MYSQLD_ABORT_EXIT);
 
 #ifndef _WIN32
-  //  Start signal handler thread.
+  //  note: Start signal handler thread.
   start_signal_handler();
 #endif
   if (opt_authentication_policy &&
@@ -8189,7 +8212,7 @@ int mysqld_main(int argc, char **argv)
   }
 
   /*
-    Invoke the bootstrap thread, if required.
+    xxxx: Invoke the bootstrap thread, if required.
   */
   process_bootstrap();
 
@@ -8256,6 +8279,7 @@ int mysqld_main(int argc, char **argv)
   (void)MYSQL_SET_STAGE(0, __FILE__, __LINE__);
 
   server_operational_state = SERVER_OPERATING;
+  // note: 到这里后mysqld service就启动成功了，发送READY=1给systemd notify socket来通知mysqld sve可以提供服务了
   sysd::notify("READY=1\nSTATUS=Server is operational\nMAIN_PID=", getpid(),
                "\n");
 
@@ -8282,8 +8306,9 @@ int mysqld_main(int argc, char **argv)
     mysqld::runtime::signal_parent(pipe_write_fd, 1);
   }
 
+  // note: 
   mysqld_socket_acceptor->check_and_spawn_admin_connection_handler_thread();
-  mysqld_socket_acceptor->connection_event_loop();
+  mysqld_socket_acceptor->connection_event_loop();  // main loop wait for connection here.
 #endif /* _WIN32 */
   server_operational_state = SERVER_SHUTTING_DOWN;
   sysd::notify("STOPPING=1\nSTATUS=Server shutdown in progress\n");
@@ -8703,6 +8728,7 @@ static void process_bootstrap() {
   The performance schema needs to be initialized as early as possible,
   before to-be-instrumented objects of the server are initialized.
 */
+// 找出需要提前解析的参数sys_var::PARSE_EARLY
 static int handle_early_options() {
   int ho_error;
   vector<my_option> all_early_options;
@@ -8845,6 +8871,7 @@ static void adjust_related_options(ulong *requested_open_files) {
 
 vector<my_option> all_options;
 
+// 定义了需要提前解析的sys_vars
 struct my_option my_long_early_options[] = {
 #if !defined(_WIN32)
     {"daemonize", 'D', "Run mysqld as sysv daemon", &opt_daemonize,
@@ -11497,6 +11524,7 @@ static int fix_paths(void) {
   (void)my_load_path(opt_plugin_dir, opt_plugin_dir, mysql_home);
   opt_plugin_dir_ptr = opt_plugin_dir;
 
+  // 在某些不完全的路径前加上前缀
   my_realpath(mysql_unpacked_real_data_home, mysql_real_data_home, MYF(0));
   mysql_unpacked_real_data_home_len = strlen(mysql_unpacked_real_data_home);
   if (mysql_unpacked_real_data_home[mysql_unpacked_real_data_home_len - 1] ==
@@ -12251,6 +12279,7 @@ extern PSI_stage_info stage_waiting_for_disk_space;
 
 #ifdef HAVE_PSI_INTERFACE
 
+// show processlist query前的stage info
 PSI_stage_info *all_server_stages[] = {
     &stage_after_create,
     &stage_alter_inplace_prepare,

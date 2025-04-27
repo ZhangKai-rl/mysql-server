@@ -2115,7 +2115,7 @@ bool has_partial_view_routine_access(THD *thd, const char *db,
       access unless Column- and Table-grants are checked too.
     @retval true Access denied. The DA is set if no_error = false!
 */
-
+// 权限认证。此处进行db和global级别判断，save_priv是传给下级的判断，一般在check_grant中判断表级权限
 bool check_access(THD *thd, Access_bitmask want_access, const char *db,
                   Access_bitmask *save_priv,
                   GRANT_INTERNAL_INFO *grant_internal_info,
@@ -2330,7 +2330,7 @@ bool check_access(THD *thd, Access_bitmask want_access, const char *db,
   @retval true  Access denied; But column or routine privileges might need to
       be checked also.
 */
-
+// requirements为所需权限，使用位表示，如1代表select
 bool check_table_access(THD *thd, Access_bitmask requirements,
                         Table_ref *tables,
                         bool any_combination_of_privileges_will_do, uint number,
@@ -2618,7 +2618,8 @@ bool report_missing_user_grant_message(THD *thd, bool user_exists,
     false ok
     true  error
 */
-
+// 调试打印：lex->users_list.head()->user.str 访问方式记录。
+// 此函数为grant的关键函数，涉及内存acl_table(如column_priv_hash->emplace)的写入
 int mysql_table_grant(THD *thd, Table_ref *table_list,
                       List<LEX_USER> &user_list, List<LEX_COLUMN> &columns,
                       Access_bitmask rights, bool revoke_grant) {
@@ -3757,7 +3758,7 @@ bool mysql_grant(THD *thd, const char *db, List<LEX_USER> &list,
       tables.
 
 */
-
+// 权限认证，表级权限判断
 bool check_grant(THD *thd, Access_bitmask want_access, Table_ref *tables,
                  bool any_combination_will_do, uint number, bool no_errors) {
   Table_ref *tl;

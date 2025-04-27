@@ -41,6 +41,7 @@
 
 /**
   Returns full load-path for a file. to may be = path.
+  相对路径 -> 绝对路径
 
   Pre-condition: At least FN_REFLEN bytes can be stored in buffer
   pointed to by 'to'. 'path' and 'own_path_prefix' are '\0'-terminated

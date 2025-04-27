@@ -5290,6 +5290,7 @@ static ST_FIELD_INFO innodb_tables_fields_info[] = {
      STRUCT_FLD(open_method, 0)},
 
 #define INNODB_TABLES_TOTAL_ROW_VERSIONS 9
+//  追踪当前表执行 instant ddl的次数，每次重建表重置为0
     {STRUCT_FLD(field_name, "TOTAL_ROW_VERSIONS"),
      STRUCT_FLD(field_length, MY_INT32_NUM_DECIMAL_DIGITS),
      STRUCT_FLD(field_type, MYSQL_TYPE_LONG), STRUCT_FLD(value, 0),

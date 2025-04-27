@@ -146,7 +146,7 @@ enum cursor_direction_t : uint8_t {
   PAGE_NO_DIRECTION = 5
 };
 
-/** Eliminates a name collision on HP-UX */
+/** 物理页数据。指向页开头。Eliminates a name collision on HP-UX */
 #define page_t ib_page_t
 /** Type of the index page */
 typedef byte page_t;
@@ -172,7 +172,7 @@ ssize, which is the number of shifts from 512. */
 static_assert(PAGE_ZIP_SSIZE_MAX < (1 << PAGE_ZIP_SSIZE_BITS),
               "PAGE_ZIP_SSIZE_MAX >= (1 << PAGE_ZIP_SSIZE_BITS)");
 
-/* Page cursor search modes; the values must be in this order! */
+/* page cursor search mode: 4种search mode. Page cursor search modes; the values must be in this order! */
 enum page_cur_mode_t {
   PAGE_CUR_UNSUPP = 0,
   PAGE_CUR_G = 1,

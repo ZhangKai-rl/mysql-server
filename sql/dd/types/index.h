@@ -61,7 +61,7 @@ class Index : virtual public Entity_object {
     IT_MULTIPLE,
     IT_FULLTEXT,
     IT_SPATIAL };
-
+// 索引实现结构
   enum enum_index_algorithm  // similar to ha_key_alg
   { IA_SE_SPECIFIC = 1,
     IA_BTREE,

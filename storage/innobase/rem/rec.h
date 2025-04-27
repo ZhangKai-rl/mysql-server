@@ -453,7 +453,7 @@ static inline bool rec_n_fields_is_sane(dict_index_t *index, const rec_t *rec,
   return (n_alloc);
 }
 
-/** The following function sets the number of allocated elements
+/** 将offsets[0]设置为数组大小。The following function sets the number of allocated elements
  for an array of offsets. */
 static inline void rec_offs_set_n_alloc(
     ulint *offsets, /*!< out: array for rec_get_offsets(),
@@ -466,7 +466,7 @@ static inline void rec_offs_set_n_alloc(
   offsets[0] = n_alloc;
 }
 
-/** The following function sets the number of fields in offsets. */
+/** 将offsets[1]设置为列数。The following function sets the number of fields in offsets. */
 static inline void rec_offs_set_n_fields(
     ulint *offsets, /*!< in/out: array returned by
                     rec_get_offsets() */

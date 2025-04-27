@@ -190,7 +190,7 @@ bool prepare_default_value(THD *thd, uchar *buf, TABLE *table,
                            const Create_field &field, dd::Column *col_obj) {
   // Create a fake field with a real data buffer in which to store the value.
   Field *regfield = make_field(field, table->s, buf + 1, buf, 0 /* null_bit */);
-
+  // note: 上边这里非常非常重要！！！！ buf + 1 -> Field::ptr
   bool retval = true;
   if (!regfield) goto err;
 
@@ -199,9 +199,9 @@ bool prepare_default_value(THD *thd, uchar *buf, TABLE *table,
   // Set if the field may be NULL.
   if (!(field.flags & NOT_NULL_FLAG)) regfield->set_null();
 
-  if (field.constant_default) {
+  if (field.constant_default) {  // the default value of field.
     // Pointless to store the value of a function as it may not be constant.
-    assert(field.constant_default->type() != Item::FUNC_ITEM);
+    assert(field.constant_default->type() != Item::FUNC_ITEM);  // todo: what type is it ?? item_string?
     type_conversion_status res =
         field.constant_default->save_in_field(regfield, true);
     if (res != TYPE_OK && res != TYPE_NOTE_TIME_TRUNCATED &&

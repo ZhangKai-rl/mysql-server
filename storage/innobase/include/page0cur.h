@@ -315,7 +315,7 @@ struct page_cur_t {
   /** pointer to a record on page */
   rec_t *rec{nullptr};
 
-  /** Current offsets of the record. */
+  /** note: Current offsets of the record. */
   ulint *offsets{nullptr};
 
   /** Pointer to the current block containing rec. */

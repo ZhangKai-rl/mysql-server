@@ -185,6 +185,7 @@ In the above usage, the temporary object will be destroyed at the end of the
 statement and hence the log message will be emitted at the end of the
 statement.  If a named object is created, then the log message will be emitted
 only when it goes out of scope or destroyed. */
+// note: 定义在 ibd2sdi.cc 中
 class info : public logger {
  public:
 #ifndef UNIV_NO_ERR_MSGS
@@ -201,6 +202,25 @@ class info : public logger {
 #else
   /** Destructor */
   ~info() override;
+#endif /* !UNIV_NO_ERR_MSGS */
+};
+
+class morphy_info : public logger {
+ public:
+#ifndef UNIV_NO_ERR_MSGS
+
+  /** Default constructor uses ER_IB_MSG_0 */
+  morphy_info() : logger(MORPHY_INFORMATION_LEVEL) {}
+
+  /** Constructor.
+  @param[in]    err             Error code from errmsg-*.txt.
+  @param[in]    args            Variable length argument list */
+  template <class... Args>
+  explicit morphy_info(int err, Args &&... args)
+      : logger(MORPHY_INFORMATION_LEVEL, err, std::forward<Args>(args)...) {}
+#else
+  /** Destructor */
+  ~morphy_info() override;
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 

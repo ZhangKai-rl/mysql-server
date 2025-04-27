@@ -107,7 +107,7 @@ using Persisted_variables_umap =
     malloc_unordered_map<std::string, st_persist_var>;
 using Persisted_variables_uset =
     malloc_unordered_set<st_persist_var, st_persist_var_hash>;
-
+// set PERSIST命令持久化全局变量到mysqld-auto.cnf，mysql启动的时候先读这个文件。保证启动的时候参数修改不会丢失。
 class Persisted_variables_cache final {
  protected:
   enum class File_version {

@@ -1353,6 +1353,7 @@ PFS_thread_key register_thread_class(const char *name, uint name_length,
   uint32 index;
   PFS_thread_class *entry;
 
+  // thread_class_array[index] = 
   REGISTER_CLASS_BODY_PART(index, thread_class_array, thread_class_max, name,
                            name_length);
 

@@ -1508,6 +1508,7 @@ static dberr_t log_files_create_file(log_t &log, Log_file_id file_id,
 
   RECOVERY_CRASH(10);
 
+// 在这里将#ib_redox_tmp rename 为 #ib_redox，表示in use
   err = log_mark_file_as_in_use(log.m_files_ctx, file_id);
 
   if (err != DB_SUCCESS) {

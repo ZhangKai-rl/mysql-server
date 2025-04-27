@@ -375,6 +375,7 @@ void SetupJobsForChildren(MEM_ROOT *mem_root, AccessPath *outer,
 
 }  // namespace
 
+// TODO
 unique_ptr_destroy_only<RowIterator> CreateIteratorFromAccessPath(
     THD *thd, MEM_ROOT *mem_root, AccessPath *top_path, JOIN *top_join,
     bool top_eligible_for_batch_mode) {

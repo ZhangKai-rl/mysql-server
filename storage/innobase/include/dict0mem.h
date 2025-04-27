@@ -1043,6 +1043,7 @@ constexpr uint32_t MAX_KEY_LENGTH_BITS = 12;
 
 /** Data structure for an index.  Most fields will be
 initialized to 0, NULL or false in dict_mem_index_create(). */
+// 可观测性: lock -> last_s/x_file_name && last_x/s_line
 struct dict_index_t {
   /** id of the index */
   space_index_t id;
@@ -1079,6 +1080,8 @@ struct dict_index_t {
   static_assert(1 << MAX_KEY_LENGTH_BITS >= MAX_KEY_LENGTH,
                 "1<<MAX_KEY_LENGTH_BITS) < MAX_KEY_LENGTH");
 
+  /* 以下在 月报 instant add column功能解析 中有 */
+
   /** number of columns the user defined to be in the index: in the internal
   representation we add more columns */
   unsigned n_user_defined_cols : 10;
@@ -1096,7 +1099,7 @@ struct dict_index_t {
   unsigned disable_ahi : 1;
 
   /** number of fields from the beginning which are enough to determine an index
-  entry uniquely */
+  entry uniquely. 比如是聚簇索引，这里表明其主键由几个field组成(联合主键的话) */
   unsigned n_uniq : 10;
 
   /** number of fields defined so far */
@@ -1131,6 +1134,7 @@ struct dict_index_t {
   unsigned uncommitted : 1;
 
   /** true if the index is clustered index and it has some instant columns */
+  // update: dict_index_add_to_cache_w_vcol
   unsigned instant_cols : 1;
 
   /** true if the index is clustered index and table has row versions */
@@ -1238,6 +1242,7 @@ struct dict_index_t {
   zip_pad_info_t zip_pad;
 
   /** read-write lock protecting the upper levels of the index tree */
+  // 可观测，记录了s/x的file_name, line
   rw_lock_t lock;
 
   /** Flag whether need to fill dd tables when it's a fulltext index. */
@@ -1887,6 +1892,7 @@ enum table_dirty_status {
   /** Some persistent metadata is buffered in DDTableBuffer table,
   need to be written back to DD table. There is must be one row in
   DDTableBuffer table for this table */
+  // 写到了内存中的 DDTableBuffer 中了，但是还没持久化到 mysql.innodb_dynamic_metadata 中
   METADATA_BUFFERED,
   /** All persistent metadata are up to date. There is no row
   for this table in DDTableBuffer table */
@@ -1906,6 +1912,7 @@ constexpr uint32_t DICT_TABLE_MAGIC_N = 76333786;
 
 /** Data structure for a database table.  Most fields will be
 initialized to 0, NULL or false in dict_mem_table_create(). */
+// innodb层表定义
 struct dict_table_t {
   /** Check if the table is compressed.
   @return true if compressed, false otherwise. */
@@ -2368,6 +2375,7 @@ detect this and will eventually quit sooner. */
   /** Quiescing states, protected by the dict_index_t::lock. ie. we can
   only change the state if we acquire all the latches (dict_index_t::lock)
   in X mode of this table's indexes. */
+  // 表的quiesce状态，用于flush table. 确保表在备份期间不被修改
   ib_quiesce_t quiesce;
 
   /** Count of the number of record locks on this table. We use this to
@@ -2497,6 +2505,7 @@ detect this and will eventually quit sooner. */
 
   /** Get the number of user columns when the first instant ADD COLUMN
   happens.
+  // 应该不是 when 是 before 吧
   @return       the number of user columns as described above */
   uint16_t get_instant_cols() const {
     return static_cast<uint16_t>(n_instant_cols - get_n_sys_cols());
@@ -2538,7 +2547,7 @@ detect this and will eventually quit sooner. */
   @return       true if it is, false otherwise */
   bool is_upgraded_instant() const { return m_upgraded_instant; }
 
-  /** Check whether the table is corrupted.
+  /** Check whether the table is corrupted. 聚簇索引损坏
   @return true if the table is corrupted, otherwise false */
   bool is_corrupted() const {
     ut_ad(magic_n == DICT_TABLE_MAGIC_N);
@@ -2681,6 +2690,7 @@ detect this and will eventually quit sooner. */
   use of the shared data dictionary, locking, or even a transaction.
   In short, these are not ACID tables at all, just temporary data stored
   and manipulated during a larger process.*/
+  // 内部临时表称为 intrinsic table
   bool is_intrinsic() const {
     if (flags2 & DICT_TF2_INTRINSIC) {
       ut_ad(is_temporary());
@@ -2718,10 +2728,13 @@ inline bool dict_index_t::is_compressed() const {
 /** Persistent dynamic metadata type, there should be 1 to 1
 relationship between the metadata and the type. Please keep them in order
 so that we can iterate over it */
+// 活跃 动态元数据信息的类型
 enum persistent_type_t {
   /** The smallest type, which should be 1 less than the first
   true type */
   PM_SMALLEST_TYPE = 0,
+
+  // 目前只有两种活跃动态元信息
 
   /** Persistent Metadata type for corrupted indexes */
   PM_INDEX_CORRUPTED = 1,
@@ -2743,6 +2756,7 @@ enum persistent_type_t {
 typedef std::vector<index_id_t, ut::allocator<index_id_t>> corrupted_ids_t;
 
 /** Persistent dynamic metadata for a table */
+// PersistentTableMetadata 是动态元信息的内存表示，对应每个 dict_table_t 的所动态元信息。
 class PersistentTableMetadata {
  public:
   /** Constructor

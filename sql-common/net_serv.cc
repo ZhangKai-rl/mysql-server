@@ -427,6 +427,8 @@ static bool net_should_retry(NET *net, uint *retry_count [[maybe_unused]]) {
 /**
   Write a logical packet with packet header.
 
+  note: 写包头。这里是写3个字节的长度，然后写1个字节的序列号，主要是写头和payload(packet)到net->write_pos
+
   Format: Packet length (3 bytes), packet number (1 byte)
   When compression is used, a 3 byte compression length is added.
 
@@ -448,7 +450,7 @@ bool my_net_write(NET *net, const uchar *packet, size_t len) {
 
   /* turn off non blocking operations */
   if (!vio_is_blocking(net->vio)) vio_set_blocking_flag(net->vio, true);
-  /*
+  /*  note: 大包处理
     Big packets are handled by splitting them in packets of MAX_PACKET_LENGTH
     length. The last packet is always a packet that is < MAX_PACKET_LENGTH.
     (The last packet may even have a length of 0)
@@ -456,6 +458,7 @@ bool my_net_write(NET *net, const uchar *packet, size_t len) {
   while (len >= MAX_PACKET_LENGTH) {
     const ulong z_size = MAX_PACKET_LENGTH;
     int3store(buff, z_size);
+    // 写length
     buff[3] = (uchar)net->pkt_nr++;
     if (net_write_buff(net, buff, NET_HEADER_SIZE) ||
         net_write_buff(net, packet, z_size)) {
@@ -464,15 +467,18 @@ bool my_net_write(NET *net, const uchar *packet, size_t len) {
     packet += z_size;
     len -= z_size;
   }
-  /* Write last packet */
+  /* 写4B包头。Write last packet */
   int3store(buff, static_cast<uint>(len));
   buff[3] = (uchar)net->pkt_nr++;
+  // 把4B header写到 net->write_pos.
   if (net_write_buff(net, buff, NET_HEADER_SIZE)) {
+      // error
     return true;
   }
 #ifdef DEBUG_DATA_PACKETS
   DBUG_DUMP("packet_header", buff, NET_HEADER_SIZE);
 #endif
+  // 上面写头这里写payload
   return net_write_buff(net, packet, len);
 }
 
@@ -934,7 +940,7 @@ bool net_write_command(NET *net, uchar command, const uchar *header,
   @retval
     1
 */
-
+// 写到net->write_pos中
 static bool net_write_buff(NET *net, const uchar *packet, size_t len) {
   DBUG_TRACE;
   ulong left_length;
@@ -972,6 +978,7 @@ static bool net_write_buff(NET *net, const uchar *packet, size_t len) {
     if (len > net->max_packet) return net_write_packet(net, packet, len);
     /* Send out rest of the blocks as full sized blocks */
   }
+  // 先写到net->buff write_pos中
   if (len > 0) memcpy(net->write_pos, packet, len);
   net->write_pos += len;
   return false;
@@ -2083,7 +2090,7 @@ static size_t net_read_packet(NET *net, size_t *complen) {
   */
   net->compress_pkt_nr = net->pkt_nr;
 
-  /* Retrieve packet length and number. */
+  /* 先读4B头，后边再读payload. Retrieve packet length and number. */
   if (net_read_packet_header(net)) goto error;
 
   net->compress_pkt_nr = net->pkt_nr;

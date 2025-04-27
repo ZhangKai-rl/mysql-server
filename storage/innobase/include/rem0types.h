@@ -38,6 +38,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "univ.i"
 
 /* We define the physical record simply as an array of bytes */
+// note: rec_t 指向的为内存byte地址，该地址为 innodb compact row foramt 的数据data部分
 typedef byte rec_t;
 
 /* Maximum values for various fields (for non-blob tuples) */

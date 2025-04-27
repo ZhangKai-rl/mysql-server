@@ -327,7 +327,7 @@ struct fts_table_t {
                       name */
 
   fts_table_type_t type; /*!< The auxiliary table type */
-
+// 这些都是有 fts index 的用户表的信息
   table_id_t table_id; /*!< The table id */
 
   space_index_t index_id; /*!< The index id */

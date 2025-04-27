@@ -115,6 +115,7 @@ constexpr const unsigned long MAX_CONNECTIONS_DEFAULT{151};
 #define VALID_RANGE(X, Y) X, Y
 #define DEFAULT(X) X
 #define BLOCK_SIZE(X) X
+/* note: container_of , offset_of 经典宏定义*/
 #define GLOBAL_VAR(X)                                                         \
   sys_var::GLOBAL, (((const char *)&(X)) - (char *)&global_system_variables), \
       sizeof(X)

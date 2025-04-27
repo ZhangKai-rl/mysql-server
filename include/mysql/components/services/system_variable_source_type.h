@@ -30,6 +30,7 @@
   set to GLOBAL, or if a variable is set from command line then source
   will hold value as COMMAND_LINE.
 */
+// 对应与performance_schema.variables_info中的VARIABLE_SOURCE字段
 enum enum_variable_source {
   COMPILED = 1,
   GLOBAL,

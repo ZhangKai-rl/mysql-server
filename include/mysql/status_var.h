@@ -36,6 +36,7 @@ enum enum_mysql_show_type {
   SHOW_CHAR,
   SHOW_CHAR_PTR,
   SHOW_ARRAY,
+  // 这种 status var 需要动态计算. 包括 Sys_var_charptr_func这种类型的系统变量
   SHOW_FUNC,
   SHOW_DOUBLE,
   /*

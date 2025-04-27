@@ -1137,7 +1137,7 @@ try_again:
 
   return (purged);
 }
-
+// the entrance of undo log record
 inline bool row_purge_record(purge_node_t *node, trx_undo_rec_t *undo_rec,
                              const que_thr_t *thr [[maybe_unused]],
                              bool updated_extern, THD *thd) {

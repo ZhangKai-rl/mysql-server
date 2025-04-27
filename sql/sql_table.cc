@@ -4825,7 +4825,7 @@ static bool count_keys(const Mem_root_array<Key_spec *> &key_list,
       else {
         uint mv_key_parts = 0;
         (*key_count)++;
-        (*key_parts) += key->columns.size();
+        (*key_parts) += key->columns.size();  // note
         for (uint i = 0; i < key->columns.size(); i++) {
           const Key_part_spec *kp = key->columns[i];
           if (!kp->is_ascending() && !(se_index_flags & HA_DESCENDING_INDEX)) {
@@ -8319,7 +8319,7 @@ bool mysql_prepare_create_table(
       }
     }
   }
-
+  /* ques: 这里没看懂？ */
   /* If fixed row records, we need one bit to check for deleted rows */
   if (!(create_info->table_options & HA_OPTION_PACK_RECORD))
     create_info->null_bits++;
@@ -8328,7 +8328,7 @@ bool mysql_prepare_create_table(
   it.rewind();
   while ((sql_field = it++)) {
     size_t length = sql_field->pack_length();
-    if (sql_field->offset + data_offset + length > reclength)
+    if (sql_field->offset + data_offset + length > reclength) // 为什么这里create_field::offset为0，不是在calculate_field_offsets中设置过了吗？
       reclength = sql_field->offset + data_offset + length;
   }
   if (reclength > file->max_record_length()) {
@@ -17513,7 +17513,7 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
     }
   }
 
-  /* ALTER TABLE using copy algorithm. */
+  /* todo: ALTER TABLE using copy algorithm. */
 
   /* Check if ALTER TABLE is compatible with foreign key definitions. */
   if (fk_check_copy_alter_table(thd, table_list, old_table_def, alter_info))

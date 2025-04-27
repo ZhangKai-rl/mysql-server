@@ -60,6 +60,7 @@ class Loader {
 
     /** Do the operation.
     @return DB_SUCCESS or error code. */
+    // xxxxx: 这里实际执行各种sec index的构建等操作
     [[nodiscard]] dberr_t operator()() noexcept;
 
    private:

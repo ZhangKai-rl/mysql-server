@@ -214,6 +214,8 @@ enum class BgcTmOptions {
   session-count queue.
 
   @see unittest/gunit/bgc_ticket_manager-t.cc
+  note: https://blog.csdn.net/lidan3959/article/details/8494021
+  fackbook实现的ticket system
  */
 class Bgc_ticket_manager {
  public:

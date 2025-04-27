@@ -124,7 +124,7 @@ constexpr size_t FIL_ADDR_PAGE = 0;
 /** Then comes 2-byte byte offset within page.*/
 constexpr size_t FIL_ADDR_BYTE = 4;
 
-/** Address size is 6 bytes. */
+/** page no 4B + offset 2B = 6B. Address size is 6 bytes. */
 constexpr size_t FIL_ADDR_SIZE = 6;
 
 /** Path separator e.g., 'dir;...;dirN' */

@@ -110,7 +110,7 @@ struct alignas(ut::INNODB_CACHE_LINE_SIZE) log_t {
 
   /** Aligned log buffer. Committing mini-transactions write there
   redo records, and the log_writer thread writes the log buffer to
-  disk in background.
+  disk in background. note: redo log buffer!!!!!
   Protected by: locking sn not to add. */
   alignas(ut::INNODB_CACHE_LINE_SIZE)
       ut::aligned_array_pointer<byte, LOG_BUFFER_ALIGNMENT> buf;

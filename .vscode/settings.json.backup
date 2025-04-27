@@ -1,0 +1,212 @@
+
+
+{
+    "git.ignoreLegacyWarning": true,
+    "editor.fontSize": 15,
+    "terminal.integrated.mouseWheelZoom": true,
+    "terminal.integrated.enableMultiLinePasteWarning": false,
+    "todo-tree.regex.regex": "(//|#|<!--|;|/\\*|^|^[ \\t]*(-|\\d+.))\\s*($TAGS)",
+"todo-tree.filtering.ignoreGitSubmodules": true,
+"todo-tree.tree.showCountsInTree": true,
+"todo-tree.regex.regexCaseSensitive": false,
+"todo-tree.general.statusBar":"current file",
+"todo-tree.general.tags": [
+    "BUG",
+    "FIXME",
+    "TODO",
+    "HACK",
+    "XXX",
+    "TAG",
+    "NOTE",
+    "INFO",
+    "QUES"
+],
+"todo-tree.highlights.defaultHighlight": {
+    "icon": "alert",
+    "type": "line",
+},
+"todo-tree.highlights.customHighlight": {
+    "BUG": {
+        "icon": "bug",
+        "foreground": "#F56C6C",
+    },
+    "FIXME": {
+        "icon": "flame",
+        "foreground": "#FF9800",
+    },
+    "TODO":{
+        "icon": "checklist",
+        "foreground": "#FFEB38",
+    },
+    "HACK":{
+        "icon": "versions",
+        "foreground": "#E040FB",
+    },
+    "XXX":{
+        "icon": "unverified",
+        "foreground": "#E91E63",
+    },
+    "TAG":{
+        "icon": "tag",
+        "foreground": "#409EFF",
+    },
+    "NOTE":{
+        "icon": "note",
+        "foreground": "#67C23A",
+    },
+    "INFO":{
+        "icon": "info",
+        "foreground": "#980de9",
+    },
+    "QUES":{
+        "icon": "unverified",
+        "foreground": "#0de898"
+    }
+},
+"gongfeng.copilot.enableAutoCompletions": true,
+"terminal.integrated.fontSize": 13,
+"diffEditor.hideUnchangedRegions.enabled": true,
+"gitlens.advanced.messages": {
+    "suppressGitVersionWarning": true
+},
+"editor.stickyScroll.maxLineCount": 10,
+"terminal.integrated.stickyScroll.enabled": true,
+"terminal.integrated.stickyScroll.maxLineCount": 10,
+"notebook.stickyScroll.enabled": true,
+"diffEditor.maxComputationTime": 0,
+
+"files.associations": {
+    "": "",
+    "*.ic": "c++"
+},
+"editor.wordWrap": "on",
+"editor.guides.bracketPairs": "active",
+"cmake.pinnedCommands": [
+    "workbench.action.tasks.configureTaskRunner",
+    "workbench.action.tasks.runTask"
+],
+"cmake.showOptionsMovedNotification": false,
+"code-runner.runInTerminal": true,
+"code-runner.saveAllFilesBeforeRun": true,
+"code-runner.executorMap": {
+
+    "javascript": "node",
+    "java": "cd $dir && javac $fileName && java $fileNameWithoutExt",
+    "c": "cd $dir && gcc $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "zig": "zig run",
+    "cpp": "cd $dir && g++ $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "objective-c": "cd $dir && gcc -framework Cocoa $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "php": "php",
+    "python": "python3 -u",
+    "perl": "perl",
+    "perl6": "perl6",
+    "ruby": "ruby",
+    "go": "go run",
+    "lua": "lua",
+    "groovy": "groovy",
+    "powershell": "powershell -ExecutionPolicy ByPass -File",
+    "bat": "cmd /c",
+    "shellscript": "bash",
+    "fsharp": "fsi",
+    "csharp": "scriptcs",
+    "vbscript": "cscript //Nologo",
+    "typescript": "ts-node",
+    "coffeescript": "coffee",
+    "scala": "scala",
+    "swift": "swift",
+    "julia": "julia",
+    "crystal": "crystal",
+    "ocaml": "ocaml",
+    "r": "Rscript",
+    "applescript": "osascript",
+    "clojure": "lein exec",
+    "haxe": "haxe --cwd $dirWithoutTrailingSlash --run $fileNameWithoutExt",
+    "rust": "cd $dir && rustc $fileName && $dir$fileNameWithoutExt",
+    "racket": "racket",
+    "scheme": "csi -script",
+    "ahk": "autohotkey",
+    "autoit": "autoit3",
+    "dart": "dart",
+    "pascal": "cd $dir && fpc $fileName && $dir$fileNameWithoutExt",
+    "d": "cd $dir && dmd $fileName && $dir$fileNameWithoutExt",
+    "haskell": "runghc",
+    "nim": "nim compile --verbosity:0 --hints:off --run",
+    "lisp": "sbcl --script",
+    "kit": "kitc --run",
+    "v": "v run",
+    "sass": "sass --style expanded",
+    "scss": "scss --style expanded",
+    "less": "cd $dir && lessc $fileName $fileNameWithoutExt.css",
+    "FortranFreeForm": "cd $dir && gfortran $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "fortran-modern": "cd $dir && gfortran $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "fortran_fixed-form": "cd $dir && gfortran $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "fortran": "cd $dir && gfortran $fileName -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+    "sml": "cd $dir && sml $fileName",
+    "mojo": "mojo run",
+    "erlang": "escript",
+    "spwn": "spwn build",
+    "pkl": "cd $dir && pkl eval -f yaml $fileName -o $fileNameWithoutExt.yaml",
+    "gleam": "gleam run -m $fileNameWithoutExt"
+},
+"C_Cpp.default.compileCommands": [
+    ""
+],
+"gongfeng.copilot.enableCodeIndexingForCompletion": true,
+"diffEditor.ignoreTrimWhitespace": false,
+"diffviewer.outputFormat": "side-by-side",
+"logFileHighlighter.customPatterns": [],
+"redhat.telemetry.enabled": false,
+"workbench.sideBar.location": "right",
+"cmake.showConfigureWithDebuggerNotification": false,
+"makefile.configureOnOpen": true,
+"commentTranslate.sourceLanguage": "en",
+"commentTranslate.targetLanguage": "zh-CN",
+"commentTranslate.maxTranslationLength": 2000,
+"editor.minimap.enabled": false,
+"gongfeng.copilot.enableCodeIndexing": true,
+"window.zoomLevel": 1,
+"security.promptForRemoteFileProtocolHandling": false,
+"remote.SSH.useLocalServer": false,
+"remote.SSH.remotePlatform": {
+    "9.134.208.252": "linux"
+},
+"gongfeng.copilot.enableSmartAdaptiveCompletionSpeed": true,
+"gongfeng.copilot.enableNextEditSuggestions": true,
+"gongfeng.copilot.enableCloseCompletionShortcutTip": true,
+"gongfeng.copilot.enableCodelensForComments": true,
+"gongfeng.copilot.floatShortcut": true,
+"gongfeng.copilot.commitMessageSuggestTAPD": true,
+"update.showReleaseNotes": false,
+"extensions.autoUpdate": "onlySelectedExtensions",
+"update.mode": "none",
+"files.autoSave": "off",
+"security.workspace.trust.untrustedFiles": "open",
+"gongfeng.copilot.featureConfig": {
+    "terminal": {
+        "autorun": false,
+        "whiteList": [],
+        "blackList": [
+            "kill",
+            "rm",
+            "chmod"
+        ],
+        "shellSelection": "auto"
+    },
+    "chat": {
+        "autofix": false,
+        "autoweb": true,
+        "chattoask": true,
+        "newChatTab": true,
+        "todoListEnable": false,
+        "allowExternalFileAccess": true
+    }
+},
+"gongfeng.copilot.mcpConfig": {
+    "autorun": true
+},
+"vscode_custom_css.imports": [
+    "file:///Users/morphyzhang/.vscode/extensions/brandonkirbyson.vscode-animations-2.0.7/dist/updateHandler.js"
+],
+"workbench.colorTheme": "Dracula Theme"
+ 
+}

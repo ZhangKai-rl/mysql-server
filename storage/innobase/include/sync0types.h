@@ -57,7 +57,7 @@ typedef pthread_mutex_t sys_mutex_t;
 #endif /* _WIN32 */
 
 /*
-                LATCHING ORDER WITHIN THE DATABASE
+           xxxx:LATCHING ORDER WITHIN THE DATABASE
                 ==================================
 
 The mutex or latch in the central memory object, for instance, a rollback
@@ -339,6 +339,7 @@ enum latch_level_t {
 /** Each latch has an ID. This id is used for creating the latch and to look
 up its meta-data. See sync0debug.c. The order does not matter here, but
 alphabetical ordering seems useful */
+// ques: 这里到底有啥用啊？
 enum latch_id_t {
   LATCH_ID_NONE = 0,
   LATCH_ID_AHI_ENABLED,
@@ -1056,6 +1057,7 @@ struct btrsea_sync_check : public sync_check_functor_t {
 
   /** Called for every latch owned by the calling thread.
   @param[in]    level           Level of the existing latch
+  // note: latch level / latch order / latch hierarchy
   @return true if the predicate check fails */
   bool operator()(const latch_level_t level) override {
     /* If calling thread doesn't hold search latch then

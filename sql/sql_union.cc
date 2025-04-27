@@ -1665,7 +1665,7 @@ bool Query_expression::ClearForExecution() {
   }
   return false;
 }
-
+// select 执行的核心
 bool Query_expression::ExecuteIteratorQuery(THD *thd) {
   THD_STAGE_INFO(thd, stage_executing);
   DEBUG_SYNC(thd, "before_join_exec");
@@ -1768,6 +1768,7 @@ bool Query_expression::ExecuteIteratorQuery(THD *thd) {
     PFSBatchMode pfs_batch_mode(m_root_iterator.get());
 
     for (;;) {
+      // note: 如select * from t1 limit 5, 2， 会走LimitOffsetIterator::Read
       int error = m_root_iterator->Read();
       DBUG_EXECUTE_IF("bug13822652_1", thd->killed = THD::KILL_QUERY;);
 

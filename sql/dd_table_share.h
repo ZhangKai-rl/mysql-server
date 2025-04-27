@@ -43,7 +43,7 @@ enum class enum_column_types;
 }  // namespace dd
 
 /**
-  Read the table definition from the data-dictionary.
+  Read the table definition from the data-dictionary. or .frm file 完成从.frm or dd 到table_share的写入
 
   @param thd        Thread handler
   @param share      Fill this with table definition

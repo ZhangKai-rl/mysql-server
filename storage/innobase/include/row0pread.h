@@ -514,6 +514,7 @@ class Parallel_reader::Scan_ctx {
   /** The first cursor should read up to the second cursor [f, s). */
   using Range = std::pair<std::shared_ptr<Iter>, std::shared_ptr<Iter>>;
 
+  /* 多个 rec 的范围组 [(1,3), (5,7), (9,22)] */
   using Ranges = std::vector<Range, ut::allocator<Range>>;
 
   /** @return the scan context ID. */

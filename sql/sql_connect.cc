@@ -554,6 +554,7 @@ static int check_connection(THD *thd) {
         return 1;
       }
 #endif
+      // 比如 127.0.0.1 会被resolve为 localhost
       rc = ip_to_hostname(&net->vio->remote, main_sctx_ip.str, &host,
                           &connect_errors);
 #ifdef HAVE_SETNS

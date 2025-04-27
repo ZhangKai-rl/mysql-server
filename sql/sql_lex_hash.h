@@ -31,6 +31,7 @@
 #ifndef SQL_LEX_HASH_INCLUDED
 #define SQL_LEX_HASH_INCLUDED
 
+// https://zhuanlan.zhihu.com/p/716485597
 class Lex_hash {
  private:
   const unsigned char *hash_map;

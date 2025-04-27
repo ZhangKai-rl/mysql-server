@@ -905,6 +905,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
 
       table->clear_partial_update_diffs();
 
+      /* 使用record[0]*/
       store_record(table, record[1]);
       bool is_row_changed = false;
       if (fill_record_n_invoke_before_triggers(

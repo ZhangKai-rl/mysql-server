@@ -3946,6 +3946,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
     auto fn = [&](const dd::Properties &p, const char *s) {
       uint32_t n_inst_cols;
       ut_a(p.exists(s));
+      // 获取 se_private_data {key=dd_table_instant_cols}
       p.get(s, &n_inst_cols);
       m_table->set_instant_cols(n_inst_cols);
       m_table->set_upgraded_instant();

@@ -1346,7 +1346,7 @@ const Listen_socket *Mysqld_socket_listener::get_listen_socket() const {
 }
 
 Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL // 等待mysql发起连接请求
   int retval = poll(&m_poll_info.m_fds[0], m_socket_vector.size(), -1);
 #else
   m_select_info.m_read_fds = m_select_info.m_client_fds;
@@ -1415,7 +1415,7 @@ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
     return nullptr;
   }
 #endif  // HAVE_LIBWRAP
-
+    // 判断是tcp socket还是unix socket
   Channel_info *channel_info = nullptr;
   if (listen_socket->m_socket_type == Socket_type::UNIX_SOCKET)
     channel_info = new (std::nothrow) Channel_info_local_socket(connect_sock);

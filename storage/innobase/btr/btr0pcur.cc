@@ -144,6 +144,7 @@ void btr_pcur_t::copy_stored_position(btr_pcur_t *dst, const btr_pcur_t *src) {
   dst->m_old_n_fields = src->m_old_n_fields;
 }
 
+// TODO
 bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
                                   ut::Location location) {
   dtuple_t *tuple;

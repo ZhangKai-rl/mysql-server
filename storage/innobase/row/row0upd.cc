@@ -3073,7 +3073,7 @@ func_exit:
 
   /* NOTE: the following function calls will also commit mtr */
 
-  if (node->is_delete) {
+  if (node->is_delete) { /* 实际执行的为delete dml, 不是真正的upd */
     err = row_upd_del_mark_clust_rec(flags, node, index, offsets, thr,
                                      referenced, &mtr);
 

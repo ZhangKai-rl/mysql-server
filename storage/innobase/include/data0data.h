@@ -692,7 +692,7 @@ struct dtuple_t {
   ignored; the default value in dtuple creation is the same value as n_fields */
   uint16_t n_fields_cmp;
 
-  /** Fields. */
+  /** Fields. 包含所有fields */
   dfield_t *fields;
 
   /** Number of virtual fields. */
@@ -701,7 +701,7 @@ struct dtuple_t {
   /** Fields on virtual column */
   dfield_t *v_fields;
 
-  /** Data tuples can be linked into a list using this field */
+  /** Data tuples can be linked into a list using this field. 这个应该是该元祖涉及的所有索引 */
   UT_LIST_NODE_T(dtuple_t) tuple_list;
 
 #ifdef UNIV_DEBUG

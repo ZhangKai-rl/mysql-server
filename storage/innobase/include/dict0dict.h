@@ -1002,6 +1002,7 @@ struct dict_persist_t;
 extern dict_persist_t *dict_persist;
 
 /* Dictionary system struct */
+// innodb层表定义缓存
 struct dict_sys_t {
 #ifndef UNIV_HOTBACKUP
   DictSysMutex mutex;          /*!< mutex protecting the data
@@ -1017,7 +1018,8 @@ struct dict_sys_t {
                                must be written to the dict system
                                header and flushed to a file; in
                                recovery this must be derived from
-                               the log records */
+                               the log records. 就是row id的全局分配变量 */
+  // 两个hash表，分别按照name , id 来查找表定义
   hash_table_t *table_hash;    /*!< hash table of the tables, based
                                on name */
   hash_table_t *table_id_hash; /*!< hash table of the tables, based
@@ -1026,7 +1028,8 @@ struct dict_sys_t {
                                by the data dictionary table and
                                index objects */
   /** Handler to sys_* tables, they're only for upgrade */
-  dict_table_t *sys_tables;  /*!< SYS_TABLES table */
+  // 系统表 的 表定义
+  dict_table_t *sys_tables;  /*!< SYS_TABLES table */  // 对应INFORMATION_SCHEMA.INNODB_SYS_TABLES
   dict_table_t *sys_columns; /*!< SYS_COLUMNS table */
   dict_table_t *sys_indexes; /*!< SYS_INDEXES table */
   dict_table_t *sys_fields;  /*!< SYS_FIELDS table */
@@ -1222,6 +1225,7 @@ struct dict_persist_t {
 
 #ifndef UNIV_HOTBACKUP
   /** DDTableBuffer table for persistent dynamic metadata */
+  // mysql.innodb_dynamic_metadata  dd table
   DDTableBuffer *table_buffer;
 #endif /* !UNIV_HOTBACKUP */
 
@@ -1333,6 +1337,8 @@ class DDTableBuffer {
 
   /** The heap used to create the search tuple and replace tuple */
   mem_heap_t *m_heap;
+
+    /* 这些用于 mysql.innodb_dynamic_metadata ddtablebuffer表的dml */
 
   /** The tuple used to search for specified table, it's protected
   by dict_persist->mutex */

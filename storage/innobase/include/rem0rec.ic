@@ -710,6 +710,7 @@ static inline byte *rec_get_start(const rec_t *rec, const ulint *offsets) {
 @param[in]      rec     physical record
 @param[in]      offsets array returned by rec_get_offsets()
 @return pointer to the origin of the copy */
+// note: 注意这里处理内存的方式
 static inline rec_t *rec_copy(void *buf, const rec_t *rec,
                               const ulint *offsets) {
   ulint extra_len;

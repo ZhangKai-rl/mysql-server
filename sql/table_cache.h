@@ -64,7 +64,7 @@ extern ulong table_cache_size_per_instance, table_cache_instances;
 
   This significantly increases scalability in some scenarios.
 */
-
+// 缓存打开的所有表名的table_cache_element对象。
 class Table_cache {
  private:
   /**
@@ -179,6 +179,7 @@ class Table_cache_manager {
   void destroy();
 
   /** Get instance of table cache to be used by particular connection. */
+  // !!!!!!!!!!
   Table_cache *get_cache(THD *thd) {
     return &m_table_cache[thd->thread_id() % table_cache_instances];
   }
@@ -225,7 +226,7 @@ extern Table_cache_manager table_cache_manager;
   It is an implementation detail of Table_cache and is present
   in the header file only to allow inlining of some methods.
 */
-
+// 缓存一个表明的table对象（一个表名对应一个table_share由所有session/thd共享，对应多个table对象各个session/thd独占）。 table_cache_element与table对象一一对应。 table definition cache与 table_share一一对应？
 class Table_cache_element {
  private:
   /*
@@ -236,9 +237,9 @@ class Table_cache_element {
       TABLE, I_P_List_adapter<TABLE, &TABLE::cache_next, &TABLE::cache_prev>>
       TABLE_list;
 
-  TABLE_list used_tables;
+  TABLE_list used_tables;  // 该表名正在使用的table对象
   TABLE_list free_tables;
-  TABLE_SHARE *share;
+  TABLE_SHARE *share;  // 对应的server层元数据对象
 
  public:
   Table_cache_element(TABLE_SHARE *share_arg) : share(share_arg) {}

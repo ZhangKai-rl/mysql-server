@@ -407,6 +407,10 @@ error::~error() {
   std::cerr << "[ERROR] ibd2sdi: " << m_oss.str() << "." << std::endl;
 }
 
+morphy_info::~morphy_info() {
+  std::cerr << "[MORPHY_INFO] ibd2sdi: " << m_oss.str() << "." << std::endl;
+}
+
 /*
 MSVS complains: Warning C4722: destructor never returns, potential memory leak.
 But, the whole point of using ib::fatal temporary object is to cause an abort.

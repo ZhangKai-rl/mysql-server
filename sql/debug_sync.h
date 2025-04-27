@@ -41,7 +41,7 @@
 class THD;
 
 #if defined(ENABLED_DEBUG_SYNC)
-
+// debug_sync入口宏
 /* Macro to be put in the code at synchronization points. */
 #define DEBUG_SYNC(_thd_, _sync_point_name_)                 \
   do {                                                       \

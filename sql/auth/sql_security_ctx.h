@@ -359,12 +359,12 @@ class Security_context {
   /**
     Global privileges from mysql.user.
   */
-  Access_bitmask m_master_access;
+  Access_bitmask m_master_access;  // acl_cache缓存的global权限信息
 
   /**
     Privileges for current db
   */
-  Access_bitmask m_db_access;
+  Access_bitmask m_db_access;  // acl_cache缓存的db权限信息。执行use db时会使用
 
   /**
     password expiration flag.

@@ -26,6 +26,7 @@
 #include "mysql/components/services/component_sys_var_service.h"
 
 const unsigned char ReplSemiSyncBase::kPacketMagicNum = 0xef;
+// 主库 semisync的flag
 const unsigned char ReplSemiSyncBase::kPacketFlagSync = 0x01;
 
 const unsigned long Trace::kTraceGeneral = 0x0001;

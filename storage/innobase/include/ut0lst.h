@@ -250,6 +250,8 @@ struct ut_list_base_explicit_getter {
 /** A type of a list storing pointers to t, chained by member m of t.
 NOTE: In cases in which definition of t is not yet in scope and thus you can't
 refer to t::m at this point yet, use UT_LIST_BASE_NODE_T_EXTERN macro instead.*/
+// 侵入式链表的表定义。表node为 t::m, 该list_node侵入式存在于类型 t 中。
+// 类型为 ut_list_node_t ， 变量名为 m。
 #define UT_LIST_BASE_NODE_T(t, m) \
   ut_list_base<t, ut_list_base_explicit_getter<t, &t::m>>
 

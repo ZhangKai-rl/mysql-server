@@ -129,7 +129,7 @@ int my_setwd(const char *dir, myf MyFlags) {
   return res;
 }
 
-/* Test if hard pathname */
+/* Test if hard pathname, 是否时绝对路径 */
 /* Returns 1 if dirname is a hard path */
 
 int test_if_hard_path(const char *dir_name) {

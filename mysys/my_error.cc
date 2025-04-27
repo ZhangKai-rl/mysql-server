@@ -478,3 +478,16 @@ void my_message_local(enum loglevel ll, uint ecode, ...) {
   (*local_message_hook)(ll, ecode, args);
   va_end(args);
 }
+
+// usage: my_message_print(">>>>>>>>>>>>>>>>>>>查询表[%s]",$1.str);
+void debug_message_print(const char *format, ...) {
+  va_list args;
+  char ebuff[ERRMSGSIZE];
+  DBUG_TRACE;
+
+  enum loglevel level = WARNING_LEVEL;
+  va_start(args, format);
+  (void)vsnprintf(ebuff, sizeof(ebuff), format, args);
+  va_end(args);
+  my_message_local(level,EE_DEBUG_INFO,ebuff);
+}

@@ -792,6 +792,7 @@ static inline bool row_sel_test_other_conds(
 
 /** Retrieves the clustered index record corresponding to a record in a
  non-clustered index. Does the necessary locking.
+ // note:区别于 mysqlhanderl Row_sel_get_clust_rec Functor，这个服务于/依赖于query_graph
  @return DB_SUCCESS or error code */
 [[nodiscard]] static dberr_t row_sel_get_clust_rec(
     sel_node_t *node, /*!< in: select_node */
@@ -3084,6 +3085,7 @@ bool row_sel_store_mysql_rec(byte *mysql_rec, row_prebuilt_t *prebuilt,
 }
 
 /** Helper class to cache clust_rec and old_ver */
+// 二级索引的回表操作, 见： https://iwiki.woa.com/p/4015184929?from=iWiki_search#%E4%B8%80%E4%BA%9B%E7%96%91%E9%97%AE
 class Row_sel_get_clust_rec_for_mysql {
   const rec_t *cached_clust_rec;
   rec_t *cached_old_vers;
@@ -3121,6 +3123,7 @@ class Row_sel_get_clust_rec_for_mysql {
 
 /** Retrieve the clustered index record corresponding to a record in a
 non-clustered index. Does the necessary locking.
+TODO
   @return DB_SUCCESS, DB_SUCCESS_LOCKED_REC, or error code */
 
 [[nodiscard]] dberr_t Row_sel_get_clust_rec_for_mysql::operator()(
@@ -3944,6 +3947,7 @@ The cursor is an iterator over the table/index.
                                 Note: if this is != 0, then prebuilt must has a
                                 pcur with stored position! In opening of a
                                 cursor 'direction' should be 0.
+                                这是一个入参，在row_search_mvcc的过程中不会改变
 @return DB_SUCCESS or error code */
 dberr_t row_search_no_mvcc(byte *buf, page_cur_mode_t mode,
                            row_prebuilt_t *prebuilt, ulint match_mode,
@@ -4257,7 +4261,7 @@ struct row_to_range_relation_t {
   bool row_must_be_at_end;
 };
 
-/** A helper function extracted from row_search_mvcc() which compares the row
+/*todo A helper function extracted from row_search_mvcc() which compares the row
 being processed with the range of the scan.
 It does not modify any of it's arguments and returns a summary of situation.
 All the arguments are named the same way as local variables at place of call,
@@ -4301,6 +4305,7 @@ static row_to_range_relation_t row_compare_row_to_range(
   if (!set_also_gap_locks || trx->skip_gap_locks() ||
       (unique_search && !rec_get_deleted_flag(rec, comp)) ||
       dict_index_is_spatial(index) ||
+      // 这个是上面 example 的情况：主键 && >= && 初始查找 && 完整唯一键 && 当前记录rec符合search_tuple，这种情况也不需要gap lock
       (index == clust_index && mode == PAGE_CUR_GE && direction == 0 &&
        dtuple_get_n_fields_cmp(search_tuple) ==
            dict_index_get_n_unique(index) &&
@@ -4409,14 +4414,19 @@ It also has optimization such as pre-caching the rows, using AHI, etc.
                                 Note: if this is != 0, then prebuilt must has a
                                 pcur with stored position! In opening of a
                                 cursor 'direction' should be 0.
+                                这是一个入参，在row_search_mvcc的过程中不会改变
 @return DB_SUCCESS or error code */
 dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
                         row_prebuilt_t *prebuilt, ulint match_mode,
                         const ulint direction) {
   DBUG_TRACE;
 
+  ib::morphy_info() << "[MORPHY] search_tuple is: " << (*prebuilt->search_tuple);
+  ib::morphy_info() << "[MORPHY] m_stop_tuple is: " << (*prebuilt->m_stop_tuple);
+
   dict_index_t *index = prebuilt->index;
   bool comp = dict_table_is_comp(index->table);
+  // search_tuple 就是需要在btr上查找的dtuple. 以 show databases; 为例, search_tuple 在 Dictionary_client::acquire -> T::update_name_key(&key, schema->id(), object_name); 中设置为 mysql.tables 的secondary index entry. index_name=schema_id, index_tuple is (id, name).
   const dtuple_t *search_tuple = prebuilt->search_tuple;
   btr_pcur_t *pcur = prebuilt->pcur;
   trx_t *trx = prebuilt->trx;
@@ -4438,6 +4448,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   const dtuple_t *vrow = nullptr;
   const rec_t *result_rec = nullptr;
   const rec_t *clust_rec;
+  // sec idex 回表 funtor
   Row_sel_get_clust_rec_for_mysql row_sel_get_clust_rec_for_mysql;
   dberr_t err = DB_SUCCESS;
   bool unique_search = false;
@@ -4446,6 +4457,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   bool set_also_gap_locks = true;
   /* if the query is a plain locking SELECT, and the isolation level
   is <= TRX_ISO_READ_COMMITTED, then this is set to false */
+  // http://mysql.taobao.org/monthly/2018/11/04/ ; https://www.cnblogs.com/ajianbeyourself/p/6686136.html ;
   bool did_semi_consistent_read = false;
   /* if the returned record was locked and we did a semi-consistent
   read (fetch the newest committed version), then this is set to
@@ -4514,6 +4526,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
   const auto record_buffer = row_sel_get_record_buffer(prebuilt);
 
+  // direction = 0: 首次打开cur，需要进行定位(注意op_info), 定位在 pcur->open_no_init，之后将btr leaf page存在pcur中了
   if (UNIV_UNLIKELY(direction == 0)) {
     trx->op_info = "starting index read";
 
@@ -4527,6 +4540,8 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
     if (prebuilt->sel_graph == nullptr) {
       /* Build a dummy select query graph */
+      // active位置： que_thr_move_to_run_state_for_mysql
+      // xxxx: sel_graph 不是为了执行 Query Graph，而是为了提供 que_thr_t 上下文结构。后续无 que_run_threads/que_thr_step
       row_prebuild_sel_graph(prebuilt);
     }
   } else {
@@ -4612,7 +4627,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
     /* Even if the condition is unique, MySQL seems to try to
     retrieve also a second row if a primary key contains more than
-    1 column. Return immediately if this is not a HANDLER
+    1 column. Return immediately if this is not a HANDLER(mysql专用语法的handler sql语句)
     command. */
 
     if (UNIV_UNLIKELY(direction != 0 && !prebuilt->used_in_HANDLER)) {
@@ -4628,6 +4643,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     goto func_exit;
   }
 
+  // note: dql的mtr是为了记录加锁，内存管理等。
   mtr_start(&mtr);
 
   /*-------------------------------------------------------------*/
@@ -4747,6 +4763,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
   /*-------------------------------------------------------------*/
   /* PHASE 3: Open or restore index cursor position */
+  // 到底是open/restore pcur 应该是根据direction决定的
 
   spatial_search = dict_index_is_spatial(index) && mode >= PAGE_CUR_CONTAIN;
 
@@ -4793,6 +4810,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
   thr = que_fork_get_first_thr(prebuilt->sel_graph);
 
+  // note
   que_thr_move_to_run_state_for_mysql(thr, trx);
 
   clust_index = index->table->first_index();
@@ -4802,7 +4820,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
   /* Do some start-of-statement preparations */
 
-  if (!prebuilt->sql_stat_start) {
+  if (!prebuilt->sql_stat_start) { /* 并不是语句的刚开始了 */
     /* No need to set an intention lock or assign a read view */
 
     if (!MVCC::is_view_active(trx->read_view) && !srv_read_only_mode &&
@@ -4821,9 +4839,9 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     if (!srv_read_only_mode) {
       trx_assign_read_view(trx);
     }
-
+    // note
     prebuilt->sql_stat_start = false;
-  } else {
+  } else { // 需要锁表，调用 lock_table
   wait_table_again:
     err = lock_table(0, index->table,
                      prebuilt->select_lock_type == LOCK_S ? LOCK_IS : LOCK_IX,
@@ -4845,6 +4863,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
       goto next_rec;
     }
 
+    // note: direction != 0, 已经rnd_init -> row_search_mvcc(direction=0) pcur->open_xxx过了，这里只需要再次restore即可，无需再次open pcur
     auto need_to_process = sel_restore_position_for_mysql(
         &same_user_rec, BTR_SEARCH_LEAF, pcur, moves_up, &mtr);
 
@@ -4889,6 +4908,8 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
       }
     }
 
+    // 进行 btr_cur_search_to_nth_level 查找
+    // note: direction==0, 进行 pcur->open
     pcur->open_no_init(index, search_tuple, mode, BTR_SEARCH_LEAF, 0, &mtr,
                        UT_LOCATION_HERE);
 
@@ -4923,6 +4944,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
       }
     }
   } else if (mode == PAGE_CUR_G || mode == PAGE_CUR_L) {
+    // case: search_tuple 为空, 从左侧或者右侧pcur，进行打开pcur
     pcur->open_at_side(mode == PAGE_CUR_G, index, BTR_SEARCH_LEAF, false, 0,
                        &mtr);
   }
@@ -5346,7 +5368,7 @@ rec_loop:
 
       ut_ad(!index->is_clustered());
 
-      if (!srv_read_only_mode &&
+      if (!srv_read_only_mode &&  // note: mvcc的可见性判断. 不可见false时进入
           !lock_sec_rec_cons_read_sees(rec, index, trx->read_view)) {
         /* We should look at the clustered index.
         However, as this is a non-locking read,
@@ -5448,6 +5470,8 @@ rec_loop:
     /* The following call returns 'offsets' associated with
     'clust_rec'. Note that 'clust_rec' can be an old version
     built for a consistent read. */
+    // note: 回表
+    // todo: 看看为什么用 que_fork_t *thr
     err = row_sel_get_clust_rec_for_mysql(
         prebuilt, index, rec, thr, &clust_rec, &offsets, &heap,
         need_vrow ? &vrow : nullptr, &mtr, prebuilt->get_lob_undo());
@@ -5493,6 +5517,7 @@ rec_loop:
       if (!heap) {
         heap = mem_heap_create(100, UT_LOCATION_HERE);
       }
+      // 二级索引， 填充虚拟列(扫描列是带虚拟列的二级索引，而且需要回表)
       row_sel_fill_vrow(rec, index, &vrow, heap);
     }
 
@@ -5973,6 +5998,7 @@ normal_return:
   /* Rollback blocking transactions from hit list for high priority
   transaction, if any. We should not be holding latches here as
   we are going to rollback the blocking transactions. */
+  // note
   trx_kill_blocking(trx);
 
   DEBUG_SYNC_C("row_search_for_mysql_before_return");

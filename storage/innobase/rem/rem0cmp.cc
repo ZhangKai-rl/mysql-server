@@ -597,6 +597,7 @@ int cmp_data_data(ulint mtype, ulint prtype, bool is_asc, const byte *data1,
   return (cmp_data(mtype, prtype, is_asc, data1, len1, data2, len2));
 }
 
+// TODO
 int cmp_dtuple_rec_with_match_low(const dtuple_t *dtuple, const rec_t *rec,
                                   const dict_index_t *index,
                                   const ulint *offsets, ulint n_cmp,
@@ -726,7 +727,7 @@ static inline ulint cmp_get_pad_char(const dtype_t *type) {
       return (ULINT_UNDEFINED);
   }
 }
-
+/** 逐bytes比较 */
 int cmp_dtuple_rec_with_match_bytes(const dtuple_t *dtuple, const rec_t *rec,
                                     const dict_index_t *index,
                                     const ulint *offsets, ulint *matched_fields,
@@ -735,6 +736,8 @@ int cmp_dtuple_rec_with_match_bytes(const dtuple_t *dtuple, const rec_t *rec,
   ulint cur_field; /* current field number */
   ulint cur_bytes;
   int ret; /* return value */
+
+  // ib::info() << "[test] dtuple is : " << *dtuple;
 
   ut_ad(dtuple_check_typed(dtuple));
   ut_ad(rec_offs_validate(rec, index, offsets));
@@ -766,7 +769,7 @@ int cmp_dtuple_rec_with_match_bytes(const dtuple_t *dtuple, const rec_t *rec,
     indexes with ascending order on the columns. */
     const bool is_ascending =
         dict_index_is_ibuf(index) || index->fields[cur_field].is_ascending;
-
+// 分别拿到本次插入的rec的cmp_field data和上次插入的rec的cmp_field data
     dtuple_b_ptr = static_cast<const byte *>(dfield_get_data(dfield));
     rec_b_ptr = rec_get_nth_field(index, rec, offsets, cur_field, &rec_f_len);
     ut_ad(!rec_offs_nth_extern(index, offsets, cur_field));

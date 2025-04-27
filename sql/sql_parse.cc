@@ -1362,7 +1362,7 @@ bool do_command(THD *thd) {
     thd->copy_status_var(&query_start_status);
   }
 
-  rc = thd->m_mem_cnt.reset();
+  rc = thd->m_mem_cnt.reset();;
   if (rc)
     thd->m_mem_cnt.set_thd_error_status();
   else {
@@ -1378,7 +1378,7 @@ bool do_command(THD *thd) {
       See init_net_server_extension()
     */
     thd->m_server_idle = true;
-    rc = thd->get_protocol()->get_command(&com_data, &command);
+    rc = thd->get_protocol()->get_command(&com_data, &command); // will hang here wait for new command.
     thd->m_server_idle = false;
   }
 
@@ -2950,7 +2950,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
   Query_block *const query_block = lex->query_block;
   /* first table of first Query_block */
   Table_ref *const first_table = query_block->get_table_list();
-  /* list of all tables in query */
+  /* note: list of all tables in query */
   Table_ref *all_tables;
   // keep GTID violation state in order to roll it back on statement failure
   bool gtid_consistency_violation_state = thd->has_gtid_consistency_violation;
@@ -3211,6 +3211,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
   Opt_trace_object trace_command(&thd->opt_trace);
   Opt_trace_array trace_command_steps(&thd->opt_trace, "steps");
 
+  // 判断是否ps
   if (lex->m_sql_cmd && lex->m_sql_cmd->owner())
     lex->m_sql_cmd->owner()->trace_parameter_types(thd);
 
@@ -3278,7 +3279,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
 #endif
 
   /*
-    Start a new transaction if CREATE TABLE has START TRANSACTION clause.
+    note: Start a new transaction if CREATE TABLE has START TRANSACTION clause.
     Disable binlog so that the BEGIN is not logged in binlog.
    */
   if (lex->create_info && lex->create_info->m_transactional_ddl &&
@@ -4922,7 +4923,7 @@ finish:
     if ((thd->is_error() && !early_error_on_rep_command) ||
         (thd->variables.option_bits & OPTION_MASTER_SQL_ERROR))
       trans_rollback_stmt(thd);
-    else {
+    else { // 为什么这里又提交一次？
       /* If commit fails, we should be able to reset the OK status. */
       thd->get_stmt_da()->set_overwrite_status(true);
       trans_commit_stmt(thd);
@@ -5247,6 +5248,7 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
   // It is possible that rewritten query may not be empty (in case of
   // multiqueries). So reset it.
   thd->reset_rewritten_query();
+  // note: create_query_expr_and_block here
   lex_start(thd);
 
   thd->m_parser_state = parser_state;
@@ -7132,6 +7134,7 @@ bool parse_sql(THD *thd, Parser_state *parser_state,
 
   thd->push_diagnostics_area(parser_da, false);
 
+  // note
   bool mysql_parse_status = thd->sql_parser();
 
   thd->pop_internal_handler();

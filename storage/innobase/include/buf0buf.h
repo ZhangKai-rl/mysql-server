@@ -67,7 +67,7 @@ enum class Page_fetch {
   /** get if in pool */
   IF_IN_POOL,
 
-  /** get if in pool, do not make the block young in the LRU list */
+  /** 仅当在内存中时读取. get if in pool, do not make the block young in the LRU list */
   PEEK_IF_IN_POOL,
 
   /** get and bufferfix, but set no latch; we have separated this case, because
@@ -75,7 +75,7 @@ enum class Page_fetch {
   care */
   NO_LATCH,
 
-  /** Get the page only if it's in the buffer pool, if not then set a watch on
+  /** 不在内存则设置 watch. Get the page only if it's in the buffer pool, if not then set a watch on
   the page. */
   IF_IN_POOL_OR_WATCH,
 
@@ -887,7 +887,7 @@ and the lock released later.
 buf_page_t *buf_page_init_for_read(ulint mode, const page_id_t &page_id,
                                    const page_size_t &page_size, bool unzip);
 
-/** Completes an asynchronous read or write request of a file page to or from
+/* TODO: Completes an asynchronous read or write request of a file page to or from
 the buffer pool.
 @param[in]      bpage   pointer to the block in question
 @param[in]      evict   whether or not to evict the page from LRU list
@@ -2236,6 +2236,7 @@ struct buf_pool_t {
 
   /** Size in pages of the area which the read-ahead algorithms read
   if invoked */
+  // read ahead， innodb buffer pool的预读. bp中用于 read-ahead的区域的页数大小
   page_no_t read_ahead_area;
 
   /** Hash table of buf_page_t or buf_block_t file pages, buf_page_in_file() ==

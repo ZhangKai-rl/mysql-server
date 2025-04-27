@@ -62,6 +62,7 @@
 
 PFS_global_param pfs_param;
 
+// 静态类成员变量的类外定义
 PFS_table_stat PFS_table_stat::g_reset_template;
 
 static void cleanup_performance_schema();

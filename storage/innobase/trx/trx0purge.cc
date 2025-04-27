@@ -332,6 +332,7 @@ void trx_purge_add_update_undo_to_history(
   undo = undo_ptr->update_undo;
   rseg = undo->rseg;
 
+  // 获取 rollback segment header 页面的 page header
   rseg_header = trx_rsegf_get(undo->rseg->space_id, undo->rseg->page_no,
                               undo->rseg->page_size, mtr);
 
@@ -362,7 +363,7 @@ void trx_purge_add_update_undo_to_history(
                      hist_size + undo->size, MLOG_4BYTES, mtr);
   }
 
-  /* Add the log as the first in the history list */
+  /* xxxx: Add the log as the first in the history list */
   flst_add_first(rseg_header + TRX_RSEG_HISTORY,
                  undo_header + TRX_UNDO_HISTORY_NODE, mtr);
 

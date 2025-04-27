@@ -80,6 +80,8 @@ inline std::ostream &operator<<(std::ostream &out, const lock_table_t &lock) {
 }
 
 /** Record lock for a page */
+// @usage: lock_rec_lock
+// note: 行锁以page为单位进行管理，同一个事务在同一个page上的所有行锁只创建一个lock_t，具体要看某一个记录上是否有锁，要用该记录在page中唯一标识的heap no到bitmap查询该位是否为1；lock_t结构体中不包含bitmap成员变量，但是在申请内存的时候，会在申请sizeof(lock_t)这块内存的基础上，额外多要一块bitmap大小的内存。紧邻lock_t存放，每个bit代表页内一行数据，使用heap_no对应。
 struct lock_rec_t {
   /** The id of the page on which records referenced by this lock's bitmap are
   located. */
@@ -87,6 +89,9 @@ struct lock_rec_t {
   /** number of bits in the lock bitmap;
   Must be divisible by 8.
   NOTE: the lock bitmap is placed immediately after the lock struct */
+  // xxxx: 位图	紧跟在结构体(lock_t而不是lock_rec_t，见RecLock::create)后面的内存区域
+  // 假设一个页面有 100 条记录
+  // n_bits = 100 + LOCK_PAGE_BITMAP_MARGIN (8) = 108
   uint32_t n_bits;
 
   /** Print the record lock into the given output stream
@@ -133,6 +138,8 @@ static inline bool lock_mode_is_next_key_lock(ulint mode) {
 static inline bool lock_rec_get_nth_bit(const lock_t *lock, ulint i);
 
 /** Lock struct; protected by lock_sys latches */
+// lock_t ib_lock_t
+// note: 具体的内部实现可能是 union: table_lock/RecLock
 struct lock_t {
   /** transaction owning the lock */
   trx_t *trx;
@@ -167,6 +174,7 @@ struct lock_t {
 
   /** The lock type and mode bit flags.
   LOCK_GAP or LOCK_REC_NOT_GAP, LOCK_INSERT_INTENTION, wait flag, ORed */
+  // note: https://iwiki.woa.com/p/4014532215#%E5%8A%A0%E9%94%81%E6%A8%A1%E5%BC%8F%E5%8F%8A%E5%8A%A0%E9%94%81%E6%B5%81%E7%A8%8B
   uint32_t type_mode;
 
 #if defined(UNIV_DEBUG)
@@ -254,6 +262,7 @@ struct lock_t {
   }
 };
 
+// ut_list_base_Node_t_extern 链表基节点的 Node_getter定义
 UT_LIST_NODE_GETTER_DEFINITION(lock_t, trx_locks)
 
 /** Convert the member 'type_mode' into a human readable string.
@@ -305,6 +314,7 @@ extern bool lock_print_waits;
 /* Safety margin when creating a new record lock: this many extra records
 can be inserted to the page without need to create a lock with a bigger
 bitmap */
+// 防止 lock_rec_fast 时 bitmap 太小(<heap_no) 导致的重复申请bitmap
 
 static const ulint LOCK_PAGE_BITMAP_MARGIN = 64;
 
@@ -654,6 +664,8 @@ struct RecID {
 
 /**
 Create record locks */
+// note: 虽然是 记录锁，但是实际上锁的不是记录本身，而是 clust idx
+/** RecLock 与 lock_rec_t 的区别。 RecLock -> create -> lock_t -> lock_rec_t */
 class RecLock {
  public:
   /**
@@ -863,6 +875,7 @@ class RecLock {
 
   /**
   Size of the record lock in bytes */
+  // 计算见 init
   size_t m_size;
 
   /**
@@ -870,7 +883,7 @@ class RecLock {
   dict_index_t *m_index;
 
   /**
-  The record lock tuple {space, page_no, heap_no} */
+  note: The record lock tuple {space, page_no, heap_no} */
   RecID m_rec_id;
 };
 
@@ -1130,6 +1143,7 @@ auto latch_peeked_shard_and_do(const lock_t *peeked_lock, F &&f) {
     const auto sharded_by = peeked_lock->rec_lock.page_id;
     trx_mutex_exit(trx);
     DEBUG_SYNC_C("try_relatch_trx_and_shard_and_do_noted_expected_version");
+    // 为了上 sharded locksys mutex, 先释放trx->mutex，然后上了后再重新获取
     locksys::Shard_naked_latch_guard guard{UT_LOCATION_HERE, sharded_by};
     trx_mutex_enter_first_of_two(trx);
     return std::forward<F>(f)();

@@ -659,7 +659,7 @@ static inline void buf_ptr_get_fsp_addr(
     const void *ptr,   /*!< in: pointer to a buffer frame */
     space_id_t *space, /*!< out: space id */
     fil_addr_t *addr)  /*!< out: page offset and byte offset */
-{
+{ //   获取page的首地址如0x1585944000               page中XDES Entry中ListNode地址如 0x158594409e, 二者相差158B
   const page_t *page = (const page_t *)ut_align_down(ptr, UNIV_PAGE_SIZE);
 
   *space = mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);

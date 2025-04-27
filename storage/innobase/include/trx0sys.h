@@ -456,7 +456,7 @@ struct trx_sys_t {
 
   /** @{ */
 
-  /** Multi version concurrency control manager */
+  /* note: Multi version concurrency control manager */
 
   MVCC *mvcc;
 

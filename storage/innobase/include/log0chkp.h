@@ -257,6 +257,7 @@ void log_free_check_validate();
 /** Reserves free_check_margin in the redo space for the current thread.
 For further details please look at description of @see log_free_check_margin().
 @param[in]  log   redo log */
+// todo
 inline void log_free_check(log_t &log) {
   ut_d(log_free_check_validate());
 

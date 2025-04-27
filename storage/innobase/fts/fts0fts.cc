@@ -1178,7 +1178,7 @@ static void fts_cache_add_doc(
   ut_ad(rw_lock_own(&cache->lock, RW_LOCK_X));
 
   n_words = rbt_size(tokens);
-
+    // 遍历 插入 doc 的tokens. tokens(doc->tokens)的获取位置，可以看 ngram_parser
   for (node = rbt_first(tokens); node; node = rbt_first(tokens)) {
     fts_tokenizer_word_t *word;
     fts_node_t *fts_node = nullptr;
@@ -2278,7 +2278,7 @@ dberr_t fts_create_index_tables_low(trx_t *trx, dict_index_t *index,
   fts_table.table_id = table_id;
   fts_table.parent = table_name;
   fts_table.table = index->table;
-
+    // 6 个 FTS index tables
   for (i = 0; i < FTS_NUM_AUX_INDEX && error == DB_SUCCESS; ++i) {
     dict_table_t *new_table;
 
@@ -5792,7 +5792,7 @@ bool fts_is_aux_table_name(fts_aux_table_t *table, const char *name,
     ++ptr;
     len = end - ptr;
   }
-
+    // 此时 ptr 指向表名
   /* All auxiliary tables are prefixed with "FTS_" and the name
   length will be at the very least greater than 20 bytes. */
   if (ptr != nullptr && len > 20 &&

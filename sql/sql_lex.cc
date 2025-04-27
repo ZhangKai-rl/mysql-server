@@ -594,6 +594,7 @@ Query_block *LEX::new_empty_query_block() {
   return select;
 }
 
+// note: 这里只创建了最顶层的一个qe和一个qb
 Query_expression *LEX::create_query_expr_and_block(
     THD *thd, Query_block *current_query_block, Item *where, Item *having,
     enum_parsing_context ctx) {
@@ -613,7 +614,7 @@ Query_expression *LEX::create_query_expr_and_block(
   // Link the new query expression below the current query block, if any
   if (current_query_block != nullptr)
     new_expression->include_down(this, current_query_block);
-
+    // 设置 master slave关系。
   new_query_block->include_down(this, new_expression);
 
   new_query_block->parent_lex = this;
@@ -648,7 +649,7 @@ Query_block *LEX::new_query(Query_block *curr_query_block) {
 
   enum_parsing_context parsing_place =
       curr_query_block != nullptr ? curr_query_block->parsing_place : CTX_NONE;
-
+  // note
   Query_expression *const new_query_expression = create_query_expr_and_block(
       thd, curr_query_block, nullptr, nullptr, parsing_place);
   if (new_query_expression == nullptr) return nullptr;
@@ -2694,7 +2695,7 @@ void Index_hint::print(const THD *thd, String *str) {
 }
 
 typedef Prealloced_array<Table_ref *, 8> Table_array;
-
+// note
 static void print_table_array(const THD *thd, String *str,
                               const Table_array &tables,
                               enum_query_type query_type) {
@@ -2947,6 +2948,7 @@ void Query_block::print(const THD *thd, String *str,
   }
 }
 
+// note
 void Query_block::print_query_block(const THD *thd, String *str,
                                     enum_query_type query_type) {
   if (query_type & QT_SHOW_SELECT_NUMBER) {
@@ -4964,6 +4966,7 @@ static void unsafe_mixed_statement(LEX::enum_stmt_accessed_table a,
 bool LEX::make_sql_cmd(Parse_tree_root *parse_tree) {
   if (!will_contextualize) return false;
 
+  // ques: LEX::THD啥时候设置的？
   m_sql_cmd = parse_tree->make_cmd(thd);
   if (m_sql_cmd == nullptr) return true;
 

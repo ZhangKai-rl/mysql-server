@@ -2284,6 +2284,7 @@ static bool fill_check_constraints_from_dd(TABLE_SHARE *share,
   return false;
 }
 
+// 填充table_share。从dd导入table meta data.
 bool open_table_def(THD *thd, TABLE_SHARE *share, const dd::Table &table_def) {
   DBUG_TRACE;
 

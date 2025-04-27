@@ -686,7 +686,9 @@ struct Key_name {
   This structure is shared between different table objects. There is one
   instance of table share per one table in the database.
 */
-
+// server层表定义table_share
+// mysql server层的表对象内存结构。不区分存储引擎，一个表对应一个table_share。这应该是表的元数据，server层.
+// 这个结构由所有session共有，因此m_ref_count. 之后创建的table结构体对象为线程独有。
 struct TABLE_SHARE {
   TABLE_SHARE() = default;
 
@@ -743,7 +745,7 @@ struct TABLE_SHARE {
   /* The following is copied to each TABLE on OPEN */
   Field **field{nullptr};
   Field **found_next_number_field{nullptr};
-  KEY *key_info{nullptr};    /* data of keys defined for the table */
+  KEY *key_info{nullptr};    /* data of keys defined for the table */ // 即索引信息
   uint *blob_field{nullptr}; /* Index to blobs in Field array */
 
   uchar *default_values{nullptr};      /* row with default values */
@@ -1253,7 +1255,7 @@ struct TABLE_SHARE {
 
  private:
   /// How many TABLE objects use this TABLE_SHARE.
-  unsigned int m_ref_count{0};
+  unsigned int m_ref_count{0}; // ??
 
   /**
     TABLE_SHARE version, if changed the TABLE_SHARE must be reopened.
@@ -1398,7 +1400,7 @@ typedef Bitmap<MAX_FIELDS> Field_map;
 */
 struct TABLE {
   TABLE_SHARE *s{nullptr};
-  handler *file{nullptr};
+  handler *file{nullptr};  // 存储引擎的句柄
   TABLE *next{nullptr}, *prev{nullptr};
 
  private:
@@ -1434,17 +1436,19 @@ struct TABLE {
     a passed THD reference, or, if there is no such, current_thd.
     The reason for this is that we cannot guarantee the field is not NULL.
   */
-  THD *in_use{nullptr};
+  THD *in_use{nullptr};  // 持有该table的线程
   Field **field{nullptr}; /* Pointer to fields */
   /// Count of hidden fields, if internal temporary table; 0 otherwise.
   uint hidden_field_count{0};
 
-  uchar *record[2]{nullptr, nullptr}; /* Pointer to records */
+  // 不包含 vcol, 但是包含 scol. 存储到 se 的 row data.
+  uchar *record[2]{nullptr, nullptr}; /* Pointer to records. mysql format的行数据 */
   uchar *write_row_record{nullptr};   /* Used as optimisation in
                                  THD::write_row */
   uchar *insert_values{nullptr};      /* used by INSERT ... UPDATE */
 
   /// Buffer for use in multi-row reads. Initially empty.
+  // ques: 和 prebuilt_t 的预读有关系吗？
   Record_buffer m_record_buffer{0, 0, nullptr};
 
   /*
@@ -4066,7 +4070,7 @@ class Field_iterator_table_ref : public Field_iterator {
                                                 Table_ref *parent_table_ref);
   Natural_join_column *get_natural_column_ref();
 };
-
+// 存储查询中所用到的所有表
 struct OPEN_TABLE_LIST {
   OPEN_TABLE_LIST *next;
   char *db, *table;

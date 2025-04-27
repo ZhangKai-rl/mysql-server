@@ -3046,7 +3046,7 @@ struct HA_CREATE_INFO {
   const CHARSET_INFO *table_charset{nullptr};
   const CHARSET_INFO *default_table_charset{nullptr};
   bool schema_read_only{false};
-  LEX_STRING connect_string{nullptr, 0};
+  LEX_STRING connect_string{nullptr, 0}; // 见： https://www.dbs724.com/202614.html
   const char *password{nullptr};
   const char *tablespace{nullptr};
   LEX_STRING comment{nullptr, 0};
@@ -4454,6 +4454,9 @@ class handler {
   enum enum_range_scan_direction { RANGE_SCAN_ASC, RANGE_SCAN_DESC };
 
  private:
+  // initialize: in ha_set_record_buffer, set to TABLE::m_record_buffer
+  // prefetch cache buffer.
+  // using: row_sel_get_record_buffer; prefetch cache; last cache.
   Record_buffer *m_record_buffer = nullptr;  ///< Buffer for multi-row reads.
   /*
     Storage space for the end range value. Should only be accessed using
@@ -4703,6 +4706,7 @@ class handler {
 
   /**
     Get the record buffer that was set with ha_set_record_buffer().
+    prefetch buffer. cache buffer.
 
     @return the buffer to use for multi-row reads, or nullptr if there is none
   */

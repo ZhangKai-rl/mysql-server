@@ -60,6 +60,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** Set and return a savepoint in mtr.
 @return savepoint */
+// TODO
 #define mtr_set_savepoint(m) (m)->get_savepoint()
 
 /** Release the (index tree) s-latch stored in an mtr memo after a

@@ -653,6 +653,7 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
   return false;
 }
 
+// ques: 为什么定义在cc中？
 class Fil_shard {
   using File_list = UT_LIST_BASE_NODE_T(fil_node_t, LRU);
   using Space_list = UT_LIST_BASE_NODE_T(fil_space_t, unflushed_spaces);
@@ -1806,7 +1807,7 @@ class Fil_system {
   friend class Fil_shard;
 };
 
-/** The tablespace memory cache. This variable is nullptr before the module is
+/** The **tablespace memory cache**. This variable is nullptr before the module is
 initialized. */
 static Fil_system *fil_system = nullptr;
 
@@ -2219,6 +2220,7 @@ connections that could drop tablespaces). If this is not the case,
 fil_space_acquire() and fil_space_release() should be used instead.
 @param[in]      space_id        Tablespace ID
 @return tablespace, or nullptr if not found */
+// get the filespace from file system.
 fil_space_t *fil_space_get(space_id_t space_id) {
   auto shard = fil_system->shard_by_id(space_id);
 
@@ -7859,6 +7861,7 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
   }
 #else /* UNIV_HOTBACKUP */
   /* Queue the aio request */
+  // note: 设置完了，实现核心 AIO
   err = os_aio(
       req_type, aio_mode, file->name, file->handle, buf, offset, len,
       fsp_is_system_temporary(page_id.space()) ? false : srv_read_only_mode,
@@ -7887,6 +7890,7 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
 
     mutex_acquire();
 
+    // ques: 同步io?
     complete_io(file, req_type);
 
     mutex_release();
@@ -7904,6 +7908,7 @@ into segments (see os0file.cc for more info). The thread specifies which
 segment it wants to wait for.
 @param[in]      segment         The number of the segment in the AIO array
                                 to wait for */
+// TODO: 单独thread/segment执行
 void fil_aio_wait(ulint segment) {
   void *m2;
   fil_node_t *m1;
@@ -7911,6 +7916,7 @@ void fil_aio_wait(ulint segment) {
 
   ut_ad(fil_validate_skip());
 
+  // note: 处理aio. 获取 m1, m2
   auto err = os_aio_handler(segment, &m1, &m2, &type);
   ut_a(err == DB_SUCCESS);
 
@@ -7952,6 +7958,7 @@ void fil_aio_wait(ulint segment) {
       if (m2 != nullptr) {
         auto bpage = static_cast<buf_page_t *>(m2);
         ut_d(bpage->take_io_responsibility());
+        // TODO: 完成 AIO 的核心!!!!!!!
         buf_page_io_complete(bpage, false);
       }
       return;
@@ -7961,6 +7968,7 @@ void fil_aio_wait(ulint segment) {
 }
 #endif /* !UNIV_HOTBACKUP */
 
+// TODO
 dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
                const page_size_t &page_size, ulint byte_offset, ulint len,
                void *buf, void *message) {
@@ -7973,6 +7981,7 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
   }
 #endif
 
+// note
   auto const err = shard->do_io(type, sync, page_id, page_size, byte_offset,
                                 len, buf, message);
 #ifdef UNIV_DEBUG
@@ -11366,6 +11375,7 @@ void Tablespace_dirs::set_scan_dirs(const std::string &in_directories) {
   add_paths(directories, separators);
 }
 
+// TODO: 这里可能花费很长时间
 /** Discover tablespaces by reading the header from .ibd files.
 @return DB_SUCCESS if all goes well */
 dberr_t Tablespace_dirs::scan() {
@@ -11463,11 +11473,14 @@ dberr_t Tablespace_dirs::scan() {
   using std::placeholders::_5;
   using std::placeholders::_6;
 
+  // using Const_iter = Scanned_files::const_iterator; -> Const_iter = std::vector<std::pair<uint16_t, std::string>>::const_iterator
   std::function<void(const Const_iter &, const Const_iter &, size_t,
                      std::mutex *, Space_id_set *, Space_id_set *)>
+      // Tablespace_dirs::duplicate_check 是类成员函数，第一个隐藏参数必须是this，因此这里要绑定下统一函数签名
       check = std::bind(&Tablespace_dirs::duplicate_check, this, _1, _2, _3, _4,
                         _5, _6);
 
+  // par_for 期望 f(check) 是一个普通的可调用对象, 是不含有this指针的
   par_for(PFS_NOT_INSTRUMENTED, ibd_files, n_threads, check, &m, &unique,
           &duplicates);
 

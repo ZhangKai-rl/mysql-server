@@ -47,6 +47,7 @@ external tools. */
 @param[in]      rec     physical record
 @param[in]      index   record descriptor
 @param[in, out] offsets array of offsets */
+// http://mysql.taobao.org/monthly/2019/08/03/
 static void rec_init_offsets_new(const rec_t *rec, const dict_index_t *index,
                                  ulint *offsets) {
   ulint status = rec_get_status(rec);
@@ -73,6 +74,7 @@ static void rec_init_offsets_new(const rec_t *rec, const dict_index_t *index,
   const byte *nulls = rec - (REC_N_NEW_EXTRA_BYTES + 1);
   const size_t nullable_cols = index->get_nullable_before_instant_add_drop();
 
+  // note: 这里的 len*s* 代表的事变长字段长度列表的位置，而不是具体的长度数值. byte类型
   const byte *lens = nulls - UT_BITS_IN_BYTES(nullable_cols);
   ulint offs = 0;
   ulint null_mask = 1;
@@ -151,6 +153,9 @@ static void rec_init_offsets_new(const rec_t *rec, const dict_index_t *index,
     rec_offs_base(offsets)[i + 1] = len;
   } while (++i < rec_offs_n_fields(offsets));
 
+  // ques: 这里为什么 +1 ？ 
+  // note: (lens + 1)是variable fields length list的结尾，两者相减后得出 字段数量+rec header的总字节数
+  // 通过这样设置了 innodb compact record format 的 extra size大小, 复制给 offsets[4]
   *rec_offs_base(offsets) = (rec - (lens + 1)) | REC_OFFS_COMPACT;
 }
 

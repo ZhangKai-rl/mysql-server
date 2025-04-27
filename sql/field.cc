@@ -1454,6 +1454,7 @@ static void set_decimal_warning(THD *thd, Field_new_decimal *field,
   @retval length of bytes copied to 'to'
 */
 
+// https://cloud.tencent.com/developer/article/1847705
 static size_t field_well_formed_copy_nchars(
     const CHARSET_INFO *to_cs, char *to, size_t to_length,
     const CHARSET_INFO *from_cs, const char *from, size_t from_length,
@@ -6580,7 +6581,7 @@ type_conversion_status Field_varstring::store(const char *from, size_t length,
 
   copy_length = field_well_formed_copy_nchars(
       field_charset, (char *)ptr + length_bytes, field_length, cs, from, length,
-      field_length / field_charset->mbmaxlen, &well_formed_error_pos,
+      field_length / field_charset->mbmaxlen, &well_formed_error_pos,  // this param show the error
       &cannot_convert_error_pos, &from_end_pos);
 
   if (length_bytes == 1)

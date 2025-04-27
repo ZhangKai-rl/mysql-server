@@ -4281,7 +4281,7 @@ error:
   @sa int2store(), int3store(), int4store(), mysql_fill_packet_header()
 */
 /* clang-format on */
-/**
+/** sslResponse41
   Fill in the beginning of the client reply packet.
 
   Used to fill in the beginning of the client reply packet
@@ -4316,9 +4316,9 @@ static char *mysql_fill_packet_header(MYSQL *mysql, char *buff,
     int4store(buff_p, client_flag);
     int4store(buff_p + 4, net->max_packet_size);
     buff[8] = (char)mysql->charset->number;
-    memset(buff + 9, 0, 32 - 9);
+    memset(buff + 9, 0, 32 - 9);  // ssl pkt 填充23B 0x00
     end = buff + 32;
-  } else {
+  } else {// 320格式sslResponse
     assert(buff_size >= 5);
     assert(client_flag <= UINT_MAX16);
 
@@ -5041,7 +5041,7 @@ static bool prep_client_reply_packet(MCPVIO_EXT *mpvio, const uchar *data,
   buff = static_cast<char *>(
       my_malloc(PSI_NOT_INSTRUMENTED, buff_size, MYF(MY_WME | MY_ZEROFILL)));
 
-  /* The client_flags is already calculated. Just fill in the packet header */
+  /* 写handshakeRespon前四个字段。The client_flags is already calculated. Just fill in the packet header */
   end = mysql_fill_packet_header(mysql, buff, buff_size);
 
   DBUG_PRINT(
@@ -5129,7 +5129,7 @@ static int send_client_reply_packet(MCPVIO_EXT *mpvio, const uchar *data,
   int buff_len;
   int ret = 0;
   bool prep_err;
-
+    // 准备数据包 handshakeResponse
   prep_err = prep_client_reply_packet(mpvio, data, data_len, &buff, &buff_len);
   if (prep_err) {
     return 1;
@@ -5192,7 +5192,7 @@ static int client_mpvio_read_packet(MYSQL_PLUGIN_VIO *mpv,
                                     uchar **buf) SUPPRESS_UBSAN;
 #endif  // __clang__
 
-/**
+/** 重要，这里表明了只能使用 acl_user表中规定的
   vio->read_packet() callback method for client authentication plugins
 
   This function is called by a client authentication plugin, when it wants
@@ -5203,7 +5203,7 @@ static int client_mpvio_read_packet(MYSQL_PLUGIN_VIO *mpv, uchar **buf) {
   MYSQL *mysql = mpvio->mysql;
   ulong pkt_len;
 
-  /* there are cached data left, feed it to a plugin */
+  /* caching_sha2_password插件进入这里。 there are cached data left, feed it to a plugin */
   if (mpvio->cached_server_reply.pkt_received) {
     *buf = mpvio->cached_server_reply.pkt;
     mpvio->cached_server_reply.pkt = nullptr;
@@ -5219,12 +5219,12 @@ static int client_mpvio_read_packet(MYSQL_PLUGIN_VIO *mpv, uchar **buf) {
       the server handshake packet came from the wrong plugin,
       or it's mysql_change_user(). Either way, there is no data
       for a plugin to read. send a dummy packet to the server
-      to initiate a dialog.
+      to initiate a dialog. 重要。
     */
     if (client_mpvio_write_packet(mpv, nullptr, 0)) return (int)packet_error;
   }
 
-  /* otherwise read the data */
+  /* otherwise read the data. 实际上是 cli_safe_read */
   pkt_len = (*mysql->methods->read_change_user_result)(mysql);
 
   /* error while reading the change user request */
@@ -5353,7 +5353,7 @@ static int client_mpvio_write_packet(MYSQL_PLUGIN_VIO *mpv, const uchar *pkt,
   if (mpvio->packets_written == 0) {
     if (mpvio->mysql_change_user)
       res = send_change_user_packet(mpvio, pkt, pkt_len);
-    else
+    else/** 重要！！！！！！ */
       res = send_client_reply_packet(mpvio, pkt, pkt_len);
   } else {
     NET *net = &mpvio->mysql->net;
@@ -5556,7 +5556,7 @@ int run_plugin_auth(MYSQL *mysql, char *data, uint data_len,
   ctx.current_factor_index = 0;
   ctx.state_function = authsm_begin_plugin_auth;
 
-  do {
+  do {/** 注意这里和connect_helper一样都是一个sm的循环: authsm_begin_plugin_auth ->  */
     status = ctx.state_function(&ctx);
     DBUG_PRINT("info", ("status %d", (int)status));
   } while (status != STATE_MACHINE_FAILED && status != STATE_MACHINE_DONE);
@@ -5636,14 +5636,14 @@ static mysql_state_machine_status authsm_begin_plugin_auth(
       Checks:
       1. Default authentication plug-in is configured
       2. Default authentication plug-in is valid.
-    */
+    */ /** =============重要：client-side选择auth plugin的逻辑！！！================ */
     auth_plugin_t *client_plugin{nullptr};
     if (mysql->options.extension && mysql->options.extension->default_auth &&
         (client_plugin = (auth_plugin_t *)mysql_client_find_plugin(
              mysql, mysql->options.extension->default_auth,
              MYSQL_CLIENT_AUTHENTICATION_PLUGIN))) {
       ctx->auth_plugin_name = mysql->options.extension->default_auth;
-    } else {
+    } else { // 如果该插件找不到并且安装失败时，直接用server传过来的plugin: caching_sha2_password
       ctx->auth_plugin_name = ctx->data_plugin;
     }
     if (!(ctx->auth_plugin = (auth_plugin_t *)mysql_client_find_plugin(
@@ -5748,7 +5748,7 @@ static mysql_state_machine_status authsm_run_first_authenticate_user(
     if (status == NET_ASYNC_NOT_READY) {
       return STATE_MACHINE_WOULD_BLOCK;
     }
-  } else {
+  } else {/** ======核心：执行plugin的authenticate_user函数======*/
     ctx->res = ctx->auth_plugin->authenticate_user(
         (struct MYSQL_PLUGIN_VIO *)&ctx->mpvio, mysql);
   }
@@ -5847,6 +5847,7 @@ static mysql_state_machine_status authsm_handle_change_user_result(
   }
 
   if (mysql->net.read_pos[0] == 254) {
+      // client处理 AuthSwitchRequest包
     ctx->state_function = authsm_run_second_authenticate_user;
   } else if (is_auth_next_factor_packet(mysql)) {
     ctx->state_function = authsm_init_multi_auth;
@@ -5864,6 +5865,8 @@ static mysql_state_machine_status authsm_handle_change_user_result(
 /**
   Start the authentication process again with the plugin which
   server asked for.
+
+  client处理authSwitchRequest包
 */
 static mysql_state_machine_status authsm_run_second_authenticate_user(
     mysql_async_auth *ctx) {
@@ -6131,7 +6134,7 @@ MYSQL *connect_helper(mysql_async_connect *ctx) {
   mysql_state_machine_status status;
   auto mysql = ctx->mysql;
   mysql->options.client_flag |= ctx->client_flag;
-  do {
+  do { // todo: 会在这里一直循环多次！！！
     status = ctx->state_function(ctx);
   } while (status != STATE_MACHINE_FAILED && status != STATE_MACHINE_DONE);
 
@@ -6645,7 +6648,7 @@ static mysql_state_machine_status csm_begin_connect(mysql_async_connect *ctx) {
       return STATE_MACHINE_FAILED;
     }
   }
-
+    // 这里connect完成后就进入了 csm_complete_connect 状态，使用其状态函数： read_greeting
   ctx->state_function = connect_done ? csm_complete_connect : csm_wait_connect;
   ctx->host = host;
   ctx->user = user;
@@ -6794,7 +6797,7 @@ static mysql_state_machine_status csm_read_greeting(mysql_async_connect *ctx) {
   DBUG_TRACE;
   MYSQL *mysql = ctx->mysql;
   DBUG_PRINT("info", ("Read first packet."));
-
+    // 等待回vio包
   if (!ctx->non_blocking)
     ctx->pkt_length = cli_safe_read(mysql, nullptr);
   else {
@@ -6811,12 +6814,13 @@ static mysql_state_machine_status csm_read_greeting(mysql_async_connect *ctx) {
                                socket_errno);
     return STATE_MACHINE_FAILED;
   }
+  // todo: 打完招呼后进行parse包。！！！！！
   ctx->state_function = csm_parse_handshake;
   return STATE_MACHINE_CONTINUE;
 }
 
 /**
-  Parse the handshake from the server.
+  解析server发来的handshakev10包。Parse the handshake from the server.
 */
 static mysql_state_machine_status csm_parse_handshake(
     mysql_async_connect *ctx) {
@@ -6832,7 +6836,7 @@ static mysql_state_machine_status csm_parse_handshake(
   DBUG_DUMP("packet", (uchar *)net->read_pos, 10);
   DBUG_PRINT("info", ("mysql protocol version %d, server=%d", PROTOCOL_VERSION,
                       mysql->protocol_version));
-  if (mysql->protocol_version != PROTOCOL_VERSION) {
+  if (mysql->protocol_version != PROTOCOL_VERSION) {// 不是 handshakev10包
     set_mysql_extended_error(mysql, CR_VERSION_ERROR, unknown_sqlstate,
                              ER_CLIENT(CR_VERSION_ERROR),
                              mysql->protocol_version, PROTOCOL_VERSION);
@@ -6841,7 +6845,7 @@ static mysql_state_machine_status csm_parse_handshake(
   server_version_end = end = strend((char *)net->read_pos + 1);
   mysql->thread_id = uint4korr((uchar *)end + 1);
   end += 5;
-  /*
+  /* 读取完 part3 -> thread_id
     Scramble is split into two parts because old clients do not understand
     long scrambles; here goes the first part.
   */
@@ -6888,11 +6892,11 @@ static mysql_state_machine_status csm_parse_handshake(
     mysql->unix_socket = nullptr;
   my_stpcpy(mysql->server_version, (char *)net->read_pos + 1);
   mysql->port = ctx->port;
-
+    // 读取 第二部分plugin data，对于handshakev10, 这里是剩下的scramble(20-8)。
   if (pkt_end >= end + SCRAMBLE_LENGTH - AUTH_PLUGIN_DATA_PART_1_LENGTH + 1)
 
   {
-    /*
+    /* note: 这里是获取mysqld server使用的default auth plugin
      move the first scramble part - directly in the NET buffer -
      to get a full continuous scramble. We've read all the header,
      and can overwrite it now.
@@ -6911,13 +6915,13 @@ static mysql_state_machine_status csm_parse_handshake(
        gets used later on. Since we don't really know the plugin for which
        the scramble_data was prepared, we can discard it and set it's length
        to 0.
-      */
+      出现malform pkt */
       if (ctx->scramble_data + ctx->scramble_data_len > pkt_end) {
         ctx->scramble_data = nullptr;
         ctx->scramble_data_len = 0;
         ctx->scramble_plugin = const_cast<char *>("");
       }
-    } else {
+    } else {// server capability 没有 client_plugin_auth，server不支持client使用插件认证。
       ctx->scramble_data_len = (int)(pkt_end - ctx->scramble_data);
       ctx->scramble_plugin = caching_sha2_password_plugin_name;
     }
@@ -6979,7 +6983,7 @@ static mysql_state_machine_status csm_establish_ssl(mysql_async_connect *ctx) {
     if (ret) {
       return STATE_MACHINE_FAILED;
     }
-  } else {
+  } else {// block. 上述没实际操作，主要分配空间之类，这里进行核心操作。
     if (cli_establish_ssl(mysql)) {
       return STATE_MACHINE_FAILED;
     }

@@ -979,11 +979,12 @@ class binlog_cache_data {
     /*
       This flag indicates that the buffer was finalized and has to be
       flushed to disk.
+      是否调用 binlog_cache_data::finalize
      */
     bool finalized : 1;
 
     /*
-      This indicates that either the cache contain an XID event, or it's
+      note: This indicates that either the cache contain an XID event, or it's
       an atomic DDL Query-log-event. In the latter case the flag is set up
       on the statement level, namely when the Query-log-event is cached
       at time the DDL transaction is not committing.
@@ -992,6 +993,7 @@ class binlog_cache_data {
       error.
       Any statement scope flag among other things must consider its
       reset policy when the statement is rolled back.
+      xa prepare产生xa prepare event也会触发. 但是 xa commit语句不会触发，也就不会导致m_atomic_prep_xids增加
     */
     bool with_xid : 1;
 
@@ -1251,7 +1253,7 @@ class binlog_cache_mngr {
 
     @param bytes_written Pointer to variable that will be set to the
                          number of bytes written for the flush.
-    @param wrote_xid     Pointer to variable that will be set to @c
+    @param wrote_xid     note: Pointer to variable that will be set to @c
                          true if any XID event was written to the
                          binary log. Otherwise, the variable will not
                          be touched.
@@ -1673,7 +1675,8 @@ bool MYSQL_BIN_LOG::write_transaction(THD *thd, binlog_cache_data *cache_data,
          thd->owned_gtid.sidno > 0);
 
   int64 sequence_number, last_committed;
-  /* Generate logical timestamps for MTS */
+  /* note: Generate logical timestamps for MTS */
+  // ques: 和 transaction_ctx::last_committed 的 store_commit_parent 什么区别？
   m_dependency_tracker.get_dependency(thd, parallelization_barrier,
                                       sequence_number, last_committed);
 
@@ -2278,7 +2281,7 @@ bool binlog_cache_data::compress(THD *thd) {
 /**
   This function finalizes the cache preparing for commit or rollback.
 
-  The function just writes all the necessary events to the cache but
+  NOTE: The function just writes all the necessary events to the cache but
   does not flush the data to the binary log file. That is the role of
   the binlog_cache_data::flush function.
 
@@ -2294,6 +2297,7 @@ int binlog_cache_data::finalize(THD *thd, Log_event *end_event) {
   DBUG_TRACE;
   if (!is_binlog_empty()) {
     assert(!flags.finalized);
+    // 如注释所说 event -> io cache. 把event写到cache(IO_CACHE)中. 之后flush 函数完成 cache -> file 
     if (int error = flush_pending_event(thd)) return error;
     if (int error = write_event(end_event)) return error;
     if (int error = this->compress(thd)) return error;
@@ -2404,12 +2408,14 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written, bool *wrote_xid,
   DBUG_TRACE;
   DBUG_PRINT("debug", ("flags.finalized: %s", YESNO(flags.finalized)));
   int error = 0;
+  // io cache -> file 前一定要经过finalize 完成了 event -> io cache。
   if (flags.finalized) {
     my_off_t bytes_in_cache = m_cache.length();
     Transaction_ctx *trn_ctx = thd->get_transaction();
 
     DBUG_PRINT("debug", ("bytes_in_cache: %llu", bytes_in_cache));
 
+    // for MTS. sequence_number::state++
     trn_ctx->sequence_number = mysql_bin_log.m_dependency_tracker.step();
 
     /*
@@ -2420,6 +2426,7 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written, bool *wrote_xid,
       the 2nd cache being flushed, the very first few transactions may be logged
       sequentially (a next one is tagged as if a preceding one is its
       commit parent).
+      @sa: MYSQL_BINLOG::write_transaction
     */
     if (trn_ctx->last_committed == SEQ_UNINIT)
       trn_ctx->last_committed = trn_ctx->sequence_number - 1;
@@ -3925,6 +3932,7 @@ bool MYSQL_BIN_LOG::open(PSI_file_key log_file_key, const char *log_name,
   */
   if (!is_relay_log) mysql_mutex_lock(&LOCK_sync);
 
+  // note: 对应到物理文件
   ret = m_binlog_file->open(log_file_key, log_file_name, flags);
 
   if (!is_relay_log) mysql_mutex_unlock(&LOCK_sync);
@@ -4949,6 +4957,8 @@ end:
 /**
   Open a (new) binlog file.
 
+  这个不是启动时初始化binlog file 只用于 binlog rotate时, 这一点与5.7是不同的
+
   - Open the log file and the index file. Register the new
   file name in it
   - When calling this when the file is in use, you must have a locks
@@ -5008,7 +5018,7 @@ bool MYSQL_BIN_LOG::open_binlog(
 
   write_error = false;
 
-  /* open the main log file */
+  /* note: open the main log file */
   if (open(m_key_file_log, log_name, new_name, new_index_number)) {
     close_purge_index_file();
     return true; /* all warnings issued */
@@ -6623,12 +6633,13 @@ int MYSQL_BIN_LOG::new_file_impl(
                   DEBUG_SYNC(current_thd, "before_rotate_binlog"););
   mysql_mutex_lock(&LOCK_xids);
   /*
-    We need to ensure that the number of prepared XIDs are 0.
+    note: We need to ensure that the number of prepared XIDs are 0.
 
     If m_atomic_prep_xids is not zero:
     - We wait for storage engine commit, hence decrease m_atomic_prep_xids
     - We keep the LOCK_log to block new transactions from being
       written to the binary log.
+      binlog rotate时要保证 in-flight committing trx = 0;
    */
   while (get_prep_xids() > 0) {
     mysql_cond_wait(&m_prep_xids_cond, &LOCK_xids);
@@ -7284,6 +7295,7 @@ int MYSQL_BIN_LOG::rotate(bool force_rotate, bool *check_purge) {
   if (DBUG_EVALUATE_IF("force_rotate", 1, 0) || force_rotate ||
       (m_binlog_file->get_real_file_size() >= (my_off_t)max_size) ||
       DBUG_EVALUATE_IF("simulate_max_binlog_size", true, false)) {
+    // note: rotate时要cond_wait m_atomic_prep_xids == 0
     error = new_file_without_locking(nullptr);
     *check_purge = true;
   }
@@ -8025,6 +8037,7 @@ int MYSQL_BIN_LOG::prepare(THD *thd, bool all) {
     right before flushing them to binary log during binlog group
     commit flush stage. Reset to HA_REGULAR_DURABILITY at the
     beginning of parsing next command.
+    NOTE
   */
   thd->durability_property = HA_IGNORE_DURABILITY;
 
@@ -8353,6 +8366,7 @@ std::pair<int, my_off_t> MYSQL_BIN_LOG::flush_thread_caches(THD *thd) {
       this function documentation for more info.
     */
     thd->set_trans_pos(log_file_name, m_binlog_file->position());
+    // note
     if (wrote_xid) inc_prep_xids(thd);
   }
   DBUG_PRINT("debug", ("bytes: %llu", bytes));
@@ -8373,6 +8387,7 @@ void MYSQL_BIN_LOG::init_thd_variables(THD *thd, bool all, bool skip_commit) {
     - Everything in the transaction structure is reset when calling
       ha_commit_low since that calls Transaction_ctx::cleanup.
   */
+  // note: 进入 bgc ordered_commit 了， follower会根据这个 cond_wait
   thd->tx_commit_pending = true;
   thd->commit_error = THD::CE_NONE;
   thd->next_to_commit = nullptr;
@@ -8419,6 +8434,7 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
 
   if (!check_and_skip_flush_logs ||
       (check_and_skip_flush_logs && commit_order_thd != nullptr)) {
+    // TODO: leader如何做到帮忙把followers的redo一起flush的？是log_write_up_to（到最新lsn）的作用
     /*
       We flush prepared records of transactions to the log of storage
       engine (for example, InnoDB redo log) in a group right before
@@ -8607,6 +8623,7 @@ bool MYSQL_BIN_LOG::change_stage(THD *thd [[maybe_unused]],
     enroll_for will release the leave_mutex once the sessions are
     queued.
   */
+  // note
   if (!Commit_stage_manager::get_instance().enroll_for(
           stage, queue, leave_mutex, enter_mutex)) {
     assert(!thd_get_cache_mngr(thd)->dbug_any_finalized());
@@ -8830,6 +8847,8 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
   }
 }
 
+// http://mysql.taobao.org/monthly/2020/05/07/
+// TODO
 int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   DBUG_TRACE;
   int flush_error = 0, sync_error = 0;
@@ -8844,7 +8863,11 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
                   binlog::Bgc_ticket_manager::instance().push_new_ticket(););
 
   DBUG_EXECUTE_IF("crash_commit_before_log", DBUG_SUICIDE(););
+
+  // note: 每个THD在进入Group Commit流程前，都会将 THD::next_to_commit 重置为nullptr：
+  // xxxx: 这里 init THD 中的 bgc 的变量
   init_thd_variables(thd, all, skip_commit);
+
   DBUG_PRINT("enter", ("commit_pending: %s, commit_error: %d, thread_id: %u",
                        YESNO(thd->tx_commit_pending), thd->commit_error,
                        thd->thread_id()));
@@ -8864,11 +8887,14 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     This will make thread wait until its turn to commit.
     Commit_order_manager maintains it own queue and its own order for the
     commit. So Stage#0 doesn't maintain separate StageID.
+    slave thread的commit order处理. 保证从苦事务commit order与主库一致
   */
   if (Commit_order_manager::wait_for_its_turn_before_flush_stage(thd) ||
       ending_trans(thd, all) ||
       Commit_order_manager::get_rollback_status(thd)) {
     if (Commit_order_manager::wait(thd)) {
+      /* ques: 所以不到这个slave 的 commit turn 时， ordered_commit 直接返回吗？*/
+      // 理解错误。 在commit_order_manager::wait中阻塞直至到自己的turn或者出现CE
       return thd->commit_error;
     }
   }
@@ -8883,9 +8909,11 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   */
 
   if (change_stage(thd, Commit_stage_manager::BINLOG_FLUSH_STAGE, thd, nullptr,
+                  /* enter_mutex */
                    &LOCK_log)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                           thd->commit_error));
+    // xxxx: follow被唤醒后继续执行finish_commit, 结束bgc，不会继续执行了
     return finish_commit(thd);
   }
 
@@ -8905,6 +8933,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     goto commit_stage;
   }
   DEBUG_SYNC(thd, "waiting_in_the_middle_of_flush_stage");
+  // 这里其实是leader在处理了
   flush_error = process_flush_stage_queue(&total_bytes, &wait_queue);
 
   if (flush_error == 0 && total_bytes > 0)
@@ -11162,6 +11191,7 @@ int THD::binlog_update_row(TABLE *table, bool is_trans,
           ev->add_row_data(after_row, after_size);
 
   /* restore read/write set for the rest of execution */
+  /* ques: 这里有改变吗？ */
   table->column_bitmaps_set_no_signal(old_read_set, old_write_set);
 
   bitmap_clear_all(&table->tmp_set);

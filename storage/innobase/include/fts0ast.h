@@ -213,7 +213,7 @@ struct fts_ast_string_t {
 /* Query term type */
 struct fts_ast_term_t {
   fts_ast_string_t *ptr; /*!< Pointer to term string.*/
-  bool wildcard;         /*!< true if wild card set.*/
+  bool wildcard;         /*!< true if wild card set. 是否有通配符*, 如果有， 在 fts_query_get_token 中 token->f_str[str_len] = '%'; */
 };
 
 /* Query text type */
@@ -235,7 +235,7 @@ struct fts_ast_node_t {
   fts_ast_text_t text;        /*!< Text node */
   fts_ast_term_t term;        /*!< Term node */
   fts_ast_oper_t oper;        /*!< Operator value */
-  fts_ast_list_t list;        /*!< Expression list */
+  fts_ast_list_t list;        /*!< Expression list. 比如说type为phrase_list时，这组词分出来的token在list->head中 */
   fts_ast_node_t *next;       /*!< Link for expr list */
   fts_ast_node_t *next_alloc; /*!< For tracking allocations */
   bool visited;               /*!< whether this node is

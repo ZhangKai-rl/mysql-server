@@ -50,6 +50,7 @@ struct SAVEPOINT {
   MDL_savepoint mdl_savepoint;
 };
 
+// TODO: 这个类应该是每个线程thd一个. THD类成员
 class Transaction_ctx {
  public:
   enum enum_trx_scope { STMT = 0, SESSION };
@@ -63,11 +64,12 @@ class Transaction_ctx {
     /* true is not all entries in the ht[] support 2pc */
     bool m_no_2pc;
     int m_rw_ha_count;
-    /* storage engines that registered in this transaction */
+    /* note: storage engines that registered in this transaction. 跟踪一个事务涉及哪些存储引擎 */
     Ha_trx_info *m_ha_list;
 
    private:
     /*
+      note
       The purpose of this member variable (i.e. flag) is to keep track of
       statements which cannot be rolled back safely(completely).
       For example,
@@ -167,6 +169,7 @@ class Transaction_ctx {
   };
 
  private:
+  // stmt trx and session tr1x
   THD_TRANS m_scope_info[2];
 
   XID_STATE m_xid_state;
@@ -194,6 +197,7 @@ class Transaction_ctx {
 #endif
   } m_flags;
   /* Binlog-specific logical timestamps. */
+  // note: used for MTS
   /*
     Store for the transaction's commit parent sequence_number.
     The value specifies this transaction dependency with a "parent"
@@ -205,6 +209,10 @@ class Transaction_ctx {
     is logged in multiple pieces.
     However the logger to the binary log may convert them
     according to its specification.
+    // lc and sn, 在事务上下文中存储的是绝对值：
+        trn_ctx->sequence_number 和 trn_ctx->last_committed 存储的是绝对值（即 state 的值）
+        在 binlog 事件中记录的是相对值：
+        在 get_dependency() 方法中，会进行转换：
   */
   int64 last_committed;
   /*
@@ -397,6 +405,7 @@ class Transaction_ctx {
   necessary.
 
   @sa General description of transaction handling in handler.cc.
+  ques: 与 Ha_trx_info_list的关系
 */
 
 class Ha_trx_info {
@@ -496,8 +505,50 @@ class Ha_trx_info {
 
 /**
   @class Ha_trx_info_list
+  @brief Ha_trx_info 的容器，为了实现 范围for， stl等。 
+  可以理解为 Ha_trx_info_list<Ha_trx_info>
+  因为是一种容器，所以内部必须实现 Iterator
+  优势：1. 封装底层结构细节 2. 提供便利访问
 
   Container to hold and allow iteration over a set of Ha_trx_info objects.
+  包装器+迭代器的设计模式
+┌─────────────────────────────────────────────────────────────────┐
+│                    包装器模式 (Wrapper Pattern)                   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌──────────────────────────────────────────────┐
+        │  原始数据结构 (Raw Data Structure)            │
+        │  ┌────────────────────────────────────────┐  │
+        │  │ Ha_trx_info (链表节点)                  │  │
+        │  │ - m_next: Ha_trx_info*                │  │
+        │  │ - m_ht: handlerton*                   │  │
+        │  │ - m_flags: uchar                      │  │
+        │  └────────────────────────────────────────┘  │
+        └──────────────────────────────────────────────┘
+                              ↓ 包装(容器化)
+        ┌──────────────────────────────────────────────┐
+        │  包装器类 (Wrapper Class)                     │
+        │  ┌────────────────────────────────────────┐  │
+        │  │ Ha_trx_info_list                       │  │
+        │  │ - m_underlying: Ha_trx_info*           │  │
+        │  │ + begin() → Iterator                   │  │
+        │  │ + end() → Iterator                     │  │
+        │  │ + operator bool()                      │  │
+        │  │ + operator*(), operator->()            │  │
+        │  └────────────────────────────────────────┘  │
+        └──────────────────────────────────────────────┘
+                              ↓ 提供(实现容器如vector，一般都要提供相应的 Iterator，否则容器无意义)
+        ┌──────────────────────────────────────────────┐
+        │  迭代器模式 (Iterator Pattern)                │
+        │  ┌────────────────────────────────────────┐  │
+        │  │ Ha_trx_info_list::Iterator             │  │
+        │  │ - m_current: Ha_trx_info*              │  │
+        │  │ - m_next: Ha_trx_info*                 │  │
+        │  │ + operator++()                         │  │
+        │  │ + operator*(), operator->()            │  │
+        │  │ + operator==(), operator!=()           │  │
+        │  └────────────────────────────────────────┘  │
+        └──────────────────────────────────────────────┘
  */
 class Ha_trx_info_list {
  public:

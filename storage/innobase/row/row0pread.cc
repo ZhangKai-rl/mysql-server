@@ -812,6 +812,7 @@ bool Parallel_reader::is_queue_empty() const {
   return (empty);
 }
 
+// parallel reader thread routine;
 void Parallel_reader::worker(Parallel_reader::Thread_ctx *thread_ctx) {
   dberr_t err{DB_SUCCESS};
   dberr_t cb_err{DB_SUCCESS};

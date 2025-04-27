@@ -50,6 +50,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 typedef std::deque<const char *, ut::allocator<const char *>> dict_names_t;
 
 /** enum that defines all system table IDs. @see SYSTEM_TABLE_NAME[] */
+// 分别对应INFORMATION_SCHEMA.INNODB_SYS_XXXXX
 enum dict_system_id_t {
   SYS_TABLES = 0,
   SYS_INDEXES,

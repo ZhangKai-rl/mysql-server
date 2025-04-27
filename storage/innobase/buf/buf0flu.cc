@@ -555,6 +555,7 @@ void buf_flush_insert_into_flush_list(
     even if the flushed_to_disk_lsn advanced after
     we read it). */
 
+    // ques: 这里为什么是flushed_to_disk_lsn, 有可能不是该block的最新修改？
     block->page.set_newest_lsn(
         std::max(lsn, log_sys->flushed_to_disk_lsn.load()));
   }
@@ -914,6 +915,7 @@ void buf_flush_relocate_on_flush_list(
 
 /** Updates the flush system data structures when a write is completed.
 @param[in]      bpage   pointer to the block in question */
+// TODO: 异步aio刷盘
 void buf_flush_write_complete(buf_page_t *bpage) {
   auto buf_pool = buf_pool_from_bpage(bpage);
 

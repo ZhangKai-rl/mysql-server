@@ -641,14 +641,14 @@ struct Tablespace {
   bool m_new;
 
   /** The tablespace name, auto-generated when needed from
-  the space number. */
+  the space number. 如undo_001文件对应name为 innodb_undo_001 */
   char *m_space_name;
 
   /** The tablespace file name, auto-generated when needed
   from the space number. */
   char *m_file_name;
 
-  /** The truncation log file name, auto-generated when needed
+  /** trunc log: undo_1_trunc.log. The truncation log file name, auto-generated when needed
   from the space number and the srv_undo_dir. */
   char *m_log_file_name;
 

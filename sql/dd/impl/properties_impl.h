@@ -72,6 +72,7 @@ namespace dd {
 
   Please also refer to the comments in the file properties.h where the
   interface is defined; the functions in the interface are commented there.
+  @brief: kv pair format的 se info
 */
 
 class Properties_impl : public Properties {

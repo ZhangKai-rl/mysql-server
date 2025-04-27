@@ -429,7 +429,7 @@ struct st_mysql_client_plugin *mysql_load_plugin_v(MYSQL *mysql,
     errmsg = "it is already loaded";
     goto err;
   }
-
+    // --plugin_dir参数的使用
   if (mysql->options.extension && mysql->options.extension->plugin_dir) {
     plugindir = mysql->options.extension->plugin_dir;
   } else {
@@ -464,7 +464,7 @@ struct st_mysql_client_plugin *mysql_load_plugin_v(MYSQL *mysql,
     goto err;
   }
 
-  /* Compile dll path */
+  /* note: 拼接plugindir和name到dlpath中，找so包。Compile dll path */
   strxnmov(dlpath, sizeof(dlpath) - 1, plugindir, "/", name, SO_EXT, NullS);
 
   DBUG_PRINT("info", ("dlopeninig %s", dlpath));
@@ -499,8 +499,8 @@ struct st_mysql_client_plugin *mysql_load_plugin_v(MYSQL *mysql,
   }
 
 #if defined(__APPLE__)
-have_plugin:
-#endif
+have_plugin:  // 此时已经找到了该client-side ud plugin.
+#endif  // 使用dlsym()函数在动态库(dlhandle)中查找名为plugin_declarations_sym的符号, 该符号应指向插件声明结构体st_mysql_client_plugin
   if (!(sym = dlsym(dlhandle, plugin_declarations_sym))) {
     errmsg = "not a plugin";
     dlclose(dlhandle);
@@ -523,7 +523,7 @@ have_plugin:
     errmsg = "it is already loaded";
     goto err;
   }
-
+    // 构建好plugin后，通过do_add_plugin加入到plugin_list中去
   plugin = add_plugin_withargs(mysql, plugin, dlhandle, argc, args);
 
   mysql_mutex_unlock(&LOCK_load_client_plugin);

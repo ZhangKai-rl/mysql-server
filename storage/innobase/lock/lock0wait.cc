@@ -1410,7 +1410,9 @@ static void lock_wait_update_schedule_and_check_for_deadlocks() {
   bottleneck, one can check if declaring this vectors as static solves the
   issue.
   */
+  /* [from] 事务阻塞在 [to] 事务上*/
   ut::vector<waiting_trx_info_t> infos;
+  /* outgoing[from] = to. outgoing 数组的下标代表是第 n 个事务, value 代表其等待的事务下标. */
   ut::vector<int> outgoing;
   ut::vector<trx_schedule_weight_t> new_weights;
 
@@ -1430,6 +1432,7 @@ static void lock_wait_update_schedule_and_check_for_deadlocks() {
 /** A thread which wakes up threads whose lock wait may have lasted too long,
 analyzes wait-for-graph changes, checks for deadlocks and resolves them, and
 updates schedule weights. */
+// 等待中事务锁调度线程coroutine
 void lock_wait_timeout_thread() {
   int64_t sig_count = 0;
   os_event_t event = lock_sys->timeout_event;

@@ -200,6 +200,8 @@ enum class Explain_format_type : ulong {
   in scripts/mysql_system_tables.sql and scripts/mysql_system_tables_fix.sql
 */
 
+// ques: 通过查看sys_vars.cc发现这里存储的应该是单用户的session_var, 而不是global_var
+// 因该不是， global_var为 global_system_variables 用户的变量为 THD::variables
 struct System_variables {
   /*
     How dynamically allocated system variables are handled:
@@ -573,6 +575,7 @@ struct System_status_var {
   ulonglong secondary_engine_execution_count;
 
   ulong com_other;
+  // 记录各个sqlcom的执行次数。如sqldelete, sqlcommit. 可以对接到grafna中
   ulong com_stat[(uint)SQLCOM_END];
 
   /*

@@ -207,7 +207,7 @@ ulint btr_height_get(dict_index_t *index, /*!< in: index tree */
 
   /* S latches the page */
   root_block = btr_root_block_get(index, RW_S_LATCH, mtr);
-
+// 直接读取root所在也的PAGE_HEADER的PAGE_LEVEL就能获取索引树高度了
   height = btr_page_get_level(buf_block_get_frame(root_block));
 
   /* Release the S latch on the root page. */
@@ -870,7 +870,7 @@ ulint btr_create(ulint type, space_id_t space, space_index_t index_id,
   if (block == nullptr) {
     return (FIL_NULL);
   }
-
+    // 一定是4吗？
   page_no = block->page.id.page_no();
   frame = buf_block_get_frame(block);
 
@@ -2968,6 +2968,7 @@ static buf_block_t *btr_lift_page_up(
   return (lift_father_up ? block_orig : father_block);
 }
 
+// todo
 bool btr_compress(btr_cur_t *cursor, bool adjust, mtr_t *mtr) {
   dict_index_t *index;
   space_id_t space;

@@ -1416,6 +1416,7 @@ int index_next_different(bool is_index_scan, handler *file,
     return result;
   } else
     return file->ha_index_read_map(record, group_prefix,
+                                  // 使用组合key的前group_key_parts个key parts进行查找
                                    make_prev_keypart_map(group_key_parts),
                                    HA_READ_AFTER_KEY);
 }

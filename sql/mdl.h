@@ -784,6 +784,8 @@ struct MDL_key {
   uint16 m_length{0};
   uint16 m_db_name_length{0};
   uint16 m_object_name_length{0};
+  // ques: 存什么？字符串数组，三元组就存在这里
+  // 三元组：namespace + db_name + table_name
   char m_ptr[MAX_MDLKEY_LENGTH]{0};
   static PSI_stage_info m_namespace_to_wait_state_name[NAMESPACE_END];
 };
@@ -986,6 +988,7 @@ class MDL_ticket : public MDL_wait_for_subgraph {
   /**
     Pointers for participating in the list of lock requests for this context.
     Context private.
+    I_P list node
   */
   MDL_ticket *next_in_context;
   MDL_ticket **prev_in_context;
@@ -1081,7 +1084,7 @@ class MDL_ticket : public MDL_wait_for_subgraph {
   MDL_context *m_ctx;
 
   /**
-    Pointer to the lock object for this lock ticket. Externally accessible.
+    note: Pointer to the lock object for this lock ticket. Externally accessible.
   */
   MDL_lock *m_lock;
 
@@ -1568,7 +1571,7 @@ class MDL_context {
 
  private:
   /**
-    Lists of all MDL tickets acquired by this connection.
+    note: MDL_cvontext::m_ticket_store Lists of all MDL tickets acquired by this connection.
 
     Lists of MDL tickets:
     ---------------------
@@ -1576,6 +1579,7 @@ class MDL_context {
     in three subsets according to their duration: locks released at
     the end of statement, at the end of transaction and locks are
     released explicitly.
+    duration: statemtnt, transaction, explicit;
 
     Statement and transactional locks are locks with automatic scope.
     They are accumulated in the course of a transaction, and released
@@ -1583,8 +1587,9 @@ class MDL_context {
     on COMMIT, ROLLBACK or ROLLBACK TO SAVEPOINT (for transactional
     locks). They must not be (and never are) released manually,
     i.e. with release_lock() call.
+    release: automatic
 
-    Tickets with explicit duration are taken for locks that span
+    Tickets with explicit duration are taken for locks that span(时间持续，跨越)
     multiple transactions or savepoints.
     These are: HANDLER SQL locks (HANDLER SQL is
     transaction-agnostic), LOCK TABLES locks (you can COMMIT/etc
@@ -1597,6 +1602,7 @@ class MDL_context {
     stored in reverse temporal order. Thus, when we rollback to
     a savepoint, we start popping and releasing tickets from the
     front until we reach the last ticket acquired after the savepoint.
+    order: 时间逆序
 
     Locks with explicit duration are not stored in any
     particular order, and among each other can be split into

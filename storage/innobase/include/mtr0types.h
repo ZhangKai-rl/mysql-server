@@ -233,7 +233,17 @@ enum mlog_id_t {
   redo log about individual pages */
   MLOG_INDEX_LOAD = 61,
 
-  /** log for some persistent dynamic metadata change */
+  /** MySQL · 引擎特性 · 动态元信息持久化.  log for some persistent dynamic metadata change */
+  /** 
+   * 包含两种 活跃动态元信息： 1. index corrup 2. auto increment
+   *      1B (类型)      |     1B （index 个数） |     12B index id              | index id    |
+   * PM_INDEX_CORRUPTED |  corrupted index num  | table_id (4B) + index_id (8B) |  .....      |
+   *
+   *  auto-inc redo :
+   *      1B (类型)     |  1 ~ 11B （auto inc 值） |
+   * PM_TABLE_AUTO_INC |   auto inc compressed    |
+
+   */
   MLOG_TABLE_DYNAMIC_META = 62,
 
   /** create a SDI index page */

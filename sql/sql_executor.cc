@@ -2352,6 +2352,7 @@ AccessPath *FinishPendingOperations(
     use a hash join, since the returned iterator depends on seeing outer rows
     when evaluating its conditions.
  */
+// todo
 AccessPath *ConnectJoins(plan_idx upper_first_idx, plan_idx first_idx,
                          plan_idx last_idx, QEP_TAB *qep_tabs, THD *thd,
                          CallingContext calling_context,
@@ -3479,6 +3480,7 @@ int report_handler_error(TABLE *table, int error) {
    @retval 1   error
 */
 
+// todo
 int join_read_const_table(JOIN_TAB *tab, POSITION *pos) {
   int error;
   DBUG_TRACE;

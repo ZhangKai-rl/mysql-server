@@ -968,7 +968,7 @@ static bool is_candidate_primary_key(THD *thd, const KEY *key,
 static void fill_dd_indexes_from_keyinfo(
     THD *thd, dd::Table *tab_obj, uint key_count, const KEY *keyinfo,
     const List<Create_field> &create_fields, handler *file) {
-  /**
+  /** 见 http://mysql.taobao.org/monthly/2019/03/07/ MySQL · 引擎特性 · 8.0 Descending Index Author: yinfeng
     Currently the index order type is not persisted in new DD or in .FRM. In
     I_S with new DD index order is calculated from the index type. That is,
     the index order is always calculated as ascending except for FULLTEXT and
@@ -2214,7 +2214,7 @@ static bool fill_dd_table_from_create_info(
         break;
       }
     }
-
+    // ques: what id gipk?????
     // Set "gipk" option for the column added for GIPK.
     for (dd::Column *col : *tab_obj->columns()) {
       if (is_generated_invisible_primary_key_column_name(col->name().c_str())) {

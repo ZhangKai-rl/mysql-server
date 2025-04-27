@@ -1854,6 +1854,7 @@ std::chrono::system_clock::time_point thd_start_time(THD *) {
 allowed, else the thread is put into sleep.
 @param[in,out]  prebuilt        row prebuilt handler
 @return InnoDB error code. */
+// note: https://zhuanlan.zhihu.com/p/1954661345992607184
 static inline dberr_t innobase_srv_conc_enter_innodb(row_prebuilt_t *prebuilt) {
   /* We rely on server to do external_lock(F_UNLCK) to reset the
   srv_conc.n_active counter. */
@@ -3342,6 +3343,7 @@ static void innobase_dict_register_dd_table_id(dd::Object_id dd_table_id);
 
 /** Validate the DD tablespace data against what's read during the
 directory scan on startup. */
+// TODO
 class Validate_files {
   using DD_tablespaces = std::vector<const dd::Tablespace *>;
   using Const_iter = DD_tablespaces::const_iterator;
@@ -3802,6 +3804,7 @@ dberr_t Validate_files::validate(const DD_tablespaces &tablespaces) {
                      const Validate_files::Const_iter &, size_t)>
       check = std::bind(&Validate_files::check, this, _1, _2, _3);
 
+  // note: 这里实际进行check. 可能耗费大量时间
   par_for(PFS_NOT_INSTRUMENTED, tablespaces, m_n_threads, check);
 
   std::ostringstream msg;
@@ -3875,6 +3878,7 @@ dberr_t Validate_files::validate(const DD_tablespaces &tablespaces) {
     return (DD_FAILURE);
   }
 
+  // note
   Validate_files validator;
   dberr_t err = validator.validate(tablespaces);
 
@@ -9070,7 +9074,7 @@ int ha_innobase::write_row(uchar *record) /*!< in: a row in MySQL format */
       m_prebuilt->template_type != ROW_MYSQL_WHOLE_ROW) {
     /* Build the template used in converting quickly between
     the two database formats */
-
+// 构造row_prebuilt_t::mysql_template和row_prebuilt_t::n_template
     build_template(true);
   }
 
@@ -10109,7 +10113,7 @@ page_cur_mode_t convert_search_mode_to_innobase(ha_rkey_function find_flag) {
 }
 
 /*
-   BACKGROUND INFO: HOW A SELECT SQL QUERY IS EXECUTED
+   TODO: BACKGROUND INFO: HOW A SELECT SQL QUERY IS EXECUTED
    ---------------------------------------------------
 The following does not cover all the details, but explains how we determine
 the start of a new SQL statement, and what is associated with it.
@@ -10121,7 +10125,7 @@ of the InnoDB data associated with this table handle instance.
 
   A) if the user has not explicitly set any MySQL table level locks:
 
-  1) MySQL calls ::external_lock to set an 'intention' table level lock on
+  1) note: MySQL calls ::external_lock to set an 'intention' table level lock on
 the table of the handle instance. There we set
 m_prebuilt->sql_stat_start = true. The flag sql_stat_start should be set
 true if we are taking this table handle instance to use in a new SQL
@@ -10160,6 +10164,7 @@ start of a new SQL statement. */
  row if any.
  @return 0, HA_ERR_KEY_NOT_FOUND, or error number */
 
+// TODO
 int ha_innobase::index_read(
     uchar *buf,                      /*!< in/out: buffer for the returned
                                      row */
@@ -10472,6 +10477,7 @@ int ha_innobase::change_active_index(
     return HA_ERR_TABLE_DEF_CHANGED;
   }
 
+  // 这里是确保有值还是分配了空间？
   ut_a(m_prebuilt->search_tuple != nullptr);
   ut_a(m_prebuilt->m_stop_tuple != nullptr);
 
@@ -13794,7 +13800,7 @@ int create_table_info_t::create_table(const dd::Table *dd_table,
     order the rows by their row id which is internally generated
     by InnoDB */
 
-    error =
+    error = /* 处理用户 sqlcom_create_table 时 没指定主键索引的情况 */
         create_clustered_index_when_no_primary(m_trx, m_flags, m_table_name);
     if (error) {
       return error;
@@ -15090,7 +15096,7 @@ int ha_innobase::create(const char *name, TABLE *form,
   if (!(create_info->options & HA_LEX_CREATE_TMP_TABLE)) {
     innobase_register_trx(ht, thd, trx);
   }
-
+    // dict_sys mutex ??????
   /* Determine if this CREATE TABLE will be making a file-per-table
   tablespace.  Note that "srv_file_per_table" is not under
   dict_sys mutex protection, and could be changed while creating the
@@ -16995,11 +17001,16 @@ static int innobase_get_mysql_key_number_for_index(
   ut_error;
 }
 
-/** Calculate Record Per Key value.
+/** Calculate Record Per Key value. 每个唯一索引键值（key的具体value）对应的平均记录数（Records Per Key）
+ * record per key value: 每个索引的唯一值，平均对应的记录数量
 Need to exclude the NULL value if innodb_stats_method is set to "nulls_ignored"
 @param[in]      index   InnoDB index.
 @param[in]      i       The column we are calculating rec per key.
 @param[in]      records Estimated total records.
+索引前缀	不同键值数 (n_diff)	rec_per_key 计算	含义
+country	50	1,000,000 / 50 = 20,000	每个国家平均 20,000 条记录
+country, city	5,000	1,000,000 / 5,000 = 200	每个(国家,城市)组合平均 200 条记录
+country, city, name	900,000	1,000,000 / 900,000 ≈ 1.11	每个(国家,城市,姓名)组合平均 1.11 条记录
 @return estimated record per key value */
 rec_per_key_t innodb_rec_per_key(const dict_index_t *index, ulint i,
                                  ha_rows records) {
@@ -17489,6 +17500,7 @@ func_exit:
 
 /** Returns statistics information of the table to the MySQL interpreter,
  in various fields of the handle object.
+ @call   table->file->info
  @return HA_ERR_* error code or 0 */
 
 int ha_innobase::info(uint flag) /*!< in: what information is requested */
@@ -18598,6 +18610,7 @@ trx_t::isolation_level_t innobase_trx_map_isolation_level(
  the SQL statement in case of an error.
  @return 0 */
 
+// TODO
 int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
                                int lock_type) /*!< in: lock type */
 {
@@ -18669,6 +18682,11 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
 
   reset_template();
 
+  /**
+   * 处理FLUSH TABLES ... WITH READ LOCK命令
+    实现表的静默（quiesce）状态，用于备份等场景
+    确保表在备份期间不被修改 
+   */
   switch (m_prebuilt->table->quiesce) {
     case QUIESCE_START:
       /* Check for FLUSH TABLE t WITH READ LOCK; */
@@ -18802,6 +18820,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
       if (sql_command == SQLCOM_LOCK_TABLES && THDVAR(thd, table_locks) &&
           thd_test_options(thd, OPTION_NOT_AUTOCOMMIT) &&
           thd_in_lock_tables(thd)) {
+        // note
         dberr_t error = row_lock_table(m_prebuilt);
 
         if (error != DB_SUCCESS) {
@@ -19985,6 +20004,7 @@ static int innobase_xa_prepare(handlerton *hton, /*!< in: InnoDB handlerton */
 
   innobase_srv_conc_force_exit_innodb(trx);
 
+  // note: 怎么理解这个innodb trx
   TrxInInnoDB trx_in_innodb(trx);
 
   if (trx_in_innodb.is_aborted() ||
@@ -22408,6 +22428,7 @@ static MYSQL_SYSVAR_ULONG(
     "Helps in performance tuning in heavily concurrent environments.",
     innobase_commit_concurrency_validate, nullptr, 0, 0, 1000, 0);
 
+// note: innodb_concurrency_tickets
 static MYSQL_SYSVAR_ULONG(concurrency_tickets, srv_n_free_tickets_to_enter,
                           PLUGIN_VAR_RQCMDARG,
                           "Number of times a thread is allowed to enter InnoDB "
@@ -23143,7 +23164,7 @@ char **thd_innodb_interpreter(THD *thd) {
       .resolve(thd, MYSQL_SYSVAR_NAME(interpreter).offset);
 }
 #endif /* UNIV_DEBUG */
-
+// 包含所有的innodb插件参数。这些参数的前缀`innodb_`在test_plugin_options中加入，从而与cnf文件里面参数名对齐
 static SYS_VAR *innobase_system_variables[] = {
     MYSQL_SYSVAR(api_trx_level),
     MYSQL_SYSVAR(api_bk_commit_interval),

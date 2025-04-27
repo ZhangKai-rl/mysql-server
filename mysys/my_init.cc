@@ -139,6 +139,7 @@ bool my_init() {
   set_crt_report_leaks();
 #endif
 
+  // 创建新文件/夹时的 unix umask设置
   my_umask = 0640;     /* Default umask for new files */
   my_umask_dir = 0750; /* Default umask for new directories */
 

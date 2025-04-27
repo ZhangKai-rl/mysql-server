@@ -915,6 +915,7 @@ Slave_worker *Mts_submode_logical_clock::get_least_occupied_worker(
 #endif
         worker = get_free_worker(rli);
       }
+      // 结束thd->enter_stage(new_stage, ..); 这里再返回之前记录的old_stage
       THD_STAGE_INFO(thd, *old_stage);
       set_timespec_nsec(&ts[1], 0);
       rli->mts_total_wait_worker_avail += diff_timespec(&ts[1], &ts[0]);

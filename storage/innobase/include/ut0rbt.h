@@ -72,7 +72,7 @@ struct ib_rbt_node_t {
 struct ib_rbt_t {
   ib_rbt_node_t *nil; /* Black colored node that is
                       used as a sentinel. This is
-                      pre-allocated too.*/
+                      pre-allocated too.*/ // 空的黑节点
 
   ib_rbt_node_t *root; /* Root of the tree, this is
                        pre-allocated and the first

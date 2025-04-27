@@ -1027,4 +1027,12 @@ size_t mysql_encryption_file_read(IO_CACHE *cache, uchar *buffer, size_t count,
 */
 size_t mysql_encryption_file_write(IO_CACHE *cache, const uchar *buffer,
                                    size_t count, myf flags);
+
+// 来自：https://cloud.tencent.com/developer/article/2221807
+#define outfilename(x) strrchr(x,'/')?strrchr(x,'/')+1:x
+extern void debug_message_print(const char *format, ...)
+     MY_ATTRIBUTE((format(printf, 1,2)));
+#define my_message_print(format, ...) debug_message_print("\r\n\033[44;37m---->%s|%s|%d|\033[0m" format, outfilename(__FILE__), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+
+
 #endif /* _my_sys_h */

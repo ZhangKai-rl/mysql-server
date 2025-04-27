@@ -149,6 +149,7 @@ PT_joined_table *PT_table_reference::add_cross_join(PT_cross_join *cj) {
   return cj;
 }
 
+// https://zhuanlan.zhihu.com/p/699369417?share_code=16nSWleXy6JKC&utm_psn=1967596031618322621
 bool PT_joined_table::contextualize_tabs(Parse_context *pc) {
   if (m_left_table_ref != nullptr) return false;  // already done
 
@@ -700,11 +701,13 @@ bool PT_select_sp_var::contextualize(Parse_context *pc) {
   return false;
 }
 
+// note: 此时已经完成了select dml的词法分析，此时进行语法分析contextualize!
 Sql_cmd *PT_select_stmt::make_cmd(THD *thd) {
   Parse_context pc(thd, thd->lex->current_query_block());
 
   thd->lex->sql_command = m_sql_command;
 
+  // note: 词法分析, m_query_expression. PT_query_expression
   if (m_qe->contextualize(&pc)) {
     return nullptr;
   }
@@ -719,6 +722,7 @@ Sql_cmd *PT_select_stmt::make_cmd(THD *thd) {
     return nullptr;
   }
 
+  // TODO
   if (pc.finalize_query_expression()) return nullptr;
 
   if (m_into != nullptr && m_has_trailing_locking_clauses) {
@@ -741,6 +745,7 @@ Sql_cmd *PT_select_stmt::make_cmd(THD *thd) {
                   std::ostringstream buf; qn->debugPrint(0, buf);
                   DBUG_PRINT("ast", ("\n%s", buf.str().c_str())););
 
+  // note: 构造sqlcmd。 contextualize时已经完成了thd::lex查询树的构建
   if (thd->lex->sql_command == SQLCOM_SELECT)
     return new (thd->mem_root) Sql_cmd_select(thd->lex->result);
   else  // (thd->lex->sql_command == SQLCOM_DO)
@@ -966,7 +971,7 @@ Sql_cmd *PT_update::make_cmd(THD *thd) {
 
   return new (thd->mem_root) Sql_cmd_update(is_multitable, &value_list->value);
 }
-
+// 相当于一个 Item 的二维数组，到it后就是一个 Item 了。
 bool PT_insert_values_list::contextualize(Parse_context *pc) {
   if (super::contextualize(pc)) return true;
   for (List_item *item_list : many_values) {
@@ -978,9 +983,10 @@ bool PT_insert_values_list::contextualize(Parse_context *pc) {
   return false;
 }
 
+// TODO: 调试一下 insert into ... values 语句
 Sql_cmd *PT_insert::make_cmd(THD *thd) {
   LEX *const lex = thd->lex;
-
+    // 应该是在这里修改的 lex->query_block. 传入 lex->query_block 到pc中，之后 pc->contextulize 完成 ast的构建。
   Parse_context pc(thd, lex->current_query_block());
 
   // Currently there are two syntaxes (old and new, respectively) for INSERT
@@ -1160,6 +1166,7 @@ Sql_cmd *PT_call::make_cmd(THD *thd) {
   return new (thd->mem_root) Sql_cmd_call(proc_name, proc_args);
 }
 
+// note:contextualize语义分析。 这个是select语句的语义分析，
 bool PT_query_specification::contextualize(Parse_context *pc) {
   if (super::contextualize(pc)) return true;
   pc->m_stack.push_back(QueryLevel(pc->mem_root, SC_QUERY_SPECIFICATION));
@@ -1223,6 +1230,7 @@ bool PT_query_specification::contextualize(Parse_context *pc) {
   return (opt_hints != nullptr ? opt_hints->contextualize(pc) : false);
 }
 
+// sql中的value语句, 必须是以ROW()的形式
 bool PT_table_value_constructor::contextualize(Parse_context *pc) {
   pc->m_stack.push_back(QueryLevel(pc->mem_root, SC_TABLE_VALUE_CONSTRUCTOR));
 
@@ -3089,7 +3097,7 @@ static bool init_alter_table_stmt(Table_ddl_parse_context *pc,
 
 Sql_cmd *PT_alter_table_stmt::make_cmd(THD *thd) {
   thd->lex->sql_command = SQLCOM_ALTER_TABLE;
-
+    // 这个是 HA_CREATE_INFO 默认的
   thd->lex->create_info = &m_create_info;
   Table_ddl_parse_context pc(thd, thd->lex->current_query_block(),
                              &m_alter_info);
@@ -3974,6 +3982,7 @@ bool PT_query_expression::contextualize(Parse_context *pc) {
   if (contextualize_safe(pc, m_with_clause))
     return true; /* purecov: inspected */
 
+  // note: 这里语法分析contextualize PT_query_specification. 后边继续contextualize_order_and_limit
   if (Parse_tree_node::contextualize(pc) || m_body->contextualize(pc))
     return true;
 
@@ -3981,6 +3990,7 @@ bool PT_query_expression::contextualize(Parse_context *pc) {
   Query_term *expr = ql.m_elts.back();
   pc->m_stack.pop_back();
 
+  // TODO
   switch (expr->term_type()) {
     case QT_UNARY: {
       Query_term_unary *ex = down_cast<Query_term_unary *>(expr);
@@ -4098,6 +4108,7 @@ bool PT_subquery::contextualize(Parse_context *pc) {
 
   // Create a Query_expression and Query_block for the subquery's query
   // expression.
+  // note: 例如subquery一定还有query_specification的，因此还要创建更多的qe_n, qb_n。传入上层qb_n-1
   Query_block *child = lex->new_query(pc->select);
   if (child == nullptr) return true;
 

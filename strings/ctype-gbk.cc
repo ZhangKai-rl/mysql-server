@@ -9976,19 +9976,19 @@ static int my_mb_wc_gbk(const CHARSET_INFO *cs [[maybe_unused]], my_wc_t *pwc,
 */
 static size_t my_well_formed_len_gbk(const CHARSET_INFO *cs [[maybe_unused]],
                                      const char *b, const char *e, size_t pos,
-                                     int *error) {
+                                     int *error) {  // 此处的b使用utf8的16进制表示，一个汉字占3个字节
   const char *b0 = b;
-  const char *emb = e - 1; /* Last possible end of an MB character */
+  const char *emb = e - 1; /* Last possible end of an MB character */  // 如字段默认值为“我很好”， emb为“好”的最后一个字节'\xbd'
 
   *error = 0;
-  while (pos-- && b < e) {
-    if ((uchar)b[0] < 128) {
+  while (pos-- && b < e) {  // begin < end, end = begin + 汉字数量 * 3
+    if ((uchar)b[0] < 128) {  // (uchar)'\xe6' > 128
       /* Single byte ascii character */
       b++;
     } else if ((b < emb) && isgbkcode((uchar)*b, (uchar)b[1])) {
       /* Double byte character */
-      b += 2;
-    } else {
+      b += 2;  // 这样设置会导致奇数的汉字默认值都会出错的。因为奇数*3=奇数，所以永远会剩余1个字节。
+    } else {  // 第一次最后一个子'好'进入了这里，出错了
       /* Wrong byte sequence */
       *error = 1;
       break;

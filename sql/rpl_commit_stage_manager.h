@@ -119,6 +119,36 @@ class Commit_stage_manager {
     */
     THD *fetch_and_empty();
 
+/**
+    初始状态：
+    ┌─────────┐
+    │ m_first │ → nullptr
+    └─────────┘
+        ↑
+      m_last (指向&m_first)
+
+
+    THD1加入后：
+    ┌─────────┐    ┌──────┐
+    │ m_first │ → │ THD1 │ → nullptr
+    └─────────┘    └──────┘
+                      ↑
+                    m_last (指向&THD1->next_to_commit)
+
+
+    THD2加入后：
+    ┌─────────┐    ┌──────┐    ┌──────┐
+    │ m_first │ → │ THD1 │ → │ THD2 │ → nullptr
+    └─────────┘    └──────┘    └──────┘
+                                  ↑
+                                m_last (指向&THD2->next_to_commit)
+
+
+    关键操作：
+    *m_last = new_thd;  // 将新THD连接到链表末尾
+    m_last = &new_thd->next_to_commit;  // 更新m_last指向新的末尾
+ */
+
     /**
        Pointer to the first thread in the queue, or nullptr if the queue is
        empty.
@@ -168,6 +198,7 @@ class Commit_stage_manager {
     SYNC_STAGE,
     COMMIT_STAGE,
     AFTER_COMMIT_STAGE,
+    // 这个是  slave worker thd 专有的
     COMMIT_ORDER_FLUSH_STAGE,
     STAGE_COUNTER
   };
@@ -240,10 +271,10 @@ class Commit_stage_manager {
 
     This will queue the session thread for writing and flushing.
 
-    If the thread being queued is assigned as stage leader, it will
+    note: If the thread being queued is assigned as stage leader, it will
     return immediately.
 
-    If wait_if_follower is true the thread is not the stage leader,
+    note: If wait_if_follower is true the thread is not the stage leader,
     the thread will be wait for the queue to be processed by the
     leader before it returns.
     In DBUG-ON version the follower marks is preempt status as ready.
@@ -266,7 +297,7 @@ class Commit_stage_manager {
     @param[in] enter_mutex
                  Pointer to the mutex that will be taken when changing stage.
 
-    @retval true  Thread is stage leader.
+    note: @retval true  Thread is stage leader.
     @retval false Thread was not stage leader and processing has been done.
    */
   bool enroll_for(StageID stage, THD *first, mysql_mutex_t *stage_mutex,
@@ -335,6 +366,7 @@ class Commit_stage_manager {
     The function is called after follower thread are processed by leader,
     to unblock follower threads.
 
+    @brief         唤醒follower线程
     @param queue   the thread list which needs to ne unblocked
     @param stage   Stage identifier current thread belong to.
   */

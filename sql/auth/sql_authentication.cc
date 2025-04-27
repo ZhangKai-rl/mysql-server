@@ -1119,7 +1119,7 @@ Cached_authentication_plugins *g_cached_authentication_plugins = nullptr;
 bool disconnect_on_expired_password = true;
 
 extern bool initialized;
-
+//  handshakeResponse41包的前四部分，4+4+1+23=32B
 /** Size of the header fields of an authentication packet. */
 #define AUTH_PACKET_HEADER_SIZE_PROTO_41 32
 #define AUTH_PACKET_HEADER_SIZE_PROTO_40 5
@@ -1594,6 +1594,8 @@ static void login_failed_error(THD *thd, MPVIO_EXT *mpvio, int passwd_used) {
   Sends a server @ref
   page_protocol_connection_phase_packets_protocol_handshake_v10
 
+  写handshakev10包
+
   @retval 0 ok
   @retval 1 error
 */
@@ -1607,9 +1609,10 @@ static bool send_server_handshake_packet(MPVIO_EXT *mpvio, const char *data,
   char scramble_buf[SCRAMBLE_LENGTH];
   char *end = buff;
 
-  DBUG_TRACE;
+  DBUG_TRACE;// 开始写handshakev10包, 1Bprotocol_version.
   *end++ = protocol_version;
 
+    // 此处设置的client_flag
   protocol->set_client_capabilities(CLIENT_BASIC_FLAGS);
 
   if (opt_using_transactions)
@@ -1693,31 +1696,31 @@ static bool send_server_handshake_packet(MPVIO_EXT *mpvio, const char *data,
     }
     data_len = SCRAMBLE_LENGTH;
   }
-
+    // handshakev10包的第二部分, 60B server_version
   end = my_stpnmov(end, server_version, SERVER_VERSION_LENGTH) + 1;
-
+     // 第三部分, 4B thread_id
   assert(sizeof(my_thread_id) == 4);
   int4store((uchar *)end, mpvio->thread_id);
   end += 4;
 
-  /*
+  /* 写handshakev10包的第四部分 auth plugin data part 1, 其实是scramble data 20B中的8B
     Old clients does not understand long scrambles, but can ignore packet
     tail: that's why first part of the scramble is placed here, and second
     part at the end of packet.
   */
   end = (char *)memcpy(end, data, AUTH_PLUGIN_DATA_PART_1_LENGTH);
   end += AUTH_PLUGIN_DATA_PART_1_LENGTH;
-  *end++ = 0;
+  *end++ = 0;  // handshakev10 -> filler 1B的0x00.
 
   int2store(end, static_cast<uint16>(protocol->get_client_capabilities()));
-  /* write server characteristics: up to 16 bytes allowed */
+  /* 这里先把后边的部分写了下，end指针没移动呢。write server characteristics: up to 16 bytes allowed */
   end[2] = (char)default_charset_info->number;
   int2store(end + 3, mpvio->server_status[0]);
   int2store(end + 5, protocol->get_client_capabilities() >> 16);
   end[7] = data_len;
   DBUG_EXECUTE_IF("poison_srv_handshake_scramble_len", end[7] = -100;);
   DBUG_EXECUTE_IF("increase_srv_handshake_scramble_len", end[7] = 50;);
-  memset(end + 8, 0, 10);
+  memset(end + 8, 0, 10);// handshakev10 -> reserved 10B '\0'
   end += 18;
   /* write scramble tail */
   end = (char *)memcpy(end, data + AUTH_PLUGIN_DATA_PART_1_LENGTH,
@@ -1725,9 +1728,10 @@ static bool send_server_handshake_packet(MPVIO_EXT *mpvio, const char *data,
   end += data_len - AUTH_PLUGIN_DATA_PART_1_LENGTH;
   end = strmake(end, client_plugin_name(mpvio->plugin),
                 strlen(client_plugin_name(mpvio->plugin)));
-
+    // 完成handshakev10的构造。
+  // 写到net->write_pos(加4B包头)成功时(返回0表示成功), 才会执行 flush
   int res = protocol->write((uchar *)buff, (size_t)(end - buff + 1)) ||
-            protocol->flush();
+            protocol->flush();  // 这里的flush实际进行了write syscall
   return res;
 }
 
@@ -1920,7 +1924,7 @@ static bool send_server_handshake_packet(MPVIO_EXT *mpvio, const char *data,
   for more details.
 
   @retval false ok
-  @retval true error
+  @retval true error. 写authSwitchRequest.发送给client.
 */
 static bool send_plugin_request_packet(MPVIO_EXT *mpvio, const uchar *data,
                                        uint data_len) {
@@ -1969,6 +1973,7 @@ static bool send_plugin_request_packet(MPVIO_EXT *mpvio, const uchar *data,
 
   DBUG_PRINT("info", ("requesting client to use the %s plugin",
                       client_auth_plugin.c_str()));
+  // note: 这里的命令是254， client在client.cc::5850 authsm_handle_change_user_result处判断， 从而运行 authsm_run_second_authenticate_user
   return net_write_command(
       mpvio->protocol->get_net(), switch_plugin_request_buf[0],
       pointer_cast<const uchar *>(client_auth_plugin.c_str()),
@@ -2122,7 +2127,7 @@ ACL_USER *decoy_user(const LEX_CSTRING &username, const LEX_CSTRING &hostname,
   return user;
 }
 
-/**
+/** 这个函数很重要！！！！！
    Finds acl entry in user database for authentication purposes.
 
    Finds a user and copies it into mpvio. Reports an authentication
@@ -2825,7 +2830,7 @@ static size_t parse_client_handshake_packet(THD *thd, MPVIO_EXT *mpvio,
     the protocol should be used.
   */
   if (bytes_remaining_in_packet < 2) return packet_error;
-
+    // todo: 这里很重要； 读取client发来的 capabilities. 先按老版本hanshakeReasponse320的格式读
   protocol->set_client_capabilities(uint2korr(end));
 
   /*
@@ -2839,7 +2844,7 @@ static size_t parse_client_handshake_packet(THD *thd, MPVIO_EXT *mpvio,
     charset_code = global_system_variables.character_set_client->number;
     goto skip_to_ssl;
   }
-
+    // 在client_capability_flags中决定用320还是40格式response.
   if (protocol->has_client_capability(CLIENT_PROTOCOL_41))
     packet_has_required_size =
         bytes_remaining_in_packet >= AUTH_PACKET_HEADER_SIZE_PROTO_41;
@@ -2874,7 +2879,7 @@ skip_to_ssl:
   DBUG_PRINT("info",
              ("client capabilities: %lu", protocol->get_client_capabilities()));
 
-  /*
+  /* 此处为ssl，暂时先不看
     If client requested SSL then we must stop parsing, try to switch to SSL,
     and wait for the client to send a new handshake packet.
     The client isn't expected to send any more bytes until SSL is initialized.
@@ -2902,7 +2907,7 @@ skip_to_ssl:
       DBUG_PRINT("error", ("Failed to accept new SSL connection"));
       return packet_error;
     }
-
+    // qa_auth_client vio_read 的对应的read处。
     DBUG_PRINT("info", ("Reading user information over SSL layer"));
     int rc = protocol->read_packet();
     pkt_len = protocol->get_packet_length();
@@ -2950,7 +2955,7 @@ skip_to_ssl:
     if (charset_code != ssl_charset_code || !packet_has_required_size)
       return packet_error;
   }
-
+    // 完成ssl。
   DBUG_PRINT("info", ("client_character_set: %u", charset_code));
   if (mpvio->charset_adapter->init_client_charset(charset_code))
     return packet_error;
@@ -3006,19 +3011,20 @@ skip_to_ssl:
   */
   size_t passwd_len = 0;
   char *passwd = nullptr;
-
+    // handshakeResponse -> auth_response
   passwd =
       get_length_encoded_string(&end, &bytes_remaining_in_packet, &passwd_len);
   if (passwd == nullptr) return packet_error;
 
   size_t db_len = 0;
   char *db = nullptr;
-
+    // ./msyql --db=xxx在这里解析
   if (protocol->has_client_capability(CLIENT_CONNECT_WITH_DB)) {
     db = get_string(&end, &bytes_remaining_in_packet, &db_len);
     if (db == nullptr) return packet_error;
   }
 
+  // ********* 注意看此处 plugin_name, 为client: ./mysql --default-auth=xxx的插件名 !!!!!!!
   size_t client_plugin_len = 0;
   const char *client_plugin =
       get_string(&end, &bytes_remaining_in_packet, &client_plugin_len);
@@ -3041,7 +3047,7 @@ skip_to_ssl:
     db_buff[db_len] = '\0';
     db = db_buff;
   }
-
+    // 根据cs转换 --user=xxx
   user_len = copy_and_convert(user_buff, sizeof(user_buff) - 1,
                               system_charset_info, user, user_len,
                               mpvio->charset_adapter->charset(), &dummy_errors);
@@ -3062,14 +3068,14 @@ skip_to_ssl:
                                                 user, user_len, MYF(MY_WME))))
     return packet_error; /* The error is set by my_strdup(). */
   mpvio->auth_info.user_name_length = user_len;
-
+  /** acl_user验证。=======核心！！！！！！====== */
   if (find_mpvio_user(thd, mpvio)) return packet_error;
 
   if (!initialized) {
     // if mysqld's been started with --skip-grant-tables option
     mpvio->status = MPVIO_EXT::SUCCESS;
   }
-
+    // 这里是处理客户端连接选项属性：如 ./mysql --xxx=xxx这些
   if (protocol->has_client_capability(CLIENT_CONNECT_ATTRS) &&
       read_client_connect_attrs(thd, &end, &bytes_remaining_in_packet, mpvio))
     return packet_error;
@@ -3112,7 +3118,7 @@ skip_to_ssl:
     mpvio->status = MPVIO_EXT::FAILURE;
     return CR_COMPRESSION_WRONGLY_CONFIGURED;
   }
-
+    // note: 关键位置
   if (!(protocol->has_client_capability(CLIENT_PLUGIN_AUTH))) {
     /* An old client is connecting */
     client_plugin = Cached_authentication_plugins::get_plugin_name(
@@ -3127,7 +3133,7 @@ skip_to_ssl:
     in that case the authentication on the client may not need to be
     restarted and a server auth plugin will read the data that the client
     has just send. Cache them to return in the next server_mpvio_read_packet().
-  */
+  这里需要再看下，到底这个mpvio->plugin在哪里变幻的！！！！！ */
   if (my_strcasecmp(system_charset_info, mpvio->acl_user_plugin.str,
                     plugin_name(mpvio->plugin)->str) != 0) {
     /* Server default plugin didn't match user plugin */
@@ -3138,7 +3144,7 @@ skip_to_ssl:
     return packet_error;
   }
 
-  /*
+  /* 这个是在acl_user表中缓存的用户创建时实际使用的plugin.
     ok, we don't need to restart the authentication on the server.
     but if the client used the wrong plugin, we need to restart
     the authentication on the client. Do it here, the server plugin
@@ -3162,12 +3168,12 @@ skip_to_ssl:
     */
     DBUG_EXECUTE_IF("assert_authentication_roundtrips",
                     { return packet_error; });
-
+    // todo: 给client发回AuthSwitchRequest
     if (send_plugin_request_packet(mpvio,
                                    (uchar *)mpvio->cached_server_packet.pkt,
                                    mpvio->cached_server_packet.pkt_len))
       return packet_error;
-
+    // 这地方很容易超时返回错误！！后来由qa_auth_client -> caching_sha2_password 仍然在这里 client_authenticate.cc::caching_sha2_password_auth_client
     mpvio->protocol->read_packet();
     passwd_len = protocol->get_packet_length();
     passwd = (char *)protocol->get_net()->read_pos;
@@ -3237,7 +3243,7 @@ static int server_mpvio_write_packet(MYSQL_PLUGIN_VIO *param,
                 ->client_auth_plugin))
     mpvio->cached_client_reply.pkt = nullptr;
   /* for the 1st packet we wrap plugin data into the handshake packet */
-  if (mpvio->packets_written == 0)
+  if (mpvio->packets_written == 0)  // 写 handshakev10 packet
     res = send_server_handshake_packet(
         mpvio, pointer_cast<const char *>(packet), packet_len);
   else if (mpvio->status == MPVIO_EXT::RESTART) {
@@ -3340,7 +3346,7 @@ static int server_mpvio_read_packet(MYSQL_PLUGIN_VIO *param, uchar **buf) {
       protocol->read_packet();
       pkt_len = protocol->get_packet_length();
     }
-  } else {
+  } else {// 这里是读取handshakeResponse包
     protocol->read_packet();
     pkt_len = protocol->get_packet_length();
   }
@@ -3354,7 +3360,7 @@ static int server_mpvio_read_packet(MYSQL_PLUGIN_VIO *param, uchar **buf) {
     the 1st packet has the plugin data wrapped into the client authentication
     handshake packet
   */
-  if (mpvio->packets_read == 1) {
+  if (mpvio->packets_read == 1) {/** =====核心函数=======  */
     pkt_len = parse_client_handshake_packet(current_thd, mpvio, buf, pkt_len);
     if (pkt_len == packet_error) goto err;
   } else
@@ -3398,12 +3404,14 @@ static int do_auth_once(THD *thd, const LEX_CSTRING &auth_plugin_name,
   mpvio->plugin = plugin;
   old_status = mpvio->status;
 
-  if (plugin) {
+  if (plugin) {/** ====注意这里是在acl_user表中找user创建时对应的plugin */
+      // 在响应的源码文件中找 st_mysql_auth 结构体实现即可。 如果是qa_auth_client 这种client-side auth plugin，则找对应的server-side plugin 如 qa_auth_server
     st_mysql_auth *auth = (st_mysql_auth *)plugin_decl(plugin)->info;
+    // 如果是caching_sha2_password ->
     res = auth->authenticate_user(mpvio, &mpvio->auth_info);
 
     if (unlock_plugin) plugin_unlock(thd, plugin);
-  } else {
+  } else {/* server找不到默认的caching_sha2_password的plugin handler */
     /* Server cannot load the required plugin. */
     Host_errors errors;
     errors.m_no_auth_plugin = 1;
@@ -3827,7 +3835,7 @@ int acl_authenticate(THD *thd, enum_server_command command) {
   int res = CR_OK;
   int ret = 1;
   MPVIO_EXT mpvio;
-  LEX_CSTRING auth_plugin_name = default_auth_plugin_name;
+  LEX_CSTRING auth_plugin_name = default_auth_plugin_name;// 默认使用auth_plugin: caching_sha2_password
   Thd_charset_adapter charset_adapter(thd);
 
   DBUG_TRACE;
@@ -3840,6 +3848,7 @@ int acl_authenticate(THD *thd, enum_server_command command) {
     assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
   });
 
+  // 初始化 mpvio 的一些回调函数, 如定义起vio_write, vio_read等
   server_mpvio_initialize(thd, &mpvio, &charset_adapter);
   /*
     Clear thd->db as it points to something, that will be freed when
@@ -3871,7 +3880,7 @@ int acl_authenticate(THD *thd, enum_server_command command) {
 
     assert(mpvio.status == MPVIO_EXT::RESTART ||
            mpvio.status == MPVIO_EXT::SUCCESS);
-  } else {
+  } else { // COM_CONNECT
     /* mark the thd as having no scramble yet */
     mpvio.scramble[SCRAMBLE_LENGTH] = 1;
 
@@ -3888,6 +3897,7 @@ int acl_authenticate(THD *thd, enum_server_command command) {
   /*
    retry the authentication, if - after receiving the user name -
    we found that we need to switch to a non-default plugin
+   // --default-auth应该可以到这里才对
   */
   if (mpvio.status == MPVIO_EXT::RESTART) {
     assert(mpvio.acl_user);
@@ -3897,7 +3907,7 @@ int acl_authenticate(THD *thd, enum_server_command command) {
     auth_plugin_name = mpvio.acl_user->plugin;
     res = do_auth_once(thd, auth_plugin_name, &mpvio);
   }
-
+    // *******这里已经完成了auth plugin的认证了，进行后续的mfa认证。*******
   if (res == CR_OK) {
     res = do_multi_factor_auth(thd, &mpvio);
   }

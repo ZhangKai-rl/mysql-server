@@ -77,6 +77,7 @@ void Transaction_ctx::register_ha(enum_trx_scope scope, Ha_trx_info *ha_info,
   ha_info->register_ha(&m_scope_info[scope], ht);
 }
 
+// note:  Ha_trx_info_list* THD_TRANS::m_ha_list, 但是返回的却是Ha_trx_info_list
 Ha_trx_info_list Transaction_ctx::ha_trx_info(enum_trx_scope scope) {
   return {m_scope_info[scope].m_ha_list};
 }

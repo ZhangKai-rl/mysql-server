@@ -214,7 +214,7 @@ constexpr uint32_t FSEG_MAGIC_N = 12 + 3 * FLST_BASE_NODE_SIZE;
 /** array of individual pages belonging to this segment in fsp fragment extent
  lists */
 constexpr uint32_t FSEG_FRAG_ARR = 16 + 3 * FLST_BASE_NODE_SIZE;
-/* number of slots in the array for the fragment pages */
+/* 32个零散页面。number of slots in the array for the fragment pages */
 #define FSEG_FRAG_ARR_N_SLOTS (FSP_EXTENT_SIZE / 2)
 /** a fragment page slot contains its  page number within space, FIL_NULL means
  that the slot is not in use */
@@ -224,6 +224,7 @@ constexpr uint32_t FSEG_FRAG_SLOT_SIZE = 4;
 #define FSEG_INODE_SIZE \
   (16 + 3 * FLST_BASE_NODE_SIZE + FSEG_FRAG_ARR_N_SLOTS * FSEG_FRAG_SLOT_SIZE)
 
+// 默认为85个inode entry per INODE PAGE.
 static inline uint32_t FSP_SEG_INODES_PER_PAGE(page_size_t page_size) {
   return (page_size.physical() - FSEG_ARR_OFFSET - 10) / FSEG_INODE_SIZE;
 }
@@ -270,7 +271,7 @@ constexpr uint32_t XDES_ID = 0;
 constexpr uint32_t XDES_FLST_NODE = 8;
 /** contains state information of the extent */
 constexpr uint32_t XDES_STATE = FLST_NODE_SIZE + 8;
-/** Descriptor bitmap of the pages in the extent */
+/** 24!!!!在xdes entry中，page state bitmap的offset为24！！！！ FLST_NODE_SIZE=12=2*6B. 12=segment id 8B + state 4B. Descriptor bitmap of the pages in the extent */
 constexpr uint32_t XDES_BITMAP = FLST_NODE_SIZE + 12;
 
 /*-------------------------------------*/
@@ -305,9 +306,9 @@ enum xdes_state_t {
   XDES_FSEG_FRAG = 5
 };
 
-/** File extent data structure size in bytes. */
+/** 40B!!!! offset of page state bitmap in XDES(24B) + size of page state bitmap(16B). Entry File extent data structure size in bytes. 后半部分是xdes entry的page state bitmap, 大小为页数64*每个页的bit数2 */
 #define XDES_SIZE \
-  (XDES_BITMAP + UT_BITS_IN_BYTES(FSP_EXTENT_SIZE * XDES_BITS_PER_PAGE))
+  (XDES_BITMAP + UT_BITS_IN_BYTES(FSP_EXTENT_SIZE * XDES_BITS_PER_PAGE))// 64pages per extent * 2 state bit per page in XDES Entry.
 
 /** File extent data structure size in bytes for MAX page size. */
 #define XDES_SIZE_MAX \
@@ -780,7 +781,8 @@ static inline bool xdes_get_bit(const xdes_t *descr, ulint bit,
 static inline page_no_t xdes_calc_descriptor_page(const page_size_t &page_size,
                                                   page_no_t offset);
 
-/** Gets a pointer to the space header and acquires a
+/** 获取该space的pageno=0（FSP_HDR）的file space header部分
+ * Gets a pointer to the space header and acquires a
 SX lock on the page.
 @param[in]      id              Space id
 @param[in]      page_size       Page size
@@ -936,7 +938,7 @@ dberr_t fsp_alter_encrypt_tablespace(THD *thd, space_id_t space_id,
 void fsp_init_resume_alter_encrypt_tablespace();
 
 /** A wrapper class to operate on a file segment inode pointer (fseg_inode_t*)
- */
+    inode entry的内存结构 */
 class File_segment_inode {
  public:
   /** Constructor

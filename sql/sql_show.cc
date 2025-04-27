@@ -2828,6 +2828,7 @@ class List_process_list : public Do_THD_Impl {
     deprecated_use_i_s_processlist_count++;
   }
 
+  // m_client_thd 为执行 show processlist 的客户端线程，inspect_thd 为被检查的线程
   void operator()(THD *inspect_thd) override {
     DBUG_TRACE;
 
@@ -2900,7 +2901,7 @@ class List_process_list : public Do_THD_Impl {
       thd_info->proc_info = "Killed";
     thd_info->command = (int)inspect_thd->get_command();  // Used for !killed.
 
-    /* STATE */
+    /* STATE of show processlist */
     thd_info->state_info = thread_state_info(m_client_thd, inspect_thd);
 
     mysql_mutex_unlock(&inspect_thd->LOCK_thd_data);
@@ -5121,6 +5122,9 @@ extern ST_FIELD_INFO optimizer_trace_info[];
   Description of ST_FIELD_INFO in table.h
 
   Make sure that the order of schema_tables and enum_schema_tables are the same.
+
+  定义ifs库的表
+  ques: 为什么没有ifs.columns
 
 */
 

@@ -469,6 +469,7 @@ class MDL_lock {
 
       Array of bitmaps which elements specify which granted locks are
       incompatible with the type of lock being requested.
+      note: 一维的锁兼容矩阵。每个元素都是一个bitmap，每个bitmap第i bit代表 enum_mdl_type中第i个mdl type，如果该bit只为了，表示该锁与该bit lock不兼容
     */
     bitmap_t m_granted_incompatible[MDL_TYPE_END];
     /**
@@ -885,6 +886,7 @@ class MDL_lock {
     Combination of IS_DESTROYED/HAS_OBTRUSIVE/HAS_SLOW_PATH flags and packed
     counters of specific types of "unobtrusive" locks which were granted using
     "fast path".
+    0-59(低位byets表示counters), 60-62(IS_DESTROYED, HAS_OBTRUSIVE, HAS_SLOW_PATH)
 
     @see MDL_scoped_lock::m_unobtrusive_lock_increment and
         @see MDL_object_lock::m_unobtrusive_lock_increment for details about how
@@ -1121,6 +1123,8 @@ static void mdl_lock_reinit(uchar *dst_arg, const uchar *src_arg) {
 
 /**
   Adapter function which allows to use murmur3 with LF_HASH implementation.
+  murmur3 hash algo
+  // https://zhuanlan.zhihu.com/p/681313778
 */
 
 static uint murmur3_adapter(const LF_HASH *, const uchar *key, size_t length) {
@@ -2107,6 +2111,7 @@ const MDL_lock::MDL_lock_strategy MDL_lock::m_scoped_lock_strategy = {
       in SCHEMA namespace are acquired for DDL statements which can update
       metadata in the schema (i.e. which acquire SU, SNW, SNRW and X locks
       on schema objects) and aren't acquired for DML.
+      //  note: 对 scope mdl只有三个 mdl type: IX, S, X 
     */
     {MDL_BIT(MDL_EXCLUSIVE) | MDL_BIT(MDL_SHARED),
      MDL_BIT(MDL_EXCLUSIVE) | MDL_BIT(MDL_INTENTION_EXCLUSIVE), 0, 0, 0, 0, 0,
@@ -2148,7 +2153,7 @@ const MDL_lock::MDL_lock_strategy MDL_lock::m_scoped_lock_strategy = {
       - "unobtrusive" types: IX
       - "obtrusive" types: X and S
 
-      We encode number of IX locks acquired using "fast path" in bits 0 .. 59
+      note: We encode number of IX locks acquired using "fast path" in bits 0 .. 59
       of MDL_lock::m_fast_path_state.
     */
     {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -2232,6 +2237,8 @@ const MDL_lock::MDL_lock_strategy MDL_lock::m_object_lock_strategy = {
          MDL_BIT(MDL_SHARED_NO_WRITE) | MDL_BIT(MDL_SHARED_READ_ONLY) |
          MDL_BIT(MDL_SHARED_UPGRADABLE) | MDL_BIT(MDL_SHARED_WRITE_LOW_PRIO) |
          MDL_BIT(MDL_SHARED_WRITE) | MDL_BIT(MDL_SHARED_READ),
+    
+     // note: 这个索引是 X MDL，根据compatible matrix，与其余10个MDL type都不兼容，因此这里置位所有bit。
      MDL_BIT(MDL_EXCLUSIVE) | MDL_BIT(MDL_SHARED_NO_READ_WRITE) |
          MDL_BIT(MDL_SHARED_NO_WRITE) | MDL_BIT(MDL_SHARED_READ_ONLY) |
          MDL_BIT(MDL_SHARED_UPGRADABLE) | MDL_BIT(MDL_SHARED_WRITE_LOW_PRIO) |
@@ -2352,6 +2359,7 @@ const MDL_lock::MDL_lock_strategy MDL_lock::m_object_lock_strategy = {
       Number of locks acquired using "fast path" are encoded in the following
       bits of MDL_lock::m_fast_path_state:
 
+      note: fast_path_state bit meaning!
       - bits 0 .. 19  - S and SH (we don't differentiate them once acquired)
       - bits 20 .. 39 - SR
       - bits 40 .. 59 - SW and SWLP (we don't differentiate them once acquired)
@@ -2396,7 +2404,12 @@ const MDL_lock::MDL_lock_strategy MDL_lock::m_object_lock_strategy = {
 bool MDL_lock::can_grant_lock(enum_mdl_type type_arg,
                               const MDL_context *requestor_ctx) const {
   bool can_grant = false;
+  // 检查两个条件判断是否通过加锁申请：
+  /** 1. 正在等待的有没有更高优先级的(注意下边代码的判断方式)
+   *  2. 已经授予的有没有不兼容的
+   */
   bitmap_t waiting_incompat_map = incompatible_waiting_types_bitmap()[type_arg];
+  // 获取 granted compatible matrix(一维)中关于此type的bitmap
   bitmap_t granted_incompat_map = incompatible_granted_types_bitmap()[type_arg];
 
   /*
@@ -2875,6 +2888,7 @@ bool MDL_context::try_acquire_lock_impl(MDL_request *mdl_request,
   /*
     Get increment for "fast path" or indication that this is
     request for "obtrusive" type of lock outside of critical section.
+    非侵入式 mdl lock type, 走slow path, 同时需要物化之前fast path mdl
   */
   unobtrusive_lock_increment =
       MDL_lock::get_unobtrusive_lock_increment(mdl_request);
@@ -2923,6 +2937,7 @@ retry:
   /*
     The below call pins pointer to returned MDL_lock object (unless
     it is the singleton object for GLOBAL, COMMIT or ACL_CACHE namespaces).
+    note: 不是每次mdl ticket都创建mdl_lock的，已有的复用，然后在mdl_lock::m_ticket/m_granted中记录mdl_ticket.
   */
   if (!(lock = mdl_locks.find_or_insert(m_pins, key, &pinned))) {
     /*
@@ -3124,6 +3139,7 @@ slow_path:
 
   ticket->m_lock = lock;
 
+  // note: 判断能不能grant lock, 根据granted lock and lock waiting list判断
   if (lock->can_grant_lock(mdl_request->type, this)) {
     lock->m_granted.add_ticket(ticket);
 
@@ -3398,6 +3414,8 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
 
   if (try_acquire_lock_impl(mdl_request, &ticket)) return true;
 
+  /* MDL_lock::can_grant_lock return false. 无法授予这个锁，加入waiting，检查死锁 */
+
   if (mdl_request->ticket) {
     /*
       We have managed to acquire lock without waiting.
@@ -3415,6 +3433,7 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
   */
   lock = ticket->m_lock;
 
+  // TODO: 准备死锁检测
   lock->m_waiting.add_ticket(ticket);
 
   /*
@@ -3478,6 +3497,7 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
   if (lock->key.mdl_namespace() != MDL_key::ACL_CACHE ||
       ticket->m_type != MDL_SHARED ||
       get_owner()->might_have_commit_order_waiters()) {
+    // TODO: deadlock detection
     find_deadlock();
   } else if (has_locks()) {
     // Locks in ACL_CACHE namespace always need connection check, so
@@ -3543,6 +3563,7 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
 #endif
 
   if (wait_status != MDL_wait::GRANTED) {
+    // mdl ticket wait timeout
     lock->remove_ticket(this, m_pins, &MDL_lock::m_waiting, ticket);
 
     /*
@@ -3855,6 +3876,7 @@ bool MDL_context::upgrade_shared_lock(MDL_ticket *mdl_ticket,
   graph is waiting for.
   As long as the initial node is remembered in the visitor,
   a deadlock is found when the same node is seen twice.
+  TODO: mdl deadlock detection core code.
 */
 
 bool MDL_lock::visit_subgraph(MDL_ticket *waiting_ticket,
@@ -3966,6 +3988,7 @@ bool MDL_lock::visit_subgraph(MDL_ticket *waiting_ticket,
   while ((ticket = granted_it++)) {
     if (ticket->get_ctx() != src_ctx &&
         ticket->is_incompatible_when_granted(waiting_ticket->get_type()) &&
+        /* note: 递归走了 deep-first search */
         ticket->get_ctx()->visit_subgraph(gvisitor)) {
       goto end_leave_node;
     }
@@ -4034,6 +4057,7 @@ bool MDL_context::visit_subgraph(MDL_wait_for_graph_visitor *gvisitor) {
 
 /**
   Try to find a deadlock. This function produces no errors.
+  // TODO: deadlock detection
 
   @note If during deadlock resolution context which performs deadlock
         detection is chosen as a victim it will be informed about the

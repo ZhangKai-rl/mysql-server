@@ -131,7 +131,7 @@ struct THR_LOCK_DATA {
   void *debug_print_param{nullptr};
   struct PSI_table *m_psi{nullptr};
 };
-
+// 这一看也是侵入式链表
 struct st_lock_list {
   THR_LOCK_DATA *data{nullptr}, **last{nullptr};
 };

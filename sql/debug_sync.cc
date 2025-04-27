@@ -408,6 +408,7 @@ using std::min;
         or destructors, which might prevent moving of this structure
         with these functions.
 */
+// debug_sync同步点的行为
 struct st_debug_sync_action {
   ulong activation_count = 0; /* max(hit_limit, execute) */
   ulong hit_limit = 0;        /* hits before kill query */

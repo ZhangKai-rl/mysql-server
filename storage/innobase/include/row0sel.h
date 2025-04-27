@@ -244,6 +244,7 @@ struct sel_buf_t {
 };
 
 /** Query plan */
+// TODO
 struct plan_t {
   dict_table_t *table; /*!< table struct in the dictionary
                        cache */

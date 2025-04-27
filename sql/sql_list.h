@@ -133,7 +133,7 @@ class base_list {
   list_node *first, **last;
 
  public:
-  uint elements;
+  uint elements;  // 元素数量
 
   bool operator==(const base_list &rhs) const {
     return elements == rhs.elements && first == rhs.first && last == rhs.last;
@@ -429,7 +429,7 @@ class base_list_iterator {
 
 template <class T>
 class List_STL_Iterator;
-
+// 可以下标，像数组一样访问的
 template <class T>
 class List : public base_list {
  public:

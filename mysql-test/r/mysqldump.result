@@ -5887,8 +5887,88 @@ my_row_id	f1
 3	7
 4	8
 5	4
+# test mysqldump export with charset binary
+CREATE TABLE `t5` (
+`name` varchar(256) CHARACTER SET gbk COLLATE gbk_chinese_ci DEFAULT NULL,
+`id` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL,
+`gender` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=gbk;
+CREATE TABLE `t6` (
+`name` varchar(256) CHARACTER SET gbk DEFAULT '我很好',
+`id` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL,
+`gender` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=gbk;
+CREATE TABLE `t7` (
+`name` varchar(256) CHARACTER SET gbk DEFAULT '我很好呀',
+`id` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL,
+`gender` varchar(256) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=gbk;
+CREATE TABLE `t8` (
+`name` varchar(256) CHARACTER SET gbk DEFAULT '我很好呀我',
+`id` varchar(256) CHARACTER SET utf8mb4 DEFAULT NULL,
+`gender` varchar(256) CHARACTER SET ascii DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=gbk;
+show tables;
+Tables_in_test
+t1
+t2
+t3
+t5
+t6
+t7
+t8
+select database();
+database()
+test
+drop table t5, t6, t7, t8;
+show tables;
+Tables_in_test
+t1
+t2
+t3
+show tables;
+Tables_in_test
+t1
+t2
+t3
+t5
+t6
+t7
+t8
+test charset utf8mb4
+drop table t5, t6, t7, t8;
+show tables;
+Tables_in_test
+t1
+t2
+t3
+show tables;
+Tables_in_test
+t1
+t2
+t3
+t5
+t6
+t7
+t8
+test charset gbk
+drop table t5, t6, t7, t8;
+show tables;
+Tables_in_test
+t1
+t2
+t3
+show tables;
+Tables_in_test
+t1
+t2
+t3
+t5
+t6
+t7
+t8
 # cleanup
-DROP TABLE t1, t2, t3;
+DROP TABLE t1, t2, t3, t5, t6, t7, t8;
 SET GLOBAL sql_generate_invisible_primary_key =
 @saved_global_sql_generate_invisible_primary_key;
 SET SESSION sql_generate_invisible_primary_key =

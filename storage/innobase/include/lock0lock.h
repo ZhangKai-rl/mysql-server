@@ -880,6 +880,7 @@ table itself at some point in time during the call */
 bool lock_table_has_locks(const dict_table_t *table);
 
 /** A thread which wakes up threads whose lock wait may have lasted too long. */
+// 事务锁调度算法的实现
 void lock_wait_timeout_thread();
 
 /** Notifies the thread which analyzes wait-for-graph that there was
@@ -957,9 +958,10 @@ Allocate cached locks for the transaction.
 @param trx              allocate cached record locks for this transaction */
 void lock_trx_alloc_locks(trx_t *trx);
 
+/* ########## for uint32_t lock_t::lock_mode */
 /** Lock modes and types */
 /** @{ */
-/** mask used to extract mode from the  type_mode field in a lock */
+/** mask used to extract mode from the  type_mode field in a lock. 最后4bit表示lockmode(IS, IX, S, X, AUTO_INC)*/
 constexpr uint32_t LOCK_MODE_MASK = 0xF;
 /** Lock types */
 /** table lock */
@@ -967,6 +969,7 @@ constexpr uint32_t LOCK_TABLE = 16;
 /** record lock */
 constexpr uint32_t LOCK_REC = 32;
 /** mask used to extract lock type from the type_mode field in a lock */
+//                          1111 0000. 即5-8bit表示lock type(TABLE, REC)
 constexpr uint32_t LOCK_TYPE_MASK = 0xF0UL;
 static_assert((LOCK_MODE_MASK & LOCK_TYPE_MASK) == 0,
               "LOCK_MODE_MASK & LOCK_TYPE_MASK");
@@ -977,6 +980,7 @@ constexpr uint32_t LOCK_WAIT = 256;
 /* Precise modes */
 /** this flag denotes an ordinary next-key lock in contrast to LOCK_GAP or
  LOCK_REC_NOT_GAP */
+// next key lock. 邻键锁
 constexpr uint32_t LOCK_ORDINARY = 0;
 /** when this bit is set, it means that the lock holds only on the gap before
   the record; for instance, an x-lock on the gap does not give permission to
@@ -1019,6 +1023,7 @@ typedef ib_mutex_t Lock_mutex;
 /** The lock system struct */
 struct lock_sys_t {
   /** The latches protecting queues of record and table locks */
+  // 80对 lock_sys->mutex的改进。 shard lock sys mutex. 保护lock_sys_t这个临界内存结构
   locksys::Latches latches;
 
   /** The hash table of the record (LOCK_REC) locks, except for predicate
@@ -1029,6 +1034,7 @@ struct lock_sys_t {
   hash_table_t *prdt_hash;
 
   /** The hash table of the predicate page (LOCK_PRD_PAGE) locks */
+  // innodb没有页锁，这个页锁是专门针对 R-tree 的。
   hash_table_t *prdt_page_hash;
 
   /** Padding to avoid false sharing of wait_mutex field */
@@ -1039,6 +1045,7 @@ struct lock_sys_t {
 
   /** Array of user threads suspended while waiting for locks within InnoDB.
   Protected by the lock_sys->wait_mutex. */
+  // note
   srv_slot_t *waiting_threads;
 
   /** The highest slot ever used in the waiting_threads array.

@@ -127,7 +127,7 @@ static uint m_registry_array_size = 0;
 
 MEM_ROOT global_acl_memory;
 MEM_ROOT memex;
-Prealloced_array<ACL_USER, ACL_PREALLOC_SIZE> *acl_users = nullptr;
+Prealloced_array<ACL_USER, ACL_PREALLOC_SIZE> *acl_users = nullptr;  // 内存中的用户结构，每增加一个用户就会往acl_users中加入一个acl_user对象。
 Prealloced_array<ACL_PROXY_USER, ACL_PREALLOC_SIZE> *acl_proxy_users = nullptr;
 Prealloced_array<ACL_DB, ACL_PREALLOC_SIZE> *acl_dbs = nullptr;
 Prealloced_array<ACL_HOST_AND_IP, ACL_PREALLOC_SIZE> *acl_wild_hosts = nullptr;
@@ -157,7 +157,7 @@ typedef std::unordered_map<
 Name_to_userlist *name_to_userlist = nullptr;
 
 bool initialized = false;
-bool skip_grant_tables(void) { return !initialized; }
+bool skip_grant_tables(void) { return !initialized; }  // 使用--skip-grant-tables选项后，不会读取grant table. 可以flush privileges重新读取
 bool acl_cache_initialized = false;
 bool allow_all_hosts = true;
 uint grant_version = 0; /* Version of priv tables */

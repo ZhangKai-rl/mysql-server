@@ -122,6 +122,7 @@ enum Visit_leaves { VL_VISIT_LEAVES, VL_SKIP_LEAVES };
   handle ORDER BY and LIMIT themselves.
 
   \verbatim
+  // note: 
   Example: ((SELECT * FROM t1 UNION SELECT * FROM t2 UNION ALL SELECT * FROM t3
              ORDER BY a LIMIT 5) INTERSECT
             (((SELECT * FROM t3 ORDER BY a LIMIT 4) ) EXCEPT SELECT * FROM t4)

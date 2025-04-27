@@ -48,6 +48,7 @@ bool Commit_stage_manager::Mutex_queue::append(THD *first) {
   int32 count = 1;
   bool empty = (m_first == nullptr);
 
+  // xxxx: 在这里利用到了 THD::next_to_commit. 并不是直接赋值，而是把 first->next_to_commit 的地址的内容直接赋值(*m_last = first)，这样只有append后 THD(无论leader/follower)的THD::next_to_commit 才由nullptr 成了 本stage的下个follower THD.
   *m_last = first;
   DBUG_PRINT("info",
              ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
@@ -58,6 +59,8 @@ bool Commit_stage_manager::Mutex_queue::append(THD *first) {
     the queue as well.
   */
 
+  // ques: 从这里看只有leader THD才有next_to_commit，其他都是nullptr?否则会重复添加follower THD到Mutex_queue中吧？
+  // 是的
   while (first->next_to_commit) {
     count++;
     first = first->next_to_commit;
@@ -170,6 +173,7 @@ void Commit_stage_manager::wait_for_ticket_turn(THD *thd,
   if (ticket_ctx.has_waited()) return;
 
   auto &ticket_manager = binlog::Bgc_ticket_manager::instance();
+  // ques: 为啥这里重新搞一个？直接用session_ticket不行嘛？
   binlog::BgcTicket ticket(ticket_ctx.get_session_ticket());
 
   CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_wait_on_ticket");
@@ -216,6 +220,7 @@ bool Commit_stage_manager::append_to(StageID stage, THD *thd) {
   return m_queue[stage].append(thd);
 }
 
+// TODO: follower 在这里当 thd->tx_commit_pending 等待在cond上
 bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
                                       mysql_mutex_t *stage_mutex,
                                       mysql_mutex_t *enter_mutex) {
@@ -225,7 +230,9 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
   DBUG_PRINT("debug",
              ("Enqueue 0x%llx to queue for stage %d", (ulonglong)thd, stage));
 
+  // 获取一个ticket 存储到 thd::Rpl_thd_context::Binlog_group_commit_ctx::m_session_ticket中
   thd->rpl_thd_ctx.binlog_group_commit_ctx().assign_ticket();
+  // note: 里面判断了是不是 stage leader or follower
   bool leader = this->append_to(stage, thd);
 
   /*
@@ -340,7 +347,11 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     thd->get_transaction()->m_flags.ready_preempt = true;
     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
 #endif
+    // ques: 这里可以看到 follower 在组提交某个stage时是一直在等待的，等待到？？（1. stage结束 2. bgc结束）
     while (thd->tx_commit_pending) {
+      // note: bgc 时 follow thd cond_wait的位置
+      // ques: m_satge_cond_binlog的粒度是很大的，如何实现并发度大时只唤醒本组followers
+      // cond + flag(tr_commit_pending)
       if (stage == COMMIT_ORDER_FLUSH_STAGE) {
         mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
       } else {
@@ -349,6 +360,7 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     }
 
     mysql_mutex_unlock(&m_lock_done);
+    // false 表明本 thd 为follower
     return false;
   }
 
@@ -462,15 +474,18 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
   }
 }
 
+// note: leader signal唤醒 followers
 void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
   mysql_mutex_lock(&m_lock_done);
 
   for (THD *thd = queue; thd; thd = thd->next_to_commit) {
+    // note: leader 通过 设置thd::tx_commit_pending flag + broadcast cond 来 signal follow
     thd->tx_commit_pending = false;
     thd->rpl_thd_ctx.binlog_group_commit_ctx().reset();
   }
 
   /* if thread belong to commit order wake only commit order queue threads */
+  // 对应的followers cond wait位置： 
   if (stage == COMMIT_ORDER_FLUSH_STAGE)
     mysql_cond_broadcast(&m_stage_cond_commit_order);
   else

@@ -117,6 +117,7 @@ static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_ONLINE_CREATE =
     Alter_inplace_info::ADD_SPATIAL_INDEX;
 
 /** Operations for rebuilding a table in place */
+// note
 static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_ALTER_REBUILD =
     Alter_inplace_info::ADD_PK_INDEX | Alter_inplace_info::DROP_PK_INDEX |
     Alter_inplace_info::CHANGE_CREATE_OPTION
@@ -6098,6 +6099,7 @@ static const char *get_error_key_name(ulint error_key_num,
   }
 }
 
+// note
 template <typename Table>
 bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
                                            Alter_inplace_info *ha_alter_info) {
@@ -6222,6 +6224,7 @@ bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
 
     if (err == DB_SUCCESS && ctx->online && ctx->need_rebuild()) {
       DEBUG_SYNC_C("row_log_table_apply1_before");
+      // ques: 这里为啥应用一次row_log?
       err = row_log_table_apply(ctx->thr, m_prebuilt->table, altered_table,
                                 ctx->m_stage);
     }
@@ -6335,6 +6338,7 @@ bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
                    eval_table, thd_ddl_buffer_size(m_prebuilt->trx->mysql_thd),
                    thd_ddl_threads(m_prebuilt->trx->mysql_thd));
 
+  // todo: 核心
   const auto err = clean_up(ddl.build());
 
   trx->isolation_level = old_isolation_level;
@@ -7579,6 +7583,7 @@ bool ha_innobase::commit_inplace_alter_table_impl(
     }
 
     if (ctx->need_rebuild()) {
+      // ques: 只有 rebuild 的 inplace DDL 才需要应用 row log??
       fail = commit_try_rebuild(ha_alter_info, ctx, altered_table, table, trx,
                                 table_share->table_name.str);
 

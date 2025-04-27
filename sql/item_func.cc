@@ -1445,6 +1445,24 @@ String *Item_int_func::val_str(String *str) {
   return str;
 }
 
+bool Item_func_wait_resolved_binlog_write::itemize(Parse_context *pc, Item **res) {
+  if (skip_itemize(res)) return false;
+  if (super::itemize(pc, res)) return true;
+  /*
+    It is unsafe because the return value depends on timing. If the timeout
+    happens, the return value is different from the one in which the function
+    returns with success.
+  */
+  pc->thd->lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_SYSTEM_FUNCTION);
+  pc->thd->lex->safe_to_cache_query = false;
+  return false;
+}
+
+longlong Item_func_wait_resolved_binlog_write::val_int() {
+  assert(fixed == 1);
+  return 0;
+}
+
 bool Item_func_connection_id::itemize(Parse_context *pc, Item **res) {
   if (skip_itemize(res)) return false;
   if (super::itemize(pc, res)) return true;
@@ -6014,6 +6032,7 @@ void user_var_entry::init(THD *thd, const Simple_cstring &name,
   m_type = STRING_RESULT;
 }
 
+// from 为var_value 的地址
 bool user_var_entry::store(const void *from, size_t length, Item_result type) {
   assert_locked();
 
@@ -6048,6 +6067,7 @@ bool user_var_entry::store(const void *ptr, size_t length, Item_result type,
                            bool unsigned_arg) {
   assert_locked();
 
+  // ptr中存储var_value
   if (store(ptr, length, type)) return true;
   collation.set(cs, dv);
   unsigned_flag = unsigned_arg;

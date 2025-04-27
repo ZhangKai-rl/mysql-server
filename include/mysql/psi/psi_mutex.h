@@ -65,6 +65,7 @@ struct PSI_mutex_service_v1 {
   /** @sa register_mutex_v1_t. */
   register_mutex_v1_t register_mutex;
   /** @sa init_mutex_v1_t. */
+  // @usage PSI_MUTEX_CALL(init_mutex)(params)
   init_mutex_v1_t init_mutex;
   /** @sa destroy_mutex_v1_t. */
   destroy_mutex_v1_t destroy_mutex;

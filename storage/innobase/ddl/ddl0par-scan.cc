@@ -92,6 +92,7 @@ struct Parallel_cursor : public Cursor {
   bool m_single_threaded_mode{};
 };
 
+// todo
 dberr_t Parallel_cursor::scan(Builders &builders) noexcept {
   ut_a(!builders.empty());
 

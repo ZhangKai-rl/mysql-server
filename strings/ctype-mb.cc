@@ -1320,10 +1320,10 @@ size_t my_numcells_mb(const CHARSET_INFO *cs, const char *b, const char *e) {
   }
   return clen;
 }
-
+// s -- start; e -- end;
 int my_mb_ctype_mb(const CHARSET_INFO *cs, int *ctype, const uchar *s,
                    const uchar *e) {
-  my_wc_t wc;
+  my_wc_t wc;  // wc 是什么？
   int res = cs->cset->mb_wc(cs, &wc, s, e);
   if (res <= 0 || wc > 0xFFFF)
     *ctype = 0;

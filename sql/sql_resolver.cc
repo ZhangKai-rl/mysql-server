@@ -186,6 +186,7 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   // If this query block is a table value constructor, a lot of the preparation
   // done in Query_block::prepare becomes irrelevant. Thus we call our own
   // Query_block::prepare_values in this case.
+  // sql中的value语句
   if (is_table_value_constructor) return prepare_values(thd);
 
   Query_expression *const unit = master_query_expression();
@@ -447,6 +448,7 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
                      // Not normalizing a view
       unit->is_leaf_block(this) && !thd->lex->is_view_context_analysis()) {
     // Query block represents a subquery within an IN/ANY/ALL/EXISTS predicate
+    // this Query_block 是 subquery
     if (resolve_subquery(thd)) return true;
   }
 
@@ -541,6 +543,7 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     if (setup_ftfuncs(thd, this)) return true;
   }
 
+  // note
   if (query_result() && query_result()->prepare(thd, fields, unit)) return true;
 
   if (has_sj_candidates() && flatten_subqueries(thd)) return true;
@@ -1367,6 +1370,38 @@ bool Query_block::resolve_subquery(THD *thd) {
 
   bool choice_made = false;  // becomes true when subquery strategy is chosen
   bool deterministic = true;
+  /** 
+      SELECT t1.id, t1.name
+      FROM t1
+      WHERE t1.price > (SELECT AVG(t2.price) 
+                        FROM t2 
+                        WHERE t2.category = t1.category)
+        AND t1.status IN (SELECT t3.status 
+                          FROM t3 
+                          WHERE t3.active = 1);
+
+      Query_expression (unit_outer)
+        └─ Query_block (qb_outer) - 外层 SELECT
+            ├─ FROM: t1
+            ├─ WHERE: 
+            │    ├─ t1.price > (subquery1)
+            │    │    └─ Query_expression (unit_sub1 where的left expr)
+            │    │         ├─ item: Item_singlerow_subselect 表达式item
+            │    │         ├─ master: qb_outer
+            │    │         └─ Query_block (qb_sub1) ← resolve_subquery 在这里运行
+            │    │              ├─ FROM: t2
+            │    │              └─ WHERE: t2.category = t1.category
+            │    │
+            │    └─ t1.status IN (subquery2)
+            │         └─ Query_expression (unit_sub2)
+            │              ├─ item: Item_in_subselect
+            │              ├─ master: qb_outer
+            │              └─ Query_block (qb_sub2) ← resolve_subquery 在这里运行
+            │                   ├─ FROM: t3
+            │                   └─ WHERE: t3.active = 1
+
+      假设this为qb_sub1, 则outer为 qb_outer
+   */
   Query_block *const outer = outer_query_block();
 
   /*
@@ -3784,8 +3819,10 @@ bool Query_block::flatten_subqueries(THD *thd) {
   Opt_trace_context *const trace = &thd->opt_trace;
 
   /*
+
+  TODO: 这里细看, 使用explain format=tree 也会出现 SELECT#N 的标记
     Semijoin flattening is bottom-up. Indeed, we have this execution flow,
-    for SELECT#1 WHERE X IN (SELECT #2 WHERE Y IN (SELECT#3)) :
+    note: for SELECT#1 WHERE X IN (SELECT #2 WHERE Y IN (SELECT#3)) :
 
     Query_block::prepare() (select#1)
        -> fix_fields() on IN condition
@@ -5295,6 +5332,7 @@ void Query_block::remove_hidden_items() {
   @returns false if success, true if error
 */
 
+// TODO
 bool Query_block::resolve_table_value_constructor_values(THD *thd) {
   // Item_values_column objects may be allocated; they should be persistent for
   // PREPARE statements.

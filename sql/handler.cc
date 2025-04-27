@@ -1605,6 +1605,7 @@ std::pair<int, bool> commit_owned_gtids(THD *thd, bool all) {
     TODO: This should be fixed in later ( >= 5.1) releases.
 */
 
+// https://xujingbao.github.io/2011/03/16/2011-03-16-mysqle79a84e4ba8be58aa1e7aea1e79086e69cbae588b6/
 int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   int error = 0;
   THD_STAGE_INFO(thd, stage_waiting_for_handler_commit);
@@ -2433,6 +2434,9 @@ static bool flush_handlerton(THD *, plugin_ref plugin, void *arg) {
   return false;
 }
 
+// ques: 这里如果是leader thd在执行的话，是不是会把这一个组thd的redo都flush到se？ 
+// ques: leader的dur_prop还是ha_ignore_durable(影响trx_flush_logs)吗？
+// 2. 虽然还是，但是这里的flush redo走的是log_write_up_to，而不是trx_flush_logs
 bool ha_flush_logs(bool binlog_group_flush) {
   if (plugin_foreach(nullptr, flush_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
                      static_cast<void *>(&binlog_group_flush))) {
@@ -3203,6 +3207,7 @@ int handler::handle_records_error(int error, ha_rows *num_rows) {
   Read [part of] row via [part of] index.
   @param[out] buf          buffer where store the data
   @param      key          Key to search for
+  note: 位图bitmap, 表示索引中哪些key parts被使用
   @param      keypart_map  Which part of key to use
   @param      find_flag    Direction/condition on key usage
 
@@ -3240,6 +3245,8 @@ int handler::ha_index_read_map(uchar *buf, const uchar *key,
     result = index_read_map(buf, key, keypart_map, find_flag);
   })
   if (!result && m_update_generated_read_fields) {
+    // se层不存储gcol
+    // /* 每次读取完成一条记录后，在handler的next接口中调用update_generated_read_fields函数中计算列b。 */
     result = update_generated_read_fields(buf, table, active_index);
     m_update_generated_read_fields = false;
   }

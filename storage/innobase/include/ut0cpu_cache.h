@@ -54,7 +54,7 @@ not handle over-aligned types.
 template <typename T>
 struct Cacheline_padded : public T {
   char pad[INNODB_CACHE_LINE_SIZE];
-  // "Inherit" constructors
+  // note: "Inherit" constructors
   using T::T;
 };
 

@@ -1957,7 +1957,7 @@ static bool acl_tables_setup_for_write_and_acquire_mdl(THD *thd,
   @retval  < 0  Error.
 
   @note  IX Backup Lock is implicitly acquired as side effect of calling
-         this function.
+         this function. See more in: mysql reference manual 8.2.3 Grant Tables.
 */
 
 int open_grant_tables(THD *thd, Table_ref *tables, bool *transactional_tables) {

@@ -36,7 +36,7 @@ static int ngram_token_size;
 #define RETURN_IF_ERROR(ret) \
   if (ret != 0) return ret;
 
-/** Parse a document into ngram.
+/** Parse a document into ngram.  这里是生成token 的地方！！！！
 @param[in]	param		plugin parser param
 @param[in]	doc		document to parse
 @param[in]	len		document length in bytes
@@ -71,7 +71,7 @@ static int ngram_parse(MYSQL_FTPARSER_PARAM *param, const char *doc, int len,
       /* Skip SPACE or ","/"." etc as they are not words*/
       int ctype;
       cs->cset->ctype(cs, &ctype, (uchar *)next, (uchar *)end);
-
+        // 如果 要插入包含 %百分号 的，一定会判定ctype成了 true_word_char !!!
       if (char_len == 1 && (*next == ' ' || !true_word_char(ctype, *next))) {
         start = next + 1;
         next = start;
@@ -83,7 +83,7 @@ static int ngram_parse(MYSQL_FTPARSER_PARAM *param, const char *doc, int len,
       next += char_len;
       n_chars++;
     }
-
+    // ngram 分词步长！！！读取够2个后进入
     if (n_chars == ngram_token_size) {
       /* Add a ngram */
       bool_info->position = start - doc;

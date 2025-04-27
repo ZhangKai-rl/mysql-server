@@ -95,12 +95,12 @@ static int test_plugin_client(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql) {
       if (cmd == 0 || cmd == 254)
         return CR_OK_HANDSHAKE_COMPLETE; /* yes. we're done */
 
-      /*
+      /* =====对应看qa_auth_server.cc::qa_auth_interface
         asking for a password with an empty prompt means mysql->password
         otherwise return an error
       */
       if ((cmd == LAST_PASSWORD[0] || cmd == PASSWORD_QUESTION[0]) && *pkt == 0)
-        reply = mysql->passwd;
+        reply = mysql->passwd;// 收到qa_auth_server.cc::qa_auth_interface发来的password请求，发给它。
       else
         return CR_ERROR;
     }
@@ -118,6 +118,7 @@ static int test_plugin_client(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql) {
   return CR_OK;
 }
 
+// client_plugin说明这个是mysql(客户端)认证用的而不是mysqld
 mysql_declare_client_plugin(AUTHENTICATION) "qa_auth_client",
     MYSQL_CLIENT_PLUGIN_AUTHOR_ORACLE, "Dialog Client Authentication Plugin",
     {0, 1, 0}, "GPL", nullptr, nullptr, nullptr, nullptr,

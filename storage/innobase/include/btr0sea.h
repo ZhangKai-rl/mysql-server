@@ -60,6 +60,7 @@ struct btr_search_t {
   /** true if the last search would have succeeded, or did succeed, using the
   hash index; NOTE that the value here is not exact: it is not calculated for
   every search, and the calculation itself is not always accurate! */
+  // false: 上次ahi hash search失败，说明 AHI 可能不准确，暂时不使用
   bool last_hash_succ;
   /** number of consecutive searches which would have succeeded, or did succeed,
   using the hash index; the range is 0 .. BTR_SEARCH_BUILD_LIMIT + 5. */

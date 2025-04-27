@@ -365,6 +365,7 @@ static void dfield_print_raw(FILE *f, const dfield_t *dfield) {
   }
 }
 
+// ques: gdb/lldb时 用std::cout显示不存在，
 void dtuple_print(FILE *f, const dtuple_t *tuple) {
   auto n_fields = dtuple_get_n_fields(tuple);
 

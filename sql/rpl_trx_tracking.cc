@@ -169,6 +169,7 @@ void Commit_order_trx_dependency_tracker::get_dependency(
   if (trn_ctx->last_committed <= m_max_committed_transaction.get_offset())
     commit_parent = SEQ_UNINIT;
   else
+    // note: use transaction_ctx::store_commit_parent的last_committed了
     commit_parent =
         std::max(trn_ctx->last_committed, m_last_blocking_transaction) -
         m_max_committed_transaction.get_offset();

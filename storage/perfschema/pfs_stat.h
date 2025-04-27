@@ -832,6 +832,7 @@ struct PFS_table_stat {
     sum_lock(result);
   }
 
+  // 静态类成员变量。 用于性能优化， memcpy(xxx, &g_reset_template, sizeof(xxx)) 快速reset stat
   static struct PFS_table_stat g_reset_template;
 };
 

@@ -668,6 +668,7 @@ static void log_sys_create() {
 
   log_calc_buf_size(log);
 
+  // note: log consumer
   log_consumer_register(log, &(log.m_checkpoint_consumer));
 }
 
@@ -1774,7 +1775,7 @@ dberr_t log_sys_init(bool expect_no_files, lsn_t flushed_lsn,
         return err;
     }
 
-  } else {
+  } else {// found files in log_group_home_dir
     /* Found existing files in old location for redo files (PRE_8_0_30).
     If expected to see no files (and create new), return error emitting
     the error message. */

@@ -68,6 +68,7 @@ void Commit_order_manager::register_trx(Slave_worker *worker) {
   this->m_workers.push(worker->id);
 }
 
+// node: odered commit stage0 的核心
 bool Commit_order_manager::wait_on_graph(Slave_worker *worker) {
   auto worker_thd = worker->info_thd;
   bool rollback_status{false};
@@ -140,6 +141,7 @@ bool Commit_order_manager::wait_on_graph(Slave_worker *worker) {
   return false;
 }
 
+/* slave进行等待，直至自己的 commit trun后返回false */
 bool Commit_order_manager::wait(Slave_worker *worker) {
   DBUG_TRACE;
 
@@ -151,6 +153,7 @@ bool Commit_order_manager::wait(Slave_worker *worker) {
       cs::apply::Commit_order_queue::enum_worker_stage::REGISTERED) {
     CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("commit_order_manager_before_wait");
 
+    // 进行等待
     if (this->wait_on_graph(worker)) return true;
 
     THD *worker_thd = worker->info_thd;
@@ -180,7 +183,7 @@ bool Commit_order_manager::wait(Slave_worker *worker) {
     /*
       Set HA_IGNORE_DURABILITY so that transaction is not flushed to the
       storage engine immediately, instead we hold all the applier worker
-      threads and flush them together in group.
+      threads and flush them together in group. 不立即刷到se，而是pending成组(延迟+批量)
       The tx_commit_pending variable determines if transaction commit is
       pending, and next_to_commit is used to maintain the commit queue for
       group commit. The tx_commit_pending and next_to_commit variables are

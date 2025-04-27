@@ -534,6 +534,7 @@ THD::Attachable_trx_rw::Attachable_trx_rw(THD *thd)
   thd->get_transaction()->xid_state()->set_state(XID_STATE::XA_NOTR);
 }
 
+// TODO
 void THD::enter_stage(const PSI_stage_info *new_stage,
                       PSI_stage_info *old_stage,
                       const char *calling_func [[maybe_unused]],
@@ -556,6 +557,7 @@ void THD::enter_stage(const PSI_stage_info *new_stage,
 #endif
 
     m_current_stage_key = new_stage->m_key;
+    // note
     set_proc_info(msg);
 
     m_stage_progress_psi =
@@ -2888,12 +2890,12 @@ void THD::send_statement_status() {
     case Diagnostics_area::DA_ERROR:
       assert(!is_mem_cnt_error_issued || is_mem_cnt_error());
       /* The query failed, send error to log and abort bootstrap. */
-      error = m_protocol->send_error(da->mysql_errno(), da->message_text(),
+      error = m_protocol->send_error(da->mysql_errno(), da->message_text(),\
                                      da->returned_sqlstate());
       break;
     case Diagnostics_area::DA_EOF:
       error =
-          m_protocol->send_eof(server_status, da->last_statement_cond_count());
+          m_protocol->send_eof(server_status, da->last_statement_cond_count());  // 返回给client信息
       break;
     case Diagnostics_area::DA_OK:
       error = m_protocol->send_ok(
@@ -3041,6 +3043,7 @@ void THD::notify_hton_post_release_exclusive(const MDL_key *mdl_key) {
 /**
   Call parser to transform statement into a parse tree.
   Then, transform the parse tree further into an AST, ready for resolving.
+  @brief: 该函数sql_parser首先调用 my_sql_parser_parse/ MYSQLparse 函数将 SQL 表达式解析为解析树，然后再调用 lex->make_sql_cmd 函数将解析树解析为 AST 语法树。源码如下：
 */
 bool THD::sql_parser() {
   /*
@@ -3056,6 +3059,10 @@ bool THD::sql_parser() {
   extern int MYSQLparse(class THD * thd, class Parse_tree_root * *root);
 
   Parse_tree_root *root = nullptr;
+  // https://zhuanlan.zhihu.com/p/716898493
+  // 参数见 sql_yacc.yy %parse-param (THD[in], Parse_tree_root[out])
+  // 具体看规则有两个办法： 1. 开启debug +=  
+  // note:              2. 在 sql_yacc.cc 中 switch (yyn) 处打断点，从而进入 sql_yacc.yy
   if (MYSQLparse(this, &root) || is_error()) {
     /*
       Restore the original LEX if it was replaced when parsing
@@ -3065,6 +3072,7 @@ bool THD::sql_parser() {
     cleanup_after_parse_error();
     return true;
   }
+  // note: select语句 -> PT_select_stmt::make_cmd
   if (root != nullptr && lex->make_sql_cmd(root)) {
     return true;
   }

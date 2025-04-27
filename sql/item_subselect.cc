@@ -545,6 +545,7 @@ bool Item_subselect::fix_fields(THD *thd, Item **ref) {
 
   if (check_stack_overrun(thd, STACK_MIN_SIZE, (uchar *)&res)) return true;
 
+  // note
   if (!(res = subquery->prepare(thd))) {
     // all transformation is done (used by prepared statements)
     changed = true;

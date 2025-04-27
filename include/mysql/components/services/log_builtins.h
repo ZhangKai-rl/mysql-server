@@ -878,6 +878,7 @@ inline void dummy_log_message(longlong severity [[maybe_unused]],
   LogEvent(LOG_TYPE_ERROR).prio(INFORMATION_LEVEL).message("Meow! %d", 4711);
 */
 
+// TODO: 整个 mysql数据库的 log 的实现!
 class LogEvent {
  private:
   log_line *ll;  // Temporary allocation to hold a log-event.

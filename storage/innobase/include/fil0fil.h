@@ -151,7 +151,7 @@ enum class Fil_state {
 
 struct fil_space_t;
 
-/** File node of a tablespace or the log data space */
+/** File node of a tablespace or the log data space , represent a file in tablespace*/
 struct fil_node_t {
   /** Returns true if the file can be closed. */
   bool can_be_closed() const;
@@ -166,7 +166,7 @@ struct fil_node_t {
   using List_node = UT_LIST_NODE_T(fil_node_t);
 
   /** tablespace containing this file */
-  fil_space_t *space;
+  fil_space_t *space;  // a tablespace may correspond to multiple files.
 
   /** file name; protected by Fil_shard::m_mutex and log_sys->mutex. */
   char *name;
@@ -232,7 +232,7 @@ struct fil_node_t {
   size_t magic_n;
 };
 
-/** Tablespace or log data space */
+/** Tablespace or log data space , represent the tablespace*/
 struct fil_space_t {
   using List_node = UT_LIST_NODE_T(fil_space_t);
   using Files = std::vector<fil_node_t, ut::allocator<fil_node_t>>;
@@ -517,6 +517,7 @@ struct fil_space_t {
   ulint magic_n;
 
   /** System tablespace */
+  //note: system tablespace
   static fil_space_t *s_sys_space;
 
   /** Check if the tablespace is compressed.

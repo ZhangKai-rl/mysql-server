@@ -209,7 +209,7 @@ static inline uint32_t fsp_flags_init(const page_size_t &page_size,
   return (flags);
 }
 
-/** Calculates the descriptor index within a descriptor page.
+/** Calculates the descriptor index within a descriptor page(XDES页).
 @param[in]      page_size       page size
 @param[in]      offset          page offset
 @return descriptor index */

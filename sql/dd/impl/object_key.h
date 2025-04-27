@@ -37,6 +37,7 @@ class Raw_table;
 
 class Object_key {
  public:
+  // TODO
   virtual Raw_key *create_access_key(Raw_table *t) const = 0;
 
   virtual String_type str() const = 0;

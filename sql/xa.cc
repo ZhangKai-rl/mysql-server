@@ -270,6 +270,7 @@ int ha_recover(Xid_commit_list *commit_list, Xa_state_list *xa_list) {
   DBUG_TRACE;
   info.found_foreign_xids = info.found_my_xids = 0;
   info.commit_list = commit_list;
+  // recover_on_ht中用
   info.dry_run = (info.commit_list == nullptr &&
                   tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
   info.list = nullptr;

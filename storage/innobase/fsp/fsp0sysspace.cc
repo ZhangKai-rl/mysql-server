@@ -780,7 +780,7 @@ dberr_t SysTablespace::check_file_spec(bool create_new_db,
 
   return (err);
 }
-
+// create the system tablespace file, such as ibdata1.
 dberr_t SysTablespace::open_or_create(bool is_temp, bool create_new_db,
                                       page_no_t *sum_new_sizes,
                                       lsn_t *flush_lsn) {

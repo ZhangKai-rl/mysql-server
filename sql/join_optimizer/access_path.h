@@ -205,6 +205,7 @@ struct AccessPath {
   {
   }
 
+  // note
   enum Type : uint8_t {
     // Basic access paths (those with no children, at least nominally).
     // NOTE: When adding more paths to this section, also update GetBasicTable()

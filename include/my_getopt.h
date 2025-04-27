@@ -95,7 +95,7 @@ struct my_option {
                                      marks the end of the my_option[]
                                      array.
                                    */
-  int id;                         /**< For 0<id<=255 it's means one
+  int id;                         /**< For 0<id<=255 it's means one  短选项
                                      character for a short option
                                      (like -A), if >255 no short option
                                      is created, but a long option still

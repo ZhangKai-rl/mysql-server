@@ -1722,7 +1722,7 @@ que_t *pars_sql(pars_info_t *info, /*!< in: extra information, or NULL */
   return (graph);
 }
 
-/** Completes a query graph by adding query thread and fork nodes
+/** TODO: Completes a query graph by adding query thread and fork nodes
 above it and prepares the graph for running. The fork created is of
 type QUE_FORK_MYSQL_INTERFACE.
 @param[in]      node            root node for an incomplete query

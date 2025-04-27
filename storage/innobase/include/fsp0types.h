@@ -60,6 +60,7 @@ page size | file space extent size
   16 KiB  |  64 pages = 1 MiB
   32 KiB  |  64 pages = 2 MiB
   64 KiB  |  64 pages = 4 MiB
+  一个区的大小，单位为pages
 */
 #define FSP_EXTENT_SIZE                                                 \
   static_cast<page_no_t>(                                               \
@@ -81,7 +82,7 @@ constexpr uint32_t FSEG_PAGE_DATA = FIL_PAGE_DATA;
 /** @name File segment header
 The file segment header points to the inode describing the file segment. */
 /** @{ */
-/** Data type for file segment header */
+/** 书中的segment header结构。 10B。 Data type for file segment header */
 typedef byte fseg_header_t;
 
 /** space id of the inode */

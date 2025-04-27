@@ -44,6 +44,7 @@ inline std::ostream &operator<<(std::ostream &out, const ut::Location &obj) {
   return obj.print(out);
 }
 
+// note
 #define UT_LOCATION_HERE (ut::Location{__FILE__, __LINE__})
 
 namespace ib {

@@ -2851,7 +2851,7 @@ bool create_key_part_field_with_prefix_length(TABLE *table, MEM_ROOT *root) {
                           ha_example_table)
   @param prgflag          READ_ALL etc..
   @param ha_open_flags    HA_OPEN_ABORT_IF_LOCKED etc..
-  @param outparam         Result table.
+  @param[out] outparam         Result table.
   @param is_create_table  Indicates that table is opened as part
                           of CREATE or ALTER and does not yet exist in SE.
   @param table_def_param  dd::Table object describing the table to be
@@ -2867,6 +2867,7 @@ bool create_key_part_field_with_prefix_length(TABLE *table, MEM_ROOT *root) {
   @retval 8    Table row format has changed in engine
 */
 
+// 由线程共享的table_share生成线程独享的table对象. 调试时要设置条件断点。等待alias == 表名。
 int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
                           uint db_stat, uint prgflag, uint ha_open_flags,
                           TABLE *outparam, bool is_create_table,
@@ -2955,11 +2956,11 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
     goto err; /* purecov: inspected */
 
   outparam->field = field_ptr;
-
+  // ques: 这里为什么 -1？？？？？
   record = (uchar *)outparam->record[0] - 1; /* Fieldstart = 1 */
-  outparam->null_flags = (uchar *)record + 1;
+  outparam->null_flags = (uchar *)record + 1;/* record[0] 开头 */
 
-  /*
+  /* 还是不太懂
     We will create fields by cloning TABLE_SHARE's fields; then we will need
     to make all new fields' pointers point into the new TABLE's record[0], by
     applying an offset to them.
@@ -2968,13 +2969,13 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
     - For internal tables, source is first TABLE's record[0], which
     happens to be created in same memory block as share->default_values, with
     offset 2 * share->rec_buff_length (see create_tmp_table()).
-  */
+  */ //         0x113503630             113506c30
   move_offset = outparam->record[0] - share->default_values +
                 (internal_tmp ? 2 * share->rec_buff_length : 0);
 
   /* Setup copy of fields from share, but use the right alias and record */
   for (i = 0; i < share->fields; i++, field_ptr++) {
-    Field *new_field = share->field[i]->clone(root);
+    Field *new_field = share->field[i]->clone(root); // 这是已经调整后的了：0x113503631
     *field_ptr = new_field;
     if (new_field == nullptr) goto err;
     new_field->init(outparam);
@@ -3038,7 +3039,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
     This needs to be done prior to generated columns as they'll call
     fix_fields and functions might want to access bitmaps.
   */
-
+    // 这里不懂
   bitmap_size = share->column_bitmap_size;
   bitmaps = root->ArrayAlloc<uchar>(bitmap_size * 8);
   if (bitmaps == nullptr) goto err;
@@ -3104,7 +3105,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
     error_reported = true;
     goto err;
   }
-
+// 例如： CREATE TABLE users ( id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50) NOT NULL, -- 静态默认值 status TINYINT DEFAULT 1, -- 动态默认值（时间戳） created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 表达式默认值（MySQL 8.0+） discount DECIMAL(5,2) DEFAULT (ROUND(RAND() * 10, 2)));
   // Unpack generated default value expressions
   outparam->gen_def_fields_ptr = nullptr;
   if (share->gen_def_field_count) {
@@ -7152,6 +7153,7 @@ static bool update_generated_columns(TABLE *table, const MY_BITMAP *columns,
   @return true if error.
 
   @todo see below for potential conflict with Bug#21815348 .
+  // https://zhuanlan.zhihu.com/p/649144461
  */
 bool update_generated_read_fields(uchar *buf, TABLE *table, uint active_index) {
   DBUG_TRACE;

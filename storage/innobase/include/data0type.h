@@ -515,6 +515,16 @@ struct dtype_t {
                             string data (in addition to
                             the string, MySQL uses 1 or 2
                             bytes to store the string length) */
+  /* 打包编码后的 muti-bytes 的最长最短长度。 打包公式为 maxlen * 5(DATA_MBMAX=5, 最多一个字符用4bytes编码) + minlen = mbminmaxlen */
+  // 为什么选择5为cardinal?
+  /**  mbminmaxlen表，cardinal=cardinal. 当cardinal最小为5时，表中无重复数据。mbminmaxlen可以唯一标识一个编码集的minmaxlen
+   *    max/min  1 2 3 4
+   *           ---------
+   *    1      |
+   *    2      |
+   *    3      |
+   *    4      |
+   */
   unsigned mbminmaxlen : 5; /*!< minimum and maximum length of a
                             character, in bytes;
                             DATA_MBMINMAXLEN(mbminlen,mbmaxlen);

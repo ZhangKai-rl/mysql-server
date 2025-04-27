@@ -219,6 +219,7 @@ void ins_node_set_new_row(
 /** Does an insert operation by updating a delete-marked existing record
  in the index. This situation can occur if the delete-marked record is
  kept in the index for consistent reads.
+ @brief  sec_index之前进行过del(del_mark)操作。例如unique id=1, 现在又来了一个insert，id=1，之前的del_mark还没被purge，因此只需进行inplace modify即可而非ins.
  @return DB_SUCCESS or error code */
 [[nodiscard]] static dberr_t row_ins_sec_index_entry_by_modify(
     ulint flags,       /*!< in: undo logging and locking flags */
@@ -1709,6 +1710,7 @@ do_possible_lock_wait:
     /* To avoid check_table being dropped, increment counter */
     check_table->n_foreign_key_checks_running.fetch_add(1);
 
+    // note
     trx_kill_blocking(trx);
 
     lock_wait_suspend_thread(thr);
@@ -2523,6 +2525,7 @@ dberr_t row_ins_clust_index_entry_low(uint32_t flags, ulint mode,
 
     if (mode != BTR_MODIFY_TREE) {
       ut_ad((mode & ~BTR_ALREADY_S_LATCHED) == BTR_MODIFY_LEAF);
+      /** 第一次尝试乐观插入 */
       err = btr_cur_optimistic_insert(flags, cursor, &offsets, &offsets_heap,
                                       entry, &insert_rec, &big_rec, thr, &mtr);
     } else {
@@ -3057,7 +3060,7 @@ func_exit:
 }
 
 /** Inserts an entry into a clustered index. Tries first optimistic,
- then pessimistic descent down the tree. If the entry matches enough
+ then pessimistic descent down the tree. If the entry matches enough(与这个delete marked record足够匹配)
  to a delete marked record, performs the insert by updating or delete
  unmarking the delete marked record.
  @return DB_SUCCESS, DB_LOCK_WAIT, DB_DUPLICATE_KEY, or some other error code */
@@ -3301,7 +3304,7 @@ static dberr_t row_ins_index_entry(dict_index_t *index, dtuple_t *entry,
 
   if (index->is_clustered()) {
     return (row_ins_clust_index_entry(index, entry, thr, false));
-  } else if (index->is_multi_value()) {
+  } else if (index->is_multi_value()) {// 聚簇/辅助索引不可能是多只索引
     return (
         row_ins_sec_index_multi_value_entry(index, entry, multi_val_pos, thr));
   } else {
@@ -3347,7 +3350,7 @@ dberr_t row_ins_index_entry_set_vals(const dict_index_t *index, dtuple_t *entry,
   ulint num_v = dtuple_get_n_v_fields(entry);
 
   n_fields = dtuple_get_n_fields(entry);
-
+// 遍历entry的所有字段，包括虚拟字段
   for (i = 0; i < n_fields + num_v; i++) {
     dict_field_t *ind_field = nullptr;
     dfield_t *field;
@@ -3405,7 +3408,7 @@ dberr_t row_ins_index_entry_set_vals(const dict_index_t *index, dtuple_t *entry,
 
       continue;
     }
-
+// field为ins_node_t::entry的field
     dfield_set_data(field, dfield_get_data(row_field), len);
     if (dfield_is_ext(row_field)) {
       ut_ad(index->is_clustered());
@@ -3426,7 +3429,7 @@ dberr_t row_ins_index_entry_set_vals(const dict_index_t *index, dtuple_t *entry,
   dberr_t err;
 
   DBUG_TRACE;
-
+// 确保dtuple的所有dfield都有mtype
   ut_ad(dtuple_check_typed(node->row));
 
   err = row_ins_index_entry_set_vals(node->index, node->entry, node->row);
@@ -3639,7 +3642,7 @@ que_thr_t *row_ins_step(que_thr_t *thr) /*!< in: query thread */
 
     /* It may be that the current session has not yet started
     its transaction, or it has been committed: */
-
+// ques: 为啥这里两个id不同？
     if (trx->id == node->trx_id) {
       /* No need to do IX-locking */
 

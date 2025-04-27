@@ -594,8 +594,10 @@ constexpr bool WITH_PFS_MEMORY = false;
      int *x = static_cast<int*>(ut::malloc_withkey(key, 10*sizeof(int)));
  */
 inline void *malloc_withkey(PSI_memory_key_t key, std::size_t size) noexcept {
+  // meta programming selector
   using impl = detail::select_malloc_impl_t<WITH_PFS_MEMORY, false>;
   using malloc_impl = detail::Alloc_<impl>;
+  // pfs=on: Alloc_::alloc -> Allocpfs::alloc 
   return malloc_impl::alloc<false>(size, key());
 }
 

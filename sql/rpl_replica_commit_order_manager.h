@@ -194,6 +194,7 @@ class Commit_order_lock_graph;
   stage. Therefore, W1 will signal in both cases.
 
  */
+// TODO
 class Commit_order_manager {
  public:
   Commit_order_manager(uint32 worker_numbers);

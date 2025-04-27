@@ -129,6 +129,7 @@ bool is_key_cache_variable_suffix(std::string_view suffix) {
 
 /**
   Wrapper around my_handle_options() for interface compatibility.
+  解析选项
 
   @param [in,out] argc       Command line options (count)
   @param [in,out] argv       Command line options (values)
@@ -813,9 +814,11 @@ static void setval_source(const struct my_option *opts, void *value) {
 
   Arguments: opts, argument
   Will set the option value to given value
+  @brief set opts = argument
 */
-
+//                          代表单个命令行选项      value应该是bool或者int值，string放在argument中
 static int setval(const struct my_option *opts, void *value,
+                  // 代表命令行选项的值
                   const char *argument, bool set_maximum_value,
                   bool boolean_as_int) {
   int err = 0, res = 0;

@@ -443,7 +443,7 @@ struct btr_pcur_t {
   void move_backward_from_page(mtr_t *mtr);
 
  public:
-  /** a B-tree cursor */
+  /** a B-tree cursor. persistent cursor封装了普通的btree cursor */
   btr_cur_t m_btr_cur;
 
   /** see TODO note below!
@@ -460,6 +460,7 @@ struct btr_pcur_t {
 
   /** if cursor position is stored, contains an initial segment of the
   latest record cursor was positioned either on, before or after */
+  // note: 借助这个来实现 persist cursor的 store_position
   rec_t *m_old_rec{nullptr};
 
   /** number of fields in old_rec */
@@ -595,6 +596,7 @@ inline bool btr_pcur_t::set_random_position(dict_index_t *index,
   return (positioned);
 }
 
+// TODO
 inline void btr_pcur_t::open_no_init(dict_index_t *index, const dtuple_t *tuple,
                                      page_cur_mode_t mode, ulint latch_mode,
                                      ulint has_search_latch, mtr_t *mtr,

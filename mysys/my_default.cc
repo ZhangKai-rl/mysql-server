@@ -878,7 +878,7 @@ static char *get_argument(const char *keyword, size_t kwlen, char *ptr,
     -1	Fatal error, abort
      1	File not found (Warning)
 */
-
+// 解析.cnf文件
 static int search_default_file_with_ext(Process_option_func opt_handler,
                                         void *handler_ctx, const char *dir,
                                         const char *ext,

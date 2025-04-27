@@ -135,6 +135,7 @@ bool get_sysvar_source(const char *name, uint length,
   return ret;
 }
 
+// 变量注册
 sys_var_chain all_sys_vars = {nullptr, nullptr};
 
 int sys_var_init() {
@@ -399,6 +400,7 @@ uchar *sys_var::session_var_ptr(THD *thd) {
 }
 
 uchar *sys_var::global_var_ptr() {
+  // sys_var::offset 记录了该sys_var作为System_variables类成员在其结构体中的偏移量
   return ((uchar *)&global_system_variables) + offset;
 }
 
@@ -1409,7 +1411,7 @@ sys_var *check_find_sys_var(THD *thd, const char *str, size_t length,
   @retval
     -1  ERROR, message not sent
 */
-
+// 执行sql：set basedir = xxx/xxx
 int sql_set_variables(THD *thd, List<set_var_base> *var_list, bool opened) {
   int error;
   List_iterator_fast<set_var_base> it(*var_list);

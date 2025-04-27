@@ -62,6 +62,7 @@ typedef struct MYSQL_LEX_CSTRING LEX_CSTRING;
 /**
   log_type -- which log to send data to
   check vs enum_log_table_type and LOG_FILE/LOG_TABLE/LOG_NONE
+  note: 几大log类型, err general slow audit misc
 */
 enum enum_log_type {
   LOG_TYPE_UNDEF = 0,

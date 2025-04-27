@@ -251,6 +251,10 @@ struct Alloc_arr : public allocator_traits<false> {
     PFS-META segment from a pointer to DATA segment.
 
     DATA is an actual segment which will keep the user data.
+
+    [PFS-META | VARLEN | PFS-META-OFFSET] [USER DATA]
+    |<------ metadata_len -------------->| |<-- size -->|
+
 */
 struct Alloc_pfs : public allocator_traits<true> {
   using pfs_metadata = PFS_metadata;
@@ -402,6 +406,7 @@ struct Alloc_pfs : public allocator_traits<true> {
 
 /** Simple utility metafunction which selects appropriate allocator variant
     (implementation) depending on the input parameter(s).
+    元编程实现的选择器selector
   */
 template <bool Pfs_memory_instrumentation_on, bool Array_specialization>
 struct select_malloc_impl {};
@@ -417,6 +422,7 @@ struct select_malloc_impl<false, true> {
                            // which specializes for arrays
 };
 
+// 开启pfs内存跟踪应该走这里
 template <bool Array_specialization>
 struct select_malloc_impl<true, Array_specialization> {
   using type = Alloc_pfs;  // Otherwise, pick PFS variant
@@ -430,9 +436,14 @@ using select_malloc_impl_t =
 
 /** Small wrapper which utilizes SFINAE to dispatch the call to appropriate
     allocator implementation.
+    开启pfs时，Impl = Alloc_pfs
   */
 template <typename Impl>
 struct Alloc_ {
+
+  // 以下两个 alloc 为 SFINAE, 最终调用到 Alloc_pfs::alloc
+  // 当 Pfs_memory_instrumentation_on 为 true 时，调用 Alloc_pfs::alloc
+
   template <bool Zero_initialized, typename T = Impl>
   static inline typename std::enable_if<T::is_pfs_instrumented_v, void *>::type
   alloc(size_t size, PSI_memory_key key) {
@@ -440,6 +451,7 @@ struct Alloc_ {
   }
   template <bool Zero_initialized, typename T = Impl>
   static inline typename std::enable_if<!T::is_pfs_instrumented_v, void *>::type
+  // note
   alloc(size_t size, PSI_memory_key /*key*/) {
     return Impl::template alloc<Zero_initialized>(size);
   }

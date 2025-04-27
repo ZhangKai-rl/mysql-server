@@ -114,7 +114,7 @@ static bool verbose = false, opt_no_create_info = false, opt_no_data = false,
             opt_drop = true, opt_keywords = false, opt_lock = true,
             opt_compress = false, create_options = true, opt_quoted = false,
             opt_databases = false, opt_alldbs = false, opt_create_db = false,
-            opt_lock_all_tables = false, opt_set_charset = false,
+            opt_lock_all_tables = false, opt_set_charset = false,  // 是否在导出文件中加入set names 'dafault-character-set'. opt_optimize选项默认开启，该选项会将opt_set_charset=true.
             opt_dump_date = true, opt_autocommit = false,
             opt_disable_keys = true, opt_xml = false,
             opt_delete_master_logs = false, opt_single_transaction = false,
@@ -128,7 +128,8 @@ static bool verbose = false, opt_no_create_info = false, opt_no_data = false,
             opt_notspcs = false, opt_drop_trigger = false,
             opt_network_timeout = false, stats_tables_included = false,
             column_statistics = false,
-            opt_show_create_table_skip_secondary_engine = false;
+            opt_show_create_table_skip_secondary_engine = false,
+            opt_cs_connection = false;
 static bool insert_pat_inited = false, debug_info_flag = false,
             debug_check_flag = false;
 static ulong opt_max_allowed_packet, opt_net_buffer_length;
@@ -229,6 +230,10 @@ static struct my_option my_long_options[] = {
      "Dump all the databases. This will be same as --databases with all "
      "databases selected.",
      &opt_alldbs, &opt_alldbs, nullptr, GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0,
+     nullptr},
+     {"cs-connection", 'z',
+     "Not set 'character_set_connection' to be 'utf8mb4' before table creating.",
+     &opt_cs_connection, &opt_cs_connection, nullptr, GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0,
      nullptr},
     {"all-tablespaces", 'Y', "Dump all the tablespaces.", &opt_alltspcs,
      &opt_alltspcs, nullptr, GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
@@ -507,7 +512,7 @@ static struct my_option my_long_options[] = {
     {"opt", OPT_OPTIMIZE,
      "Same as --add-drop-table, --add-locks, --create-options, --quick, "
      "--extended-insert, --lock-tables, --set-charset, and --disable-keys. "
-     "Enabled by default, disable with --skip-opt.",
+     "***Enabled by default***, disable with --skip-opt.",
      nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG, 0, 0, 0, nullptr, 0,
      nullptr},
     {"order-by-primary", OPT_ORDER_BY_PRIMARY,
@@ -2934,15 +2939,30 @@ static uint get_table_structure(const char *table, char *db, char *table_type,
       if (is_log_table || is_replication_metadata_table)
         row[1] += 13; /* strlen("CREATE TABLE ")= 13 */
 
-      fprintf(sql_file,
-              "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
-              "/*!50503 SET character_set_client = utf8mb4 */;\n"
-              "%s%s;\n"
-              "/*!40101 SET character_set_client = @saved_cs_client */;\n",
-              (is_log_table || is_replication_metadata_table)
-                  ? "CREATE TABLE IF NOT EXISTS "
-                  : "",
-              row[1]);
+      if (opt_set_charset && strcmp(default_charset, "binary") == 0 && !opt_cs_connection) {
+          fprintf(sql_file,
+                  "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
+                  "/*!50503 SET character_set_client = utf8mb4 */;\n"
+                  "/*!40101 SET @saved_cs_connection     = @@character_set_connection */;\n"
+                  "/*!50503 SET character_set_connection = utf8mb4 */;\n"
+                  "%s%s;\n"
+                  "/*!40101 SET character_set_client = @saved_cs_client */;\n"
+                  "/*!40101 SET character_set_connection = @saved_cs_connection */;\n",
+                  (is_log_table || is_replication_metadata_table)
+                      ? "CREATE TABLE IF NOT EXISTS "
+                      : "",
+                  row[1]);
+      } else {
+          fprintf(sql_file,
+                  "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
+                  "/*!50503 SET character_set_client = utf8mb4 */;\n"
+                  "%s%s;\n"
+                  "/*!40101 SET character_set_client = @saved_cs_client */;\n",
+                  (is_log_table || is_replication_metadata_table)
+                      ? "CREATE TABLE IF NOT EXISTS "
+                      : "",
+                  row[1]);
+      }
 
       check_io(sql_file);
       mysql_free_result(result);

@@ -1332,6 +1332,7 @@ IF(USE_BISON_RESULTS_FROM_MAKE_DIST)
       )
   ENDFOREACH()
 ELSE()
+  # note: for parser
   BISON_TARGET(mysql_parser
     ${CMAKE_CURRENT_SOURCE_DIR}/sql_yacc.yy
     ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc

@@ -44,6 +44,7 @@ class Trigger;
 
 ///////////////////////////////////////////////////////////////////////////
 
+// 普通的用户表
 class Table : virtual public Abstract_table {
  public:
   typedef Table_impl Impl;

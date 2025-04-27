@@ -493,7 +493,7 @@ dberr_t fts_index_fetch_nodes(
   pars_info_bind_function(info, "my_func", fetch->read_record, fetch);
   pars_info_bind_varchar_literal(info, "word", word->f_str, word->f_len);
 
-  if (!*graph) {
+  if (!*graph) { /* info 中包含了 func: fetch->read_record, arg[out]: fetch, 即这条sql的结果存储在 fetch 变量中 */
     *graph = fts_parse_sql(fts_table, info,
                            "DECLARE FUNCTION my_func;\n"
                            "DECLARE CURSOR c IS"

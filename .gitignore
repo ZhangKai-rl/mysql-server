@@ -17,7 +17,7 @@ source_downloads
 [._]sw[a-p]
 
 # Configuration files for Visual Studio Code
-.vscode/
+# .vscode/
 
 build/
 datatool/
@@ -31,3 +31,16 @@ scalability_jobs_*
 .cproject
 .project
 .settings/
+# build
+.idea
+.codebuddy
+# .vscode
+build*
+boost_1_77_0/
+boost_1_59_0/
+build_out/
+cmake-build-debug
+cmake-build-8039-debug
+
+# for mac
+.DS_Store

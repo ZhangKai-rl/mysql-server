@@ -134,6 +134,8 @@ static const char *log_label_from_prio(int prio) {
       return "Warning";
     case INFORMATION_LEVEL:
       return "Note";
+    case MORPHY_INFORMATION_LEVEL:
+      return "Morphy_Note";
     default:
       return "Error";
   }

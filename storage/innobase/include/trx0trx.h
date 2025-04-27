@@ -407,6 +407,7 @@ typedef std::vector<ib_lock_t *, ut::allocator<ib_lock_t *>> lock_pool_t;
 /** The locks and state of an active transaction.
 Protected by exclusive lock_sys latch or trx->mutex combined with shared
 lock_sys latch (unless stated otherwise for particular field). */
+// 一个事务的锁管理器, 区别全局锁管理器lock_sys
 struct trx_lock_t {
   /** Default constructor. */
   trx_lock_t() = default;
@@ -421,6 +422,8 @@ struct trx_lock_t {
   trx->lock.trx_locks, so that the thread which iterates over the list can spot
   a change if it occurred while it was reacquiring latches.
   Protected by trx->mutex. */
+  // 用于验证释放trx->mutex期间，此trx_lock_t是否发生了改变(trx_lock_t::trx_locks_version++)
+  // 每次添加/删除事务锁链表(trx_lock_t::trx_locks)时递增
   uint64_t trx_locks_version;
 
   /** If this transaction is waiting for a lock, then blocking_trx points to a
@@ -517,6 +520,8 @@ struct trx_lock_t {
   */
   que_thr_t *wait_thr;
 
+  /* pool of rec locks and table locks. */
+
   /** Pre-allocated record locks. Protected by trx->mutex. */
   lock_pool_t rec_pool;
 
@@ -544,10 +549,12 @@ struct trx_lock_t {
   the "emptiness" of the list and that one can check for emptiness in a safe
   manner (in current implementation length of the list is stored explicitly so
   one can read it without risking unsafe pointer operations) */
+  // note: base node of trx_lock_t 某个事务的锁链表基节点。 该链表元素为lock_t
   trx_lock_list_t trx_locks;
 
   /** AUTOINC locks held by this transaction.
-  Note that these are also in the trx_locks list.
+  Note that these are also in the trx_locks list. 也会执行locksys::add_to_trx_locks(lock);
+  // 为什么这么存储：性能优化。用于快速访问和释放 AUTO_INC 锁（避免遍历整个 trx_locks 链表）, 注意这里只存指向lock_t的指针，实际的lock_t对象仍在 trx_locks链表中。
   This vector needs to be freed explicitly when the trx instance is destroyed.
   Protected by trx->mutex. */
   ib_vector_t *autoinc_locks;
@@ -856,7 +863,7 @@ struct trx_t {
                             mark and the actual async kill because
                             the running thread can change. */
 
-  /* These fields are not protected by any mutex. */
+  /* 文字的debug print info. These fields are not protected by any mutex. */
   const char *op_info; /*!< English text describing the
                        current operation, or an empty
                        string */
@@ -919,6 +926,7 @@ struct trx_t {
   this transaction in
   srv_conc_enter_innodb to be inside the
   InnoDB engine */
+  // note: innodb_thread_concurrency, innodb_concurrency_tickets
   uint32_t n_tickets_to_enter_innodb;
   /*!< this can be > 0 only when
   declared_to_... is true; when we come
@@ -1554,9 +1562,10 @@ class TrxInInnoDB {
     ulint loop_count = 0;
     /* start with optimistic sleep time - 20 micro seconds. */
     ulint sleep_time = 20;
-
+    // 执行过 trxininnodb -> enter -> ++trx->in_innodb, 这里等待 trx->in_innodb变为0(TrxInInnoDB::exit)
     while (is_forced_rollback(trx)) {
       /* Wait for the async rollback to complete */
+      // note: 这里的异步回滚是指启动时undo的事务异步回滚吧
 
       trx_mutex_exit(trx);
 

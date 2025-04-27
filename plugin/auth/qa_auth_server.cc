@@ -55,10 +55,10 @@ static int qa_auth_interface(MYSQL_PLUGIN_VIO *vio,
 
   info->password_used = PASSWORD_USED_YES;
 
-  /* fail if the password is wrong */
+  /* auth_string就是server-side存的用户密码。 fail if the password is wrong */
   if (strcmp((const char *)pkt, info->auth_string)) return CR_ERROR;
 
-  /* Test of default_auth */
+  /* 因为只用于test，所以即使密码对，也只能限于这个test user!!!!Test of default_auth */
   if (strcmp(info->user_name, "qa_test_11_user") == 0) {
     strcpy(info->authenticated_as, "qa_test_11_dest");
   } else

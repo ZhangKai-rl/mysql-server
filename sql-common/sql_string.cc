@@ -846,12 +846,12 @@ size_t well_formed_copy_nchars(const CHARSET_INFO *to_cs, char *to,
         sure the string wasn't truncated in the middle of a character.
         If so, truncate to a character boundary.
       */
-      if (to_cs->mbmaxlen > 1 && to_cs->mbmaxlen == to_cs->mbminlen)
+      if (to_cs->mbmaxlen > 1 && to_cs->mbmaxlen == to_cs->mbminlen)  // gbk is not fixed-width charset
         min_length -= min_length % to_cs->mbmaxlen;
 
       res = to_cs->cset->well_formed_len(to_cs, from, from + min_length, nchars,
                                          &well_formed_error);
-      if (res > 0) memmove(to, from, res);
+      if (res > 0) memmove(to, from, res);  // 实际进行数据拷贝的位置
       *from_end_pos = from + res;
 
       /*
@@ -880,7 +880,7 @@ size_t well_formed_copy_nchars(const CHARSET_INFO *to_cs, char *to,
           res > min_length - to_cs->mbmaxlen) {
         const char *from_end = from + min(res + to_cs->mbmaxlen, from_length);
 
-        size_t extra = to_cs->cset->well_formed_len(
+        size_t extra = to_cs->cset->well_formed_len(  // todo: ****error*****here!!!!!!proved to be truncated, so continue to copy.
             to_cs, *from_end_pos, from_end, 1, &well_formed_error);
 
         well_formed_error = (res + extra < min_length);
@@ -890,7 +890,7 @@ size_t well_formed_copy_nchars(const CHARSET_INFO *to_cs, char *to,
       *cannot_convert_error_pos = nullptr;
       if (from_offset) res += to_cs->mbminlen;
     }
-  } else {
+  } else {  // from_cs == binary进入此分支
     int cnvres;
     my_wc_t wc;
     my_charset_conv_mb_wc mb_wc = from_cs->cset->mb_wc;

@@ -48,7 +48,7 @@ class Cache_element;
 
   @tparam  T  Dictionary object type.
 */
-
+// 本地dd缓存，第一级，当前线程ddl
 template <typename T>
 class Local_multi_map : public Multi_map_base<T> {
  private:

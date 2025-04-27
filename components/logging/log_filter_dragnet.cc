@@ -392,6 +392,8 @@ static void log_filter_append_item_value(char *out_buf, size_t out_siz,
         case INFORMATION_LEVEL:
           len = log_bs->substitute(out_writepos, out_left, "INFORMATION");
           break;
+        case MORPHY_INFORMATION_LEVEL:
+          len = log_bs->substitute(out_writepos, out_left, "MORPHY_INFORMATION");
         default:
           /*
             We have no idea what this is (either breakage, or new
@@ -837,7 +839,8 @@ static set_arg_result log_filter_set_arg(const char **token, const size_t *len,
       prio = WARNING_LEVEL;
     else if ((log_bs->compare(*token, "NOTE", 4, true) == 0) ||
              (log_bs->compare(*token, "INFO", 4, true) == 0) ||
-             (log_bs->compare(*token, "INFORMATION", 11, true) == 0))
+             (log_bs->compare(*token, "INFORMATION", 11, true) == 0) ||
+             (log_bs->compare(*token, "MORPHY_INFORMATION", 18, true) == 0))
       prio = INFORMATION_LEVEL;
     else {
       *state = "unknown prio";

@@ -46,7 +46,8 @@ class RTree_inserter;
 
 /** For loading indexes. */
 struct Builder {
-  /** Build phase/states. */
+  /** note: Build phase/states. */
+  // note: 看似state, 实则phase， asm
   enum class State : uint8_t {
     /** Initial phase. */
     INIT,

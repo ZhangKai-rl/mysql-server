@@ -913,6 +913,7 @@ struct Vio;
 
 typedef struct NET {
   MYSQL_VIO vio;
+  // write_pos，已经写到的buff位置(这里是打算发送到clietn的末尾). buff(client->server)这是读取client数据的存储接收缓冲区
   unsigned char *buff, *buff_end, *write_pos, *read_pos;
   my_socket fd; /* For Perl DBI/dbd */
   /**
@@ -1119,7 +1120,7 @@ struct rand_struct {
   @ingroup group_cs
   @{
 */
-#define NET_HEADER_SIZE 4  /**< standard header size */
+#define NET_HEADER_SIZE 4  /**< standard header size. 3B length + 1B sequence id.  */
 #define COMP_HEADER_SIZE 3 /**< compression header extra size */
 /** @}*/
 

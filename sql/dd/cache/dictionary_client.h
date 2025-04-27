@@ -146,6 +146,7 @@ class SPI_lru_cache_owner_ptr {
 template <typename T>
 class Cache_element;
 
+// 用于访问dd。依次访问一级和二级dd缓存，都没有的话去innodb dd table读取，mysql.tables.
 class Dictionary_client {
  public:
   /**

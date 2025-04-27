@@ -501,6 +501,7 @@ namespace ib {
 
 #if !defined(UNIV_HOTBACKUP) && !defined(UNIV_NO_ERR_MSGS)
 
+// note: logger的核心实现部分, 实际上使用了sql层的 LogEvent
 void logger::log_event(std::string msg) {
   LogEvent()
       .type(LOG_TYPE_ERROR)
@@ -509,6 +510,7 @@ void logger::log_event(std::string msg) {
       .subsys("InnoDB")
       .verbatim(msg.c_str());
 }
+// note: ib::logger 的底层为sql层的log_event
 logger::~logger() { log_event(m_oss.str()); }
 
 /*

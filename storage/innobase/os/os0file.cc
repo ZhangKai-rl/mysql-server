@@ -421,6 +421,7 @@ inline std::ostream &operator<<(std::ostream &out, const Slot &obj) noexcept {
 }
 
 /** The asynchronous i/o array structure */
+// note: 不是单例类. s_ibuf, s_reads, s_writes
 class AIO {
  public:
   /** Constructor
@@ -613,7 +614,8 @@ class AIO {
   respectively. The caller must create an i/o handler thread for each
   segment in these arrays by calling start_threads().
   @param[in]    n_per_seg       maximum number of pending aio
-                                  operations allowed per segment
+                                  operations allowed per segment.
+                                max pending aio op requests per thread/segment
   @param[in]    n_readers       number of reader threads
   @param[in]    n_writers       number of writer threads
   @return true if AIO sub-system was started successfully */
@@ -1526,6 +1528,7 @@ segment number.
 @param[out]     array           AIO wait array
 @param[in]      segment         global segment number
 @return local segment number within the aio array */
+// todo
 ulint AIO::get_array_and_local_segment(AIO *&array, ulint segment) {
   const auto extra = number_of_extra_threads();
   ut_a(segment < os_aio_n_segments);
@@ -5868,6 +5871,7 @@ bool os_file_check_mode(const char *name, bool read_only) {
   }
 }
 #ifndef UNIV_HOTBACKUP
+// TODO
 dberr_t os_aio_handler(ulint segment, fil_node_t **m1, void **m2,
                        IORequest *request) {
   dberr_t err;
@@ -6098,6 +6102,7 @@ bool AIO::start(ulint n_per_seg, ulint n_readers, ulint n_writers) {
 
   size_t n_segments = 0;
 
+  // 非只读模式下才有
   if (0 < n_extra) {
     ut_ad(n_extra == 1);
     s_ibuf = create(LATCH_ID_OS_AIO_IBUF_MUTEX, n_per_seg, 1);
@@ -6169,11 +6174,13 @@ static void io_handler_thread(ulint segment) {
 }
 
 #ifdef UNIV_PFS_THREAD
+// 看 ha_innodb 中 io_read_thread key应该是后期拼接上来的
 mysql_pfs_key_t io_ibuf_thread_key;
 mysql_pfs_key_t io_read_thread_key;
 mysql_pfs_key_t io_write_thread_key;
 #endif /* UNIV_PFS_THREAD */
 
+// TODO
 void AIO::start_threads() {
   ulint segment = 0;
   const auto start = [&](mysql_pfs_key_t key, PSI_thread_seqnum seqnum) {
@@ -7367,6 +7374,7 @@ thread.
 @param[out]     m2              Callback argument
 @param[in]      type            IO context
 @return DB_SUCCESS or error code */
+// TODO: simulated AIO 核心 : https://leviathan.vip/2020/03/24/mysql-understand-simulated-aio/#top
 static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
                                         void **m2, IORequest *type) {
   Slot *slot;
@@ -7394,6 +7402,7 @@ static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
 
     ulint n_reserved;
 
+    /* 检查是否有已经完成但状态尚未更新的IO请求 */
     slot = handler.check_completed(&n_reserved);
 
     if (slot != nullptr) {
@@ -7413,7 +7422,7 @@ static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
 
       return (DB_SUCCESS);
 
-    } else if (handler.select()) {
+    } else if (handler.select()) { /* note: 执行slot选择策略(没有需要update的slot，但是有slot有aio req) */
       break;
     }
 
@@ -7433,9 +7442,11 @@ static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
     os_event_wait(event);
   }
 
-  /** Found a slot that has already completed its IO */
+  /* note: Found a slot that has already completed its IO */
 
   if (slot == nullptr) {
+    // note: AIO 核心
+
     /* Merge adjacent requests */
     handler.merge();
 
@@ -7458,6 +7469,7 @@ static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
 
     srv_set_io_thread_op_info(global_segment, "doing file i/o");
 
+    // XXXXXXXXXX: AIO核心, pwrite/pread systemcall
     handler.io();
 
     srv_set_io_thread_op_info(global_segment, "file i/o done");
@@ -7475,6 +7487,7 @@ static dberr_t os_aio_simulated_handler(ulint global_segment, fil_node_t **m1,
     slot = handler.first_slot();
   }
 
+  /* 传出处理完成的 message1/2 */
   ut_ad(slot->is_reserved);
 
   *m1 = slot->m1;

@@ -177,6 +177,7 @@ size_t dirname_part(char *to, const char *name, size_t *to_res_length) {
 
 /**
   Convert directory name to use under this system.
+  用于不同系统下转换路径格式中的特殊字符，如分割符
 
   Pre-condition: At least FN_REFLEN bytes can be stored in buffer
   pointed to by 'to'. 'from' is a '\0'-terminated byte buffer.

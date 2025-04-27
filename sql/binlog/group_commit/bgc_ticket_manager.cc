@@ -70,6 +70,7 @@ binlog::BgcTicket binlog::Bgc_ticket_manager::get_coalesced_ticket() const {
   return this->m_coalesced_ticket.load();
 }
 
+// ques: 只有在组复制group replication里面调用了？
 std::pair<binlog::BgcTicket, binlog::BgcTicket>
 binlog::Bgc_ticket_manager::push_new_ticket(BgcTmOptions options) {
   AtomicBgcTicketGuard back_ticket_guard = m_back_ticket.scoped_lock();

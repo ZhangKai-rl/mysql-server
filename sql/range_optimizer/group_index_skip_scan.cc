@@ -298,6 +298,7 @@ int GroupIndexSkipScanIterator::Read() {
           }
         }
         if (!result) found_result = true;
+      // skip scan deduplicate
       } else if (key_infix_len > 0) {
         /*
           If this is just a GROUP BY or DISTINCT without MIN or MAX and there
@@ -309,6 +310,7 @@ int GroupIndexSkipScanIterator::Read() {
         result = table()->file->ha_index_read_map(
             table()->record[0], group_prefix,
             make_prev_keypart_map(real_key_parts), HA_READ_KEY_EXACT);
+        // 找到group第一条记录就返回
         if (result == 0) {
           return 0;
         }

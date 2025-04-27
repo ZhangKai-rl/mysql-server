@@ -140,7 +140,7 @@ int my_realpath(char *to, const char *filename, myf MyFlags) {
   DBUG_TRACE;
 
   DBUG_PRINT("info", ("executing realpath"));
-  unique_ptr_free<char> ptr(realpath(filename, nullptr));
+  unique_ptr_free<char> ptr(realpath(filename, nullptr)); /* filename路径中有目录不存在时返回了nullptr */
   if (ptr) {
     strmake(to, ptr.get(), FN_REFLEN - 1);
   } else {

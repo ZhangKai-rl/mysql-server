@@ -116,7 +116,7 @@ struct mysql_async_auth {
   const char *data_plugin;
   const char *db;
 
-  const char *auth_plugin_name;
+  const char *auth_plugin_name;// 这里是client-side第一次实际使用的auth plugin，发回handshakeResponse41包前。
   auth_plugin_t *auth_plugin;
   MCPVIO_EXT mpvio;
   ulong pkt_length;
@@ -158,7 +158,7 @@ enum ssl_exchange_state {
   Struct to track the state of a connection being established.  Once
   the connection is established, the context should be discarded and
   relevant values copied out of it.
-*/
+   一般用 ctx 定义变量 */
 struct mysql_async_connect {
   /* state for the overall connection process */
   MYSQL *mysql;
@@ -177,7 +177,7 @@ struct mysql_async_connect {
   int scramble_data_len;
   char *scramble_data;
   /** The server sends the default plugin name in Protocol::HandshakeV10 */
-  const char *scramble_plugin;
+  const char *scramble_plugin;// 从server发来的handshakev10包中读取的client_auth_plugin_name
   char *scramble_buffer;
   bool scramble_buffer_allocated;
 

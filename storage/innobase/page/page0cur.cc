@@ -164,7 +164,7 @@ first partially matched field in the upper limit record
 lower limit record
 @param[in,out]  ilow_matched_bytes      already matched bytes in the
 first partially matched field in the lower limit record
-@param[out]     cursor                  page cursor
+@param[out]     cursor                  page cursor. 把这个查找到的位置记录在page_cursor中
 @return true on success */
 static inline bool page_cur_try_search_shortcut_bytes(
     const buf_block_t *block, const dict_index_t *index, const dtuple_t *tuple,
@@ -191,7 +191,7 @@ static inline bool page_cur_try_search_shortcut_bytes(
 
   ut_ad(rec);
   ut_ad(page_rec_is_user_rec(rec));
-  if (ut_pair_cmp(*ilow_matched_fields, *ilow_matched_bytes,
+  if (ut_pair_cmp(*ilow_matched_fields, *ilow_matched_bytes,// 将fields作为高位，bytes作为低位，进行比较
                   *iup_matched_fields, *iup_matched_bytes) < 0) {
     up_match = low_match = *ilow_matched_fields;
     up_bytes = low_bytes = *ilow_matched_bytes;
@@ -199,7 +199,7 @@ static inline bool page_cur_try_search_shortcut_bytes(
     up_match = low_match = *iup_matched_fields;
     up_bytes = low_bytes = *iup_matched_bytes;
   }
-
+// 这里直接将本次需要插入的dtuple与PAGE_HEADER->LAST_INSERT记录的上次插入的rec进行了比较
   if (cmp_dtuple_rec_with_match_bytes(tuple, rec, index, offsets, &low_match,
                                       &low_bytes) < 0) {
     goto exit_func;
@@ -325,6 +325,12 @@ static bool page_cur_has_null(const rec_t *rec, const dict_index_t *index) {
 @param[in,out] ilow_matched_fields Already matched fields in lower limit record
 @param[out] cursor Page cursor
 @param[in,out] rtr_info Rtree search stack */
+/**
+  // 二分查找，返回：
+  // - page_cursor：指向找到的记录
+  // - up_match：与右边记录的匹配字段数
+  // - low_match：与左边记录的匹配字段数
+ */
 void page_cur_search_with_match(const buf_block_t *block,
                                 const dict_index_t *index,
                                 const dtuple_t *tuple, page_cur_mode_t mode,
@@ -597,7 +603,7 @@ void page_cur_search_with_match(const buf_block_t *block,
   }
 }
 
-/** Search the right position for a page cursor.
+/** note: 页内记录二分查找函数。在page中找对应record. Search the right position for a page cursor.
 @param[in]      block                   buffer block
 @param[in]      index                   index tree
 @param[in]      tuple                   key to be searched for
@@ -753,7 +759,7 @@ void page_cur_search_with_match_bytes(
   up_rec = page_dir_slot_get_rec(slot);
 
   /* Perform linear search until the upper and lower records come to
-  distance 1 of each other. */
+  distance 1 of each other. 二分法位置 */
 
   while (page_rec_get_next_const(low_rec) != up_rec) {
     mid_rec = page_rec_get_next_const(low_rec);
@@ -1218,15 +1224,16 @@ byte *page_cur_parse_insert_rec(
   return (const_cast<byte *>(ptr + end_seg_len));
 }
 
-/** Inserts a record next to page cursor on an uncompressed page.
+/** Inserts a record **next to** page cursor on an uncompressed page.
  Returns pointer to inserted record if succeed, i.e., enough
  space available, NULL otherwise. The cursor stays at the same position.
  @return pointer to record if succeed, NULL otherwise */
+// TODO
 rec_t *page_cur_insert_rec_low(
     rec_t *current_rec,  /*!< in: pointer to current record after
-                     which the new record is inserted */
+                     which(current_rec) the new record is inserted */
     dict_index_t *index, /*!< in: record descriptor */
-    const rec_t *rec,    /*!< in: pointer to a physical record */
+    const rec_t *rec,    /*!< in: pointer to a physical record, 待插入的 rec_t */
     ulint *offsets,      /*!< in/out: rec_get_offsets(rec, index) */
     mtr_t *mtr)          /*!< in: mini-transaction handle, or NULL */
 {
@@ -1291,6 +1298,13 @@ rec_t *page_cur_insert_rec_low(
       goto use_heap;
     }
 
+    /** 
+     * 布局:     [Extra Info] [Record Data] 
+        指针:     ↑            ↑
+                 insert_buf   free_rec
+    ques: 这里为什么减? 
+    基本可以看出， free_rec 指向的实际为 rec_t 也就是 innodb compact row format的 data 部分，不包含 extra 部分，该部分在内存前面 
+     */
     insert_buf = free_rec - rec_offs_extra_size(foffsets);
 
     if (page_is_comp(page)) {
@@ -1317,6 +1331,7 @@ rec_t *page_cur_insert_rec_low(
   }
 
   /* 3. Create the record */
+  // note: insert_buf存整个compact rec, 而 insert_rec(rec_t) 存compact rec的data(rec_t)部分
   insert_rec = rec_copy(insert_buf, rec, offsets);
   rec_offs_make_valid(insert_rec, index, offsets);
 

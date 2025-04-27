@@ -1640,7 +1640,7 @@ dberr_t srv_start(bool create_new_db) {
   mysql_stage_register("innodb", srv_stages, UT_ARR_SIZE(srv_stages));
 #endif /* HAVE_PSI_STAGE_INTERFACE */
 
-  /* Switch latching order checks on in sync0debug.cc, if
+  /* note: Switch latching order checks on in sync0debug.cc, if
   --innodb-sync-debug=false (default) */
   ut_d(sync_check_enable());
 
@@ -1712,6 +1712,8 @@ dberr_t srv_start(bool create_new_db) {
       sprintf(srv_monitor_file_name, "%s/innodb_status." ULINTPF,
               static_cast<const char *>(MySQL_datadir_path),
               os_proc_get_number());
+      
+      ib::info() << "srv_monitor_file_name:" << srv_monitor_file_name;
 
       srv_monitor_file = fopen(srv_monitor_file_name, "w+");
 
@@ -2264,6 +2266,7 @@ dberr_t srv_start(bool create_new_db) {
 
     /* Create the thread which watches the timeouts
     for lock waits */
+    // https://zhuanlan.zhihu.com/p/1954661636473328402
     srv_threads.m_lock_wait_timeout = os_thread_create(
         srv_lock_timeout_thread_key, 0, lock_wait_timeout_thread);
 

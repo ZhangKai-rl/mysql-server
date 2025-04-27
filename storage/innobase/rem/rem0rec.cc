@@ -741,6 +741,7 @@ size_t get_extra_bytes_for_temp_redundant(const dict_index_t *index,
                                 files in index creation
 @param[in]      rec_version     rec version (could be 0 also)
 @return record instant information for record on leaf page */
+// 月报 instant add column功能解析： http://mysql.taobao.org/monthly/2020/03/01/
 static inline Rec_instant_state rec_convert_dtuple_to_rec_comp(
     rec_t *rec, const dict_index_t *index, const dfield_t *fields,
     ulint n_fields, const dtuple_t *v_entry, ulint status, bool temp,

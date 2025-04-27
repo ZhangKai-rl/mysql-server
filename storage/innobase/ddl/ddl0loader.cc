@@ -175,6 +175,7 @@ class Loader::Task_queue {
 
       mutex_exit(&m_mutex);
 
+      // note
       err = task();
 
     } while (err == DB_SUCCESS);
@@ -446,6 +447,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     } else {
       /* Read clustered index of the table and create files for secondary
       index entries for merge sort and bulk build of the indexes. */
+      // todo
       err = cursor->scan(m_builders);
     }
 
@@ -458,6 +460,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     DEBUG_SYNC_C("ddl_after_scan");
 
     if (err == DB_SUCCESS) {
+      // todo
       err = load();
     }
 

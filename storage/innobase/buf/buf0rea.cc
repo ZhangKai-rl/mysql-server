@@ -124,6 +124,7 @@ ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
 
   IORequest request(type | IORequest::READ);
 
+  // TODO
   *err = fil_io(request, sync, page_id, page_size, 0, page_size.physical(), dst,
                 bpage);
 
@@ -150,6 +151,7 @@ ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
   return (1);
 }
 
+// innodb buffer pool 的 随机文件预读
 ulint buf_read_ahead_random(const page_id_t &page_id,
                             const page_size_t &page_size, bool inside_ibuf) {
   buf_pool_t *buf_pool = buf_pool_get(page_id);
@@ -219,6 +221,7 @@ ulint buf_read_ahead_random(const page_id_t &page_id,
         buf_page_peek_if_young(bpage)) {
       recent_blocks++;
 
+      // 随机预读的判定条件
       if (recent_blocks >= BUF_READ_AHEAD_RANDOM_THRESHOLD(buf_pool)) {
         rw_lock_s_unlock(hash_lock);
         goto read_ahead;

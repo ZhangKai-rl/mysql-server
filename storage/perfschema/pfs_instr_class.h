@@ -105,6 +105,7 @@ typedef unsigned int PFS_socket_key;
 /** Key, naming a memory instrument. */
 typedef unsigned int PFS_memory_key;
 
+// note
 enum PFS_class_type {
   PFS_CLASS_NONE = 0,
   PFS_CLASS_MUTEX = 1,
@@ -162,9 +163,9 @@ class PFS_instr_name {
     SETTERS INSTEAD.
 
     The data members should really have been private, but having both
-    private and public members would make the class a non-POD.  We
+    note: private and public members would make the class a non-POD.  We
     need to call memset on PFS_instr_class (in init_instr_class), and
-    the behavior of memset is undefined on non-POD objects.  Therefore
+    note: the behavior of memset is undefined on non-POD objects.  Therefore
     we keep the data members public, with an underscore prefix, and
     this warning text.
   */
@@ -202,12 +203,14 @@ class PFS_instr_name {
 };
 
 /** Information for all instrumentation. */
+// note: instrument 可以翻译为 监测点/插桩/性能探针
 struct PFS_instr_class {
   /** Class type */
   PFS_class_type m_type;
   /** True if this instrument is enabled. */
   bool m_enabled;
   /** True if this instrument is timed. */
+  // 计时
   bool m_timed;
   /** Instrument flags. */
   uint m_flags;

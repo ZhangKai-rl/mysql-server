@@ -49,8 +49,10 @@ class Logical_clock {
     Offset is subtracted from the actual "absolute time" value at
     logging a replication event. That is the event holds logical
     timestamps in the "relative" format. They are meaningful only in
-    the context of the current binlog.
+    the context of the *******current binlog.
     The member is updated (incremented) per binary log rotation.
+    处理 binlog file retate的情况，rotate后 sn和lc不再有意义，可以任意并行。
+    ques: offset应该是此state相对于rotate前的offset?
   */
   int64 offset;
 
@@ -68,6 +70,8 @@ class Logical_clock {
     This operation is invoked when binlog rotates and at that time
     there can't any concurrent step() callers so no need to guard
     the assignment.
+    //note: 注意 binlog file rotate and update offset 的 timing
+    都是update到transaction_counter的state
   */
   void update_offset(int64 new_offset) {
     assert(offset <= new_offset);
@@ -105,6 +109,7 @@ class Commit_order_trx_dependency_tracker {
   void rotate();
 
  private:
+ // https://zhuanlan.zhihu.com/p/142879585: m_max_committed_transaction，保存已提交的最大事务号；m_transaction_counter，保存已prepare的最大事务号。
   /* Committed transactions timestamp */
   Logical_clock m_max_committed_transaction;
 
@@ -216,6 +221,7 @@ enum enum_binlog_transaction_dependency_tracking {
   Dependency tracker is a container singleton that dispatches between the three
   methods associated with the binlog-transaction-dependency-tracking option.
   There is a singleton instance of each of these classes.
+  https://zhuanlan.zhihu.com/p/142879585
 */
 class Transaction_dependency_tracker {
  public:

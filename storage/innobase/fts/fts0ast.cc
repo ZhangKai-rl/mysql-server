@@ -553,13 +553,14 @@ dberr_t fts_ast_visit(fts_ast_oper_t oper,      /*!< in: current operator */
   is ignored in the first pass. We have two passes during the revisit:
   We process nodes with FTS_EXIST_SKIP in the exist pass, and then
   process nodes with FTS_IGNORE_SKIP in the ignore pass.
-
+// +【快递到家】宝格迪卡 时光纯银女戒 一个（2克拉）0*  被分词为： phrase_list(快递到家), phrase_list(宝格迪卡)
   The order should be restrictly followed, or we will get wrong results.
   For example, we have a query 'a +b -c d +e -f'.
   first pass: process 'a' and 'd' by union;
   exist pass: process '+b' and '+e' by intersection;
   ignore pass: process '-c' and '-f' by difference. */
-
+    // 以 ‘Ishmael’ ngram分词器(默认步长2) 为例， 会分词为： ['Is', 'sh', 'hm', 'ma', 'ae', 'el']
+    // 调试时直接看 fts_ast_node_t::next->next-next->term->str 即可
   for (node = node->list.head; node && (error == DB_SUCCESS);
        node = node->next) {
     switch (node->type) {

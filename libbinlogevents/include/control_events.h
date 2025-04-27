@@ -1010,6 +1010,7 @@ class Gtid_event : public Binary_log_event {
     Transaction_ctx::last_committed and
     Transaction_ctx::sequence_number for details.
     Note: Transaction_ctx is in the MySQL server code.
+    // used for MTS
   */
   long long int last_committed;
   long long int sequence_number;
@@ -1031,6 +1032,7 @@ class Gtid_event : public Binary_log_event {
 
     The layout of the buffer is as follows
     <pre>
+    // note
     +----------+---+---+-------+--------------+---------+----------+
     |gtid flags|SID|GNO|TS_TYPE|logical ts(:s)|commit ts|trx length|
     +----------+---+---+-------+------------------------+----------+

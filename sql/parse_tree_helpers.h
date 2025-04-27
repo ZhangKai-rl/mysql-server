@@ -66,6 +66,10 @@ class Mem_root_array;
 
   This wrapper class overrides abstract virtual functions of the parent
   class with dummy wrappers to make C++ compiler happy.
+
+  子类以 PTI_ 开头: https://zhuanlan.zhihu.com/p/1903411627216332439
+  在某些特定情况下，我们无法确定 Token 准确对应的 Item，所以使用 Parse_tree_item 作为解析过程中专门用于存储 Item 的placeholder。
+  在contextualize阶段时，会转换成 Item。
 */
 class Parse_tree_item : public Item {
  public:

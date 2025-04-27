@@ -134,6 +134,7 @@ class Table_columns_view {
   template <typename U = ExclusionFilter>
   Table_columns_view(
       unsigned long options = 0,
+      // 谓词模板的使用
       typename std::enable_if<std::is_same<
           U, std::function<bool(TABLE const *, size_t)>>::value>::type * =
           nullptr);

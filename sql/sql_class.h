@@ -786,6 +786,7 @@ struct Ha_data {
   /**
     Storage engine specific thread local data.
     Lifetime: one user connection.
+    ha_innobase is 'innodb_session_t'
   */
   void *ha_ptr;
   /**
@@ -989,6 +990,8 @@ class THD : public MDL_context_owner,
 
   /**
     The query associated with this statement.
+    完整的sql语句输入，如：select * from table_a;
+    使用thd->query()或者thd->query().str获取
   */
   LEX_CSTRING m_query_string;
   String m_normalized_query;
@@ -1050,7 +1053,8 @@ class THD : public MDL_context_owner,
   /* Slave applier execution context */
   Relay_log_info *rli_slave;
 
-  /* Is transaction commit still pending */
+  /* Is transaction commit still pending. 这个pending可能是为了后期group批量commit */
+  // 见 init_thd_variables
   bool tx_commit_pending;
 
   /**
@@ -1105,6 +1109,7 @@ class THD : public MDL_context_owner,
   collation_unordered_map<std::string, unique_ptr_with_deleter<user_var_entry>>
       user_vars{system_charset_info, key_memory_user_var_entry};
   struct rand_struct rand;              // used for authentication
+  // protectd by THD::LOCK_thd_sysvar. 见sys_var::update 更新session_var的过程
   struct System_variables variables;    // Changeable local variables
   struct System_status_var status_var;  // Per thread statistic vars
   struct System_status_var
@@ -1449,6 +1454,7 @@ class THD : public MDL_context_owner,
 
  public:
   // See comment in THD::enter_cond about why SUPPRESS_TSAN is needed.
+  // 调用了 set_proc_info
   void enter_stage(const PSI_stage_info *stage, PSI_stage_info *old_stage,
                    const char *calling_func, const char *calling_file,
                    const unsigned int calling_line) SUPPRESS_TSAN;
@@ -1611,7 +1617,7 @@ class THD : public MDL_context_owner,
   uint fill_variables_recursion_level;
 
  private:
-  /* container for handler's private per-connection data */
+  /* note: container for handler's private per-connection data */
   Prealloced_array<Ha_data, PREALLOC_NUM_HA> ha_data;
 
  public:
@@ -2548,7 +2554,16 @@ class THD : public MDL_context_owner,
 
   /**
     Used by MYSQL_BIN_LOG to maintain the commit queue for binary log
-    group commit.
+    group commit. 提交THD队列
+    赋值：通过二级指针直接对地址复制的
+
+    xxxx:next_to_commit的生命周期：
+      1. 初始化：nullptr（binlog.cc:8389）
+      2. 加入队列：仍然是nullptr（自己的next_to_commit）
+      3. 下一个THD加入：被修改为指向下一个THD（通过*m_last间接修改）
+      4. 队列末尾：保持nullptr（最后一个THD）
+    见 Commit_stage_manager::Mutex_queue::append
+
   */
   THD *next_to_commit;
 
@@ -3206,7 +3221,7 @@ class THD : public MDL_context_owner,
 
     To raise this flag, use my_error().
   */
-  inline bool is_error() const { return get_stmt_da()->is_error(); }
+  inline bool is_error() const { return get_stmt_da()->is_error(); }  // 这里应该致命错误才为true。如果是执行sql返回错误吗（my_error）这种，thd->is_error()=false.
 
   /// Returns first Diagnostics Area for the current statement.
   Diagnostics_area *get_stmt_da() { return m_stmt_da; }

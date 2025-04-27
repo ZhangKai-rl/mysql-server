@@ -49,7 +49,7 @@ typedef byte flst_node_t;
 /* The physical size of a list base node in bytes */
 constexpr ulint FLST_BASE_NODE_SIZE = 4 + 2 * FIL_ADDR_SIZE;
 
-/* The physical size of a list node in bytes */
+/* 2*6B=12B. The physical size of a list node in bytes */
 constexpr ulint FLST_NODE_SIZE = 2 * FIL_ADDR_SIZE;
 
 /** Initializes a list base node.

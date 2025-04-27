@@ -414,6 +414,7 @@ enum class Subquery_strategy : int {
   DELETED,
 };
 
+// exist子句中的subquery
 class Item_exists_subselect : public Item_subselect {
   typedef Item_subselect super;
 
@@ -609,6 +610,7 @@ class Item_in_subselect : public Item_exists_subselect {
   Item_func_not_all *upper_item;  // point on NOT/NOP before ALL/SOME subquery
 
  private:
+  // note: 见sql_yacc.yy, predicate: rule
   PT_subquery *pt_subselect;
 
  public:

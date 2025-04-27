@@ -68,6 +68,7 @@
   @param F the source file name
   @param L the source file line
   @return the current stage progress
+  用于 show processlist or pfs.table
 */
 #define MYSQL_SET_STAGE(K, F, L) inline_mysql_set_stage(K, F, L)
 

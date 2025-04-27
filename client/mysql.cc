@@ -1249,7 +1249,7 @@ BOOL windows_ctrl_handler(DWORD fdwCtrlType) {
   return false;
 }
 #endif
-
+// 有main函数，这个会生成可执行文件，而不是作为一个动态/静态库使用。对应mysql binary client.
 int main(int argc, char *argv[]) {
   char buff[80];
 
@@ -1645,6 +1645,7 @@ void window_resize(int) {
 }
 #endif
 
+// mysql的option 读取到这里了。
 static struct my_option my_long_options[] = {
     {"help", '?', "Display this help and exit.", nullptr, nullptr, nullptr,
      GET_NO_ARG, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
@@ -4742,6 +4743,7 @@ static bool init_connection_options(MYSQL *mysql) {
                     opt_load_data_local_dir))
     return true;
 
+  // 如果 ./msyql --default_auth 则添加选项至 MYSQL
   if (opt_default_auth && *opt_default_auth)
     mysql_options(mysql, MYSQL_DEFAULT_AUTH, opt_default_auth);
 

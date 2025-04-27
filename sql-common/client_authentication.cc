@@ -635,7 +635,7 @@ int caching_sha2_password_auth_client(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql) {
 
   /*
     Get the scramble from the server because we need it when sending encrypted
-    password.
+    password. 执行：client_mpvio_read_packet
   */
   if (vio->read_packet(vio, &pkt) != SCRAMBLE_LENGTH + 1) {
     DBUG_PRINT("info", ("Scramble is not of correct length."));

@@ -157,7 +157,7 @@ and return. don't execute actual insert. */
  @return query thread to run next or NULL */
 que_thr_t *row_ins_step(que_thr_t *thr); /*!< in: query thread */
 
-/* Insert node structure */
+/* Insert node structure. que_common_t必须在第一个字段，用于reinterpret_cast */
 
 struct ins_node_t {
   que_common_t common;     /*!< node type: QUE_NODE_INSERT */
@@ -170,7 +170,7 @@ struct ins_node_t {
   ulint state;             /*!< node execution state */
   dict_index_t *index;     /*!< NULL, or the next index where the index
                            entry should be inserted */
-  dtuple_t *entry;         /*!< NULL, or entry to insert in the index;
+  dtuple_t *entry;         /*!< 这里记录的是插入表每个索引的tuple. NULL, or entry to insert in the index;
                            after a successful insert of the entry,
                            this should be reset to NULL */
   UT_LIST_BASE_NODE_T(dtuple_t, tuple_list)

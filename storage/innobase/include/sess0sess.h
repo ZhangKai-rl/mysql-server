@@ -62,7 +62,7 @@ class dict_intrinsic_table_t {
   dict_table_t *m_handler;
 };
 
-/** InnoDB private data that is cached in THD */
+/** note: InnoDB private data that is cached in THD */
 typedef std::map<
     std::string, dict_intrinsic_table_t *, std::less<std::string>,
     ut::allocator<std::pair<const std::string, dict_intrinsic_table_t *>>>

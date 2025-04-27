@@ -59,6 +59,8 @@ std::stringstream NotifyGlobals::fmt;
 /**
   Looks for the name of the socket file in the environment variable
   NOTIFY_SOCKET. Connects NotifyGlobals::socket to it if present.
+  
+  systemd socket激活机制？在mysql通过systemd service启动时，mysqld启动成功后会发送 READY=1给 systemd notify socket，之后才会向外提供mysqld service
 */
 void notify_connect() {
 #ifndef _WIN32

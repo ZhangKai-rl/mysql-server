@@ -215,6 +215,7 @@ ulong srv_parallel_read_threads;
 /** If this flag is true, then we will use the native aio of the
 OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads. */
+// innodb的两种aio, linux native aio && simulated aio
 bool srv_use_native_aio = false;
 
 bool srv_numa_interleave = false;
@@ -751,6 +752,7 @@ to do.  The thread table can be seen as an analogue to the process table
 in a traditional Unix implementation. */
 
 /** The server system struct */
+// todo: 这个是做什么的？
 struct srv_sys_t {
   ib_mutex_t tasks_mutex; /*!< variable protecting the
                           tasks queue */
@@ -762,6 +764,7 @@ struct srv_sys_t {
   ulint n_sys_threads; /*!< size of the sys_threads
                        array */
 
+  // note
   srv_slot_t *sys_threads; /*!< server thread table */
 
   ulint n_threads_active[SRV_MASTER + 1];

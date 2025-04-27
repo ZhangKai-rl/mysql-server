@@ -352,7 +352,25 @@ shared locks are allowed. To prevent starving of a writer blocked by
 readers, a writer may queue for x-lock by decrementing lock_word: no
 new readers will be let in while the thread waits for readers to
 exit. */
+/** // 获取S锁：lock_word--
+// 释放S锁：lock_word++
+2. 排他锁（X锁）操作
+// 获取X锁：lock_word -= X_LOCK_DECR
+// 释放X锁：lock_word += X_LOCK_DECR
+3. 共享排他锁（SX锁）操作
+// 获取SX锁：lock_word -= X_LOCK_HALF_DECR  
+// 释放SX锁：lock_word += X_LOCK_HALF_DECR
 
+if (lock_word == X_LOCK_DECR) {
+    // 无锁状态
+} else if (lock_word > 0) {
+    // 有共享锁，数量 = X_LOCK_DECR - lock_word
+} else if (lock_word <= 0) {
+    // 有排他锁或SX锁
+}
+ */
+
+// note: 可观测，记录了s/x的file_name, line
 struct rw_lock_t
 #ifdef UNIV_DEBUG
     : public latch_t
@@ -367,7 +385,7 @@ struct rw_lock_t
   rw_lock_t(const rw_lock_t &) = delete;
   rw_lock_t &operator=(const rw_lock_t &) = delete;
 
-  /** Holds the state of the lock. */
+  /** NOTE: Holds the state of the lock. */
   std::atomic<int32_t> lock_word;
 
   /** 1: there are waiters */

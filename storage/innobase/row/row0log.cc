@@ -200,9 +200,11 @@ struct row_log_t {
   /** Whether the definition of the PRIMARY KEY has remained the same */
   bool same_pk;
 
-  /** Default values of added columns, or NULL */
+  /** note: Default values of added columns, or NULL */
   const dtuple_t *add_cols;
 
+  // note: col_map: 数组，存的是原表中的列id对应到新表的列id。
+  // 如： col_map[0] = 2;  // 原表的第0列 映射到 新表的第2列
   /** Mapping of old column numbers to new ones, or NULL if !table */
   const ulint *col_map;
 

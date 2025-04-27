@@ -162,6 +162,7 @@ struct srv_stats_t {
 
 /** Structure which keeps shared future objects for InnoDB background
 threads. One should use these objects to check if threads exited. */
+// note
 struct Srv_threads {
   /** Monitor thread (prints info). */
   IB_thread m_monitor;
@@ -456,7 +457,7 @@ extern ulong srv_debug_system_mem_size;
 
 /** Space for log buffer, expressed in bytes. Note, that log buffer
 will use only the largest power of two, which is not greater than
-the assigned space. */
+the assigned space. log_sys的内存redo log buffer的大小: log_sys::buf */
 extern ulong srv_log_buffer_size;
 
 /** When log writer follows links in the log recent written buffer,

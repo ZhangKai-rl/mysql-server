@@ -172,9 +172,9 @@ bool Storage_adapter::get(THD *thd, const K &key, enum_tx_isolation isolation,
     assert(thd->is_system_thread() || thd->killed || thd->is_error());
     return true;
   }
-
+  // 这里是开表后自动填充到 dd::Abstract_table::DD_table中了嘛？答：主要是根据这个找表名，然后在otx::m_tables中根据表名找需要的dd tables
   const Entity_object_table &table = T::DD_table::instance();
-  // Get main object table.
+  // Get main object table.             "tables". 因为是Abstract_table::DD_table所以是mysql.tables
   Raw_table *t = trx.otx.get_table(table.name());
 
   // Find record by the object-id.

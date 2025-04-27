@@ -1021,6 +1021,7 @@ dberr_t log_create_unused_file(const Log_files_context &ctx,
   const auto file_path = log_file_path_for_unused_file(ctx, file_id);
 
   bool ret;
+  // 创建#ib_redox_tmp
   auto file = os_file_create(innodb_log_file_key, file_path.c_str(),
                              OS_FILE_CREATE | OS_FILE_ON_ERROR_NO_EXIT,
                              OS_FILE_NORMAL, OS_LOG_FILE, false, &ret);

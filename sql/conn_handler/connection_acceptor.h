@@ -62,6 +62,7 @@ class Connection_acceptor {
     Connection_handler_manager *mgr =
         Connection_handler_manager::get_instance();
     while (!connection_events_loop_aborted()) {
+      // 主线程会一直执行这个loop
       Channel_info *channel_info = m_listener->listen_for_connection_event();
       if (channel_info != nullptr) mgr->process_new_connection(channel_info);
     }

@@ -514,6 +514,8 @@ void warn_on_deprecated_user_defined_collation(
 
 %start start_entry
 
+// https://zhuanlan.zhihu.com/p/716898493
+// 这里是MYSQLparse的入口. sql_parser -> MYSQLparser函数的参数
 %parse-param { class THD *YYTHD }
 %parse-param { class Parse_tree_root **parse_tree }
 
@@ -1398,6 +1400,7 @@ void warn_on_deprecated_user_defined_collation(
 %token<lexer.keyword> BULK_SYM                   1201  /* MYSQL */
 %token<lexer.keyword> URL_SYM                    1202   /* MYSQL */
 %token<lexer.keyword> GENERATE_SYM               1203   /* MYSQL */
+%token TEST_0528                                 1204
 
 /*
   Precedence rules used to resolve the ambiguity when using keywords as idents
@@ -1859,6 +1862,7 @@ void warn_on_deprecated_user_defined_collation(
         query_expression_with_opt_locking_clauses
 
 %type <query_primary>
+        // TODO query_primary, query_specification啥意思
         query_primary
         query_specification
 
@@ -2223,6 +2227,7 @@ rule: <-- starts at col 1
   Thanks.
 */
 
+/* 这里应该是解析入口规则 */
 start_entry:
           sql_statement
         | GRAMMAR_SELECTOR_EXPR bit_expr END_OF_INPUT
@@ -10617,6 +10622,10 @@ function_call_keyword:
           {
             $$= NEW_PTN Item_func_current_user(@$);
           }
+        | TEST_0528 optional_braces
+          {
+            $$= NEW_PTN Item_func_current_user(@$);
+          }
         | DATE_SYM '(' expr ')'
           {
             $$= NEW_PTN Item_typecast_date(@$, $3);
@@ -12021,6 +12030,7 @@ use_partition:
   i.e. <single_table_parens>, <joined_table_parens> and
   <table_reference_list_parens>. It's a bit tedious but the grammar is
   unambiguous and doesn't have shift/reduce conflicts.
+  // https://zhuanlan.zhihu.com/p/720046825 : json table 函数
 */
 table_factor:
           single_table

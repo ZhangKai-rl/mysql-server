@@ -678,7 +678,7 @@ static void update_schema_options(const dd::Schema *sch_obj,
 
   @return Pointer to the new TABLE_SHARE, or NULL if there was an error
 */
-
+// 先从tdc（tdc表定义缓存链表，元素为table_share表定义）找，找不到从.frm载入
 TABLE_SHARE *get_table_share(THD *thd, const char *db, const char *table_name,
                              const char *key, size_t key_length, bool open_view,
                              bool open_secondary) {
@@ -9546,6 +9546,7 @@ bool fill_record(THD *thd, TABLE *table, const mem_root_deque<Item *> &fields,
       set_field_to_null_with_conversions()). So evaluation of this flag can't
       be moved outside of fill_record(), to be done once per statement.
     */
+    // note
     if (value->save_in_field(rfield, false) < 0) {
       my_error(ER_UNKNOWN_ERROR, MYF(0));
       return true;
@@ -9873,6 +9874,7 @@ bool fill_record_n_invoke_before_triggers(
 
     return rc || check_inserting_record(thd, table->field);
   } else {
+    // note
     if (fill_record(thd, table, fields, values, nullptr, nullptr,
                     raise_autoinc_has_expl_non_null_val))
       return true;

@@ -1721,6 +1721,7 @@ class PT_select_stmt : public Parse_tree_root {
 
  private:
   enum_sql_command m_sql_command;
+  // PT_query_expression
   PT_query_expression_body *m_qe;
   PT_into_destination *m_into;
   const bool m_has_trailing_locking_clauses;

@@ -508,6 +508,7 @@ bool Sql_cmd_dml::prepare(THD *thd) {
 
   assert(!is_prepared());
 
+  // note: sql_cmd_dml::execute执行器的三个阶段： prepare/resolve -> optimize -> execute
   assert(!lex->unit->is_prepared() && !lex->unit->is_optimized() &&
          !lex->unit->is_executed());
 
@@ -563,7 +564,7 @@ bool Sql_cmd_dml::prepare(THD *thd) {
     Prepared_stmt_arena_holder ps_arena_holder(thd);
     Enable_derived_merge_guard derived_merge_guard(
         thd, is_show_cmd_using_system_view(thd));
-
+    // note!!!
     if (prepare_inner(thd)) goto err;
     if (needs_explicit_preparation() && result != nullptr) {
       result->cleanup();
@@ -640,6 +641,7 @@ bool Sql_cmd_select::prepare_inner(THD *thd) {
     parameters->m_use_select_limit = true;
   }
 
+  // ques: 
   if (unit->is_simple()) {
     Query_block *const select = unit->first_query_block();
     select->context.resolve_in_select_list = true;
@@ -669,6 +671,7 @@ bool has_external_table(Table_ref *query_tables) {
   return false;
 }
 
+// TODO
 bool Sql_cmd_dml::execute(THD *thd) {
   DBUG_TRACE;
 
@@ -714,7 +717,7 @@ bool Sql_cmd_dml::execute(THD *thd) {
       error_handler_active = true;
     }
   }
-
+  // note: execute是包含所有阶段的. 这里进入prepare阶段，其中包含resolve阶段
   if (!is_prepared()) {
     if (prepare(thd)) goto err;
   } else {
@@ -1516,6 +1519,7 @@ SJ_TMP_TABLE *create_sj_tmp_table(THD *thd, JOIN *join,
   setup_materialized_table().
 */
 
+// http://mysql.taobao.org/monthly/2020/07/04/
 static bool setup_semijoin_dups_elimination(JOIN *join, uint no_jbuf_after) {
   uint tableno;
   THD *thd = join->thd;
@@ -1537,6 +1541,7 @@ static bool setup_semijoin_dups_elimination(JOIN *join, uint no_jbuf_after) {
       continue;
     }
     QEP_TAB *last_sj_tab = tab + pos->n_sj_tables - 1;
+    // 选择 semi-join stratege
     switch (pos->sj_strategy) {
       case SJ_OPT_MATERIALIZE_LOOKUP:
       case SJ_OPT_MATERIALIZE_SCAN:
@@ -1689,6 +1694,7 @@ static bool setup_semijoin_dups_elimination(JOIN *join, uint no_jbuf_after) {
           }
         }
 
+        // 创建 sj tmp table 物化表
         SJ_TMP_TABLE *sjtbl = create_sj_tmp_table(thd, join, sjtabs, last_tab);
         if (sjtbl == nullptr) {
           return true;
@@ -1699,6 +1705,8 @@ static bool setup_semijoin_dups_elimination(JOIN *join, uint no_jbuf_after) {
 
         tableno += pos->n_sj_tables;
         break;
+
+        // 之后就再 do_sj_dups_weedout 中处理了
       }
       case SJ_OPT_FIRST_MATCH: {
         /*

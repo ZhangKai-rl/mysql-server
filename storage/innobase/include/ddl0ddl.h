@@ -451,7 +451,7 @@ struct Context {
     }
   }
 
-  /** Build the indexes.
+  /** note: Build the indexes.
   @return DB_SUCCESS or error code. */
   [[nodiscard]] dberr_t build() noexcept;
 

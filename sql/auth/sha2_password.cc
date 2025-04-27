@@ -936,10 +936,10 @@ static int caching_sha2_password_authenticate(MYSQL_PLUGIN_VIO *vio,
   RSA *private_key = nullptr;
   RSA *public_key = nullptr;
 #endif /* OPENSSL_VERSION_NUMBER >= 0x30000000L */
-
+    // 盐值
   generate_user_salt(scramble, SCRAMBLE_LENGTH + 1);
 
-  /*
+  /* 准备与mysql客户端发起握手，发送随机生成的盐值. 收到mysql client连接时这里是 server_mpvio_write_packet
     Note: The nonce is split into 8 + 12 bytes according to
     http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
     Native authentication sent 20 bytes + '\0' character = 21 bytes.

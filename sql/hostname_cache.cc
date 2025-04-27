@@ -415,7 +415,7 @@ static inline bool is_hostname_valid(const char *hostname) {
 }
 
 /**
-  Resolve IP-address to host name.
+  Resolve IP-address to host name. 解析 ip -> hostname
 
   This function does the following things:
     - resolves IP-address;

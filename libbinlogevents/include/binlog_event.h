@@ -143,6 +143,7 @@
 /**
    Uninitialized timestamp value (for either last committed or sequence number).
    Often carries meaning of the minimum value in the logical timestamp domain.
+   note: minimum!!!
 */
 const int64_t SEQ_UNINIT = 0;
 

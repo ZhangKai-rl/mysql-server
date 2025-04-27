@@ -1168,7 +1168,7 @@ Create the lock instance
 @param[in, out] index   Index on which record lock is required
 @param[in] mode         The lock mode desired
 @param[in] rec_id       The record id
-@param[in] size         Size of the lock + bitmap requested
+@param[in] size         Size of the lock + bitmap requested(X)。实际为bitmap字节数
 @return a record lock instance */
 lock_t *RecLock::lock_alloc(trx_t *trx, dict_index_t *index, ulint mode,
                             const RecID &rec_id, ulint size) {
@@ -1178,8 +1178,10 @@ lock_t *RecLock::lock_alloc(trx_t *trx, dict_index_t *index, ulint mode,
 
   lock_t *lock;
 
+  // rec pool 不够了，直接malloc 一个 lock_t
   if (trx->lock.rec_cached >= trx->lock.rec_pool.size() ||
       sizeof(*lock) + size > REC_LOCK_SIZE) {
+    // note: 注意这个内存分配的方式
     ulint n_bytes = size + sizeof(*lock);
     mem_heap_t *heap = trx->lock.lock_heap;
     auto ptr = mem_heap_alloc(heap, n_bytes);
@@ -1214,6 +1216,8 @@ lock_t *RecLock::lock_alloc(trx_t *trx, dict_index_t *index, ulint mode,
     ut_ad(8 * size < UINT32_MAX);
     rec_lock.n_bits = static_cast<uint32_t>(8 * size);
 
+    // xxxx: 紧跟在 lock_t 后面的内存，用于存放 lock_rec_t中的bitmap
+    // note: 这里跟dtuple的dfield的内存分配是一样的
     memset(&lock[1], 0x0, size);
   }
 
@@ -1352,7 +1356,7 @@ lock_t *RecLock::create(trx_t *trx, const lock_prdt_t *prdt) {
   */
   ut_ad(trx_mutex_own(trx));
 
-  /* Create the explicit lock instance and initialise it. */
+  /* note: Create the explicit lock instance and initialise it. */
 
   lock_t *lock = lock_alloc(trx, m_index, m_mode, m_rec_id, m_size);
 
@@ -1730,6 +1734,7 @@ static inline lock_rec_req_status lock_rec_lock_fast(
 
   lock_rec_req_status status = LOCK_REC_SUCCESS;
 
+  // 目前page上还没有 lock_rec_t
   if (lock == nullptr) {
     if (!impl) {
       RecLock rec_lock(index, block, heap_no, mode);
@@ -1744,8 +1749,11 @@ static inline lock_rec_req_status lock_rec_lock_fast(
     trx_mutex_enter(trx);
 
     if (lock_rec_get_next_on_page(lock) != nullptr || lock->trx != trx ||
+        /* page有多个rec lock ||                       rec lock不是当前事务的 */
         lock->type_mode != (mode | LOCK_REC) ||
         lock_rec_get_n_bits(lock) <= heap_no) {
+        /* 锁的位图大小不足以容纳当前记录 */
+      // 无法走 fast path add rec lock
       status = LOCK_REC_FAIL;
     } else if (!impl) {
       /* If the nth bit of the record lock is already set
@@ -1933,6 +1941,7 @@ of a page supremum record, a gap type lock.
 @param[in,out]  thr             query thread
 @return DB_SUCCESS, DB_SUCCESS_LOCKED_REC, DB_LOCK_WAIT, DB_DEADLOCK,
 DB_SKIP_LOCKED, or DB_LOCK_NOWAIT */
+// note: innodb record lock的核心. RecLock -> RecLock::add_to_waitq -> RecLock::create -> lock_t -> lock_rec_t
 static dberr_t lock_rec_lock(bool impl, select_mode sel_mode, ulint mode,
                              const buf_block_t *block, ulint heap_no,
                              dict_index_t *index, que_thr_t *thr) {
@@ -2042,6 +2051,7 @@ static void lock_grant(lock_t *lock) {
   trx_mutex_exit(lock->trx);
 }
 
+// todo
 void lock_make_trx_hit_list(trx_t *hp_trx, hit_list_t &hit_list) {
   trx_mutex_enter(hp_trx);
   const trx_id_t hp_trx_id = hp_trx->id;
@@ -4122,18 +4132,19 @@ lock_sys latches to be taken before trx->mutex.
 One way around it is to use exclusive global lock_sys latch, which heavily
 deteriorates concurrency. Another is to try to reacquire the latches in needed
 order, veryfing that the list wasn't modified meanwhile.
+// 这里采用的第二种办法，乐观处理，避免并发瓶颈
 This function performs following steps:
 1. releases trx->mutex,
 2. acquires proper lock_sys shard latch for given lock,
 3. reaquires trx->mutex
-4. executes f unless trx's locks list has changed
+4. executes f unless trx's locks list has changed(可能放trx->mutex期间trx locks发生了变化)
 Before and after this function following should hold:
 - the shared global lock_sys latch is held
 - the trx->mutex is held
 @param[in]    lock    the lock we are interested in
-@param[in]    f       the function to execute when the shard is latched
+@param[in]    f       the function to execute when the shard(lock_t锁在的lock sys sharded lock) is latched
 @return true if f was called, false if it couldn't be called because trx locks
-        have changed while relatching trx->mutex
+        have changed(trx_lock_t的version在释放trx->mutex期间change了) while relatching trx->mutex
 */
 template <typename F>
 static bool try_relatch_trx_and_shard_and_do(const lock_t *lock, F &&f) {

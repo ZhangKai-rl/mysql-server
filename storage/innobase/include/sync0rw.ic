@@ -648,6 +648,7 @@ static inline void pfs_rw_lock_sx_lock_func(rw_lock_t *lock, ulint pass,
     }
   }
 
+  // 上边为pfs的psi监控，这里实际上rw lock
   ret = rw_lock_s_lock_low(lock, pass, location);
 
   return ret;

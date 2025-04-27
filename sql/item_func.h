@@ -3161,7 +3161,7 @@ class Item_func_set_user_var : public Item_var_func {
   union {
     longlong vint;
     double vreal;
-    String *vstr;
+    String *vstr; /* set @var1='zk'; zk在这里存储 */
     my_decimal *vdec;
   } save_result;
 
@@ -3707,6 +3707,28 @@ class Item_func_is_free_lock final : public Item_int_func {
   }
 };
 
+class Item_func_wait_resolved_binlog_write : public Item_int_func {
+  typedef Item_int_func super;
+
+  uint64_t lsn;
+
+public:
+  Item_func_wait_resolved_binlog_write() : Item_int_func() {}
+
+  explicit Item_func_wait_resolved_binlog_write(const POS &pos) : super(pos) {}
+
+  Item_func_wait_resolved_binlog_write(const POS &pos, Item *a)
+      : Item_int_func(pos, a) {}
+
+  Item_func_wait_resolved_binlog_write(const POS &pos, Item *a, Item *b)
+      : Item_int_func(pos, a, b) {}
+
+  const char* func_name() const override { return "WAIT_RESOLVED_BINLOG_WRITE"; }
+
+  bool itemize(Parse_context *pc, Item **res) override;
+
+  longlong val_int() override;
+};
 class Item_func_is_used_lock final : public Item_int_func {
   typedef Item_int_func super;
 

@@ -1248,7 +1248,7 @@ static dberr_t fts_query_cache(
   ut_a(index_cache != nullptr);
 
   if (query->cur_node->term.wildcard && query->flags != FTS_PROXIMITY &&
-      query->flags != FTS_PHRASE) {
+      query->flags != FTS_PHRASE) { /* fts_query_phrase_search */
     /* Wildcard search the index cache */
     fts_cache_find_wildcard(query, index_cache, token);
   } else {
@@ -1304,7 +1304,7 @@ static dberr_t fts_query_cache(
   if (token->f_len == 0) {
     return (query->error);
   }
-
+  // 在 fts_cache_t 中找token
   fts_query_cache(query, token);
 
   /* Setup the callback args for filtering and
@@ -2398,7 +2398,7 @@ func_exit:
   return (query->error);
 }
 
-/** Split the phrase into tokens
+/** Split the phrase into tokens. 这里处理两种： text and phrase
 @param[in,out]  query           query instance
 @param[in]      node            query node to search
 @param[in,out]  tokens          token vector
@@ -2567,7 +2567,7 @@ static void fts_query_phrase_split(fts_query_t *query,
     for (i = 0; i < num_token; i++) {
       /* Search for the first word from the phrase. */
       token = static_cast<fts_string_t *>(ib_vector_get(tokens, i));
-
+        // query::matched，当前token的match信息； query::match_array，所有token的match信息
       if (query->flags & FTS_PROXIMITY || query->flags & FTS_PHRASE) {
         query->matched = query->match_array[i];
       }
@@ -2636,7 +2636,7 @@ static void fts_query_phrase_split(fts_query_t *query,
       of the buffer cache. */
       auto matched = fts_phrase_or_proximity_search(query, tokens);
       query->matched = query->match_array[0];
-
+        // ques: 是所有tokens的match都放到match_array[0]了，还是 tokens[0]的match放到了match_array[0]？
       /* Read the actual text in and search for the phrase. */
       if (matched) {
         ut_ad(query->error == DB_SUCCESS);
@@ -2714,10 +2714,10 @@ static byte *fts_query_get_token(
     token->f_len = str_len + 1;
 
     memcpy(token->f_str, node->term.ptr->str, str_len);
-
+    // 拷贝完，后面增加 % wildcard
     token->f_str[str_len] = '%';
     token->f_str[token->f_len] = 0;
-
+    // Is -> Is%
     new_ptr = token->f_str;
   }
 
@@ -2759,7 +2759,7 @@ static dberr_t fts_query_visitor(
 
       /* Force collection of doc ids and the positions. */
       query->collect_positions = true;
-
+        // phrase is : 快递 递到 到家
       query->error = fts_query_phrase_search(query, node);
 
       query->collect_positions = false;
@@ -2772,7 +2772,7 @@ static dberr_t fts_query_visitor(
 
       break;
 
-    case FTS_AST_TERM:
+    case FTS_AST_TERM: /* 因为是ngram, 所以此处分词，Ishmael， 先被分为: Is */
       token.f_str = node->term.ptr->str;
       token.f_len = node->term.ptr->len;
 
@@ -2787,14 +2787,14 @@ static dberr_t fts_query_visitor(
           rbt_add_node(query->wildcard_words, &parent, &word);
         }
       }
-
+        // 对于 fts_term_t::wildcard=true的来说，添加到word_freqs的为token本身
       /* Add the word to our RB tree that will be used to
       calculate this terms per document frequency. */
       fts_query_add_word_freq(query, &token);
-
+        // token -> token%
       ptr = fts_query_get_token(node, &token);
       query->error = fts_query_execute(query, &token);
-
+      // fts_query_execute： 这时候已经在query的word_freq中添加了此token的词频rbtree，现在进行doc的token查找，并记录到query中对应rbtree中。
       if (ptr) {
         ut::free(ptr);
       }
@@ -3641,7 +3641,7 @@ dberr_t fts_query(trx_t *trx, dict_index_t *index, uint flags,
   query.trx = query_trx;
   query.index = index;
   query.boolean_mode = boolean_mode;
-  query.deleted = fts_doc_ids_create();
+  query.deleted = fts_doc_ids_create(); // 这个感觉是查完后，用于filter的
   query.cur_node = nullptr;
 
   query.fts_common_table.type = FTS_COMMON_TABLE;
@@ -3674,7 +3674,7 @@ dberr_t fts_query(trx_t *trx, dict_index_t *index, uint flags,
   }
 
   query.total_size += SIZEOF_RBT_CREATE;
-
+// mysql 官方文档插入的8条数据
   query.total_docs = dict_table_get_n_rows(index->table);
 
   query.limit = limit;
@@ -3715,7 +3715,7 @@ dberr_t fts_query(trx_t *trx, dict_index_t *index, uint flags,
   lc_query_str = static_cast<byte *>(
       ut::zalloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, lc_query_str_len));
 
-  /* For binary collations, a case sensitive search is
+  /* 注意这里的cs。For binary collations, a case sensitive search is
   performed. Hence don't convert to lower case. */
   if (my_binary_compare(charset)) {
     memcpy(lc_query_str, query_str, query_len);
@@ -3757,7 +3757,7 @@ dberr_t fts_query(trx_t *trx, dict_index_t *index, uint flags,
     }
 
     DBUG_EXECUTE_IF("fts_union_limit_off", query.limit = ULONG_UNDEFINED;);
-
+    // 这里可以接上月报的代码分析了： http://mysql.taobao.org/monthly/2025/05/01/
     /* Traverse the Abstract Syntax Tree (AST) and execute
     the query. */
     query.error = fts_ast_visit(FTS_NONE, ast, fts_query_visitor, &query,

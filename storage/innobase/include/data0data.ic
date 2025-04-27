@@ -403,6 +403,7 @@ static inline dtuple_t *dtuple_create_from_mem(void *buf, ulint buf_size,
   tuple->n_fields = n_fields;
   tuple->n_v_fields = n_v_fields;
   tuple->n_fields_cmp = n_fields;
+  // xxxx: dfield分配在dtuple_t的后面. 类似 lock_t后的lock_rec_t::rec_bitmap
   tuple->fields = (dfield_t *)&tuple[1];
   if (n_v_fields > 0) {
     tuple->v_fields = &tuple->fields[n_fields];

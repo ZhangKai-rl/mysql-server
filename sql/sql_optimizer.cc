@@ -334,6 +334,7 @@ bool JOIN::check_access_path_with_fts() const {
   @retval false Success.
   @retval true Error, error code saved in member JOIN::error.
 */
+// todo
 bool JOIN::optimize(bool finalize_access_paths) {
   DBUG_TRACE;
 
@@ -1032,7 +1033,7 @@ bool JOIN::optimize(bool finalize_access_paths) {
   }
 
   count_field_types(query_block, &tmp_table_param, *fields, false, false);
-
+    // 创建 accessPaths
   create_access_paths();
 
   // Creating iterators may evaluate a constant hash join condition, which may

@@ -250,6 +250,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
   uint sync_counter;
 
   mysql_cond_t m_prep_xids_cond;
+  // 根据 ：https://bugs.mysql.com/bug.php?id=118797 来看， xa事务(实际是xa commit, xa prepare还是有的)没xid，因此不会增加该counter
   std::atomic<int32> m_atomic_prep_xids{0};
 
   /**
@@ -609,6 +610,8 @@ class MYSQL_BIN_LOG : public TC_LOG {
 
   /**
     Flush and commit the transaction.
+
+    TODO
 
     This will execute an ordered flush and commit of all outstanding
     transactions and is the main function for the binary log group

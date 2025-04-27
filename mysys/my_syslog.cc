@@ -166,6 +166,7 @@ err:
 
   switch (level) {
     case INFORMATION_LEVEL:
+    case MORPHY_INFORMATION_LEVEL:
     case SYSTEM_LEVEL:
       _level = LOG_INFO;
       break;

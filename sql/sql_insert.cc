@@ -576,7 +576,8 @@ bool Sql_cmd_insert_values::execute_inner(THD *thd) {
     for (Field **next_field = insert_table->field; *next_field; ++next_field) {
       (*next_field)->reset_warnings();
     }
-
+    // insert into t1 values((v1), (v2), ...); values插入多个数据时，遍历调用 write_record
+    // 遍历 成员   mem_root_deque<List_item *> insert_many_values;
     for (const List_item *values : insert_many_values) {
       Autoinc_field_has_explicit_non_null_value_reset_guard after_each_row(
           insert_table);
@@ -590,6 +591,7 @@ bool Sql_cmd_insert_values::execute_inner(THD *thd) {
         has_error = true;
         break;
       }
+      // TODO
       if (fill_record_n_invoke_before_triggers(
               thd, &info, insert_field_list, *values, insert_table,
               TRG_EVENT_INSERT, insert_table->s->fields, true, nullptr)) {
@@ -1193,7 +1195,7 @@ bool Sql_cmd_insert_base::prepare_inner(THD *thd) {
   if ((insert_into_view || column_count == 0) &&
       (select_insert || value_count > 0))
     bitmap_set_all(insert_table->write_set);
-
+    // 写表全部字段， set_all !
   MY_BITMAP *function_default_columns = nullptr;
   if (get_default_columns(thd, insert_table, &function_default_columns))
     return true;

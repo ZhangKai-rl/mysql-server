@@ -87,6 +87,7 @@ bool add_static_system_variable_chain(sys_var *chain);
 bool add_dynamic_system_variable_chain(sys_var *chain);
 void delete_dynamic_system_variable_chain(sys_var *chain);
 
+// 系统变量类型
 enum enum_var_type : int {
   OPT_DEFAULT = 0,
   OPT_SESSION,
@@ -102,10 +103,11 @@ enum enum_var_type : int {
   optionally it can be assigned to, optionally it can have a command-line
   counterpart with the same name.
 */
+// 某个系统变量的类型。 每个系统变量都由这个来定义 如 Sys_var_integer max_connections
 class sys_var {
  public:
-  sys_var *next;
-  LEX_CSTRING name;
+  sys_var *next;  // all_sys_vars链表遍历时使用
+  LEX_CSTRING name;  // 系统变量string, name.str
   /**
     If the variable has an alias in the persisted variables file, this
     should point to it.  This has the following consequences:
@@ -114,7 +116,7 @@ class sys_var {
     - When loading persisted variables, an occurrence of any one of
       the variables will initialize both variables.
   */
-  sys_var *m_persisted_alias;
+  sys_var *m_persisted_alias; // 持久化系统变量，写到mysqld-auto.cnf中
   /**
     If m_persist_alias is set, and the current variable is deprecated
     and m_persist_alias is the recommended substitute, then this flag
@@ -150,7 +152,8 @@ class sys_var {
     */
     SENSITIVE = 0x20000
   };
-  static const int PARSE_EARLY = 1;
+  // two parse flags.
+  static const int PARSE_EARLY = 1;  // 标记需要优先解析的系统变量，其他变量可能会依赖这个。基础变量
   static const int PARSE_NORMAL = 2;
   /**
     Enumeration type to indicate for a system variable whether
@@ -167,11 +170,13 @@ class sys_var {
   typedef bool (*on_update_function)(sys_var *self, THD *thd,
                                      enum_var_type type);
 
-  int flags;                      ///< or'ed flag_enum values
-  int m_parse_flag;               ///< either PARSE_EARLY or PARSE_NORMAL.
+  int flags;                      ///< or'ed flag_enum values  类型为：sys_var::flag_enum
+  int m_parse_flag;               ///< either PARSE_EARLY优先解析 or PARSE_NORMAL.
   const SHOW_TYPE show_val_type;  ///< what value_ptr() returns for sql_show.cc
   my_option option;               ///< min, max, default values are stored here
+  // mutex or rdlock
   PolyLock *guard;                ///< *second* lock that protects the variable
+  // 在sys_vars.cc中创建static Sys_var_xxx时，通过GLOBAL/SESSION_VAR(xxx) 赋值给 sys_var::offset
   ptrdiff_t offset;  ///< offset to the value from global_system_variables
   on_check_function on_check;
   /**
@@ -967,6 +972,7 @@ class set_var_base {
 
 /**
   set_var_base descendant for assignments to the system variables.
+  变量修改请求
 */
 class set_var : public set_var_base {
  public:

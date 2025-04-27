@@ -45,6 +45,8 @@
         Check stack size; Send error if there isn't enough stack to continue
 ****************************************************************************/
 
+// 匿名 namespace 的主要作用是将 stack_direction 变量的链接属性从外部链接（external linkage）改为内部链接（internal linkage）。
+// 这样也就说明了 stack_directon 只有check_stack.cc本文件中会用到, 这个符号不会被导出到目标文件的符号表中, 避免 ODR
 namespace {
 int stack_direction = 0;
 }
@@ -122,6 +124,7 @@ bool check_stack_overrun(const THD *thd, long margin, unsigned char *buf) {
   }
 #endif
 
+  // 计算已用栈大小
   long stack_used =
       used_stack(thd->thread_stack, reinterpret_cast<char *>(&stack_used));
   if (stack_used >= static_cast<long>(my_thread_stack_size - margin) ||

@@ -1136,7 +1136,7 @@ void trx_rseg_array_create(space_id_t space_id, mtr_t *mtr) {
   byte *ptr;
   ulint len;
 
-  /* Create the fseg directory file block in a new allocated file segment */
+  /* 46: https://whoiami.github.io/INNODB_UNDO_PHYSICAL_FORMAT . Create the fseg directory file block in a new allocated file segment */
   block = fseg_create(space_id, 0,
                       RSEG_ARRAY_HEADER + RSEG_ARRAY_FSEG_HEADER_OFFSET, mtr);
   buf_block_dbg_add_level(block, SYNC_RSEG_ARRAY_HEADER);
@@ -1145,9 +1145,11 @@ void trx_rseg_array_create(space_id_t space_id, mtr_t *mtr) {
 
   page = buf_block_get_frame(block);
 
+  // 写入undo space FIL_PAGE_TYPE_RSEG_ARRAY 页面 File Header中的 FIL_PAGE_TYPE
   mlog_write_ulint(page + FIL_PAGE_TYPE, FIL_PAGE_TYPE_RSEG_ARRAY, MLOG_2BYTES,
                    mtr);
 
+  // todo: 看看这里page是不是往后移动了10B？
   rsegs_header = page + RSEG_ARRAY_HEADER;
 
   /* Initialize the rseg array version. */
@@ -1155,6 +1157,8 @@ void trx_rseg_array_create(space_id_t space_id, mtr_t *mtr) {
 
   /* Initialize the directory size. */
   mach_write_to_4(rsegs_header + RSEG_ARRAY_SIZE_OFFSET, 0);
+
+  /** note: 写完这两个字段，位置就是 38 + 4 + 4了，即到达 RSEG_ARRAY_HEADER + RSEG_ARRAY_FSEG_HEADER_OFFSET */
 
   /* Reset the rollback segment header page slots. Use the full page
   minus overhead.  Reserve some extra room for future use.  */

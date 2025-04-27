@@ -151,6 +151,7 @@ static bool handle_bootstrap_impl(handle_bootstrap_args *args) {
     Disable_binlog_guard disable_binlog(thd);
     Disable_sql_log_bin_guard disable_sql_log_bin(thd);
 
+    // sql_initialize.cc cmds 执行创建 mysql_system_users.sql 等 cmds
     Compiled_in_command_iterator comp_iter;
     rc = process_iterator(thd, &comp_iter, true);
 
@@ -197,6 +198,7 @@ static int process_iterator(THD *thd, Command_iterator *it,
   for (;;) {
     int rc;
 
+    // 取出一条 cmds 里面的 sql query
     rc = it->next(query);
 
     if (rc == READ_BOOTSTRAP_EOF) {

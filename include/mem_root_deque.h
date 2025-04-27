@@ -320,7 +320,7 @@ class mem_root_deque {
 #endif
     }
 
-    // Iterator (required for InputIterator).
+    // Iterator (required for InputIterator). 迭代器解引用
     Iterator_element_type &operator*() const {
       assert_not_invalidated();
       return m_deque->get(m_physical_idx);
@@ -340,7 +340,7 @@ class mem_root_deque {
 
     // InputIterator (required for ForwardIterator).
     bool operator!=(const Iterator &other) const { return !(*this == other); }
-
+        // 迭代器解引用
     Iterator_element_type *operator->() const {
       assert_not_invalidated();
       return &m_deque->get(m_physical_idx);
@@ -434,7 +434,7 @@ class mem_root_deque {
   using const_iterator = Iterator<const Element_type>;
   using reverse_iterator = std::reverse_iterator<iterator>;
   using reverse_const_iterator = std::reverse_iterator<const_iterator>;
-
+    // 重载 begin函数， for( xxx : mem_root_deque<Item *> ) 就会调用到这里
   iterator begin() { return iterator{this, m_begin_idx}; }
   iterator end() { return iterator{this, m_end_idx}; }
   reverse_iterator rbegin() { return std::make_reverse_iterator(end()); }
@@ -612,6 +612,7 @@ class mem_root_deque {
   /// Gets a reference to the memory used to store an element with the given
   /// physical index, starting from zero. Note that block_elements is always
   /// a power of two, so the division and modulus operations are cheap.
+  // note: 这里非常有助于理解 mem_root_deque的实现原理
   Element_type &get(size_t physical_idx) const {
     return m_blocks[physical_idx / block_elements]
         .elements[physical_idx % block_elements];

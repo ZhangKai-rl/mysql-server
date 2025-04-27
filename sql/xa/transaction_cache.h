@@ -49,6 +49,7 @@ namespace xa {
   associated with XA transactions.
 
   The cache is used during the recovery stage of an XA transaction.
+  ques: 只用于 xa recovery stage?? 单例模式
 
   @note this class is a singleton class.
  */
@@ -165,7 +166,7 @@ class Transaction_cache {
   /**
    Class constructor.
 
-   It's declared private since this class is a singleton class.
+   note: It's declared private since this class is a singleton class.
    */
   Transaction_cache();
 

@@ -59,12 +59,15 @@ static const ulint TRX_MAGIC_N = 91118598;
 
 /** If this flag is set then the transaction cannot be rolled back
 asynchronously. */
+// 禁止async rollback flag. 异步回滚如kill thread_id. 当某个thread_id的trx进入commit时，设置此flag避免数据不一致。
+// 注意使用 TRX_FORCE_ROLLBACK_MASK &= 来mask/unset掉此flag. 10 0000 0000 0000 0000 0000 0000 0000
 static const uint32_t TRX_FORCE_ROLLBACK_DISABLE = 1 << 29;
 
 /** Mark the transaction for forced rollback */
 static const uint32_t TRX_FORCE_ROLLBACK = 1U << 31;
 
 /** For masking out the above flags */
+// usage: trx->in_innodb &= xxx_mask              1 1111 1111 1111 1111 1111 1111 1111
 static const uint32_t TRX_FORCE_ROLLBACK_MASK = 0x1FFFFFFF;
 
 /** Transaction execution states when trx->state == TRX_STATE_ACTIVE */

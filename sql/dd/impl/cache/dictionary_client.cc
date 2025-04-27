@@ -958,7 +958,7 @@ void Dictionary_client::acquire_uncommitted(const K &key, T **object,
   m_registry_uncommitted.get(key, &element);
   if (element) {
     *object = const_cast<T *>(element->object());  // TODO: Const cast
-    // Check proper MDL lock.
+    // Check proper MDL lock. 这时候也有有S MDL
     assert(MDL_checker::is_read_locked(m_thd, *object));
     uncommitted_id = (*object)->id();
   }
@@ -1368,6 +1368,9 @@ bool Dictionary_client::acquire(const String_type &schema_name,
   DEBUG_SYNC(m_thd, "acquired_schema_while_acquiring_table");
 
   // Create the name key for the object.
+  // TODO: important
+  // NOTE: 这里是 搜索 mysql.tables 表， 根据其二级索引 name=schema_id(id, name);
+  // 下面构造这个 KEY
   typename T::Name_key key;
   T::update_name_key(&key, schema->id(), object_name);
 

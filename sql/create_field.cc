@@ -707,7 +707,7 @@ size_t Create_field::max_display_width_in_bytes() const {
   } else if (sql_type == MYSQL_TYPE_LONG_BLOB || sql_type == MYSQL_TYPE_JSON ||
              sql_type == MYSQL_TYPE_GEOMETRY) {
     return Field::MAX_LONG_BLOB_WIDTH;
-  } else {
+  } else { // text
     // If the user has given a display width to the TEXT type where the display
     // width is 2^32-1, the below computation will exceed
     // MAX_LONG_BLOB_WIDTH if the character set is multi-byte. So we must

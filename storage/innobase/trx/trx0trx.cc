@@ -1365,7 +1365,7 @@ static void trx_start_low(
   }
 
   /* The initial value for trx->no: TRX_ID_MAX is used in
-  read_view_open_now: */
+  read_view_open_now: 事务提交前trx->no赋值为id最大值 */
 
   trx->no = TRX_ID_MAX;
 
@@ -1392,7 +1392,7 @@ static void trx_start_low(
   (internal) transactions. Note: Transactions marked explicitly as
   read only can write to temporary tables, we put those on the RO
   list too. */
-
+// note: 为该事务分配回滚段
   if (!trx->read_only &&
       (trx->mysql_thd == nullptr || read_write || trx->ddl_operation)) {
     trx_assign_rseg_durable(trx);
@@ -1412,6 +1412,7 @@ static void trx_start_low(
 
     trx_add_to_rw_trx_list(trx);
 
+    // note
     trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);
 
     ut_ad(trx_sys_validate_trx_list());
@@ -3347,7 +3348,7 @@ void trx_start_if_not_started_xa_low(trx_t *trx, bool read_write) {
   switch (trx->state.load(std::memory_order_relaxed)) {
     case TRX_STATE_NOT_STARTED:
     case TRX_STATE_FORCED_ROLLBACK:
-      trx_start_low(trx, read_write);
+      trx_start_low(trx, read_write);// 具体的开启事务
       return;
 
     case TRX_STATE_ACTIVE:

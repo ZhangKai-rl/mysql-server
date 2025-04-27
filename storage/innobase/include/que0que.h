@@ -366,7 +366,7 @@ constexpr uint32_t QUE_FORK_BEING_FREED = 4;
 /* Flag which is ORed to control structure statement node types */
 constexpr uint32_t QUE_NODE_CONTROL_STAT = 1024;
 
-/* Query graph node types */
+/* TODO: Query graph node types */
 constexpr uint32_t QUE_NODE_LOCK = 1;
 constexpr uint32_t QUE_NODE_INSERT = 2;
 constexpr uint32_t QUE_NODE_UPDATE = 4;

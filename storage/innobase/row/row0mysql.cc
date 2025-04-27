@@ -418,7 +418,7 @@ byte *row_mysql_store_col_in_innobase_format(
     integers are stored in a little-endian format. */
 
     byte *p = buf + col_len;
-
+// note: DATA_INT类型，由mysql little-endian field format -> innodb  big-endian field format的转换逻辑，逐字节转换
     for (;;) {
       p--;
       *p = *mysql_data;
@@ -620,11 +620,12 @@ static void row_mysql_convert_row_to_innobase(
       }
       dfield_multi_value_dup(dfield, *heap);
     } else {
+        // todo
       row_mysql_store_col_in_innobase_format(
           dfield, prebuilt->ins_upd_rec_buff + templ->mysql_col_offset,
           true, /* MySQL row format data */
           mysql_rec + templ->mysql_col_offset, templ->mysql_col_len,
-          dict_table_is_comp(prebuilt->table));
+          dict_table_is_comp(prebuilt->table));// compact!
 
       /* server has issue regarding handling BLOB virtual fields,
       and we need to duplicate it with our own memory here */
@@ -1078,7 +1079,7 @@ static dtuple_t *row_get_prebuilt_insert_row(
 
   /* option 1 : HERE create the insert node as per row version now on disk */
   dtuple_t *row;
-
+    // 为 dtuple_t* 申请空间
   row = dtuple_create_with_vcol(prebuilt->heap, table->get_n_cols(),
                                 dict_table_get_n_v_cols(table));
 
@@ -1581,7 +1582,7 @@ static dberr_t row_insert_for_mysql_using_ins_graph(const byte *mysql_rec,
 
 run_again:
   thr->run_node = node;
-  thr->prev_node = node;
+  thr->prev_node = node; // ??
 
   row_ins_step(thr);
 
@@ -1703,7 +1704,7 @@ run_again:
 }
 
 /** Does an insert for MySQL.
-@param[in]      mysql_rec       row in the MySQL format
+@param[in]      mysql_rec       row in the MySQL format. server record
 @param[in,out]  prebuilt        prebuilt struct in MySQL handle
 @return error code or DB_SUCCESS*/
 dberr_t row_insert_for_mysql(const byte *mysql_rec, row_prebuilt_t *prebuilt) {
@@ -1725,7 +1726,9 @@ void row_prebuild_sel_graph(row_prebuilt_t *prebuilt) {
   if (prebuilt->sel_graph == nullptr) {
     node = sel_node_create(prebuilt->heap);
 
+    // 这里最后返回了 pars_complete_graph_for_exec 创建的 que_fork_t
     prebuilt->sel_graph = static_cast<que_fork_t *>(que_node_get_parent(
+        // 返回 que_thr_t
         pars_complete_graph_for_exec(static_cast<sel_node_t *>(node),
                                      prebuilt->trx, prebuilt->heap, prebuilt)));
 

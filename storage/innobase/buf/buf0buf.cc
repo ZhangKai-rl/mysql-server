@@ -1007,6 +1007,7 @@ static buf_chunk_t *buf_chunk_init(
   mem_size = ut_2pow_round(mem_size, UNIV_PAGE_SIZE);
   /* Reserve space for the block descriptors. */
   mem_size += ut_2pow_round(
+                                                      // 确保是进行了向上取整
       (mem_size / UNIV_PAGE_SIZE) * (sizeof *block) + (UNIV_PAGE_SIZE - 1),
       UNIV_PAGE_SIZE);
 
@@ -2134,6 +2135,7 @@ static void buf_pool_resize() {
 
   /* Assumes that buf_resize_thread has already issued the necessary
   memory barrier to read srv_buf_pool_size and srv_buf_pool_old_size */
+  // bp size是多少页，新的bp页数
   new_instance_size = srv_buf_pool_size / srv_buf_pool_instances;
   new_instance_size /= UNIV_PAGE_SIZE;
 
@@ -4344,6 +4346,7 @@ buf_block_t *Buf_fetch<T>::single_page() {
   return (block);
 }
 
+// note: 这里有两个mode, 1. latch mode: rw_latch 2. fetch mode: Page_fetch
 buf_block_t *buf_page_get_gen(const page_id_t &page_id,
                               const page_size_t &page_size, ulint rw_latch,
                               buf_block_t *guess, Page_fetch mode,
@@ -4442,6 +4445,8 @@ bool buf_page_optimistic_get(ulint rw_latch, buf_block_t *block,
 
   bool success;
   mtr_memo_type_t fix_type;
+
+  // 在这里可以理解下mutex与lock的不同
 
   auto loc = ut::Location{file, line};
   switch (rw_latch) {
@@ -5582,6 +5587,7 @@ void buf_page_t::set_io_fix(buf_io_fix io_fix) {
 #endif
 }
 
+// TODO: aio后处理，这时候已经通过aio pread预读完page了. 比如进行page放到bp上(X)， page早就在bp上了，这里只是激活(buf_io_read -> buf_io_none)
 bool buf_page_io_complete(buf_page_t *bpage, bool evict) {
   auto buf_pool = buf_pool_from_bpage(bpage);
   const bool uncompressed = (buf_page_get_state(bpage) == BUF_BLOCK_FILE_PAGE);

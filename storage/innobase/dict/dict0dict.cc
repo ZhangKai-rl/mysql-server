@@ -2042,7 +2042,7 @@ bool dict_col_name_is_reserved(const char *name) /*!< in: column name */
   return false;
 }
 
-/** Return maximum size of the node pointer record.
+/** 根据dict index获取最长的记录长度(row record format length)。Return maximum size of the node pointer record.
  @return maximum size of the record in bytes */
 ulint dict_index_node_ptr_max_size(const dict_index_t *index) /*!< in: index */
 {
@@ -2067,7 +2067,7 @@ ulint dict_index_node_ptr_max_size(const dict_index_t *index) /*!< in: index */
 
   comp = dict_table_is_comp(index->table);
 
-  /* Each record has page_no, length of page_no and header. */
+  /* ques:具体代表什么？Each record has page_no, length of page_no and header. */
   rec_max_size = comp ? REC_NODE_PTR_SIZE + 1 + REC_N_NEW_EXTRA_BYTES
                       : REC_NODE_PTR_SIZE + 2 + REC_N_OLD_EXTRA_BYTES;
 
@@ -3732,6 +3732,7 @@ rec_t *dict_index_copy_rec_order_prefix(const dict_index_t *index,
 }
 
 /** Builds a typed data tuple out of a physical record.
+// TODO
  @return own: data tuple */
 dtuple_t *dict_index_build_data_tuple(
     dict_index_t *index, /*!< in: index tree */

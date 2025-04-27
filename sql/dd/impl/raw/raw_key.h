@@ -36,6 +36,8 @@ struct Raw_key {
   int index_no;
   int key_len;
 
+  // bitmap of key parts that are used in the index
+  // 复合键支持：对于多列索引，标识哪些列参与了这个键
   key_part_map keypart_map;
 
   Raw_key(int p_index_no, int p_key_len, key_part_map p_keypart_map)

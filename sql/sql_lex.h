@@ -290,7 +290,7 @@ enum class enum_alter_user_attribute {
 
 /* Structure for db & table in sql_yacc */
 class Table_function;
-
+// table_identifier
 class Table_ident {
  public:
   LEX_CSTRING db;
@@ -549,6 +549,8 @@ class Index_hint {
    represented by the member m_query_term, see query_term.h
    For example for following query:
 
+  note: @example
+
    select *
      from table1
      where table1.field IN (select * from table1_1_1 union
@@ -614,12 +616,153 @@ class Index_hint {
     |
     +->select1.1.1->select1.1.2
 
+  层次0 (顶层):
+  ┌────────────────────────────────────────────────────────┐
+  │ QE1: main_unit                                         │
+  │   ├─ QB1: select1 ◄═neighbor═► QB4: select2 ◄═neighbor═► QB7: select3
+  └────────────────────────────────────────────────────────┘
+          │ slave                        │ slave              │ slave
+          │                              │                    │
+          ▼                              ▼                    ▼
+  层次1:   QE2: unit1.1                  QE3: unit2.1         NULL
+          │                              │
+          ├─ QB2: select1.1.1            ├─ QB5: select2.1.1
+          │  ◄═neighbor═►                │
+          └─ QB3: select1.1.2            │ slave
+                                          ▼
+  层次2:                                 QE4: unit2.1.1.1
+                                          │
+                                          └─ QB6: select2.1.1.1.1
+
+  层次3:                                 (最深层)
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    QE1: main_unit (顶层)                            │
+│                    master: NULL                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ first_query_block
+                              ▼
+        ┌─────────────────────────────────────────────────────┐
+        │         QB1: select1 (from table1)                  │
+        │         master_query_expression: QE1                │
+        │         next: select2 ◄──neighbor──► select2        │
+        └─────────────────────────────────────────────────────┘
+                      │                    │
+                      │ slave              │ next (neighbor)
+                      ▼                    ▼
+        ┌──────────────────────┐  ┌─────────────────────────────────┐
+        │  QE2: unit1.1        │  │  QB4: select2 (from table2)     │
+        │  master: select1     │  │  master_query_expression: QE1   │
+        └──────────────────────┘  │  next: select3 ◄──neighbor──►   │
+                │                 └─────────────────────────────────┘
+                │ first_query_block         │                │
+                ▼                           │ slave          │ next
+    ┌────────────────────────┐              ▼                ▼
+    │ QB2: select1.1.1       │    ┌──────────────────┐  ┌──────────────┐
+    │ (from table1_1_1)      │    │ QE3: unit2.1     │  │ QB7: select3 │
+    │ master_qe: QE2         │    │ master: select2  │  │ (from table3)│
+    │ next: select1.1.2 ◄──┐ │    └──────────────────┘  │ master_qe:   │
+    └────────────────────────┘│              │           │ QE1          │
+                              │              │           │ slave: NULL  │
+                   neighbor   │              │           └──────────────┘
+                              │              │ first_query_block
+                              │              ▼
+                              │    ┌─────────────────────────────┐
+                              │    │ QB5: select2.1.1            │
+                              │    │ (from table2_1_1)           │
+                              │    │ master_qe: QE3              │
+                              │    │ next: NULL                  │
+                              │    └─────────────────────────────┘
+                              │              │
+                              │              │ slave
+                              │              ▼
+                              │    ┌──────────────────────────┐
+                              │    │ QE4: unit2.1.1.1     │
+                              │    │ master: select2.1.1      │
+                              │    └──────────────────────────┘
+                              │              │
+                              │              │ first_query_block
+                              │              ▼
+                              │    ┌──────────────────────────────────┐
+                              │    │ QB6: select2.1.1.1.1         │
+                              │    │ (from table2_1_1_1_1)            │
+                              │    │ master_qe: QE4                   │
+                              │    │ slave: NULL, next: NULL          │
+                              │    └──────────────────────────────────┘
+                              │
+                              └──► ┌────────────────────────┐
+                                   │ QB3: select1.1.2       │
+                                   │ (from table1_1_2)      │
+                                   │ master_qe: QE2         │
+                                   │ slave: NULL            │
+                                   └────────────────────────┘
+
+QB1: select1
+  └─ m_where_cond (Item*)
+       │
+       └─ Item_in_optimizer  ← 优化器包装层
+            │
+            ├─ left_expr: Item_field (table1.field)  ← 左侧表达式
+            │
+            └─ Item_in_subselect  ← IN子查询表达式
+                 │
+                 ├─ left_expr: Item_field (table1.field)  ← 左侧操作数
+                 │
+                 └─ unit: Query_expression* → QE2: unit1.1  ← 指向子查询表达式
+                      │
+                      └─ first_query_block → QB2: select1.1.1
+                           │
+                           └─ next → QB3: select1.1.2
+
+QB1: select1
+│
+└─ m_where_cond: Item*
+     │
+     └─ Item_in_optimizer
+          │
+          ├─ args[0]: Item_field
+          │    └─ field_name: "field"
+          │    └─ table_name: "table1"
+          │
+          └─ args[1]: Item_in_subselect
+               │
+               ├─ left_expr: Item_field (table1.field)
+               │
+               ├─ unit: Query_expression* ──────────┐
+               │                                     │
+               ├─ substype(): IN_SUBS               │
+               │                                     │
+               └─ strategy: (执行策略)               │
+                                                     │
+                                                     ▼
+                              ┌──────────────────────────────────┐
+                              │ QE2: unit1.1                     │
+                              │ - master: select1                │
+                              │ - first_query_block: select1.1.1 │
+                              └──────────────────────────────────┘
+                                            │
+                                            ▼
+                              ┌──────────────────────────────────┐
+                              │ QB2: select1.1.1                 │
+                              │ - FROM: table1_1_1               │
+                              │ - next: select1.1.2 (UNION)      │
+                              └──────────────────────────────────┘
+                                            │
+                                            ▼
+                              ┌──────────────────────────────────┐
+                              │ QB3: select1.1.2                 │
+                              │ - FROM: table1_1_2               │
+                              │ - next: NULL                     │
+                              └──────────────────────────────────┘
+
 */
 
 /**
   This class represents a query expression (one query block or
   several query blocks combined with UNION).
 */
+// TODO: 理解上边注释
 class Query_expression {
   /**
     Intrusive double-linked list of all query expressions
@@ -737,6 +880,7 @@ class Query_expression {
 
     May be nullptr even after create_access_paths(), or in the case of an
     unfinished materialization (see optimize()).
+    note
    */
   unique_ptr_destroy_only<RowIterator> m_root_iterator;
   AccessPath *m_root_access_path = nullptr;
@@ -768,6 +912,7 @@ class Query_expression {
 
   /// @return true for a query expression without UNION/INTERSECT/EXCEPT or
   /// multi-level ORDER, i.e. we have a "simple table".
+  // 如union语句，其query_expression::m_query_term就是query_term_union(QT_UNION)
   bool is_simple() const { return m_query_term->term_type() == QT_QUERY_BLOCK; }
 
   /// Values for Query_expression::cleaned
@@ -971,6 +1116,7 @@ class Query_expression {
    */
   bool ClearForExecution();
 
+  // note
   bool ExecuteIteratorQuery(THD *thd);
   bool execute(THD *thd);
   bool explain(THD *explain_thd, const THD *query_thd);
@@ -983,6 +1129,7 @@ class Query_expression {
   */
   void destroy();
 
+  // note: 打印查看语法解析的结果， qe/qb结构
   void print(const THD *thd, String *str, enum_query_type query_type);
   bool accept(Select_lex_visitor *visitor);
 
@@ -1152,6 +1299,8 @@ enum class enum_explain_type {
   This class represents a query block, aka a query specification, which is
   a query consisting of a SELECT keyword, followed by a table list,
   optionally followed by a WHERE clause, a GROUP BY, etc.
+  这个类之前叫 SELECT_LEX, 对应SELECT_LEX_unit
+  note: 可以进行打印， print_query_block
 */
 class Query_block : public Query_term {
  public:
@@ -1975,6 +2124,7 @@ class Query_block : public Query_term {
     this is a list of base tables and derived tables. After derived tables
     processing is done, this is a list of base tables only.
     Use Table_ref::next_leaf to traverse the list.
+    抽象语法树中的 leaf tables
   */
   Table_ref *leaf_tables{nullptr};
   /// Last table for LATERAL join, used by table functions
@@ -2199,6 +2349,7 @@ class Query_block : public Query_term {
   bool decorrelate_condition(Semijoin_decorrelation &sj_decor,
                              Table_ref *join_nest);
 
+  // TODO
   bool convert_subquery_to_semijoin(THD *thd, Item_exists_subselect *subq_pred);
   Table_ref *synthesize_derived(THD *thd, Query_expression *unit,
                                 Item *join_cond, bool left_outer,

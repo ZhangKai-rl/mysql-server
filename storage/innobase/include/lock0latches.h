@@ -100,6 +100,8 @@ And to "stop the world" one can simply x-latch the global latch by using:
 This class does not expose too many public functions, as the intention is to
 rather use friend guard classes, like the Shard_latches_guard demonstrated.
 */
+// https://leviathan.vip/2020/12/22/mysql-understand-trx-lock/
+// WL#10314: https://dev.mysql.com/worklog/task/?id=10314
 class Latches {
  private:
   using Lock_mutex = ib_mutex_t;
@@ -174,6 +176,7 @@ class Latches {
   class Page_shards {
     /** Each shard is protected by a separate mutex. Mutexes are padded to avoid
     false sharing issues with cache. */
+    // 将 lock_sys->mutex 分为 32 shards, 来减少冲突
     Padded_mutex mutexes[SHARDS_COUNT];
     /**
     Identifies the page shard which contains record locks for records from the

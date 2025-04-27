@@ -106,6 +106,7 @@ void bootstrap_parser_state::report_error_details(log_function_t log) {
   log(buffer);
 }
 
+// --init-file=bootstrap.sql
 int read_bootstrap_query(char *query, size_t *query_length, MYSQL_FILE *input,
                          fgets_fn_t fgets_fn, bootstrap_parser_state *state) {
   /* Allow for up to 3 extra characters in lookup. */

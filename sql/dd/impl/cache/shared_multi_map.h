@@ -113,7 +113,7 @@ namespace cache {
 
   @tparam  T  Dictionary object type.
 */
-
+// 共享dd缓存，第二级，所有线程共享
 template <typename T>
 class Shared_multi_map : public Multi_map_base<T> {
  private:

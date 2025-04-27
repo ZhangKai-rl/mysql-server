@@ -155,6 +155,7 @@ class Sharded_rw_lock {
     std::for_each(m_shards, m_shards + m_n_shards, f);
   }
 
+  // 实际的 sharded rw lock 的存储数组，下边为数组的元素个数。
   Shard *m_shards = nullptr;
 
   size_t m_n_shards = 0;
