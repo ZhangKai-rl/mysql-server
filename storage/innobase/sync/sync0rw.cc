@@ -464,9 +464,12 @@ static inline bool rw_lock_x_lock_low(
     rw_lock_x_lock_wait(lock, pass, 0, file_name, line);
 
   } else {
+    // 此时decr失败！因为lock_word = 0 < X_LOCK_HALF_DECR(有了一个x锁了)
+
     if (!pass && lock->recursive.load(std::memory_order_acquire) &&
         lock->writer_thread.load(std::memory_order_relaxed) ==
             std::this_thread::get_id()) {
+      // 同一线程重入加锁
       /* Decrement failed: An X or SX lock is held by either
       this thread or another. Try to relock. */
       /* Other s-locks can be allowed. If it is request x

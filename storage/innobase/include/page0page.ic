@@ -48,7 +48,7 @@ static inline page_t *page_align(
 {
   return ((page_t *)ut_align_down(ptr, UNIV_PAGE_SIZE));
 }
-/** 找这个ptr在一个页面中的offset. Gets the offset within a page.
+/** 找这个ptr在一个页面中的offset(ptr相对页面的相对offset). Gets the offset within a page.
  @return offset from the start of the page */
 static inline ulint page_offset(
     const void *ptr) /*!< in: pointer to page frame */

@@ -237,6 +237,7 @@ static trx_undo_rec_t *trx_undo_get_next_rec_from_next_page(
     }
   }
 
+  // note: undo log页面的page header中的页面flist node(可以看出是同一个undo page list/ segment / no)
   next_page_no = flst_get_next_addr(
                      undo_page + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE, mtr)
                      .page;
@@ -257,6 +258,7 @@ static trx_undo_rec_t *trx_undo_get_next_rec_from_next_page(
 }
 
 /** Gets the next record in an undo log.
+ques: 这里应该是跨页不垮no/组。同一组下一页的undo rec
  @return undo log record, the page s-latched, NULL if none */
 trx_undo_rec_t *trx_undo_get_next_rec(
     trx_undo_rec_t *rec, /*!< in: undo record */

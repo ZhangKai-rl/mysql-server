@@ -215,6 +215,7 @@ static inline trx_undo_rec_t *trx_undo_page_get_prev_rec(
 
 /** Returns the next undo log record on the page in the specified log, or
  NULL if none exists.
+ // 返回本页下一条undo rec的地址
  @return pointer to record, NULL if none */
 static inline trx_undo_rec_t *trx_undo_page_get_next_rec(
     trx_undo_rec_t *rec, /*!< in: undo log record */
@@ -229,8 +230,10 @@ static inline trx_undo_rec_t *trx_undo_page_get_next_rec(
 
   end = trx_undo_page_get_end(undo_page, page_no, offset);
 
+  // end of this record / start offset of next undo rec.  2B
   next = mach_read_from_2(rec);
 
+  // 本条就是本页最后一条日志了
   if (next == end) {
     return (nullptr);
   }

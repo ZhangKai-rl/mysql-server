@@ -267,6 +267,8 @@ struct trx_rseg_t {
   page_no_t last_page_no{};
 
   /** Byte offset of the last not yet purged log header */
+  // note: 是undo log header在undo header page中的offset
+  // 见：trx_rseg_mem_create. 这个是file list node(pageno4, offset2)中的offset, 而history的list node就在undo log header中
   size_t last_offset{};
 
   /** Transaction number of the last not yet purged log */
@@ -585,6 +587,7 @@ class TrxUndoRsegs {
   /** The rollback segments transaction number. */
   trx_id_t m_trx_no;
 
+  // m_rsegs最大为2，但可能只有1或者0个
   size_t m_rsegs_n{};
 
   /** Rollback segments of a transaction, scheduled for purge. */

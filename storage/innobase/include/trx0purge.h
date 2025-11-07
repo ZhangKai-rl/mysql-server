@@ -1029,6 +1029,14 @@ struct trx_purge_t {
   /* The following two fields form the 'purge pointer' which advances
   during a purge, and which is used in history list truncation */
 
+  /* 形成了一个生产者消费者模型
+    不变式: iter >= limit（先读后写）
+    1. iter前进  → 读取undo记录，构建purge任务
+    2. 执行清理  → worker线程清理索引
+    3. limit前进 → limit = iter（清理完成）
+    4. 截断历史  → 基于limit截断history list 
+  */
+
   /** Limit up to which we have read and parsed the UNDO log records.  Not
   necessarily purged from the indexes.  Note that this can never be less than
   the limit below, we check for this invariant in trx0purge.cc */
@@ -1045,9 +1053,11 @@ struct trx_purge_t {
   /** true if the info of the next record to purge is stored below: if yes, then
   the transaction number and the undo number of the record are stored in
   purge_trx_no and purge_undo_no above */
+  // 每当从history list读下一个undo log组的时候，都会设置为false
   bool next_stored;
 
   /** Rollback segment for the next undo record to purge */
+  // TrxUndoRsegsIterator::set_next()
   trx_rseg_t *rseg;
 
   /** Page number for the next undo record to purge, page number of the log
@@ -1061,13 +1071,16 @@ struct trx_purge_t {
   page_no_t hdr_page_no;
 
   /** Header byte offset on the page */
+  // ques: 待确定
   ulint hdr_offset;
 
   /** Iterator to get the next rseg to process */
+  // 用来获取 trx_purge_t::rseg. 这里面只存储一个事务的(0-2个)rsegs
   TrxUndoRsegsIterator *rseg_iter;
 
   /** Binary min-heap, ordered on TrxUndoRsegs::trx_no. It is protected
   by the pq_mutex */
+  // ques: 待purge的undo段? 具体是undo段还是回滚段？ 应该是回滚段, 通过回滚段再去索引undo段(undo page list).
   purge_pq_t *purge_queue;
 
   /** Mutex protecting purge_queue */

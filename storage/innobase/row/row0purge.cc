@@ -1227,6 +1227,7 @@ que_thr_t *row_purge_step(que_thr_t *thr) {
 
   ut_ad(que_node_get_type(node) == QUE_NODE_PURGE);
 
+  // 见 purge_group_t::assign
   if (node->recs != nullptr && !node->recs->empty()) {
     purge_node_t::rec_t rec;
 

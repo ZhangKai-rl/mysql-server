@@ -1146,6 +1146,7 @@ string of bytes */
 using fil_faddr_t = byte;
 
 /** File space address */
+// note: file dlist(page no 4 + offset 2)，base node还有长度4
 struct fil_addr_t {
   /* Default constructor */
   fil_addr_t() : page(FIL_NULL), boffset(0) {}

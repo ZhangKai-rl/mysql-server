@@ -336,6 +336,7 @@ constexpr uint32_t TRX_UNDO_PREPARED_IN_TC = 7;
 /** Transaction undo log memory object; this is protected by the undo_mutex
 in the corresponding transaction object */
 
+// 这个和undo header page 的 undo log header很像
 struct trx_undo_t {
   /** Undo log may could be allocated to store transaction GTIDs. */
   enum class Gtid_storage {
@@ -472,6 +473,7 @@ constexpr uint32_t TRX_UNDO_PAGE_TYPE = 0;
 constexpr uint32_t TRX_UNDO_PAGE_START = 2;
 /** On each page of the undo log this field contains the byte offset of the
  first free byte on the page */
+ // 表示当前页面中存储的最后一条undo日志结束时的偏移量，或者说从这个位置开始，可以继续写入新的undo日志。
 constexpr uint32_t TRX_UNDO_PAGE_FREE = 4;
 /** The file list node in the chain of undo log pages */
 constexpr uint32_t TRX_UNDO_PAGE_NODE = 6;

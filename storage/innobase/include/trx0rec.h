@@ -321,6 +321,7 @@ constexpr uint32_t TRX_UNDO_MODIFY_OP = 2;
 /** The type and compilation info flag in the undo record for update.
 For easier understanding let the 8 bits be numbered as
 7, 6, 5, 4, 3, 2, 1, 0. */
+// typeinfo 0-3, cmplinfo 4-5, TRX_UNDO_UPD_EXTERN 7, TRX_UNDO_MODIFY_BLOB 6
 struct type_cmpl_t {
   type_cmpl_t() : m_flag(0) {}
 

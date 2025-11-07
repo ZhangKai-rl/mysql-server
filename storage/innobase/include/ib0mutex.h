@@ -371,6 +371,8 @@ struct TTASFutexMutex {
 
 #endif /* HAVE_IB_LINUX_FUTEX */
 
+// ib_mutex_t 一般是指这个
+// 策略模式. 并且是crtp的变体（利用组合而非继承）
 template <template <typename> class Policy = NoPolicy>
 struct TTASEventMutex {
   typedef Policy<TTASEventMutex> MutexPolicy;

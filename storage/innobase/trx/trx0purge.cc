@@ -121,6 +121,8 @@ const page_size_t TrxUndoRsegsIterator::set_next() {
     m_purge_sys->iter.trx_no = (*m_iter)->last_trx_no;
 
   } else if (!m_purge_sys->purge_queue->empty()) {
+    // 要先从 trx_pruge_t::purge_queue中取 rsegs
+
     /* Read the next element from the queue.
     Combine elements if they have same transaction number.
     This can happen if a transaction shares redo rollback segment
@@ -1808,6 +1810,7 @@ static void trx_purge_rseg_get_next_history_log(
 /** Position the purge sys "iterator" on the undo record to use for purging.
 @param[in,out]  purge_sys       purge instance
 @param[in]      page_size       page size */
+// note: 只处理了del_mark undo
 static void trx_purge_read_undo_rec(trx_purge_t *purge_sys,
                                     const page_size_t &page_size) {
   ulint offset;
@@ -1819,12 +1822,14 @@ static void trx_purge_read_undo_rec(trx_purge_t *purge_sys,
   purge_sys->hdr_offset = purge_sys->rseg->last_offset;
   page_no = purge_sys->hdr_page_no = purge_sys->rseg->last_page_no;
 
+  // rseg中有del_mark类型undo，因此需要purge记录(比如加到垃圾记录链表page_free)
   if (purge_sys->rseg->last_del_marks) {
     mtr_t mtr;
     trx_undo_rec_t *undo_rec = nullptr;
 
     mtr_start(&mtr);
 
+    // 回滚段是有del_mark undo rec的，这里直接获取undo header page的第一条undo rec
     undo_rec = trx_undo_get_first_rec(
         &modifier_trx_id, purge_sys->rseg->space_id, page_size,
         purge_sys->hdr_page_no, purge_sys->hdr_offset, RW_S_LATCH, &mtr);
@@ -1866,6 +1871,7 @@ static void trx_purge_choose_next_log(void) {
 
   const page_size_t &page_size = purge_sys->rseg_iter->set_next();
 
+  // rseg的设置？ 就是上面的 rseg_iter 确定
   if (purge_sys->rseg != nullptr) {
     trx_purge_read_undo_rec(purge_sys, page_size);
   } else {
@@ -1876,6 +1882,7 @@ static void trx_purge_choose_next_log(void) {
 
 /** Gets the next record to purge and updates the info in the purge system.
  @return copy of an undo log record or pointer to the dummy undo log record */
+ // 返回的是当前undo rec
 static trx_undo_rec_t *trx_purge_get_next_rec(
     ulint *n_pages_handled, /*!< in/out: number of UNDO pages
                             handled */
@@ -1904,6 +1911,7 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
     /* It is the dummy undo log record, which means that there is no need to
     purge this undo log */
 
+    // 本组undo logs已经完了，继续读rollback segment header page中的history list，找下一个undo header apge/ undo log组
     trx_purge_rseg_get_next_history_log(purge_sys->rseg, n_pages_handled);
 
     /* Look for the next undo log and record to purge */
@@ -1922,6 +1930,8 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
 
   rec2 = rec;
 
+  // 这个循环的目的是计算 本组undo log/no/segment/undo page list涉及的页面数量
+  // note：上面理解错误，这里只是找到本组下一条(需要purge的， del_mark, upd_exist && no ord, extern storage)undo log的位置
   for (;;) {
     ulint type;
     trx_undo_rec_t *next_rec;
@@ -1934,6 +1944,7 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
                                           purge_sys->hdr_offset);
 
     if (next_rec == nullptr) {
+      // rec为本页最后一个undo rec, 本页没有下一个undo记录， 说明当前页已经处理完了， 需要处理下一个页
       rec2 = trx_undo_get_next_rec(rec2, purge_sys->hdr_page_no,
                                    purge_sys->hdr_offset, &mtr);
       break;
@@ -2035,6 +2046,7 @@ struct Purge_groups_t {
       purge_node_t *node = static_cast<purge_node_t *>(thrs[grpid]->child);
       ut_a(que_node_get_type(node) == QUE_NODE_PURGE);
       ut_ad(node->recs == nullptr);
+      // note
       node->recs = m_groups[grpid];
     }
   }
@@ -2065,6 +2077,7 @@ struct Purge_groups_t {
       mem_heap_allocator<std::pair<const table_id_t, std::size_t>>>;
 
   /** Given a table_id obtain the group id to which it belongs. */
+  // 根据table_id获取组id， 即m_groups[组id]存放这个table_id_t的recs
   GroupBy m_grpid_umap;
 
   /** Allocator used for the vector below. */
@@ -2073,6 +2086,7 @@ struct Purge_groups_t {
   /** A vector of groups.  The size of this vector is equal to the number of
   purge threads.  Each undo record is assigned to one of the groups, based on
   its table_id. The index into this vector is the group_id. */
+  // vector大小等于purge线程数，每个undo记录分配到一个组，基于table_id。
   std::vector<purge_node_t::Recs *, vec_alloc> m_groups;
 
   /** Memory heap in which memory for unordered_map & vector is allocated.*/
@@ -2207,6 +2221,8 @@ void Purge_groups_t::distribute_if_needed() {
     mem_heap_t *heap)       /*!< in: memory heap where copied */
 {
   if (!purge_sys->next_stored) {
+    // ques: 填充 purge_sys->iter
+    // 实际上获取了一组undo logs(undo no, 一个undo page list，虽然可能重用), 并读取了undo header page的第一条undo rec
     trx_purge_choose_next_log();
 
     if (!purge_sys->next_stored) {
@@ -2229,6 +2245,7 @@ void Purge_groups_t::distribute_if_needed() {
 
   /* The following call will advance the stored values of the
   purge iterator. */
+  // 推进iter/pageno/offset到本组下一条要purge的undo rec， 返回当前undo rec
 
   return (trx_purge_get_next_rec(n_pages_handled, heap));
 }
@@ -2281,17 +2298,19 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
   Purge_groups_t purge_groups(n_purge_threads, heap);
   purge_groups.init();
 
+  // 读取batch_size的undo page数量，添加相应undo rec到purge_group中
   while (n_pages_handled < batch_size) {
     /* Track the max {trx_id, undo_no} for truncating the
     UNDO logs once we have purged the records. */
 
+    // ques: 这里怎么知道limit的已经purge完毕了？
     if (trx_purge_check_limit()) {
       purge_sys->limit = purge_sys->iter;
     }
 
     purge_node_t::rec_t rec;
 
-    /* Fetch the next record, and advance the purge_sys->iter. */
+    /* Fetch the next record, and advance the purge_sys->iter.(函数末尾的函数进行advance) */
     rec.undo_rec = trx_purge_fetch_next_rec(&rec.modifier_trx_id, &rec.roll_ptr,
                                             &n_pages_handled, heap);
 
@@ -2306,6 +2325,7 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
   }
 
   purge_groups.distribute_if_needed();
+  // note: 填充purge_node_t的recs
   purge_groups.assign(run_thrs);
 
   ut_ad(trx_purge_check_limit());
@@ -2423,6 +2443,7 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
 #endif /* UNIV_DEBUG */
 
   /* Fetch the UNDO recs that need to be purged. */
+  // 读取下一条undo rec时， iter移动到了下一个page，purge处理过的page数量
   n_pages_handled = trx_purge_attach_undo_recs(n_purge_threads, batch_size);
 
   /* Do we do an asynchronous purge or not ? */

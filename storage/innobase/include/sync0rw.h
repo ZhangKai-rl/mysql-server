@@ -102,6 +102,7 @@ enum rw_lock_type_t {
 start value for the lock_word, meaning that it limits the maximum number
 of concurrent read locks before the rw_lock breaks. */
 /* We decrement lock_word by X_LOCK_HALF_DECR for sx_lock. */
+// 用于rw_lock_t的lock_word的. latch
 constexpr int32_t X_LOCK_DECR = 0x20000000;
 constexpr int32_t X_LOCK_HALF_DECR = 0x10000000;
 
@@ -386,6 +387,12 @@ struct rw_lock_t
   rw_lock_t &operator=(const rw_lock_t &) = delete;
 
   /** NOTE: Holds the state of the lock. */
+  /**
+   * lock_word > 0：有S锁持有者
+   * lock_word == 0：没有任何锁持有者，X锁可以生效
+   * lock_word < 0：有X锁或SX锁持有者
+note: 初始值为 lock_word = X_LOCK_DECR
+   */
   std::atomic<int32_t> lock_word;
 
   /** 1: there are waiters */
