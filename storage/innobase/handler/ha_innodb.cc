@@ -2093,7 +2093,7 @@ inline void innobase_active_small(void) {
   }
 }
 
-/** Converts an InnoDB error code to a MySQL error code.
+/* note: Converts an InnoDB error code to a MySQL error code.
 Also tells to MySQL about a possible transaction rollback inside InnoDB caused
 by a lock wait timeout or a deadlock.
 @param[in]  error   InnoDB error code.

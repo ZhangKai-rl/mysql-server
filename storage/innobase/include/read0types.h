@@ -45,6 +45,14 @@ class MVCC;
 /** Read view lists the trx ids of those transactions for which a consistent
 read should not see the modifications to the database. */
 
+/*
+  字段	含义	用途
+  m_up_limit_id	低水位（最小活跃事务ID）	trx_id < m_up_limit_id 的修改一定可见
+  m_low_limit_id	高水位（下一个事务ID）	trx_id >= m_low_limit_id 的修改一定不可见
+  m_ids	活跃事务ID数组	用于判断 [m_up_limit_id, m_low_limit_id) 区间内的可见性
+  m_low_limit_no	Purge 边界	trx_no < m_low_limit_no 的 undo log 可以被清理
+  // // trx no 小于该值的事务所产生的旧版本数据行不再被我需要
+*/
 class ReadView {
   /** This is similar to a std::vector but it is not a drop
   in replacement. It is specific to ReadView. */
@@ -299,6 +307,8 @@ class ReadView {
   /** The view does not need to see the undo logs for transactions
   whose transaction number is strictly smaller (<) than this value:
   they can be removed in purge if not needed by other views */
+  // purge的边界，trx_no < m_low_limit_no 的trx的undo log可以被purge, 取值为trx_get_serialisation_min_trx_no. 既然用于purge，那么这个值只有oldest rv才有用了
+  // 结合前边的 le 一起看。这个代表了最老的rv
   trx_id_t m_low_limit_no;
 
 #ifdef UNIV_DEBUG
@@ -309,7 +319,7 @@ class ReadView {
   trx_id_t m_view_low_limit_no;
 #endif /* UNIV_DEBUG */
 
-  /** AC-NL-RO transaction view that has been "closed". */
+  /* note: AC-NL-RO transaction view that has been "closed". */
   bool m_closed;
 
   typedef UT_LIST_NODE_T(ReadView) node_t;

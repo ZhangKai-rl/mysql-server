@@ -922,6 +922,7 @@ static inline void rec_set_instant_row_version_new(rec_t *rec,
   /* Note : row_version might be 0 while storing a new row in upgraded table */
   ut_ad(is_valid_row_version(row_version));
 
+  // 跟 set_n_fields都是同一位置： header前1byte。
   byte *ptr = rec - (REC_N_NEW_EXTRA_BYTES + 1);
   *ptr = static_cast<byte>(row_version);
 }

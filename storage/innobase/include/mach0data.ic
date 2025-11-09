@@ -53,6 +53,7 @@ static inline void mach_write_to_2(byte *b, ulint n) {
   ut_ad(b);
   ut_ad((n | 0xFFFFUL) <= 0xFFFFUL);
 
+  // note: 从这里看出是大端字节序big endian：低地址存储高字节
   b[0] = (byte)(n >> 8);
   b[1] = (byte)(n);
 }
@@ -162,6 +163,7 @@ static inline ulint mach_write_compressed(byte *b, ulint n) {
   } else if (n < 0x4000) {
     // 01000000 00000000
     /* 10nnnnnn nnnnnnnn (14 bits) */
+    // [0x80, 0x4000): 2byte表示，最高bit置1(或上0x8000)
     mach_write_to_2(b, n | 0x8000);
     return (2);
   } else if (n < 0x200000) {
@@ -499,6 +501,7 @@ static inline uint64_t mach_read_next_much_compressed(const byte **b) {
     *b += 2;
   } else if (val < 0xFE) {
     /* 1111110n nnnnnnnn nnnnnnnn (17 bits) (extended) */
+    // 使用 & 0x1FFFF 取低17bits有效数据，然后 | 0xFFFE0000: 符号扩展为负数补码
     val = (mach_read_from_3(*b) & 0x1FFFF) | 0xFFFE0000;
     ut_ad(val < 0xFFFFFC00);
     *b += 3;

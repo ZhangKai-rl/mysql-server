@@ -81,6 +81,7 @@ dtuple_t *row_build_index_entry_low(const dtuple_t *row, const row_ext_t *ext,
     return (entry);
   }
 
+  // 注意sec idx 也要set_n_fields_cmp. 比如idx(col1...coln)会有一个隐藏的主键作为sec idx的值。即entry = (col1...coln, 隐藏的主键). set_n_fields_cmp(col1..coln, 其实也包括主键)
   if (dict_index_is_ibuf(index)) {
     dtuple_set_n_fields_cmp(entry, entry_len);
     /* There may only be externally stored columns

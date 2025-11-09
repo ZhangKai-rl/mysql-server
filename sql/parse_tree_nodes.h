@@ -153,7 +153,7 @@ bool contextualize_nodes(Mem_root_array_YY<Node_type *> nodes,
 
 /**
   Base class for all top-level nodes of SQL statements
-
+  note: 词法/语法解析树的根节点
   @ingroup ptn_stmt
 */
 class Parse_tree_root {
@@ -1404,6 +1404,7 @@ class PT_query_specification : public PT_query_primary {
         opt_having_clause(nullptr),
         opt_window_clause(nullptr) {}
 
+  // note
   bool contextualize(Parse_context *pc) override;
 
   bool has_into_clause() const override { return opt_into1 != nullptr; }

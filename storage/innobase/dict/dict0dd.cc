@@ -3206,6 +3206,28 @@ inline int dd_fill_dict_index(const dd::Table &dd_table, const TABLE *m_form,
   if (m_form->s->keys == 0 || m_form->s->primary_key == MAX_KEY) {
     /* Create an index which is used as the clustered index;
     order the rows by the hidden InnoDB column DB_ROW_ID. */
+
+    /*  GEN_CLUST_INDEX 聚簇索引的定义. n_uniq=1 = db_row_id
+          [0] GEN_CLUST_INDEX (CLUSTERED, hidden)
+          Fields: DB_ROW_ID, DB_TRX_ID, DB_ROLL_PTR, name, age. (因为是聚簇索引，所以value包含所以表字段)
+          n_uniq: 1 (DB_ROW_ID) （key为db_row_id）
+
+        +------------------+
+        | DB_ROW_ID (6B)   |  <- Hidden row identifier (Primary Key)
+        +------------------+
+        | DB_TRX_ID (6B)   |  <- Transaction ID
+        +------------------+
+        | DB_ROLL_PTR (7B) |  <- Rollback pointer
+        +------------------+
+        | User Column 1    |  <- All user-defined columns
+        +------------------+
+        | User Column 2    |
+        +------------------+
+        | ...              |
+        +------------------+
+        | User Column N    |
+        +------------------+
+    */
     dict_index_t *index = dict_mem_index_create(
         m_table->name.m_name, "GEN_CLUST_INDEX", 0, DICT_CLUSTERED, 0);
     index->n_uniq = 0;

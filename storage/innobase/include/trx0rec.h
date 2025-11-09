@@ -108,6 +108,7 @@ byte *trx_undo_update_rec_get_sys_cols(
 struct type_cmpl_t;
 
 /** Builds an update vector based on a remaining part of an undo log record.
+note: remaining part: upd_exist主键各列后的字段. https://juejin.cn/book/6844733769996304392/section/6844733770067607566?enter_from=course_center&utm_source=course_center#heading-10
 @param[in] ptr Remaining part in update undo log record, after reading the row
 reference. NOTE that this copy of the undo log record must be preserved as long
 as the update vector is used, as we do NOT copy the data in the record!
@@ -298,9 +299,13 @@ record */
 /** fresh insert into clustered index */
 constexpr uint32_t TRX_UNDO_INSERT_REC = 11;
 /** update of a non-delete-marked  record */
+// 不更新主键的两种场景
+/* 正常来说upd_exist是不需要purge的 */
 constexpr uint32_t TRX_UNDO_UPD_EXIST_REC = 12;
 /** update of a delete marked record to a not delete marked record; also the
 fields of the record can change */
+// 更新一个已经被删除(del_mark)的记录；如某个记录被删除后，在很快插入一个相同的记录；之前的记录若未被purge，就可能重用该记录所在位置。
+// 记录场景： 删除后快速插入(purge del_mark undo前)相同主键的记录
 constexpr uint32_t TRX_UNDO_UPD_DEL_REC = 13;
 /* delete marking of a record; fields do not change */
 constexpr uint32_t TRX_UNDO_DEL_MARK_REC = 14;
@@ -321,7 +326,7 @@ constexpr uint32_t TRX_UNDO_MODIFY_OP = 2;
 /** The type and compilation info flag in the undo record for update.
 For easier understanding let the 8 bits be numbered as
 7, 6, 5, 4, 3, 2, 1, 0. */
-// typeinfo 0-3, cmplinfo 4-5, TRX_UNDO_UPD_EXTERN 7, TRX_UNDO_MODIFY_BLOB 6
+// typeinfo 0-3, cmplinfo 4-5(这个是啥？), TRX_UNDO_UPD_EXTERN 7, TRX_UNDO_MODIFY_BLOB 6
 struct type_cmpl_t {
   type_cmpl_t() : m_flag(0) {}
 

@@ -500,6 +500,17 @@ SEL_ROOT *SEL_ROOT::clone_tree(RANGE_OPT_PARAM *param) const {
   return new_tree;
 }
 
+/**
+    tree1: (a > 10) AND (b < 20)
+    tree2: (a < 50) AND (c = 5)
+
+    tree_and(tree1, tree2):
+      keys[idx_a] = key_and(a > 10, a < 50) = (10 < a < 50)
+      keys[idx_b] = (b < 20)
+      keys[idx_c] = (c = 5)
+
+    结果：(10 < a < 50) AND (b < 20) AND (c = 5)
+ */
 SEL_TREE *tree_and(RANGE_OPT_PARAM *param, SEL_TREE *tree1, SEL_TREE *tree2) {
   DBUG_TRACE;
 
@@ -878,6 +889,8 @@ static SEL_ROOT *and_all_keys(RANGE_OPT_PARAM *param, SEL_ROOT *key1,
   RETURN
     RB-tree root of the resulting SEL_ARG graph.
     NULL if the result of AND operation is an empty interval {0}.
+
+    keys[idx_a] = key_and(a > 10, a < 50) = (10 < a < 50)
 */
 
 SEL_ROOT *key_and(RANGE_OPT_PARAM *param, SEL_ROOT *key1, SEL_ROOT *key2) {

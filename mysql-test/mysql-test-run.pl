@@ -4951,6 +4951,7 @@ sub run_testcase ($) {
     # Check if servers need to be reinitialized for the test.
     my $server_need_reinit = servers_need_reinitialization($tinfo);
 
+    # 取决于测试的需求。MySQL 测试框架采用智能重用策略（Smart Reuse Strategy）：默认行为：尽可能重用当前的 mysqld 进程.
     my @restart = servers_need_restart($tinfo);
     if (@restart != 0) {
       stop_secondary_engine_servers() if $tinfo->{'secondary-engine'};

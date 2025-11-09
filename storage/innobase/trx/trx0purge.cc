@@ -502,6 +502,8 @@ static void trx_purge_free_segment(trx_rseg_t *rseg, fil_addr_t hdr_addr,
 }
 
 /** Removes unnecessary history data from a rollback segment. */
+// 如果一个undo page list的undo no都大于limit都可清理，经过trx_undo_truncate_start后，只剩下空的undo header page了。
+// 假设该undo page未被重用，之后会走到trx_purge_free_segment，直接吧该segment free掉，同时header page也就被释放了
 static void trx_purge_truncate_rseg_history(
     trx_rseg_t *rseg,          /*!< in: rollback segment */
     const purge_iter_t *limit) /*!< in: truncate offset */
@@ -527,8 +529,11 @@ static void trx_purge_truncate_rseg_history(
   rseg_hdr =
       trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, &mtr);
 
+  // hdr_addr指向history list最后一个node的undo header page的undo log header起始位置
   hdr_addr = trx_purge_get_log_from_hist(
+      // 获取history list最后一个node
       flst_get_last(rseg_hdr + TRX_RSEG_HISTORY, &mtr));
+// xxxx: loop 处理history list的所有undo page list.
 loop:
   if (hdr_addr.page == FIL_NULL) {
     rseg->unlatch();
@@ -560,6 +565,7 @@ loop:
     return;
   }
 
+  // 完成一个undo page list的处理。从history list中获取上个undo page list的undo header page addr.
   prev_hdr_addr = trx_purge_get_log_from_hist(
       flst_get_prev_addr(log_hdr + TRX_UNDO_HISTORY_NODE, &mtr));
 
@@ -596,6 +602,7 @@ loop:
   rseg_hdr =
       trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, &mtr);
 
+  // 推进loop
   hdr_addr = prev_hdr_addr;
 
   goto loop;
@@ -1244,6 +1251,7 @@ static bool trx_purge_mark_undo_for_truncate(size_t truncate_count) {
   size_t num_active = 0;
 
   /* Look for any undo space that is inactive explicitly. */
+  // 先truncate 手动设置 INactive的
   auto undo_ts = undo::spaces->find_first_inactive_explicit(&num_active);
   if (undo_ts != nullptr) {
     undo_trunc->mark(undo_ts);
@@ -1253,7 +1261,7 @@ static bool trx_purge_mark_undo_for_truncate(size_t truncate_count) {
 
   undo::spaces->s_unlock();
 
-  /* If we get here, there are no undo spaces currently being truncated
+  /* note: If we get here, there are no undo spaces currently being truncated
   and none that are SET INACTIVE explicitly. */
   ut_a(num_active > 0);
 
@@ -1281,10 +1289,10 @@ static bool trx_purge_mark_undo_for_truncate(size_t truncate_count) {
     undo_trunc->reset_timer();
   }
 
-  /* Find an undo tablespace that is too big and needs to be truncated. */
+  /* note: Find an undo tablespace that is too big and needs to be truncated. */
   undo::spaces->s_lock();
 
-  /* Avoid bias selection and so start the scan immediately after the
+  /* note: Avoid bias selection and so start the scan immediately after the
   last space selected for truncate. Scan through all undo tablespaces. */
   space_id_t space_num = undo_trunc->get_scan_space_num();
   space_id_t first_space_num_scanned = space_num;
@@ -1452,7 +1460,7 @@ static bool trx_purge_truncate_marked_undo_low(space_id_t space_num,
     /* purecov: end */
   }
 
-  /* Do the truncate.  This will change the space_id of the marked_space. */
+  /* note: Do the truncate.  This will change the space_id of the marked_space. */
   bool success = trx_undo_truncate_tablespace(marked_space);
 
   if (!success) {
@@ -1595,6 +1603,7 @@ NOTE that when this function is called, the caller must not
 have any latches on undo log pages!
 @param[in]  limit  Truncate limit
 @param[in]  view   Purge view */
+// 遍历undo fsp的所有history list，移除limit前的history list。释放/清空页面(段无页面后也free)
 static void trx_purge_truncate_history(purge_iter_t *limit,
                                        const ReadView *view) {
   MONITOR_INC_VALUE(MONITOR_PURGE_TRUNCATE_HISTORY_COUNT, 1);
@@ -1628,9 +1637,11 @@ static void trx_purge_truncate_history(purge_iter_t *limit,
     }
 
     /* Purge rollback segments in this undo tablespace. */
+    // ques: 居然只是s lock
     undo_space->rsegs()->s_lock();
 
     for (auto rseg : *undo_space->rsegs()) {
+      // note: truncate rseg history list.
       trx_purge_truncate_rseg_history(rseg, limit);
     }
     undo_space->rsegs()->s_unlock();
@@ -2311,6 +2322,7 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
     purge_node_t::rec_t rec;
 
     /* Fetch the next record, and advance the purge_sys->iter.(函数末尾的函数进行advance) */
+    // 这里每次只获取了一条undo rec。里面会进行不断的取，取完一组undo log继续取下一组。所以purge_groups里边并不是同一组undo logs
     rec.undo_rec = trx_purge_fetch_next_rec(&rec.modifier_trx_id, &rec.roll_ptr,
                                             &n_pages_handled, heap);
 
@@ -2399,12 +2411,15 @@ static void trx_purge_truncate(void) {
   ut_ad(trx_purge_check_limit());
 
   if (purge_sys->limit.trx_no == 0) {
+    // 当前批次没有实际处理任何undo record. 也就是没读，那么此时iter==limit
     trx_purge_truncate_history(&purge_sys->iter, &purge_sys->view);
   } else {
+    // update in trx_purge_attach_undo_recs. iter>limit(完成purge的)
     trx_purge_truncate_history(&purge_sys->limit, &purge_sys->view);
   }
 
   /* Attempt to truncate an undo tablespace. */
+  // TODO
   trx_purge_truncate_undo_spaces();
 }
 
@@ -2512,6 +2527,7 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
   undo logs during upgrade to update purge history
   length. */
   if (truncate || srv_upgrade_old_undo_found) {
+    // note: 进行undo space truncate
     trx_purge_truncate();
   }
 

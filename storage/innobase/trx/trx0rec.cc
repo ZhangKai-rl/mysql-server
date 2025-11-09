@@ -234,6 +234,7 @@ bool trx_undo_rec_is_multi_value(const byte *undo_rec) {
 
 /** Write virtual column index info (index id and column position in index)
 to the undo log
+详细写入内容见size
 @param[in,out]  undo_page       undo log page
 @param[in]      table           the table
 @param[in]      pos             the virtual column position
@@ -271,10 +272,12 @@ static byte *trx_undo_log_v_idx(page_t *undo_page, const dict_table_t *table,
 
   ptr += 2;
 
+  // n_idx: 5
   ptr += mach_write_compressed(ptr, n_idx);
 
   dict_v_idx_list::iterator it;
 
+  // n_idx * (id: 5, pos: 5)
   for (it = vcol->v_indexes->begin(); it != vcol->v_indexes->end(); ++it) {
     dict_v_idx_t v_index = *it;
 
@@ -283,6 +286,7 @@ static byte *trx_undo_log_v_idx(page_t *undo_page, const dict_table_t *table,
     ptr += mach_write_compressed(ptr, v_index.nth_field);
   }
 
+  // total length: 2
   mach_write_to_2(old_ptr, ptr - old_ptr);
 
   return (ptr);
@@ -292,7 +296,7 @@ static byte *trx_undo_log_v_idx(page_t *undo_page, const dict_table_t *table,
 indexed, and return its position
 @param[in]      table           the table
 @param[in]      ptr             undo log pointer
-@param[out]     col_pos         the column number or ULINT_UNDEFINED
+* @param[out]     col_pos         the column number or ULINT_UNDEFINED
                                 if the column is not indexed any more
 @return remaining part of undo log record after reading these values */
 static const byte *trx_undo_read_v_idx_low(const dict_table_t *table,
@@ -346,7 +350,7 @@ still indexed, and output its position
                                 check to see if this is undo log. When
                                 first_v_col is true, is_undo_log is output,
                                 when first_v_col is false, is_undo_log is input
-@param[in,out]  field_no        the column number
+* @param[in,out]  field_no        the column number
 @return remaining part of undo log record after reading these values */
 const byte *trx_undo_read_v_idx(const dict_table_t *table, const byte *ptr,
                                 bool first_v_col, bool *is_undo_log,
@@ -570,6 +574,7 @@ byte *trx_undo_rec_get_pars(
   *type = type_cmpl.type_info();
   *cmpl_info = type_cmpl.cmpl_info();
 
+  // TODO: 先不管large object
   if (type_cmpl.is_lob_undo()) {
     /* Reading the new 1-byte undo record flag. */
     uint8_t undo_rec_flags = 0x00;
@@ -676,6 +681,7 @@ byte *trx_undo_rec_get_col_val(const byte *ptr, const byte **field, ulint *len,
 }
 
 /** Builds a row reference from an undo log record.
+ * 感觉是根据undo rec构建出进行dml写undo rec前的rec. 为什么要构建这个orig rec?
  @return pointer to remaining part of undo record */
 byte *trx_undo_rec_get_row_ref(
     byte *ptr,           /*!< in: remaining part of a copy of an undo log
@@ -709,6 +715,7 @@ byte *trx_undo_rec_get_row_ref(
 
     dfield = dtuple_get_nth_field(*ref, i);
 
+    // 这里undo rec的字段是主键每个列占用的存储空间大小和真实值。给构建的dtuple各个field赋值
     ptr = trx_undo_rec_get_col_val(ptr, &field, &len, &orig_len);
 
     dfield_set_data(dfield, field, len);
@@ -1154,7 +1161,7 @@ static ulint trx_undo_page_report_modify(
     page_t *undo_page,    /*!< in: undo log page */
     trx_t *trx,           /*!< in: transaction */
     dict_index_t *index,  /*!< in: clustered index where update or
-                          delete marking is done */
+                          delete marking is done . 一定是聚簇索引 */
     const rec_t *rec,     /*!< in: clustered index record which
                           has NOT yet been modified */
     const ulint *offsets, /*!< in: rec_get_offsets(rec, index) */
@@ -1273,6 +1280,7 @@ static ulint trx_undo_page_report_modify(
   /*----------------------------------------*/
   /* Store then the fields required to uniquely determine the
   record which will be modified in the clustered index */
+  // unique of 聚簇索引
 
   for (i = 0; i < dict_index_get_n_unique(index); i++) {
     field = rec_get_nth_field(index, rec, offsets, i, &flen);
@@ -1299,7 +1307,7 @@ static ulint trx_undo_page_report_modify(
   }
 
   /*----------------------------------------*/
-  /* Save to the undo log the old values of the columns to be updated. */
+  /* note: Save to the undo log the old values of the columns to be updated. */
 
   if (update) {
     if (trx_undo_left(undo_page, ptr) < 5) {
@@ -1313,6 +1321,7 @@ static ulint trx_undo_page_report_modify(
     need to double check if there are any non-indexed columns
     being registered in update vector in case they will be indexed
     in new table */
+    // 如果表在进行 online ddl, 则index->table是旧表定义。 因为这个thd是与ddl并发的dml线程，在ddl完成后apply online_log
     if (dict_index_is_online_ddl(index) && index->table->n_v_cols > 0) {
       for (i = 0; i < upd_get_n_fields(update); i++) {
         upd_field_t *fld = upd_get_nth_field(update, i);
@@ -1320,6 +1329,7 @@ static ulint trx_undo_page_report_modify(
 
         /* These columns must not have an index
         on them */
+        // ques: 这里看不懂. InnoDB只为有索引的虚拟列记录旧值到Undo Log
         if (upd_fld_is_virtual_col(fld) &&
             dict_table_get_nth_v_col(table, pos)->v_indexes->empty()) {
           n_updated--;
@@ -1329,6 +1339,7 @@ static ulint trx_undo_page_report_modify(
 
     ptr += mach_write_compressed(ptr, n_updated);
 
+    // note
     for (i = 0; i < upd_get_n_fields(update); i++) {
       upd_field_t *fld = upd_get_nth_field(update, i);
 
@@ -1346,6 +1357,7 @@ static ulint trx_undo_page_report_modify(
       if (is_virtual) {
         /* Skip the non-indexed column, during
         an online alter table */
+        // 跟上边 n_updated-- 的判断逻辑一样
         if (dict_index_is_online_ddl(index) &&
             dict_table_get_nth_v_col(table, pos)->v_indexes->empty()) {
           continue;
@@ -1370,6 +1382,7 @@ static ulint trx_undo_page_report_modify(
       if (is_virtual) {
         ut_ad(fld->field_no < table->n_v_def);
 
+        // 对这个vcol记录其vidx的info
         ptr = trx_undo_log_v_idx(undo_page, table, fld->field_no, ptr,
                                  first_v_col);
         if (ptr == nullptr) {
@@ -1476,6 +1489,8 @@ static ulint trx_undo_page_report_modify(
       }
     }
   }
+
+  /* xxxx: 完成处理upd类型的undo rec(upd_del, upd_exist) */
 
   /* Reset the first_v_col, so to put the virtual column undo
   version marker again, when we log all the indexed columns */
@@ -1685,6 +1700,7 @@ static ulint trx_undo_page_report_modify(
     return 0;
   }
 
+  // undo rec format end: this record start pos.
   mach_write_to_2(ptr, first_free);
   ptr += 2;
   mach_write_to_2(undo_page + first_free, ptr - undo_page);
@@ -1743,9 +1759,11 @@ byte *trx_undo_update_rec_get_update(const byte *ptr, const dict_index_t *index,
   if (type != TRX_UNDO_DEL_MARK_REC) {
     n_fields = mach_read_next_compressed(&ptr);
   } else {
+    // del_mark不处理, 那就只处理两种update: upd_exist && 
     n_fields = 0;
   }
 
+  // +2?? trx_id and roll_ptr
   update = upd_create(n_fields + 2, heap);
 
   update->table = index->table;
@@ -1775,6 +1793,7 @@ byte *trx_undo_update_rec_get_update(const byte *ptr, const dict_index_t *index,
 
   /* Store then the updated ordinary columns to the update vector */
 
+  // TODO: 解析 被更新列更新前信息(n_fields后面). 对应undo log rec的记录位置：xx。  格式：https://www.modb.pro/db/1761956055471906816
   for (i = 0; i < n_fields; i++) {
     const byte *field;
     ulint len;
@@ -1785,6 +1804,7 @@ byte *trx_undo_update_rec_get_update(const byte *ptr, const dict_index_t *index,
 
     field_no = mach_read_next_compressed(&ptr);
 
+    // note
     is_virtual = (field_no >= REC_MAX_N_FIELDS);
 
     if (is_virtual) {
@@ -2426,8 +2446,10 @@ err_exit:
 
   rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
 
+  // note: missing_history = true说明purge sys清理了undo，丢失了rec的历史版本。
   missing_history = purge_sys->view.changes_visible(trx_id, name);
   if (!missing_history) {
+    // ques: todo. 当前版本记录对rv是不可见的，根据undo往前回滚版本
     *undo_rec = trx_undo_get_undo_rec_low(roll_ptr, heap, is_temp);
   }
 

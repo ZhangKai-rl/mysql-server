@@ -1208,6 +1208,10 @@ static byte *parse_index_flag(byte *ptr, const byte *end_ptr, uint8_t &flag) {
   return ptr;
 }
 
+/*
+  Redo Log 中包含了重建索引结构所需的所有元数据.
+  在 Redo Log 恢复时，mlog_parse_index 从 Redo Log 中读取这些元数据，重建出一个 dummy index：
+*/
 byte *mlog_parse_index(byte *ptr, const byte *end_ptr, dict_index_t **index) {
   /* Read the 1 byte for index log version */
   uint8_t index_log_version = 0;
@@ -1268,7 +1272,7 @@ static byte *mlog_parse_index_v1(byte *ptr, const byte *end_ptr,
     table->set_instant_cols(inst_cols);
   }
 
-  /* Create a dummy dict_index_t */
+  /* ques: Create a dummy dict_index_t */
   dict_index_t *ind =
       dict_mem_index_create(RECOVERY_INDEX_TABLE_NAME,
                             RECOVERY_INDEX_TABLE_NAME, DICT_HDR_SPACE, 0, n);

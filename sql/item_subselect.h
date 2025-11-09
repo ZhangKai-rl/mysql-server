@@ -76,6 +76,9 @@ template <class T>
 class List;
 
 /* base class for subselects */
+// qe中的子查询。from后派生表使用 table_ref* query_expression::derived_table
+// note: 此处！select/where后subselect用 item_subselect* item表示
+// item_subselect在item tree中一定是leaf node.
 
 class Item_subselect : public Item_result_field {
   typedef Item_result_field super;

@@ -609,6 +609,7 @@ struct dfield_t {
   /*!< spatial status of externally stored field
   in undo log for purge */
   unsigned len; /*!< data length; UNIV_SQL_NULL if SQL null */
+  // 看 data0type.h 或者 dtype_t::print函数分析具体类型
   dtype_t type; /*!< type of data */
 
   bool is_virtual() const { return (type.is_virtual()); }

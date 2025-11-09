@@ -571,6 +571,7 @@ struct trx_lock_t {
   Writers who want to set it to true, should hold a latch on the lock-sys queue
   they intend to add a lock to.
   Writers may set it to false at any time. */
+  // 当设置为 true 时，表示该事务在记录上的所有锁，在记录被purge时，都应该被继承为gap锁
   std::atomic<bool> inherit_all;
 
   /** Weight of the waiting transaction used for scheduling.

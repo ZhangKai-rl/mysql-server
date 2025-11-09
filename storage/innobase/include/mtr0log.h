@@ -252,6 +252,7 @@ bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
 @param[in]  ptr      buffer
 @param[in]  end_ptr  buffer end
 @param[out] index    own: dummy index
+ques: mlog_parse_index 为什么用 dummy index?
 @return parsed record end, NULL if not a complete record */
 byte *mlog_parse_index(byte *ptr, const byte *end_ptr, dict_index_t **index);
 

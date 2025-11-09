@@ -497,6 +497,7 @@ struct upd_field_t {
                           query graph */
   dfield_t old_val;       /*!< old value for the column */
   dfield_t new_val;       /*!< new value for the column */
+  // 为啥vcol没有 new_v_col? 有的，vcol和普通col公用 new_val. 另外vcol是根据其base_col来计算的，new_vcol_val随时根据base_col计算
   dfield_t *old_v_val;    /*!< old value for the virtual column */
 
   Field *mysql_field; /*!< the mysql field object. */
@@ -562,6 +563,7 @@ static inline void upd_fld_set_virtual_col(upd_field_t *upd_fld) {
 }
 
 /* Update vector structure */
+// 记录更新前的信息，具体看undo record format
 struct upd_t {
   /** Heap from which memory allocated. This is not a new heap, rather
   will point to other heap. Therefore memory allocated from this heap
@@ -800,6 +802,8 @@ constexpr uint32_t UPD_NODE_UPDATE_SOME_SEC = 6;
 constexpr uint32_t UPD_NODE_NO_ORD_CHANGE = 1;
 /** no record field size will be changed in the update */
 constexpr uint32_t UPD_NODE_NO_SIZE_CHANGE = 2;
+
+// cmpl & UPD_NODE_NO_ORD_CHANGE & UPD_NODE_NO_SIZE_CHANGE != 0表明时in-place update
 #endif /* !UNIV_HOTBACKUP */
 
 #include "row0upd.ic"

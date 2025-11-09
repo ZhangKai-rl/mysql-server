@@ -744,6 +744,7 @@ struct TABLE_SHARE {
 
   /* The following is copied to each TABLE on OPEN */
   Field **field{nullptr};
+  // auto inc field, fill_column_from_dd中根据dd::column::auto_flags找。
   Field **found_next_number_field{nullptr};
   KEY *key_info{nullptr};    /* data of keys defined for the table */ // 即索引信息
   uint *blob_field{nullptr}; /* Index to blobs in Field array */
@@ -3485,6 +3486,7 @@ class Table_ref {
     SQL_I_List). Considers views as leaves (unlike 'next_leaf' below).
     Created at parse time in Query_block::add_table_to_list() ->
     table_list.link_in_list().
+    local意味着变形只在当前Query_block进行
   */
   Table_ref *next_local{nullptr};
   /* link in a global list of all queries tables */

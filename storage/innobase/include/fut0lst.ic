@@ -44,6 +44,7 @@ constexpr uint32_t FLST_PREV = 0;
 constexpr uint32_t FLST_NEXT = FIL_ADDR_SIZE;
 
 /* We define the field offsets of a base node for the list */
+// 4Blength. 6Bfirst(4Bpageno, 2Boffset), 6Blast链表基节点中存储的链表尾节点地址(4Bpageno, 2Boffset)
 /** 32-bit list length field */
 constexpr uint32_t FLST_LEN = 0;
 /** 6-byte address of the first element of the list; undefined if empty list */

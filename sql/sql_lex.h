@@ -780,6 +780,9 @@ class Query_expression {
   Query_block *slave;
 
   // The query set operation structure, see doc for Query_term.
+  // http://mysql.taobao.org/monthly/2024/12/02/
+  // note: 存储qe的关系（如UNION，except） 和 子查询位置。 该结构见query_term类注释。将两类信息使用树表示，m_query_term为该树的根
+  // 用于表示查询的逻辑结构, 在 contextualize 阶段逐步构造，在 finalize_query_expression() 中完成
   Query_term *m_query_term{nullptr};
 
  public:
@@ -955,6 +958,7 @@ class Query_expression {
   /* LIMIT clause runtime counters */
   ha_rows select_limit_cnt, offset_limit_cnt;
   /// Points to subquery if this query expression is used in one, otherwise NULL
+  // select/ where后的标量子查询树的根
   Item_subselect *item;
   /**
     The WITH clause which is the first part of this query expression. NULL if
@@ -964,6 +968,7 @@ class Query_expression {
   /**
     If this query expression is underlying of a derived table, the derived
     table. NULL if none.
+    比如from 语句后面
   */
   Table_ref *derived_table;
   /**
@@ -1301,6 +1306,7 @@ enum class enum_explain_type {
   optionally followed by a WHERE clause, a GROUP BY, etc.
   这个类之前叫 SELECT_LEX, 对应SELECT_LEX_unit
   note: 可以进行打印， print_query_block
+  // 优化器代码速览：http://mysql.taobao.org/monthly/2024/12/02/
 */
 class Query_block : public Query_term {
  public:

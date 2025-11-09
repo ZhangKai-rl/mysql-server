@@ -623,6 +623,7 @@ void trx_rsegs_init(purge_pq_t *purge_queue) {
 
   /* Get GTID transaction number from SYS */
   mtr.start();
+  // 这里开了个mtr是因为trx_sysf_get()需要mtr的参数，主要是为了锁并未写redo
   trx_sysf_t *sys_header = trx_sysf_get(&mtr);
   auto page = sys_header - TRX_SYS;
   auto gtid_trx_no = mach_read_from_8(page + TRX_SYS_TRX_NUM_GTID);

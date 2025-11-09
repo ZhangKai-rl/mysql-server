@@ -3227,6 +3227,7 @@ int handler::handle_records_error(int error, ha_rows *num_rows) {
   index scan and without calling ha_index_init. In this case the
   ha_index_read_map is on the same index as the previous ha_index_scan.
   This is particularly used in conjunction with multi read ranges.
+  根据keypart_map来使用索引定位记录
 */
 
 int handler::ha_index_read_map(uchar *buf, const uchar *key,
@@ -3598,6 +3599,8 @@ int handler::ha_index_next_pushed(uchar *buf) {
   @verbatim 1,2,3,4,5,... @endverbatim
     If increment=10 and offset=5 and previous number is 1, we get:
   @verbatim 1,5,15,25,35,... @endverbatim
+  inc = 20, offset = 100;
+  4, 24, 44, 64, 100, 120, 140.
 */
 inline ulonglong compute_next_insert_id(ulonglong nr,
                                         struct System_variables *variables) {
@@ -3743,6 +3746,7 @@ inline ulonglong prev_insert_id(ulonglong nr,
 #define AUTO_INC_DEFAULT_NB_MAX_BITS 16
 #define AUTO_INC_DEFAULT_NB_MAX ((1 << AUTO_INC_DEFAULT_NB_MAX_BITS) - 1)
 
+// TODO
 int handler::update_auto_increment() {
   ulonglong nr, nb_reserved_values = 0;
   bool append = false;
@@ -3850,6 +3854,7 @@ int handler::update_auto_increment() {
           nb_desired_values = AUTO_INC_DEFAULT_NB_MAX;
       }
       /* This call ignores all its parameters but nr, currently */
+      // 进入se 获取上个自增字段的目前值
       get_auto_increment(variables->auto_increment_offset,
                          variables->auto_increment_increment, nb_desired_values,
                          &nr, &nb_reserved_values);
@@ -3990,6 +3995,7 @@ void handler::get_auto_increment(ulonglong offset [[maybe_unused]],
   }
 
   if (table->s->next_number_keypart == 0) {  // Autoincrement at key-start
+    // 获取最后一个index的行
     error = ha_index_last(table->record[1]);
     /*
       MySQL implicitly assumes such method does locking (as MySQL decides to
@@ -4002,6 +4008,7 @@ void handler::get_auto_increment(ulonglong offset [[maybe_unused]],
     key_copy(key, table->record[0],
              table->key_info + table->s->next_number_index,
              table->s->next_number_key_offset);
+    // 根据key map进入index读取
     error =
         ha_index_read_map(table->record[1], key,
                           make_prev_keypart_map(table->s->next_number_keypart),
@@ -7573,6 +7580,7 @@ uint calculate_key_len(TABLE *table, uint key, key_part_map keypart_map) {
   KEY_PART_INFO *end_key_part = key_part + actual_key_parts(key_info);
   uint length = 0;
 
+  // 总共需要key/index中？
   while (key_part < end_key_part && keypart_map) {
     length += key_part->store_length;
     keypart_map >>= 1;

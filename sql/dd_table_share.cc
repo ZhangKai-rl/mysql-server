@@ -891,6 +891,7 @@ static Field *make_field(const dd::Column &col_obj, const CHARSET_INFO *charset,
 /**
   Add Field constructed according to column metadata from dd::Column
   object to TABLE_SHARE.
+  构造table_share中的一个Field
 */
 
 static bool fill_column_from_dd(THD *thd, TABLE_SHARE *share,
@@ -1045,6 +1046,7 @@ static bool fill_column_from_dd(THD *thd, TABLE_SHARE *share,
     reg_field->m_default_val_expr = default_val_expr;
   }
 
+  // note
   if ((auto_flags & Field::NEXT_NUMBER) != 0)
     share->found_next_number_field = &share->field[field_nr];
 

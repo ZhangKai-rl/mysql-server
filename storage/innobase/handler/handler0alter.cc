@@ -6261,7 +6261,14 @@ bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
           dup_key =
               &ha_alter_info->key_info_buffer[m_prebuilt->trx->error_key_num];
         } else {
-          /* Check if there is generated cluster index column */
+          /* Check if there is generated cluster index column. index(db_row_id) */
+          /* 
+            当表没有显式的 PRIMARY KEY 时，InnoDB 会自动创建一个隐藏的聚簇索引 GEN_CLUST_INDEX
+            这个索引 不在 key_info_buffer 中（因为它是 InnoDB 内部的，MySQL 层不知道）但它 在 InnoDB 的索引列表中占据位置 0
+            结果：
+            ctx->num_to_add_index = ha_alter_info->key_count + 1（多了一个 GEN_CLUST_INDEX）
+          */
+          // ques: 调试下看看这里是不是一定是 num_to_add_index == (key_count + 1). index(DB_ROW_ID)
           if (ctx->num_to_add_index > ha_alter_info->key_count) {
             assert(m_prebuilt->trx->error_key_num <= ha_alter_info->key_count);
             dup_key =

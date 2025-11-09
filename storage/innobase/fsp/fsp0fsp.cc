@@ -3470,6 +3470,7 @@ static void fseg_free_page_low(fseg_inode_t *seg_inode,
 @param[in] page Page offset
 @param[in] ahi Whether we may need to drop the adaptive hash index
 @param[in,out] mtr Mini-transaction */
+// TODO
 void fseg_free_page(fseg_header_t *seg_header, space_id_t space_id,
                     page_no_t page, bool ahi, mtr_t *mtr) {
   DBUG_TRACE;

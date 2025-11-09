@@ -707,7 +707,7 @@ Sql_cmd *PT_select_stmt::make_cmd(THD *thd) {
 
   thd->lex->sql_command = m_sql_command;
 
-  // note: 词法分析, m_query_expression. PT_query_expression
+  // note: 词法分析, m_query_expression. 实际进入 PT_query_expression::contextualize or PT_query_specification
   if (m_qe->contextualize(&pc)) {
     return nullptr;
   }
@@ -1511,6 +1511,7 @@ static Surrounding_context qt2sc(Query_term_type qtt) {
   @param      pc   the parse context
   @param      setop the set operation query term to be filled in with children
   @param      ql   parsing query level
+  TODO
 */
 void PT_set_operation::merge_descendants(Parse_context *pc,
                                          Query_term_set_op *setop,
@@ -1649,6 +1650,7 @@ void PT_set_operation::merge_descendants(Parse_context *pc,
   setop->m_first_distinct = first_distinct;
 }
 
+// 这里要结合parse tree来看： https://iwiki.woa.com/p/4015115123/edit
 bool PT_set_operation::contextualize_setop(Parse_context *pc,
                                            Query_term_type setop_type,
                                            Surrounding_context context) {
@@ -1657,12 +1659,15 @@ bool PT_set_operation::contextualize_setop(Parse_context *pc,
 
   if (m_lhs->contextualize(pc)) return true;
 
+  // note: 创建query_block, 并设置到select. 比如 qb1 union qb2, 这里创建qb2
   pc->select = pc->thd->lex->new_set_operation_query(pc->select);
 
   if (pc->select == nullptr || m_rhs->contextualize(pc)) return true;
 
+  // note
   pc->thd->lex->pop_context();
 
+  // 这里是query term: union, except, intersect, 根据op 创建对应的query_term 
   QueryLevel ql = pc->m_stack.back();
   pc->m_stack.pop_back();
 
@@ -3982,7 +3987,7 @@ bool PT_query_expression::contextualize(Parse_context *pc) {
   if (contextualize_safe(pc, m_with_clause))
     return true; /* purecov: inspected */
 
-  // note: 这里语法分析contextualize PT_query_specification. 后边继续contextualize_order_and_limit
+  // note: 这里语法分析contextualize PT_query_specification(正常是，如果有union可能进入PT_union). 后边继续contextualize_order_and_limit
   if (Parse_tree_node::contextualize(pc) || m_body->contextualize(pc))
     return true;
 
@@ -3990,7 +3995,7 @@ bool PT_query_expression::contextualize(Parse_context *pc) {
   Query_term *expr = ql.m_elts.back();
   pc->m_stack.pop_back();
 
-  // TODO
+  // TODO: 处理query_expression::m_query_term，构造term tree
   switch (expr->term_type()) {
     case QT_UNARY: {
       Query_term_unary *ex = down_cast<Query_term_unary *>(expr);

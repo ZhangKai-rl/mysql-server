@@ -1,0 +1,22 @@
+boost_*
+build_*
+cmake-build*
+.idea/
+unittest
+extra/
+man
+router/
+storage/ndb/
+storage/csv/
+storage/myisam/
+storage/federated/
+scripts/
+doxygen_resources/
+mysql-test/
+packaging/
+testclients/
+
+
+
+# plugin/
+# components/

@@ -722,6 +722,7 @@ static inline uint32_t rec_get_n_fields_instant(const rec_t *rec,
 }
 
 /* For INSTANT ADD/DROP, we may have following 5 types of rec for table :
+  http://mysql.taobao.org/monthly/2023/12/02/
   +----------------------------------------------------------------------------+
   |              SCENARIO                         |        STATE               |
   |----------------------------------+------------+---------+------------------|

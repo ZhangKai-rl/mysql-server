@@ -209,6 +209,7 @@ constexpr uint32_t TRX_RSEG_MAX_SIZE = 0;
 /** Number of file pages occupied by the logs in the history list */
 constexpr uint32_t TRX_RSEG_HISTORY_SIZE = 4;
 /* The update undo logs for committed transactions */
+// history list按照undo no从新到旧排序
 constexpr uint32_t TRX_RSEG_HISTORY = 8;
 /* Header for the file segment where this page is placed */
 constexpr uint32_t TRX_RSEG_FSEG_HEADER = 8 + FLST_BASE_NODE_SIZE;

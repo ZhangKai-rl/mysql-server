@@ -684,6 +684,7 @@ static inline ulint dict_index_get_n_fields(
  we do not take multiversioning into account: in the B-tree use the value
  returned by dict_index_get_n_unique_in_tree.
  @return number of fields */
+// note
 static inline ulint dict_index_get_n_unique(
     const dict_index_t *index) /*!< in: an internal representation
                                of index (in the dictionary cache) */

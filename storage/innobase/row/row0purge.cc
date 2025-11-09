@@ -489,6 +489,7 @@ if possible.
     pcur.m_btr_cur.thr = static_cast<que_thr_t *>(que_node_get_parent(node));
   }
 
+  // 进行btr search
   search_result = row_search_index_entry(index, entry, mode, &pcur, &mtr);
 
   if (dict_index_is_spatial(index)) {
@@ -594,6 +595,7 @@ static inline void row_purge_remove_sec_if_poss(
   if (row_purge_remove_sec_if_poss_leaf(node, index, entry)) {
     return;
   }
+// 乐观purge失败：purge 导致了btree smo，进行pessimistic delete
 retry:
   auto success = row_purge_remove_sec_if_poss_tree(node, index, entry);
   /* The delete operation may fail if we have little
@@ -673,6 +675,7 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
       if (node->index->is_multi_value()) {
         row_purge_remove_multi_sec_if_poss(node, heap, false);
       } else {
+        // 构造sec index entry(索引的输入，根据entry来索引(btr search)到具体的记录存储位置)
         dtuple_t *entry = row_build_index_entry_low(
             node->row, nullptr, node->index, heap, ROW_BUILD_FOR_PURGE);
         row_purge_remove_sec_if_poss(node, node->index, entry);
@@ -681,6 +684,7 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
       mem_heap_empty(heap);
     }
 
+    // ques: clust index的已经purge过了吗？并不是，因为clust index的entry是通过row来构造的，row是没有被purge的，所以clust index的entry是没有被purge的。 在所有sec index rec purge完成后再purge clust index rec(row_purge_remove_clust_if_poss)
     node->index = node->index->next();
   }
 
@@ -701,8 +705,13 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
 
   ut_ad(!node->table->skip_alter_undo);
 
+  // 两种情况下无需清理sec idx entry: 
+  /* 1. 将一个del_mark的rec更新为非del_mark的rec(旧索引条目会在处理 DELETE 操作的 Undo 记录（TRX_UNDO_DEL_MARK_REC）时被清理)
+   * 2. update操作没改变任何二级索引的记录，也没改变聚簇索引的有序字段
+  */
   if (node->rec_type == TRX_UNDO_UPD_DEL_REC ||
       (node->cmpl_info & UPD_NODE_NO_ORD_CHANGE)) {
+    // 直接跳到清理外部存储
     goto skip_secondaries;
   }
 
@@ -723,6 +732,7 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
     que_thr_t *thr = nullptr;
 #endif
 
+    // note: upd_exist是否涉及了索引(有序)字段的更新
     if (row_upd_changes_ord_field_binary(
             node->index, node->update, thr, nullptr, nullptr,
             (node->index->is_multi_value() ? &non_mv_upd : nullptr))) {
@@ -732,6 +742,7 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
         /* Build the older version of the index entry */
         dtuple_t *entry = row_build_index_entry_low(
             node->row, nullptr, node->index, heap, ROW_BUILD_FOR_PURGE);
+        // note: 核心
         row_purge_remove_sec_if_poss(node, node->index, entry);
         mem_heap_empty(heap);
       }
@@ -739,6 +750,7 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
 
     node->index = node->index->next();
   }
+  // upd_exist不同于del_mark，是不需要purge clust index entry的。
 
   mem_heap_free(heap);
 
@@ -839,6 +851,7 @@ inline void row_purge_upd_exist_or_extern(const que_thr_t *thr [[maybe_unused]],
  @param[in,out] thd                     current thread
  @param[in,out] thr                     execution thread
  @return true if purge operation required */
+// 解析一条undo rec， 这里对照具体undo rec format看: http://mysql.taobao.org/monthly/2021/12/02/
 static bool row_purge_parse_undo_rec(purge_node_t *node,
                                      trx_undo_rec_t *undo_rec,
                                      bool *updated_extern, THD *thd,
@@ -865,6 +878,7 @@ static bool row_purge_parse_undo_rec(purge_node_t *node,
     return (false);
   }
 
+  // ques: info_bits的作用
   ptr = trx_undo_update_rec_get_sys_cols(ptr, &trx_id, &roll_ptr, &info_bits);
   node->table = nullptr;
   node->trx_id = trx_id;
@@ -1020,6 +1034,7 @@ try_again:
 
   clust_index = node->table->first_index();
 
+  // ques: index 到底什么时候会是corrupted状态？
   if (clust_index == nullptr || clust_index->is_corrupted()) {
     /* The table was corrupt in the data dictionary.
     dict_set_corrupted() works on an index, and
@@ -1050,8 +1065,12 @@ try_again:
     goto close_exit;
   }
 
+  // ques: row_ref就是聚簇索引用于索引的dtuple_t。 为什么需要row_ref? 定位聚簇索引记录. 这里构造了一个聚簇索引的dtuple, 定位需要purge的聚簇索引entry
+  // Undo 记录只包含变更信息，不包含记录的物理位置, 需要通过主键值（row_ref）在聚簇索引中重新定位记录. 因为记录可能已经被移动、分裂到其他页面
+  // TODO: 此时ptr指向了old roll_ptr下一个字段
   ptr = trx_undo_rec_get_row_ref(ptr, clust_index, &(node->ref), node->heap);
 
+  // note: roll_ptr
   ptr = trx_undo_update_rec_get_update(ptr, clust_index, type, trx_id, roll_ptr,
                                        info_bits, node->heap, &(node->update),
                                        nullptr, type_cmpl);
@@ -1148,6 +1167,7 @@ inline bool row_purge_record(purge_node_t *node, trx_undo_rec_t *undo_rec,
 /** Fetches an undo log record and does the purge for the recorded operation.
  If none left, or the current purge completed, returns the control to the
  parent node, which is always a query thread node. */
+// note: 注意上边说的，**一条undo log**的purge
 static void row_purge(purge_node_t *node,       /*!< in: row purge node */
                       trx_undo_rec_t *undo_rec, /*!< in: record to purge */
                       que_thr_t *thr)           /*!< in: query thread */
@@ -1170,7 +1190,7 @@ static void row_purge(purge_node_t *node,       /*!< in: row purge node */
       return;
     }
 
-    /* Retry the purge in a second. */
+    /* Retry the purge in a second if failure occurs. */
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 }

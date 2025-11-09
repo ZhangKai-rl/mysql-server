@@ -539,9 +539,20 @@ struct dict_col_t {
   bool is_visible;
 
  private:
+  // TODO
+
   /* Position of column on physical row.
   If column prefix is part of PK, it appears twice on row. First 2 bytes are
   for prefix position and next 2 bytes are for column position on row. */
+  // 这个可以查系统表。列物理位置，逻辑位置为dict_col_T::ind
+/*
+    31                    16 15              1  0
+    +------------------------+------------------+---+
+    |   prefix_phy_pos       | col_phy_pos      | F |
+    |   (高16位)              | (低15位)         |(标志)|
+    +------------------------+------------------+---+
+*/
+  // 物理位置的意思是随着instant add/drop而改变，但是ind逻辑位置是不变的
   uint32_t phy_pos{UINT32_UNDEFINED};
 
   /* Row version in which this column was added INSTANTly to the table */
@@ -814,9 +825,11 @@ typedef std::list<dict_v_idx_t, ut::allocator<dict_v_idx_t>> dict_v_idx_list;
 /** Data structure for a virtual column in a table */
 struct dict_v_col_t {
   /** column structure */
+  // 描述该vcol的dict_col_t.
   dict_col_t m_col;
 
   /** array of base column ptr */
+  // 基列信息：vcol可能由多个基列组成
   dict_col_t **base_col;
 
   /** number of base columns */
@@ -828,6 +841,7 @@ struct dict_v_col_t {
   /** Virtual index list, and column position in the index,
   the allocated memory is not from table->heap, nor it is
   tracked by dict_sys->size */
+  // 基于这个vcol的vindex
   dict_v_idx_list *v_indexes;
 };
 

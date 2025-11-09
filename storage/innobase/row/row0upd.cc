@@ -1427,6 +1427,13 @@ void row_upd_replace(dtuple_t *row, row_ext_t **ext, const dict_index_t *index,
   row_upd_replace_vcol(row, table, update, true, nullptr, nullptr);
 }
 
+// 判断UPDATE操作是否改变了索引的有序字段(实际就是是否修改了[二级]索引字段)。
+/* 如果变化了, 需要执行以下操作：
+  // 1. 删除旧的二级索引条目
+  // 2. 插入新的二级索引条目
+  // 3. 在Undo日志中记录完整的旧值（用于回滚）
+  // 4. 在Purge时需要清理旧的索引条目
+*/
 bool row_upd_changes_ord_field_binary_func(dict_index_t *index,
                                            const upd_t *update,
                                            IF_DEBUG(const que_thr_t *thr, )
@@ -1452,6 +1459,7 @@ bool row_upd_changes_ord_field_binary_func(dict_index_t *index,
 
   clust_index = index->table->first_index();
 
+  // 遍历索引字段，对比索引字段的旧值dfield和新值upd_t::field::new_val，有变则需要清理sec idx entry
   for (i = 0; i < n_unique; i++) {
     const dict_field_t *ind_field;
     const dict_col_t *col;

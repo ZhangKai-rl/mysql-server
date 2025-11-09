@@ -531,7 +531,7 @@ static inline uint8_t rec_get_n_fields_length(ulint n_fields);
 /** Set the row version on one new style leaf page record.
 This is only needed for table after instant ADD/DROP COLUMN.
 @param[in,out]  rec             leaf page record
-@param[in]      version         row version */
+@param[in]      version         row version 8029 for instant ddl */
 static inline void rec_set_instant_row_version_new(rec_t *rec, uint8_t version);
 
 /** Set the row version on one old style leaf page record.

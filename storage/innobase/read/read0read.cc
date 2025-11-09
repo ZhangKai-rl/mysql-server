@@ -352,6 +352,7 @@ MVCC::~MVCC() {
 Copy the transaction ids from the source vector */
 
 void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
+  // note 这是个优化点，为query生成rv是需要一直持有trx_sys_mutex
   ut_ad(trx_sys_mutex_own());
 
   ulint size = trx_ids.size();
@@ -531,9 +532,12 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
 
   /** If no new RW transaction has been started since the last view
   was created then reuse the the existing view. */
+  // ReadView 复用优化（Fast Path）
   if (view != nullptr) {
+    // 利用指针最低位（LSB）作为标志位（closed 标记）, p & ~1：清除最低位，恢复真实指针
     uintptr_t p = reinterpret_cast<uintptr_t>(view);
 
+    // note: 这里和指针指向的对象无关，只涉及指针本身8Bytes，指针最低位LSB表示指向的rv是否closed, dual representation, 实现fast/slow path
     view = reinterpret_cast<ReadView *>(p & ~1);
 
     ut_ad(view->m_closed);
@@ -544,9 +548,30 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
     There is an inherent race here between purge and this
     thread. Purge will skip views that are marked as closed.
     Therefore we must set the low limit id after we reset the
-    closed status after the check. */
+    closed status after the check. 
+    这段注释指出了 AC-NL-RO 事务的 Fast Path 复用 与 Purge 线程 之间存在固有的竞态条件。*/
+    // ques: 如何理解这个race condition with purge thread?
+    /*
+        时间线    AC-NL-RO 线程                    Purge 线程
+        ------    ----------------                 ------------
+        T1        view->m_closed = false          
+        T2        检查 m_low_limit_id              
+        T3        发现不匹配，需要回滚             
+        T4                                         trx_sys_mutex_enter()
+        T5                                         get_oldest_view()
+        T6                                         看到 m_closed = false ✅
+        T7                                         copy_prepare(*view)
+        T8        view->m_closed = true (回滚)    
+        T9                                         使用了即将失效的 view
+
+      后果：
+        Purge 使用的 m_low_limit_no 可能过于保守
+        本应该清理的 undo log 被保留了
+        先设置为closed然后再检查，可能回退。后果可控，可能有些undo log没被清理
+    */
 
     if (trx_is_autocommit_non_locking(trx) && view->empty()) {
+      // 注意这里没持有 trx_sys_t::mutex
       view->m_closed = false;
 
       if (view->m_low_limit_id == trx_sys_get_next_trx_id_or_no()) {
@@ -557,6 +582,9 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
     }
   }
 
+  // fast path复用trx->read_view失败，走slow path
+
+  // note: 优化点： trx_sys_mutex锁, 生成rv时
   trx_sys_mutex_enter();
 
   if (view != nullptr) {
@@ -569,6 +597,7 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
   if (view != nullptr) {
     view->prepare(trx->id);
 
+    // 从这里判断 mvcc 的 m_view 是按照创建时间trx_id顺序排的 新的rv在前
     UT_LIST_ADD_FIRST(m_views, view);
 
     ut_ad(!view->is_closed());
@@ -689,6 +718,7 @@ void MVCC::clone_oldest_view(ReadView *view) {
     view->copy_complete();
   }
   /* Update view to block purging transaction till GTID is persisted. */
+  // note: 注意 purge对gtid persist的处理
   auto &gtid_persistor = clone_sys->get_gtid_persistor();
   auto gtid_oldest_trxno = gtid_persistor.get_oldest_trx_no();
   view->reduce_low_limit(gtid_oldest_trxno);

@@ -5248,7 +5248,7 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
   // It is possible that rewritten query may not be empty (in case of
   // multiqueries). So reset it.
   thd->reset_rewritten_query();
-  // note: create_query_expr_and_block here
+  // note: 最顶层的 create_query_expr_and_block here
   lex_start(thd);
 
   thd->m_parser_state = parser_state;

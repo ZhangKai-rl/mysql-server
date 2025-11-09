@@ -132,6 +132,7 @@ class MVCC {
 
   /** Active and closed views, the closed views will have the
   creator trx id set to TRX_ID_MAX */
+  // 按照 m_low_limit_no 的递减顺序排列（从大到小) 见MVCC::validate / le
   view_list_t m_views;
 };
 

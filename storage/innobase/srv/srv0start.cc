@@ -2182,6 +2182,7 @@ dberr_t srv_start(bool create_new_db) {
 
     /* The purge system needs to create the purge view and
     therefore requires that the trx_sys is inited. */
+    // note: 初始的pruge pq的创建
     purge_queue = trx_sys_init_at_db_start();
 
     if (srv_is_upgrade_mode) {

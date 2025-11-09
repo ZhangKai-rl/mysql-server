@@ -110,6 +110,14 @@ enum Surrounding_context {
 
 struct QueryLevel {
   Surrounding_context m_type;
+  // note: 一般是存query_block单个select, 也可以是query_term_union/intersect/except
+  /**  elts: elements的缩写
+   * elts 在 contextualize 过程中充当临时容器，用于：
+      收集子节点: 在递归处理 Parse Tree 时，子节点将自己 push 到父节点的 elts 中
+      延迟组合: 收集完所有子节点后，再决定如何组合成父节点
+      支持多路操作: 对于 UNION/INTERSECT/EXCEPT，可能有多个子节点（如 A UNION B UNION C）
+      树构建: 最终从 elts 中取出节点，构建 Query_term 树
+   */
   mem_root_deque<Query_term *> m_elts;
   bool m_has_order{false};
   QueryLevel(MEM_ROOT *mem_root, Surrounding_context sc, bool has_order = false)
@@ -122,6 +130,8 @@ struct Parse_context {
   THD *const thd;                      ///< Current thread handler
   MEM_ROOT *mem_root;                  ///< Current MEM_ROOT
   Query_block *select;                 ///< Current Query_block object
+  // note
+  // 初始状态 m_stack = [0] : [QueryLevel(SC_TOP, elts=[], has_order=false)] 
   mem_root_deque<QueryLevel> m_stack;  ///< Aids query term tree construction
   /// Call upon parse completion.
   /// @returns true on error, else false
@@ -178,6 +188,8 @@ class Parse_tree_node_tmpl {
 
   /**
     Do all context-sensitive things and mark the node as contextualized
+  
+    xxxx: 词法解析后调用，-> 词法解析树 -> (lex::make_sql_cmd) -> 如 root: PT_select_stmt::make_cmd -> contextualize -> lex(qeury_expression, query_block这个lex结构)
 
     @param      pc      current parse context
 

@@ -257,6 +257,9 @@ bool check_unique_constraint(TABLE *table);
 ulonglong unique_hash(const Field *field, ulonglong *hash);
 int read_const(TABLE *table, Index_lookup *ref);
 
+/* 优化器代码速览: 通过调用alloc_qep()函数来完成，该函数会为每个best_ref中的每个JOIN_TAB都创建一个QEP_TAB对象。
+note: JOIN_TAB可以理解为是JOIN::make_join_plan()过程中对每个表的抽象，而QEP_TAB实在生成执行器时对每个表的抽象。
+在创建完QEP_TAB后，会通过QEP_TAB::init(JOIN_TAB *jt)函数来将JOIN_TAB中需要共享的数据传递给QEP_TAB。其实，JOIN_TAB和QEP_TAB都继承了QEP_shared_owner，只不过他们额外保存了在各自阶段所需的对表的信息。*/
 class QEP_TAB : public QEP_shared_owner {
  public:
   QEP_TAB()

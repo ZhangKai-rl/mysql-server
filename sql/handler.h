@@ -4515,6 +4515,7 @@ class handler {
     next_insert_id is set to the next value, then for all other rows
     next_insert_id is used (and increased each time) without calling
     get_auto_increment().
+    这个和auto increment有关。 auto_increment_[increment, offset].
   */
   ulonglong next_insert_id;
   /**
@@ -4527,6 +4528,8 @@ class handler {
   /**
     Interval returned by get_auto_increment() and being consumed by the
     inserter.
+    性能优化，会维持一个 auto inc的interval。
+    如果是 values(auto_inc=null, x), (auto_inc=null, y) 预留(nr+1, nr+2). 第二次插入到update_auto_increment时，不用再进入se了。
   */
   Discrete_interval auto_inc_interval_for_cur_row;
   /**

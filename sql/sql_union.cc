@@ -686,6 +686,9 @@ bool Query_expression::can_materialize_directly_into_result() const {
   @param removed_options Options that cannot be used for this query
 
   @returns false if success, true if error
+  note: 优化器代码速览。优化器的入口。 优化过程的入口是对最外层Query_expression调用prepare函数，Query_expression会对所有它的所有slave调用prepare函数，并且处理集合操作。
+  在prepare结束后，会对最外层的Query_expression调用optimize函数，同样的，也会对它的所有slave调用optimize函数。 
+  Resolver和Logical Transformation的主要逻辑几乎都在Query_block::prepare()函数中，因此，我们就重点介绍该函数。
  */
 
 bool Query_expression::prepare(THD *thd, Query_result *sel_result,

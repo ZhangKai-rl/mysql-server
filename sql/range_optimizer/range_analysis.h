@@ -46,6 +46,9 @@ class THD;
     this structure.
     All direct "users" of this module are located within this file, too.
 
+    范围优化器range optimizer: http://mysql.taobao.org/monthly/2021/06/03/
+    min-max tree
+
  */
 SEL_TREE *get_mm_tree(THD *thd, RANGE_OPT_PARAM *param, table_map prev_tables,
                       table_map read_tables, table_map current_table,

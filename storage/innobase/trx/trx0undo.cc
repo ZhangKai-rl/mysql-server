@@ -322,6 +322,7 @@ trx_undo_rec_t *trx_undo_get_first_rec(trx_id_t *modifier_trx_id,
     return (rec);
   }
 
+  // xxxx: 推进到undo page list下一页
   return (trx_undo_get_next_rec_from_next_page(space, page_size, undo_page,
                                                page_no, offset, mode, mtr));
 }
@@ -1173,6 +1174,7 @@ void trx_undo_truncate_end_func(IF_DEBUG(const trx_t *trx, ) trx_undo_t *undo,
 }
 
 /** Truncate the head of an undo log.
+xxxx: 处理一个完整的undo page list
 NOTE that only whole pages are freed; the header page is not
 freed, but emptied, if all the records there are below the limit.
 @param[in,out]  rseg            rollback segment
@@ -1193,6 +1195,7 @@ void trx_undo_truncate_start(trx_rseg_t *rseg, page_no_t hdr_page_no,
   if (!limit) {
     return;
   }
+// note: 
 loop:
   mtr.start();
 
@@ -1200,6 +1203,7 @@ loop:
     mtr.set_log_mode(MTR_LOG_NO_REDO);
   }
 
+  // xxxx: 在这里推进loop到undo page list的next page.
   rec = trx_undo_get_first_rec(nullptr, rseg->space_id, rseg->page_size,
                                hdr_page_no, hdr_offset, RW_X_LATCH, &mtr);
   if (rec == nullptr) {
@@ -1221,7 +1225,9 @@ loop:
 
   page_no = page_get_page_no(undo_page);
 
+  // 分别处理undo header/normal page
   if (page_no == hdr_page_no) {
+    // header page 只empty而不free，因为有segment header info, 根据segment header如果list都空了，直接吧segment free掉
     trx_undo_empty_header_page(rseg->space_id, rseg->page_size, hdr_page_no,
                                hdr_offset, &mtr);
   } else {
@@ -1230,6 +1236,7 @@ loop:
 
   mtr.commit();
 
+  // 回到loop，继续处理下一个page
   goto loop;
 }
 

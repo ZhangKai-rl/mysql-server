@@ -434,6 +434,7 @@ const uint32_t max_rseg_init_threads = 4;
 /** Creates and initializes the central memory structures for the transaction
  system. This is called when the database is started.
  @return min binary heap of rsegs to purge */
+ //TODO
 purge_pq_t *trx_sys_init_at_db_start(void) {
   purge_pq_t *purge_queue;
   trx_sysf_t *sys_header;

@@ -122,7 +122,7 @@ enum Visit_leaves { VL_VISIT_LEAVES, VL_SKIP_LEAVES };
   handle ORDER BY and LIMIT themselves.
 
   \verbatim
-  // note: 
+  // note: 多加深理解。 《优化器代码速览》分析了这个例子
   Example: ((SELECT * FROM t1 UNION SELECT * FROM t2 UNION ALL SELECT * FROM t3
              ORDER BY a LIMIT 5) INTERSECT
             (((SELECT * FROM t3 ORDER BY a LIMIT 4) ) EXCEPT SELECT * FROM t4)
@@ -205,6 +205,7 @@ enum Visit_leaves { VL_VISIT_LEAVES, VL_SKIP_LEAVES };
 
   The built structure can be traced with the debug trace keyword "ast", e.g.
   as SET SESSION debug = 'd,ast:O,/tmp/mysqld.trace';
+  优化器代码速览：http://mysql.taobao.org/monthly/2024/12/02/
 */
 
 class Query_term {
@@ -400,6 +401,7 @@ class Query_term {
 };
 
 /// Common base class for n-ary set operations, including unary.
+//  优化器代码速览：http://mysql.taobao.org/monthly/2024/12/02/
 class Query_term_set_op : public Query_term {
   /// Replaces the old "fake" query block for post processing result set with
   /// ORDER BY, LIMIT.

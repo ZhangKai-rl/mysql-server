@@ -226,6 +226,8 @@ struct trx_rseg_t {
   which are constant */
   RsegMutex mutex;
 
+  // rseg的唯一页面： rollback segment header page的地址
+
   /** space ID where the rollback segment header is placed */
   space_id_t space_id{};
 

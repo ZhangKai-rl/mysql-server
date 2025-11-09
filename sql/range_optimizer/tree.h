@@ -64,6 +64,7 @@ bool sel_trees_can_be_ored(SEL_TREE *tree1, SEL_TREE *tree2,
 
   As a special case, a nullptr SEL_ROOT means a range that is always true.
   This is true both for keys[] and next_key_part.
+  索引Range的图结构，针对于索引列的森林树结构
 */
 class SEL_ROOT {
  public:
@@ -460,6 +461,9 @@ inline uint invert_max_flag(uint max_flag) {
 
     We avoid consuming too much memory by setting a limit on the number of
     SEL_ARG object we can construct during one range analysis invocation.
+    记录了索引列(keypart)的RB Tree结构，有两种表示形式，内部link和RB tree，各个keypart通过next_key_part相连.
+    也就是说，一个SEL_ARG可以表示一个keypart索引列的范围
+    note: 理解sel_arg: https://blog.csdn.net/weixin_34352005/article/details/90688529 代表一个区间. 这篇gdb理解了min-max tree的range optimization
 */
 
 class SEL_ARG {
@@ -513,7 +517,11 @@ class SEL_ARG {
     if the type is MAYBE_KEY. Todo: fix this so SEL_ARGs without R-B
     children are handled consistently. See related WL#5894.
   */
+  // rb tree
   SEL_ARG *left, *right;    /* R-B tree children */
+  // 用于内部link. next 指针表示同一列(相同key_part)的多个区间取交集
+  // SEL_ARG链表：复杂的区间: https://blog.csdn.net/weixin_34352005/article/details/90688529
+  // 每一个"简单区间"都由一个SEL_ARG表示，对相同的key part，如果是多个OR条件则用指针prev/next链接，如果是相关的多个key part则用next_key_part指针链接。
   SEL_ARG *next, *prev;     /* Links for bi-directional interval list */
   SEL_ARG *parent{nullptr}; /* R-B tree parent (nullptr for root) */
   /*
@@ -868,6 +876,9 @@ inline bool SEL_ROOT::simple_key() const {
   return elements == 1 && !root->next_key_part;
 }
 
+// 录选择的表上所有可选择的索引的图结构针对索引的类森林数组. 是个森林！
+// http://mysql.taobao.org/monthly/2021/06/03/
+// 优化器代码速览： 在行数估计过程中，会把一个复杂的WHERE条件用SEL_TREE结构来表示。SEL_TREE是可以简单理解为一个多个红黑树构成的森林，一个key_part上的所有不相邻区间按照顺序表示为一个红黑树，不同的key_part按照在Key中顺序关系通过next_key_part指针相连
 class SEL_TREE {
  public:
   /**

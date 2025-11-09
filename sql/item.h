@@ -394,11 +394,38 @@ class Item_name_string : public Name_string {
   separate Query_block which allow to remove tricks of changing this
   structure before and after INSERT/CREATE and its SELECT to make correct
   field name resolution.
+
+mermaid: 赋值流程图
+graph TD
+    A[Parse SQL] -->|Create Query_block| B[Query_block Constructor]
+    B -->|Initialize| C[context default constructor]
+    C -->|Set first_context| D[first_context = &context]
+    
+    D -->|Call set_context| E[Query_block::set_context]
+    E -->|Initialize| F[context.init]
+    E -->|Set back pointer| G[context.query_block = this]
+    E -->|Set outer context| H[context.outer_context = outer]
+    E -->|Push to LEX| I[parent_lex->push_context]
+    
+    I -->|Contextualize| J[PT_query_specification::contextualize]
+    J -->|Process FROM clause| K[contextualize_array join_table_list]
+    K -->|Set table list| L[context.table_list = get_table_list]
+    K -->|Set resolution range| M[context.first_name_resolution_table = ...]
+    
+    L -->|Ready for| N[Name Resolution in fix_fields]
+    M -->|Ready for| N
+    
+    style A fill:#e1f5ff
+    style N fill:#c8e6c9
+    style E fill:#fff9c4
+    style J fill:#fff9c4
+
 */
 struct Name_resolution_context {
   /*
     The name resolution context to search in when an Item cannot be
     resolved in this context (the context of an outer select)
+    解析相关子查询的名称
   */
   Name_resolution_context *outer_context;
   /// Link to next name res context with the same query block as the base
@@ -849,6 +876,8 @@ struct ContainedSubquery {
 
   These mechanisms can also be used to handle other objects with shorter
   lifespan, such as function references and variable references.
+  // 比如select中选择字段出现subquery(一般是标量子查询)，一般使用expr表示，这时就可以用item表示(Item_subselect* query_expression::item)
+  // 这里的item就是item树的根. 
 */
 class Item : public Parse_tree_node {
   typedef Parse_tree_node super;
@@ -4164,6 +4193,7 @@ class Item_field : public Item_ident {
   typedef Item_ident super;
 
  protected:
+  // note
   void set_field(Field *field);
   void fix_after_pullout(Query_block *parent_query_block,
                          Query_block *removed_query_block) override {
