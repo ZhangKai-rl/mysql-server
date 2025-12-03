@@ -92,6 +92,7 @@ Names
   comment     - a text comment, displayed in "Description" column of
                 SHOW CHARACTER SET output.
 
+# note: 转换表，ctype二级页表转换大小写sort
 Conversion tables
 -----------------
   
@@ -130,6 +131,7 @@ In all Asian charsets these arrays are set up as follows:
 - The sort_order array is filled case insensitively for the
   ASCII range 0x00..0x7F, and in "binary" fashion for the multi-byte
   range 0x80..0xFF for these collations:
+  # ASCII范围内按照不区分大小写排序，之后的多字节范围按照字节码排序
 
   cp932_japanese_ci,
   euckr_korean_ci,

@@ -85,6 +85,7 @@ typedef recalc_pool_t::iterator recalc_pool_iterator_t;
 
 /** Pool where we store information on which tables are to be processed
 by background statistics gathering. */
+// dict stats pool
 static recalc_pool_t *recalc_pool;
 
 /** Initialize the recalc pool, called once during thread initialization. */

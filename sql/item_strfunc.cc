@@ -1414,6 +1414,7 @@ bool Item_func_lower::resolve_type(THD *thd) {
   if (agg_arg_charsets_for_string_result(collation, args, 1)) return true;
 
   assert(collation.collation != nullptr);
+  // note: 问题应该就在这！！！
   multiply = collation.collation->casedn_multiply;
   converter = collation.collation->cset->casedn;
   set_data_type_string(args[0]->max_char_length() * multiply);

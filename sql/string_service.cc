@@ -143,7 +143,48 @@ int mysql_string_iterator_isdigit(
 /*
   This function provide plugin service to convert a String pointed by handle to
   lower case. Conversion depends on the client character set info
+
+输入字符串："Hello"
+
+┌─────────────────────────────────────────────────────────────┐
+│ 步骤 1：获取字符集信息                                       │
+├─────────────────────────────────────────────────────────────┤
+│ CHARSET_INFO *cs = &my_charset_utf8mb4_general_ci;          │
+│ const MY_UNICASE_INFO *caseinfo = cs->caseinfo;             │
+│ // caseinfo = &my_unicase_default                           │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+                  ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 步骤 2：逐字符转换                                           │
+├─────────────────────────────────────────────────────────────┤
+│ 'H' (U+0048):                                               │
+│   page = caseinfo->page[0x00] = plane00                     │
+│   result = plane00[0x48].tolower = 0x0068 ('h')            │
+│                                                             │
+│ 'e' (U+0065):                                               │
+│   page = caseinfo->page[0x00] = plane00                     │
+│   result = plane00[0x65].tolower = 0x0065 ('e')            │
+│                                                             │
+│ 'l' (U+006C):                                               │
+│   page = caseinfo->page[0x00] = plane00                     │
+│   result = plane00[0x6C].tolower = 0x006C ('l')            │
+│                                                             │
+│ 'l' (U+006C):                                               │
+│   result = 0x006C ('l')                                     │
+│                                                             │
+│ 'o' (U+006F):                                               │
+│   page = caseinfo->page[0x00] = plane00                     │
+│   result = plane00[0x6F].tolower = 0x006F ('o')            │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+                  ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 输出字符串："hello"                                          │
+└─────────────────────────────────────────────────────────────┘
+
 */
+// note: to_lower函数的实现
 mysql_string_handle mysql_string_to_lowercase(
     mysql_string_handle string_handle) {
   String *str = (String *)string_handle;
@@ -156,6 +197,7 @@ mysql_string_handle mysql_string_to_lowercase(
     size_t len = str->length() * cs->casedn_multiply;
     res->set_charset(cs);
     res->alloc(len);
+    // TODO
     len = cs->cset->casedn(cs, str->ptr(), str->length(), res->ptr(), len);
     res->length(len);
   }

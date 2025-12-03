@@ -116,15 +116,15 @@ template <bool RANGE_CHECK, bool SUPPORT_MB4>
 static ALWAYS_INLINE int my_mb_wc_utf8_prototype(my_wc_t *pwc, const uchar *s,
                                                  const uchar *e) {
   if (RANGE_CHECK && s >= e) return MY_CS_TOOSMALL;
-
+  // 转换成unicode码uchar，进行判断。
   uchar c = s[0];
-  if (c < 0x80) {
+  if (c < 0x80) { // 单字节处理，ascii范围(0x00-0x7F, 0-127)。 超出 ascii码范围了
     *pwc = c;
     return 1;
   }
-
+  // utf8 双字节编码处理： 0xC2 - 0xDF, 即 小于 0xE0. 对应 Unicode：U+0080 - U+07FF
   if (c < 0xe0) {
-    if (c < 0xc2)  // Resulting code point would be less than 0x80.
+    if (c < 0xc2)  // Resulting code point would be less than 0x80. // 0x80 - 0xC1 是非法序列
       return MY_CS_ILSEQ;
 
     if (RANGE_CHECK && s + 2 > e) return MY_CS_TOOSMALL2;
@@ -204,7 +204,7 @@ static inline int my_mb_wc_utf8mb3(my_wc_t *pwc, const uchar *s,
   between this and my_mb_wc_utf8mb3 is that this function also can handle
   four-byte UTF-8 characters.
 
-  @param[out] pwc the parsed character, if any
+  @param[out] pwc the parsed character, if any. utf8mbr -> unicode wc的结果
   @param s the string to read from
   @param e the end of the string; will not read past this
 

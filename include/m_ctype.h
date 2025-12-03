@@ -65,17 +65,50 @@ static inline void MY_PUT_MB2(unsigned char *s, uint16 code) {
   s[1] = code & 0xFF;
 }
 
+/* MY_UNICASE_INFO 是 MySQL 字符集系统中的 Unicode 大小写转换和排序信息表 */
 typedef struct MY_UNICASE_CHARACTER {
-  uint32 toupper;
-  uint32 tolower;
-  uint32 sort;
+  uint32 toupper;        // 转换为大写的 Unicode 码点
+  uint32 tolower;        // 转换为小写的 Unicode 码点
+  uint32 sort;           // 用于排序的权重值
 } MY_UNICASE_CHARACTER;
 
 typedef struct MY_UNICASE_INFO {
-  my_wc_t maxchar;
-  const MY_UNICASE_CHARACTER **page;
+  my_wc_t maxchar;                      // 支持的最大字符码点
+  const MY_UNICASE_CHARACTER **page;    // 二级页表指针数组. 使用二级页表结构实现 O(1) 时间复杂度的查找
 } MY_UNICASE_INFO;
 
+// TODO: 从这里开始看
+// ques: 为什么使用二级页表？Unicode 字符集非常庞大，如果使用一维数组存储所有字符的大小写信息，会造成巨大的内存浪费。一维：1,114,112 × 12 字节 = 12.7 MB	。二维：256 × 8 字节 + 实际使用页面 × 3 KB = ~100 KB	
+/*
+    // 第一级：页表指针数组（256 个指针）
+    const MY_UNICASE_CHARACTER *my_unicase_pages_default[256] = {
+        plane00,   // 索引 0x00: 指向 U+0000 - U+00FF 的数据
+        plane01,   // 索引 0x01: 指向 U+0100 - U+01FF 的数据
+        plane02,   // 索引 0x02: 指向 U+0200 - U+02FF 的数据
+        nullptr,   // 索引 0x06: 未使用，节省内存
+        nullptr,   // 索引 0x07: 未使用，节省内存
+        // ... 大量 nullptr ...
+    };
+
+    // 第二级：具体字符数据（每个 plane 256 个字符）
+    static const MY_UNICASE_CHARACTER plane00[256] = {
+        {0x0000, 0x0000, 0x0000},  // U+0000
+        {0x0041, 0x0061, 0x0041},  // U+0041: 'A'
+        // ... 256 个字符 ...
+    };
+
+    查找步骤：
+      // 给定 Unicode 码点 wc，查找其小写形式
+      my_wc_t wc = 0x0041;  // 'A'
+      // 步骤 1：提取高 8 位作为页面索引
+      page_index = wc >> 8;           // 0x0041 >> 8 = 0x00
+      // 步骤 2：获取页面指针
+      page = my_unicase_pages_default[0x00];  // = plane00
+      // 步骤 3：提取低 8 位作为页内索引
+      char_index = wc & 0xFF;         // 0x0041 & 0xFF = 0x41
+      // 步骤 4：获取字符信息
+      result = page[0x41].tolower;    // = 0x0061 ('a')
+*/
 extern MY_UNICASE_INFO my_unicase_default;
 extern MY_UNICASE_INFO my_unicase_turkish;
 extern MY_UNICASE_INFO my_unicase_mysql500;
@@ -334,6 +367,10 @@ typedef struct MY_CHARSET_HANDLER {
   size_t (*numcells)(const CHARSET_INFO *, const char *b, const char *e);
 
   /* Unicode conversion */
+/* 
+  mb = Multi-Byte（多字节）表示特定字符集的多字节编码表示（如 UTF-8、GBK、Latin1 等）
+  wc = Wide Character（宽字符）表示 Unicode 码点（Code Point），在 MySQL 中定义为 my_wc_t（实际是 ulong 类型）
+*/
   my_charset_conv_mb_wc mb_wc;
   my_charset_conv_wc_mb wc_mb;
 
@@ -382,6 +419,7 @@ extern MY_CHARSET_HANDLER my_charset_ascii_handler;
 extern MY_CHARSET_HANDLER my_charset_ucs2_handler;
 
 /* See strings/CHARSET_INFO.txt about information on this structure  */
+// cs的总入口. cset + coll
 struct CHARSET_INFO {
   uint number;
   uint primary_number;
@@ -392,6 +430,7 @@ struct CHARSET_INFO {
   const char *comment;
   const char *tailoring;
   struct Coll_param *coll_param;
+  /* ctype, to_lower, to_upper 都是 查表 + mask实现的 */
   const uchar *ctype;
   const uchar *to_lower;
   const uchar *to_upper;
@@ -399,9 +438,12 @@ struct CHARSET_INFO {
   struct MY_UCA_INFO *uca; /* This can be changed in apply_one_rule() */
   const uint16 *tab_to_uni;
   const MY_UNI_IDX *tab_from_uni;
+  // note: 注意这里和 to_lower/to_upper/sort_order 不一样
+  // 这里是unicode的转换。采用二级页表。     // 二级页表查找：高8位索引页，低8位索引字符, 见 my_tolower_utf8mb4
   const MY_UNICASE_INFO *caseinfo;
   const struct lex_state_maps_st *state_maps; /* parser internal data */
   const uchar *ident_map;                     /* parser internal data */
+  // note: 问题位置
   uint strxfrm_multiply;
   uchar caseup_multiply;
   uchar casedn_multiply;
@@ -414,7 +456,7 @@ struct CHARSET_INFO {
   bool escape_with_backslash_is_dangerous;
   uchar levels_for_compare;
 
-  MY_CHARSET_HANDLER *cset;
+  MY_CHARSET_HANDLER *cset; /* cs->cset */
   MY_COLLATION_HANDLER *coll;
 
   /**

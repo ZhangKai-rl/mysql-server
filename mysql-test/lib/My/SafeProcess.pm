@@ -176,6 +176,11 @@ sub new {
     print "### safe_path: ", $safe_path, " ", join(" ", @safe_args), "\n";
   }
 
+  print "\n [MORPHY] TEST BOOTSTRAP \n";
+  # exit(0);
+  # print "\n [MORPHY] TEST BOOTSTRAP: sleep for gdb bt. \n";
+  # sleep(10000);
+
   my $pid = create_process(append   => $opts{append},
                            args     => \@safe_args,
                            error    => $error,

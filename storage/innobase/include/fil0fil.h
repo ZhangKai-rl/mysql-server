@@ -1120,6 +1120,16 @@ extern Fil_path MySQL_undo_path;
 extern bool MySQL_undo_path_is_unique;
 
 /** Initial size of a single-table tablespace in pages */
+// https://developer.aliyun.com/article/600183
+/*
+0: file space header
+1: insert buffer bitmap
+2: inode page
+3: sdi index page
+4: index page
+5: freshly allocated page
+6: freshly allocated page
+*/
 constexpr size_t FIL_IBD_FILE_INITIAL_SIZE = 7;
 constexpr size_t FIL_IBT_FILE_INITIAL_SIZE = 5;
 

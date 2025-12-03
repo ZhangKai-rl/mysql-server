@@ -54,6 +54,30 @@ static inline int my_valid_mbcharlen_utf8mb3(const uchar *s, const uchar *e) {
       &wc, s, e);
 }
 
+/*
+  static const MY_UNICASE_CHARACTER plane00[] = {
+    // {toupper, tolower, sort}
+    {0x0000, 0x0000, 0x0000},  // U+0000: NULL
+    {0x0001, 0x0001, 0x0001},  // U+0001: SOH
+    // ... 省略 ...
+    {0x0041, 0x0061, 0x0041},  // U+0041: 'A' → 小写 'a' (U+0061)
+    {0x0042, 0x0062, 0x0042},  // U+0042: 'B' → 小写 'b' (U+0062)
+    // ... 省略 ...
+    {0x005A, 0x007A, 0x005A},  // U+005A: 'Z' → 小写 'z' (U+007A)
+    // ... 省略 ...
+    {0x0041, 0x0061, 0x0041},  // U+0061: 'a' → 大写 'A' (U+0041)
+    {0x0042, 0x0062, 0x0042},  // U+0062: 'b' → 大写 'B' (U+0042)
+    // ... 省略 ...
+    {0x005A, 0x007A, 0x005A},  // U+007A: 'z' → 大写 'Z' (U+005A)
+  };
+
+  含义为：
+    Unicode	字符	toupper	tolower	sort	说明
+    U+0041	'A'	0x0041	0x0061	0x0041	大写 A → 小写 a
+    U+0061	'a'	0x0041	0x0061	0x0041	小写 a → 大写 A
+    U+0042	'B'	0x0042	0x0062	0x0042	大写 B → 小写 b
+    U+0062	'b'	0x0042	0x0062	0x0042	小写 b → 大写 B
+*/
 static const MY_UNICASE_CHARACTER plane00[] = {
     {0x0000, 0x0000, 0x0000}, {0x0001, 0x0001, 0x0001},
     {0x0002, 0x0002, 0x0002}, {0x0003, 0x0003, 0x0003},
@@ -480,6 +504,7 @@ static const MY_UNICASE_CHARACTER plane02[] = {
     {0x0238, 0x0238, 0x0238}, {0x0239, 0x0239, 0x0239},
     {0x023A, 0x023A, 0x023A}, {0x023B, 0x023B, 0x023B},
     {0x023C, 0x023C, 0x023C}, {0x023D, 0x023D, 0x023D},
+    // note: 可以看到 Ⱦ -> wc unicode 574 0x23E，的lower unicode也是 0x23E
     {0x023E, 0x023E, 0x023E}, {0x023F, 0x023F, 0x023F},
     {0x0240, 0x0240, 0x0240}, {0x0241, 0x0241, 0x0241},
     {0x0242, 0x0242, 0x0242}, {0x0243, 0x0243, 0x0243},
@@ -1618,7 +1643,22 @@ static const MY_UNICASE_CHARACTER planeFF[] = {
     {0xFFFC, 0xFFFC, 0xFFFC}, {0xFFFD, 0xFFFD, 0xFFFD},
     {0xFFFE, 0xFFFE, 0xFFFE}, {0xFFFF, 0xFFFF, 0xFFFF}};
 
+/*
+  static const MY_UNICASE_CHARACTER *my_unicase_pages_default[256] = {
+    plane00,   // 页 0x00: U+0000 - U+00FF (基本拉丁字母)
+    plane01,   // 页 0x01: U+0100 - U+01FF (拉丁扩展-A)
+    plane02,   // 页 0x02: U+0200 - U+02FF (拉丁扩展-B)
+    plane03,   // 页 0x03: U+0300 - U+03FF (希腊字母)
+    plane04,   // 页 0x04: U+0400 - U+04FF (西里尔字母)
+    plane05,   // 页 0x05: U+0500 - U+05FF (希伯来字母)
+    nullptr,   // 页 0x06: 未使用
+    nullptr,   // 页 0x07: 未使用
+    // ... 更多页面 ...
+    planeFF    // 页 0xFF: U+FF00 - U+FFFF (全角字符)
+  }; 
+*/
 static const MY_UNICASE_CHARACTER *my_unicase_pages_default[256] = {
+    // 进入查看
     plane00, plane01, plane02, plane03, plane04, plane05, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1652,6 +1692,7 @@ static const MY_UNICASE_CHARACTER *my_unicase_pages_default[256] = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, planeFF};
 
+// 默认
 MY_UNICASE_INFO my_unicase_default = {0xFFFF, my_unicase_pages_default};
 
 /*
@@ -7218,7 +7259,7 @@ static int my_wc_mb_utf8mb4(const CHARSET_INFO *cs [[maybe_unused]], my_wc_t wc,
       wc = wc >> 6;
       wc |= 0x10000;
       [[fallthrough]];
-    case 3:
+    case 3: /* 会倒叙执行 wc unicode -> mb utf8mb4 的编码转换。比如这个三字节表示的utf8mb4, r[2] -> r[1] -> r[0] */
       r[2] = (uchar)(0x80 | (wc & 0x3f));
       wc = wc >> 6;
       wc |= 0x800;
@@ -7278,7 +7319,10 @@ static int my_wc_mb_utf8mb4_no_range(const CHARSET_INFO *cs [[maybe_unused]],
 static inline void my_tolower_utf8mb4(const MY_UNICASE_INFO *uni_plane,
                                       my_wc_t *wc) {
   if (*wc <= uni_plane->maxchar) {
-    const MY_UNICASE_CHARACTER *page;
+    const MY_UNICASE_CHARACTER *page;  // 高8bit为page一级页表索引， 低8bit为page二级页表索引
+    // 574 -> hex 0x 02 3e
+    // page[(*wc >> 8)] 为page一级页表索引, 574 >> 8 = 0x 02 = 0d 2
+    // page[*wc & 0xFF] 为page二级页表索引, 574 & 0xFF = 0x 3e = 0d 62
     if ((page = uni_plane->page[(*wc >> 8)])) *wc = page[*wc & 0xFF].tolower;
   }
 }
@@ -7378,6 +7422,7 @@ static size_t my_caseup_str_utf8mb4(const CHARSET_INFO *cs, char *src) {
   return (size_t)(dst - dst0);
 }
 
+// 这里应该所有的utf8mb4 dn都用, 只是传入的cs不同. cs=utf8mb4, src=aaaȾbbb, srclen=8
 static size_t my_casedn_utf8mb4(const CHARSET_INFO *cs, char *src,
                                 size_t srclen, char *dst, size_t dstlen) {
   my_wc_t wc;
@@ -7388,9 +7433,16 @@ static size_t my_casedn_utf8mb4(const CHARSET_INFO *cs, char *src,
 
   while ((src < srcend) &&
          (srcres = my_mb_wc_utf8mb4(&wc, (uchar *)src, (uchar *)srcend)) > 0) {
+    // note: 关键在这。 对 general_ci 来说，  Ⱦ -> wc 574
     my_tolower_utf8mb4(uni_plane, &wc);
     if ((dstres = my_wc_mb_utf8mb4(cs, wc, (uchar *)dst, (uchar *)dstend)) <= 0)
       break;
+    // ques: 这里处理 Ⱦ 字符后，为什么src 由 Ⱦbbb变成了 (0xa6)bb.
+    // 原因是 utf8mb4 编码下 Ⱦ 为 (utf8mb4: 0x c8 be, unicode wc: U+ 0x 02 3e(574)) 共2bytes, 其对应小写为 ⱦ (U+2C66(11366)，UTF-8: 0xE2 0xB1 0xA6)
+    // 这里外层Item_str_conv::multiply == 1, 因此 dst 复用了 src 的地址. 所以 src += srcres(Ⱦ的2bytes) 后 src 变为 (0xa6)bb。
+    // 接下来继续处理 src中的 0xa6, 在mb_wc转unicode时，0xa6开头为双字节utf，然而后续跟的b,是不合法的, return MY_CS_ILSEQ from my_mb_wc_utf8mb4(s=0xa6bb)
+    // 然后退出了 while 循环, 接着退出了 my_casedn_utf8mb4
+    // 然后退出了 while 循环, 接着退出了 my_casedn_utf8mb4
     src += srcres;
     dst += dstres;
   }
@@ -7741,7 +7793,7 @@ MY_CHARSET_HANDLER my_charset_utf8mb4_handler = {nullptr, /* init */
                                                  my_caseup_str_utf8mb4,
                                                  my_casedn_str_utf8mb4,
                                                  my_caseup_utf8mb4,
-                                                 my_casedn_utf8mb4,
+                                                 my_casedn_utf8mb4,/*  my_charset_conv_case casedn;*/
                                                  my_snprintf_8bit,
                                                  my_long10_to_str_8bit,
                                                  my_longlong10_to_str_8bit,
@@ -7769,6 +7821,7 @@ CHARSET_INFO my_charset_utf8mb4_general_ci = {
     ctype_utf8mb4,                /* ctype        */
     to_lower_utf8mb4,             /* to_lower     */
     to_upper_utf8mb4,             /* to_upper     */
+    // 为什么一样？
     to_upper_utf8mb4,             /* sort_order   */
     nullptr,                      /* uca          */
     nullptr,                      /* tab_to_uni   */
@@ -7787,8 +7840,8 @@ CHARSET_INFO my_charset_utf8mb4_general_ci = {
     ' ',                          /* pad char      */
     false,                        /* escape_with_backslash_is_dangerous */
     1,                            /* levels_for_compare */
-    &my_charset_utf8mb4_handler,
-    &my_collation_utf8mb4_general_ci_handler,
+    &my_charset_utf8mb4_handler,  /* cset */
+    &my_collation_utf8mb4_general_ci_handler, /* coll */
     PAD_SPACE};
 
 CHARSET_INFO my_charset_utf8mb4_bin = {

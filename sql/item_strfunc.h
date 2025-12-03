@@ -408,6 +408,8 @@ class Item_func_insert : public Item_str_func {
 
 class Item_str_conv : public Item_str_func {
  protected:
+  // multiply 表示 大小写转换时字符串长度的最大扩展倍数（Case Conversion Expansion Multiplier）。作用：在执行 LOWER() 或 UPPER() 函数时，某些字符集的字符在大小写转换后，字节长度可能会增加，multiply 用于预先计算所需的缓冲区大小。
+  // 例如 acsii, latin1, utf8mb4 的 multiply 都是 1. 但是例如日语 半角 'ｶﾞ' (0x8EAB 0x8EDE, 4 字节) → 全角 'ガ' (0xA5AC, 2 字节)
   uint multiply;
   my_charset_conv_case converter;
   String tmp_value;

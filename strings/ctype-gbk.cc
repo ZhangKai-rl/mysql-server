@@ -1275,6 +1275,7 @@ static const MY_UNICASE_CHARACTER *my_caseinfo_pages_gbk[256] = {
 
 static MY_UNICASE_INFO my_caseinfo_gbk = {0xFFFF, my_caseinfo_pages_gbk};
 
+// 见 strings/CHARSET_INFO.txt 的注释
 static const uchar sort_order_gbk[] = {
     '\000',        '\001',        '\002',        '\003',        '\004',
     '\005',        '\006',        '\007',        '\010',        '\011',

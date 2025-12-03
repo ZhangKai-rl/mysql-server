@@ -136,6 +136,13 @@ constexpr uint32_t FSP_SPACE_ID = 0;
 /** this field contained a value up to which we know that the modifications in
  the database have been flushed to the file space; not used now */
 constexpr uint32_t FSP_NOT_USED = 4;
+/*
+字段	含义	是否占用磁盘空间
+FSP_SIZE	表空间的物理页面数	是（决定文件大小）
+FSP_FREE_LIMIT	已初始化页面(页面元数据)的边界	否（只是一个 4 字节的元数据）
+free_limit后的page还没有加入extent中。（没有加入任何extent list）
+
+*/
 /** Current size of the space in pages */
 constexpr uint32_t FSP_SIZE = 8;
 /** Minimum page number for which the  free list has not been initialized: the

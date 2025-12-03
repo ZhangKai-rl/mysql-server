@@ -550,11 +550,14 @@ loop:
   undo_trx_no = mach_read_from_8(log_hdr + TRX_UNDO_TRX_NO);
 
   if (undo_trx_no >= limit->trx_no) {
+    // 如果 >= limit，说明可能还有活跃事务需要这个 undo log
+    // 停止截断，保留这个及之后的 undo log
     /* limit space_id should match the rollback segment
     space id to avoid freeing if the page belongs to a
     different rollback segment for the same trx_no. */
     if (undo_trx_no == limit->trx_no &&
         rseg->space_id == limit->undo_rseg_space) {
+      // 如果正好等于 limit，可以部分截断
       trx_undo_truncate_start(rseg, hdr_addr.page, hdr_addr.boffset,
                               limit->undo_no);
     }
@@ -1614,6 +1617,7 @@ static void trx_purge_truncate_history(purge_iter_t *limit,
   low_limit number, though this is not necessary */
 
   if (limit->trx_no >= view->low_limit_no()) {
+    // 最多 truncate 到purge view的low_limit_no()
     limit->trx_no = view->low_limit_no();
     limit->undo_no = 0;
     limit->undo_rseg_space = SPACE_UNKNOWN;
@@ -1683,6 +1687,7 @@ static void trx_purge_truncate_undo_spaces() {
 
   /* Truncate as many undo spaces as can be truncated.
   Break the loop and return whenever the process cannot be completed. */
+  // 每次Purge批次最多截断1个Undo表空间, 通过轮询机制（undo_trunc->increment_scan()）
   for (size_t i = 0; i < undo::spaces->size(); ++i) {
     /* Check current activity and if conditions allow, mark the undo space that
     needs to be truncated. */

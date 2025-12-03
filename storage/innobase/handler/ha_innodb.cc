@@ -15008,6 +15008,8 @@ bool ha_innobase::upgrade_table(THD *thd, const char *db_name,
 bool ha_innobase::get_se_private_data(dd::Table *dd_table, bool reset) {
   static uint n_tables = 0;
   static uint n_indexes = 0;
+  // DD 表空间（space 0xFFFFFFFE）的前 3 页是系统页. fsp_hdr, ibuf_bitmap, inode
+  // ques: 不是 FIL_IBD_FILE_INITIAL_SIZE ？
   static uint n_pages = 4;
 
   /* Reset counters on second create during upgrade. */
@@ -15055,6 +15057,7 @@ bool ha_innobase::get_se_private_data(dd::Table *dd_table, bool reset) {
   for (dd::Index *i : *dd_table->indexes()) {
     i->set_tablespace_id(dict_sys_t::s_dd_dict_space_id);
 
+    // ques: 如何判断的？ n_pages++ 是预测的 root page 号
     if (fsp_is_inode_page(n_pages)) {
       ++n_pages;
       ut_ad(!fsp_is_inode_page(n_pages));
@@ -15062,6 +15065,7 @@ bool ha_innobase::get_se_private_data(dd::Table *dd_table, bool reset) {
 
     dd::Properties &p = i->se_private_data();
 
+    // 预先硬编码 root page
     p.set(dd_index_key_strings[DD_INDEX_ROOT], n_pages++);
     p.set(dd_index_key_strings[DD_INDEX_ID], ++n_indexes);
     p.set(dd_index_key_strings[DD_INDEX_TRX_ID], 0);

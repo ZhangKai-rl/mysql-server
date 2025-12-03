@@ -1015,6 +1015,7 @@ struct trx_purge_t {
   que_t *query;
 
   /** The purge will not remove undo logs which are >= this view (purge view) */
+  // ques: 看着是在truncate(处理undo rec而不是purge user rec)的时候起作用
   ReadView view;
 
   /** true if view is active */
