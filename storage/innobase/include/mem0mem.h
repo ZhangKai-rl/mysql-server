@@ -49,6 +49,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** A block of a memory heap consists of the info structure
 followed by an area of memory */
+// NOTE !!!!
 typedef struct mem_block_info_t mem_block_t;
 
 /** A memory heap is a nonempty linear list of memory blocks */
@@ -59,6 +60,12 @@ dynamic memory pool of the C compiler, BUFFER means allocation from the
 buffer pool; the latter method is used for very big heaps */
 
 /** the most common type */
+/**
+type	值	小块分配（< 8KB）	大块分配（≥ 8KB）	能否返回 NULL
+MEM_HEAP_DYNAMIC	0	ut::malloc（OS 堆）	ut::malloc（OS 堆）	❌ 不能（OOM 即 fatal）
+MEM_HEAP_BUFFER	1	ut::malloc（OS 堆）	buf_block_alloc（Buffer Pool）	❌ 不能
+MEM_HEAP_BTR_SEARCH | MEM_HEAP_BUFFER	3	ut::malloc（OS 堆）	从 free_block_ptr 预留页取	✅ 可以返回 NULL
+ */
 constexpr uint32_t MEM_HEAP_DYNAMIC = 0;
 constexpr uint32_t MEM_HEAP_BUFFER = 1;
 /** this flag can optionally be ORed to MEM_HEAP_BUFFER, in which case
@@ -112,6 +119,8 @@ const byte MEM_NO_MANS_LAND_AFTER_BYTE = 0xDF;
 The space is allocated only in multiples of UNIV_MEM_ALIGNMENT. In debug mode
 contains two areas of no mans lands before and after the buffer requested. */
 static inline uint64_t MEM_SPACE_NEEDED(uint64_t N) {
+  // n is uint64_t, bug aligment is uint32_t, 符号扩展时会高位填0出错bug
+  // 此bug在block超4G时header写错出现。
   return ut_calc_align(N + 2 * MEM_NO_MANS_LAND, UNIV_MEM_ALIGNMENT);
 }
 
@@ -299,6 +308,7 @@ void mem_heap_validate(const mem_heap_t *heap);
 struct buf_block_t;
 
 /** The info structure stored at the beginning of a heap block */
+// note: mem_block_t == mem_block_info_t
 struct mem_block_info_t {
   /** Magic number for debugging. */
   uint64_t magic_n;
@@ -314,6 +324,39 @@ struct mem_block_info_t {
   UT_LIST_NODE_T(mem_block_t) list;
   /** In the first block of the list this is the base node of the list of
   blocks; in subsequent blocks this is undefined. */
+/**
+TODO: 理解 ut extern list
+┌─────────────────── 编译期 ───────────────────┐
+│                                              │
+│  1. 定义节点: UT_LIST_NODE_T(mem_block_t) list;
+│     → 在 mem_block_t 中嵌入 { prev, next }   │
+│                                              │
+│  2. 定义链表头: UT_LIST_BASE_NODE_T(mem_block_t, list) base;
+│     → ut_list_base<mem_block_t,              │
+│          ut_list_base_explicit_getter<        │
+│            mem_block_t,                       │
+│            &mem_block_t::list                 │ ← 成员指针编译期绑定
+│          >>                                   │
+│                                              │
+│  3. get_node() 内联展开:                      │
+│     element.*(&mem_block_t::list)             │
+│     → *(element_addr + offset_of_list)        │ ← 直接偏移访问
+│                                              │
+└──────────────────────────────────────────────┘
+
+┌─────────────────── 运行时 ───────────────────┐
+│                                              │
+│  ut_list_append(heap->base, new_block);      │
+│  │                                           │
+│  ├── List::get_node(*elem)                   │
+│  │   → elem.list   (零开销访问)              │
+│  │                                           │
+│  ├── elem_node.next = nullptr;               │
+│  ├── elem_node.prev = list.last_element;     │
+│  └── list.last_element = elem;               │
+│                                              │
+└──────────────────────────────────────────────┘
+ */
   UT_LIST_BASE_NODE_T_EXTERN(mem_block_t, list) base;
   /** Physical length of this block in bytes. */
   ulint len;

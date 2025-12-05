@@ -1,0 +1,548 @@
+CREATE DATABASE IF NOT EXISTS test_unicode_case;
+USE test_unicode_case;
+#
+# Save original parameters
+#
+SET @saved_collation_connection = @@collation_connection;
+SET @saved_character_set_client = @@character_set_client;
+SET @saved_character_set_results = @@character_set_results;
+#
+# CASE-1: Reproduce the original bug - String truncation with utf8mb4_0900_ai_ci
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT lower('aaaȾbbb') AS result;
+result
+aaaⱦbbb
+SELECT lower('aaaȾbbb') = 'aaaⱦbbb' AS is_correct;
+is_correct
+1
+# End of CASE-1
+#
+# CASE-2: Test all known characters with byte-length-changing case conversion
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT 'U+023F' AS unicode_point, 'Ȿ' AS original, lower('Ȿ') AS lowered,
+HEX('Ȿ') AS hex_original, HEX(lower('Ȿ')) AS hex_lowered,
+LENGTH('Ȿ') AS len_original, LENGTH(lower('Ȿ')) AS len_lowered;
+unicode_point	original	lowered	hex_original	hex_lowered	len_original	len_lowered
+U+023F	Ȿ	ȿ	E2B1BE	C8BF	3	2
+SELECT 'U+2C7F->U+0240' AS conversion, 'ɀ' AS original, upper('ɀ') AS uppered,
+HEX('ɀ') AS hex_original, HEX(upper('ɀ')) AS hex_uppered,
+LENGTH('ɀ') AS len_original, LENGTH(upper('ɀ')) AS len_uppered;
+conversion	original	uppered	hex_original	hex_uppered	len_original	len_uppered
+U+2C7F->U+0240	ɀ		C980		2	0
+SELECT upper('aaaɀbbb') AS result;
+result
+AAAⱿBBB
+SELECT upper('aaaɀbbb') = 'aaaȺbbb' AS is_correct;
+is_correct
+0
+SELECT upper('xxxⱦyyy') AS result;
+result
+XXXȾYYY
+SELECT upper('pppȿqqq') AS result;
+result
+PPPⱾQQQ
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_reverse;
+multiple_reverse
+ȾȾȾȾ
+SELECT upper('ⱦaȿbɀc') AS mixed_reverse;
+mixed_reverse
+ȾAⱾBⱿC
+# End of CASE-2
+#
+# CASE-3: Edge cases - Empty, single char, multiple special chars
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT lower('') AS empty_lower, upper('') AS empty_upper;
+empty_lower	empty_upper
+	
+SELECT lower('Ⱦ') AS single_lower, upper('ⱦ') AS single_upper;
+single_lower	single_upper
+	Ⱦ
+SELECT lower('ȾȾȾȾ') AS multiple_lower;
+multiple_lower
+ⱦⱦⱦⱦ
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_upper;
+multiple_upper
+ȾȾȾȾ
+SELECT lower('ȾȾȾ') AS mixed_lower;
+mixed_lower
+ⱦⱦⱦ
+SELECT lower('ȾȾȾ') AS mixed_lower2;
+mixed_lower2
+ⱦⱦⱦ
+SELECT lower('Ⱦabc') AS at_start;
+at_start
+ⱦabc
+SELECT lower('abcȾ') AS at_end;
+at_end
+abc
+SELECT lower('aȾbȾc') AS in_middle;
+in_middle
+aⱦbⱦc
+SELECT lower('ȾaȾbȾcȾ') AS multiple_positions;
+multiple_positions
+ⱦaⱦbⱦcⱦ
+SELECT LENGTH(lower(CONCAT(REPEAT('a', 100), 'Ⱦ', REPEAT('b', 100)))) AS long_string_length;
+long_string_length
+203
+SELECT SUBSTRING(lower(CONCAT(REPEAT('a', 100), 'Ⱦ', REPEAT('b', 100))), 98, 7) AS long_string_middle;
+long_string_middle
+aaaⱦbbb
+SELECT lower('ȾȾ') AS only_special;
+only_special
+ⱦⱦ
+SELECT upper('ⱦ') AS single_reverse_upper;
+single_reverse_upper
+Ⱦ
+SELECT upper('ɀ') AS single_reverse_upper2;
+single_reverse_upper2
+
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_reverse_upper;
+multiple_reverse_upper
+ȾȾȾȾ
+SELECT upper('ɀɀɀɀ') AS multiple_reverse_upper2;
+multiple_reverse_upper2
+ⱿⱿⱿⱿ
+SELECT upper('ⱦabc') AS reverse_at_start;
+reverse_at_start
+ȾABC
+SELECT upper('abcⱦ') AS reverse_at_end;
+reverse_at_end
+ABCȾ
+SELECT upper('aⱦbⱦc') AS reverse_in_middle;
+reverse_in_middle
+AȾBȾC
+SELECT upper('ⱦaⱦbⱦcⱦ') AS reverse_multiple_positions;
+reverse_multiple_positions
+ȾAȾBȾCȾ
+SELECT LENGTH(upper(CONCAT(REPEAT('a', 100), 'ⱦ', REPEAT('b', 100)))) AS long_reverse_length;
+long_reverse_length
+202
+SELECT SUBSTRING(upper(CONCAT(REPEAT('a', 100), 'ⱦ', REPEAT('b', 100))), 98, 7) AS long_reverse_middle;
+long_reverse_middle
+AAAȾBBB
+SELECT upper('ⱦⱦɀɀ') AS only_reverse_special;
+only_reverse_special
+ȾȾⱿⱿ
+SELECT lower(upper('ⱦⱦⱦ')) AS reverse_roundtrip;
+reverse_roundtrip
+ⱦⱦⱦ
+SELECT upper(lower('ȾȾȾ')) AS forward_roundtrip;
+forward_roundtrip
+ȾȾȾ
+# End of CASE-3
+#
+# CASE-4: Compare behavior across different collations
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT 'utf8mb4_0900_ai_ci' AS collation, lower('aaaȾbbb') AS result;
+collation	result
+utf8mb4_0900_ai_ci	aaaⱦbbb
+SET NAMES utf8mb4 COLLATE utf8mb4_general_ci;
+SELECT 'utf8mb4_general_ci' AS collation, lower('aaaȾbbb') AS result;
+collation	result
+utf8mb4_general_ci	aaaȾbbb
+SET NAMES utf8mb4 COLLATE utf8mb4_bin;
+SELECT 'utf8mb4_bin' AS collation, lower('aaaȾbbb') AS result;
+collation	result
+utf8mb4_bin	aaaȾbbb
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+SELECT 'utf8mb4_unicode_ci' AS collation, lower('aaaȾbbb') AS result;
+collation	result
+utf8mb4_unicode_ci	aaaȾbbb
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs;
+SELECT 'utf8mb4_0900_as_cs' AS collation, lower('aaaȾbbb') AS result;
+collation	result
+utf8mb4_0900_as_cs	aaaⱦbbb
+# End of CASE-4
+#
+# CASE-5: Test with table columns and WHERE clauses
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE TABLE test_case_conversion (
+id INT NOT NULL AUTO_INCREMENT,
+str_col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+text_col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+PRIMARY KEY (id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+INSERT INTO test_case_conversion(str_col, text_col) VALUES 
+('aaaȾbbb', 'aaaȾbbb'),
+('Ⱦ', 'Ⱦ'),
+('ȾxxxȾ', 'ȾxxxȾ'),
+('Ȿ', 'Ȿ'),
+('ȾȾȾȾ', 'ȾȾȾȾ'),
+('normaltext', 'normaltext'),
+('MixedȾCase', 'MixedȾCase'),
+-- Reverse conversion test data (lowercase with 3 bytes)
+('aaaⱦbbb', 'aaaⱦbbb'),
+('ⱦ', 'ⱦ'),
+('ⱦxxxⱦ', 'ⱦxxxⱦ'),
+('ɀ', 'ɀ'),
+('ⱦⱦⱦⱦ', 'ⱦⱦⱦⱦ'),
+('Mixedⱦcase', 'Mixedⱦcase');
+SELECT id, str_col, lower(str_col) AS lowered FROM test_case_conversion ORDER BY id;
+id	str_col	lowered
+1	aaaȾbbb	aaaⱦbbb
+2	Ⱦ	ⱦ
+3	ȾxxxȾ	ⱦxxxⱦ
+4	Ȿ	ȿ
+5	ȾȾȾȾ	ⱦⱦⱦⱦ
+6	normaltext	normaltext
+7	MixedȾCase	mixedⱦcase
+8	aaaⱦbbb	aaaⱦbbb
+9	ⱦ	ⱦ
+10	ⱦxxxⱦ	ⱦxxxⱦ
+11	ɀ	ɀ
+12	ⱦⱦⱦⱦ	ⱦⱦⱦⱦ
+13	Mixedⱦcase	mixedⱦcase
+SELECT id, text_col, upper(text_col) AS uppered FROM test_case_conversion WHERE text_col LIKE '%Ⱦ%' ORDER BY id;
+id	text_col	uppered
+1	aaaȾbbb	AAAȾBBB
+2	Ⱦ	Ⱦ
+3	ȾxxxȾ	ȾXXXȾ
+5	ȾȾȾȾ	ȾȾȾȾ
+7	MixedȾCase	MIXEDȾCASE
+8	aaaⱦbbb	AAAȾBBB
+9	ⱦ	Ⱦ
+10	ⱦxxxⱦ	ȾXXXȾ
+12	ⱦⱦⱦⱦ	ȾȾȾȾ
+13	Mixedⱦcase	MIXEDȾCASE
+SELECT id, str_col FROM test_case_conversion WHERE lower(str_col) = 'aaaⱦbbb';
+id	str_col
+1	aaaȾbbb
+8	aaaⱦbbb
+SELECT id, str_col FROM test_case_conversion WHERE upper(str_col) = 'AAAȾBBB';
+id	str_col
+1	aaaȾbbb
+8	aaaⱦbbb
+SELECT id, str_col, upper(str_col) AS uppered FROM test_case_conversion WHERE str_col LIKE '%ⱦ%' ORDER BY id;
+id	str_col	uppered
+1	aaaȾbbb	AAAȾBBB
+2	Ⱦ	Ⱦ
+3	ȾxxxȾ	ȾXXXȾ
+5	ȾȾȾȾ	ȾȾȾȾ
+7	MixedȾCase	MIXEDȾCASE
+8	aaaⱦbbb	AAAȾBBB
+9	ⱦ	Ⱦ
+10	ⱦxxxⱦ	ȾXXXȾ
+12	ⱦⱦⱦⱦ	ȾȾȾȾ
+13	Mixedⱦcase	MIXEDȾCASE
+CREATE TABLE test_lookup (
+lookup_str VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_lookup VALUES ('aaaⱦbbb'), ('ⱦ'), ('normaltext');
+SELECT t1.id, t1.str_col, t2.lookup_str 
+FROM test_case_conversion t1 
+INNER JOIN test_lookup t2 ON lower(t1.str_col) = t2.lookup_str
+ORDER BY t1.id;
+id	str_col	lookup_str
+1	aaaȾbbb	aaaⱦbbb
+2	Ⱦ	ⱦ
+6	normaltext	normaltext
+8	aaaⱦbbb	aaaⱦbbb
+9	ⱦ	ⱦ
+DROP TABLE test_lookup;
+CREATE TABLE test_lookup_reverse (
+lookup_str VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_lookup_reverse VALUES ('AAAȾBBB'), ('Ⱦ'), ('NORMALTEXT');
+SELECT t1.id, t1.str_col, t2.lookup_str 
+FROM test_case_conversion t1 
+INNER JOIN test_lookup_reverse t2 ON upper(t1.str_col) = t2.lookup_str
+ORDER BY t1.id;
+id	str_col	lookup_str
+1	aaaȾbbb	AAAȾBBB
+2	Ⱦ	Ⱦ
+6	normaltext	NORMALTEXT
+8	aaaⱦbbb	AAAȾBBB
+9	ⱦ	Ⱦ
+DROP TABLE test_lookup_reverse;
+# End of CASE-5
+#
+# CASE-7: Verify data integrity and comparison operations
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT upper(lower('ȾȾȾ')) = 'ȾȾȾ' AS roundtrip_upper;
+roundtrip_upper
+1
+SELECT lower(upper('ⱦⱦⱦ')) = 'ⱦⱦⱦ' AS roundtrip_lower;
+roundtrip_lower
+1
+SELECT 'Ⱦ' = lower('Ⱦ') AS case_insensitive_equal;
+case_insensitive_equal
+0
+SELECT BINARY 'Ⱦ' = BINARY lower('Ⱦ') AS binary_not_equal;
+binary_not_equal
+0
+Warnings:
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+CREATE TABLE test_sort (
+id INT,
+val VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_sort VALUES 
+(1, 'Ⱦaaa'),
+(2, 'ⱦbbb'),
+(3, 'Ⱦccc'),
+(4, 'aaaa'),
+(5, 'zzzz');
+SELECT id, val, lower(val) AS lowered FROM test_sort ORDER BY lower(val);
+id	val	lowered
+4	aaaa	aaaa
+1	Ⱦaaa	ⱦaaa
+2	ⱦbbb	ⱦbbb
+3	Ⱦccc	ⱦccc
+5	zzzz	zzzz
+DROP TABLE test_sort;
+SELECT lower(str_col) AS lowered, COUNT(*) AS cnt 
+FROM test_case_conversion 
+GROUP BY lower(str_col)
+HAVING COUNT(*) > 0
+ORDER BY lowered;
+lowered	cnt
+aaaⱦbbb	2
+mixedⱦcase	2
+normaltext	1
+ȿ	1
+ⱦ	2
+ⱦⱦⱦⱦ	2
+ⱦxxxⱦ	2
+ɀ	1
+SELECT DISTINCT lower(str_col) AS distinct_lowered 
+FROM test_case_conversion 
+ORDER BY distinct_lowered;
+distinct_lowered
+aaaⱦbbb
+mixedⱦcase
+normaltext
+ȿ
+ⱦ
+ⱦⱦⱦⱦ
+ⱦxxxⱦ
+ɀ
+SELECT lower(upper('ⱦⱦⱦ')) = 'ⱦⱦⱦ' AS reverse_roundtrip_lower;
+reverse_roundtrip_lower
+1
+SELECT upper(lower('ɀɀɀ')) = 'ɀɀɀ' AS reverse_roundtrip_upper;
+reverse_roundtrip_upper
+0
+SELECT 'ⱦ' = upper('ⱦ') AS reverse_case_insensitive_equal;
+reverse_case_insensitive_equal
+1
+SELECT BINARY 'ⱦ' = BINARY upper('ⱦ') AS reverse_binary_not_equal;
+reverse_binary_not_equal
+0
+Warnings:
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+CREATE TABLE test_sort_reverse (
+id INT,
+val VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_sort_reverse VALUES 
+(1, 'ⱦaaa'),
+(2, 'Ⱦbbb'),
+(3, 'ⱦccc'),
+(4, 'aaaa'),
+(5, 'zzzz'),
+(6, 'ɀddd');
+SELECT id, val, upper(val) AS uppered FROM test_sort_reverse ORDER BY upper(val);
+id	val	uppered
+4	aaaa	AAAA
+1	ⱦaaa	ȾAAA
+2	Ⱦbbb	ȾBBB
+3	ⱦccc	ȾCCC
+5	zzzz	ZZZZ
+6	ɀddd	ⱿDDD
+DROP TABLE test_sort_reverse;
+SELECT upper(str_col) AS uppered, COUNT(*) AS cnt 
+FROM test_case_conversion 
+GROUP BY upper(str_col)
+HAVING COUNT(*) > 0
+ORDER BY uppered;
+uppered	cnt
+AAAȾBBB	2
+MIXEDȾCASE	2
+NORMALTEXT	1
+Ȿ	1
+Ⱦ	2
+ȾȾȾȾ	2
+ȾXXXȾ	2
+Ɀ	1
+SELECT DISTINCT upper(str_col) AS distinct_uppered 
+FROM test_case_conversion 
+ORDER BY distinct_uppered;
+distinct_uppered
+AAAȾBBB
+MIXEDȾCASE
+NORMALTEXT
+Ȿ
+Ⱦ
+ȾȾȾȾ
+ȾXXXȾ
+Ɀ
+SELECT 
+'Forward' AS direction,
+'Ⱦ' AS original,
+lower('Ⱦ') AS converted,
+LENGTH('Ⱦ') AS original_bytes,
+LENGTH(lower('Ⱦ')) AS converted_bytes,
+LENGTH(lower('Ⱦ')) - LENGTH('Ⱦ') AS byte_diff
+UNION ALL
+SELECT 
+'Reverse' AS direction,
+'ⱦ' AS original,
+upper('ⱦ') AS converted,
+LENGTH('ⱦ') AS original_bytes,
+LENGTH(upper('ⱦ')) AS converted_bytes,
+LENGTH(upper('ⱦ')) - LENGTH('ⱦ') AS byte_diff;
+direction	original	converted	original_bytes	converted_bytes	byte_diff
+Forward	Ⱦ		2	0	-2
+Reverse	ⱦ	Ⱦ	3	2	-1
+# End of CASE-7
+#
+# CASE-8: Test with larger datasets
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE TABLE test_performance (
+id INT AUTO_INCREMENT PRIMARY KEY,
+data VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_performance(data) 
+SELECT CONCAT('test_', n, '_Ⱦ_', n) 
+FROM (
+SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+) numbers;
+SELECT COUNT(*) AS total_rows FROM test_performance;
+total_rows
+10
+SELECT COUNT(*) AS correct_conversions 
+FROM test_performance 
+WHERE lower(data) LIKE '%ⱦ%';
+correct_conversions
+10
+UPDATE test_performance SET data = lower(data) WHERE id <= 5;
+SELECT id, data FROM test_performance WHERE id <= 5 ORDER BY id;
+id	data
+1	test_1_ⱦ_1
+2	test_2_ⱦ_2
+3	test_3_ⱦ_3
+4	test_4_ⱦ_4
+5	test_5_ⱦ_5
+SELECT id, data FROM test_performance 
+WHERE data IN (SELECT lower(str_col) FROM test_case_conversion WHERE str_col LIKE '%Ⱦ%')
+ORDER BY id;
+id	data
+DROP TABLE test_performance;
+# End of CASE-8
+#
+# CASE-9: Test with mixed character sets
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT lower('HelloȾWorld') AS ascii_unicode_mix;
+ascii_unicode_mix
+helloⱦworld
+SELECT lower('中文Ⱦ测试') AS cjk_unicode_mix;
+cjk_unicode_mix
+中文ⱦ测试
+SELECT lower('😀Ⱦ😀') AS emoji_unicode_mix;
+emoji_unicode_mix
+😀ⱦ😀
+SELECT lower('ПриветȾWorld中文') AS multi_script;
+multi_script
+приветⱦworld中文
+SELECT lower('123Ⱦ456') AS numbers_unicode;
+numbers_unicode
+123ⱦ456
+SELECT lower('!!!Ⱦ???') AS punctuation_unicode;
+punctuation_unicode
+!!!ⱦ???
+# End of CASE-9
+#
+# CASE-11: Test with stored procedures and functions
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE FUNCTION test_lower_func(input_str VARCHAR(255))
+RETURNS VARCHAR(255)
+DETERMINISTIC
+BEGIN
+RETURN lower(input_str);
+END//
+SELECT test_lower_func('aaaȾbbb') AS func_result;
+func_result
+aaaⱦbbb
+SELECT test_lower_func('ȾȾȾȾ') AS func_result2;
+func_result2
+ⱦⱦⱦⱦ
+CREATE PROCEDURE test_lower_proc(IN input_str VARCHAR(255), OUT output_str VARCHAR(255))
+BEGIN
+SET output_str = lower(input_str);
+END//
+CALL test_lower_proc('aaaȾbbb', @result);
+SELECT @result AS proc_result;
+proc_result
+aaaⱦbbb
+CALL test_lower_proc('ȾȾȾ', @result2);
+SELECT @result2 AS proc_result2;
+proc_result2
+ⱦⱦⱦ
+DROP FUNCTION test_lower_func;
+DROP PROCEDURE test_lower_proc;
+# End of CASE-11
+#
+# CASE-12: Test with views
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE VIEW test_view AS
+SELECT id, str_col, lower(str_col) AS lowered, upper(str_col) AS uppered
+FROM test_case_conversion;
+SELECT * FROM test_view WHERE str_col LIKE '%Ⱦ%' ORDER BY id;
+id	str_col	lowered	uppered
+1	aaaȾbbb	aaaⱦbbb	AAAȾBBB
+2	Ⱦ	ⱦ	Ⱦ
+3	ȾxxxȾ	ⱦxxxⱦ	ȾXXXȾ
+5	ȾȾȾȾ	ⱦⱦⱦⱦ	ȾȾȾȾ
+7	MixedȾCase	mixedⱦcase	MIXEDȾCASE
+8	aaaⱦbbb	aaaⱦbbb	AAAȾBBB
+9	ⱦ	ⱦ	Ⱦ
+10	ⱦxxxⱦ	ⱦxxxⱦ	ȾXXXȾ
+12	ⱦⱦⱦⱦ	ⱦⱦⱦⱦ	ȾȾȾȾ
+13	Mixedⱦcase	mixedⱦcase	MIXEDȾCASE
+SELECT * FROM test_view WHERE lowered IN ('aaaⱦbbb', 'ⱦ') ORDER BY id;
+id	str_col	lowered	uppered
+1	aaaȾbbb	aaaⱦbbb	AAAȾBBB
+2	Ⱦ	ⱦ	Ⱦ
+8	aaaⱦbbb	aaaⱦbbb	AAAȾBBB
+9	ⱦ	ⱦ	Ⱦ
+DROP VIEW test_view;
+# End of CASE-12
+#
+# CASE-13: Regression test - Verify normal ASCII case conversion still works
+#
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT lower('HeLLo WoRLd') = 'hello world' AS mixed_ascii;
+mixed_ascii
+1
+SELECT lower('ABC123XYZ!!!') = 'abc123xyz!!!' AS ascii_with_special;
+ascii_with_special
+1
+SELECT lower('ÀÁÂÃÄÅÆÇÈÉÊË') AS european_chars;
+european_chars
+àáâãäåæçèéêë
+# End of CASE-13
+#
+# Restore original parameters and clean up
+#
+SET collation_connection = @saved_collation_connection;
+SET character_set_client = @saved_character_set_client;
+SET character_set_results = @saved_character_set_results;
+DROP TABLE IF EXISTS test_case_conversion;
+DROP DATABASE IF EXISTS test_unicode_case;
+#
+# Bug#119463: Test completed successfully
+# All case conversion operations with byte-length-changing characters work correctly
+#

@@ -435,6 +435,7 @@ struct TTASEventMutex {
   }
 
   /** Acquire the mutex.
+   *  https://www.bookstack.cn/read/aliyun-rds-core/e707d16ce2086552.md
   @param[in]    max_spins       max number of spins
   @param[in]    max_delay       max delay per spin
   @param[in]    filename        from where called
@@ -541,6 +542,7 @@ struct TTASEventMutex {
       above. Otherwise we could have simply done the extra
       spin above. */
 
+      // note: 基于innodb自己的 wait array实现
       if (wait(filename, line, 4)) {
         n_spins += 4;
 

@@ -1304,6 +1304,7 @@ static void buf_pool_create(buf_pool_t *buf_pool, ulint buf_pool_size,
     ut_a(srv_n_page_hash_locks != 0);
     ut_a(srv_n_page_hash_locks <= MAX_PAGE_HASH_LOCKS);
 
+    // note: page_hash of bp ins
     buf_pool->page_hash =
         ib_create(2 * buf_pool->curr_size, LATCH_ID_HASH_TABLE_RW_LOCK,
                   srv_n_page_hash_locks, MEM_HEAP_FOR_PAGE_HASH);
@@ -3616,6 +3617,7 @@ struct Buf_fetch_normal : public Buf_fetch<Buf_fetch_normal> {
   dberr_t get(buf_block_t *&block) noexcept;
 };
 
+// XXXX
 dberr_t Buf_fetch_normal::get(buf_block_t *&block) noexcept {
   /* Keep this path as simple as possible. */
   for (;;) {
@@ -3648,6 +3650,7 @@ dberr_t Buf_fetch_normal::get(buf_block_t *&block) noexcept {
     }
 
     /* Page not in buf_pool: needs to be read from file */
+    /* note: IO */
     read_page();
   }
 
@@ -4202,6 +4205,8 @@ buf_block_t *Buf_fetch<T>::single_page() {
   Counter::inc(m_buf_pool->stat.m_n_page_gets, m_page_id.page_no());
 
   for (;;) {
+    // note: buf fetch是 标准的 CRTP实现, 基类调用派生类buf_fetch_normal::get实现
+    /* static_cast<T*>(this) 将基类指针向下转换为派生类指针 */
     if (static_cast<T *>(this)->get(block) == DB_NOT_FOUND) {
       return (nullptr);
     }
@@ -4771,6 +4776,7 @@ static void buf_page_init(buf_pool_t *buf_pool, const page_id_t &page_id,
   ut_a(block->page.id == page_id);
   block->page.size.copy_from(page_size);
 
+  // buf_page_init时，将此block page插入page_hash
   HASH_INSERT(buf_page_t, hash, buf_pool->page_hash, page_id.hash(),
               &block->page);
 
@@ -5009,6 +5015,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 
     if (block && buf_page_in_file(&block->page) &&
         !buf_pool_watch_is_sentinel(buf_pool, &block->page)) {
+      // 比如space 被 truncate 成为一个幽灵页。根据 space version判断stale
       if (block->page.was_stale()) {
         /* We must release page hash latch. The LRU mutex protects the block
         from being relocated or freed. */
@@ -5045,7 +5052,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
     }
     break;
   }
-  /* If we get here, the page was not in buf_pool: init it there */
+  /* note: If we get here, the page was not in buf_pool: init it there */
 
   DBUG_PRINT("ib_buf", ("create page " UINT32PF ":" UINT32PF, page_id.space(),
                         page_id.page_no()));
@@ -5079,7 +5086,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 
   rw_lock_x_unlock(hash_lock);
 
-  /* The block must be put to the LRU list */
+  /* note: The block must be put to the LRU list */
   buf_LRU_add_block(&block->page, false);
 
   buf_pool->stat.n_pages_created.fetch_add(1);

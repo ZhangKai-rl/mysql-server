@@ -261,6 +261,7 @@ static void *handle_connection(void *arg) {
   }
 
   for (;;) {
+    // note: create THD for each connection!
     THD *thd = init_new_thd(channel_info);
     if (thd == nullptr) {
       connection_errors_internal++;

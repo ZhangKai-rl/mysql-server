@@ -298,6 +298,8 @@ constexpr uint32_t QUE_THR_MAGIC_N = 8476583;
 constexpr uint32_t QUE_THR_MAGIC_FREED = 123461526;
 
 /* Query graph fork node: its fields are protected by the query thread mutex */
+// que_fork_t = que_t
+// 查询树结构见：trx_roll_graph_build
 struct que_fork_t {
   que_common_t common; /*!< type: QUE_NODE_FORK */
   que_t *graph;        /*!< query graph of this node */
@@ -343,6 +345,7 @@ struct que_fork_t {
 };
 
 /* Query fork (or graph) types */
+// NOTE: query
 constexpr uint32_t QUE_FORK_SELECT_NON_SCROLL = 1; /* forward-only cursor */
 constexpr uint32_t QUE_FORK_SELECT_SCROLL = 2;     /* scrollable cursor */
 constexpr uint32_t QUE_FORK_INSERT = 3;

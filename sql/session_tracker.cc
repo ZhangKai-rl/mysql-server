@@ -1600,6 +1600,32 @@ bool Session_tracker::changed_any() {
                             change data needs to be written.
 */
 
+/**
+THD::send_statement_status()                        // sql_class.cc:2880
+  |
+  └─ Protocol_classic::send_ok()                    // protocol_classic.cc:947
+      └─ thd->session_tracker.store(thd, store)     // 序列化所有变化
+          ├─ Session_sysvars_tracker::store()       // 序列化系统变量
+          ├─ Current_schema_tracker::store()        // 序列化当前数据库
+          ├─ Transaction_state_tracker::store()     // 序列化事务状态
+          └─ Session_state_change_tracker::store()  // 序列化布尔标志
+OK Packet:
+  [header: 0x00]
+  [affected_rows: length-encoded]
+  [last_insert_id: length-encoded]
+  [server_status: 2 bytes]
+  [warning_count: 2 bytes]
+  [info: length-encoded string]
+  [session_state_info: length-encoded string]  ← Session_tracker 数据
+      |
+      ├─ [total_length: length-encoded]
+      └─ [tracker_data: repeated]
+          ├─ [tracker_type: 1 byte]           // SESSION_TRACK_SYSTEM_VARIABLES
+          ├─ [data_length: length-encoded]
+          └─ [data: variable]
+              ├─ [var_name: length-encoded string]
+              └─ [var_value: length-encoded string]
+ */
 void Session_tracker::store(THD *thd, String &buf) {
   /* Temporary buffer to store all the changes. */
   String temp;

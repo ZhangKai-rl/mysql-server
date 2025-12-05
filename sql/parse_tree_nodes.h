@@ -2804,6 +2804,8 @@ class PT_create_table_stmt final : public PT_table_ddl_stmt_base {
   PT_query_expression_body *opt_query_expression;
   Table_ident *opt_like_clause;
 
+  // pc2.create_info -> thd->lex->create_info -> &PT_create_table_stmt::m_create_info. 实际由make_cmd pc2 contextualize时赋值
+  // option->contextualize(&pc2)
   HA_CREATE_INFO m_create_info;
 
  public:

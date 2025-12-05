@@ -2968,7 +2968,6 @@ static buf_block_t *btr_lift_page_up(
   return (lift_father_up ? block_orig : father_block);
 }
 
-// todo
 bool btr_compress(btr_cur_t *cursor, bool adjust, mtr_t *mtr) {
   dict_index_t *index;
   space_id_t space;

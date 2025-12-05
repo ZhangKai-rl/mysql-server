@@ -580,6 +580,11 @@ class Table_impl : public Abstract_table_impl, virtual public Table {
 
   // References to tightly-coupled objects.
 
+/* 设计模式：这是典型的 Composite 模式（组合模式） —— Table_impl 作为父对象，
+聚合了 m_indexes、m_foreign_keys、m_partitions、m_triggers、m_check_constraints
+等多个子对象集合，形成一棵 DD Object 树。
+*/
+
   Index_collection m_indexes;
   Foreign_key_collection m_foreign_keys;
   Foreign_key_parent_collection m_foreign_key_parents;

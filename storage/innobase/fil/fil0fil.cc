@@ -654,7 +654,9 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
 }
 
 // ques: 为什么定义在cc中？
+// 表空间管理器
 class Fil_shard {
+  // note
   using File_list = UT_LIST_BASE_NODE_T(fil_node_t, LRU);
   using Space_list = UT_LIST_BASE_NODE_T(fil_space_t, unflushed_spaces);
   using Spaces = std::unordered_map<space_id_t, fil_space_t *>;
@@ -1268,6 +1270,23 @@ class Fil_shard {
 };
 
 /** The tablespace memory cache */
+// 全局单例表空间管理系统
+/**
+ * @brief 
+Fil_system (全局单例)
+ ├── Fil_shard[0..63]        (普通表空间分片，space_id % 64 路由)
+ │    ├── m_mutex             (每个 shard 独立的 mutex)
+ │    ├── m_spaces            (hash map: space_id → fil_space_t*)
+ │    └── m_LRU               (已打开文件的 LRU 链表)
+ │         └── fil_node_t     (LRU 中的节点)
+ │
+ ├── Fil_shard[64..67]       (Undo 表空间专用分片)
+ │
+ └── 每个 Fil_shard 管理多个 fil_space_t
+      └── 每个 fil_space_t 包含一个或多个 fil_node_t (1:N)
+           └── 通常 N=1 (file-per-table)
+               系统表空间 N 可以 >1 (多个 ibdata 文件)
+ */
 class Fil_system {
  public:
   using Fil_shards = std::vector<Fil_shard *>;

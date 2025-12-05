@@ -48,10 +48,12 @@ class Indexes;
 
 ///////////////////////////////////////////////////////////////////////////
 
+// 区别dd::Indexes系统元数据表，这是用户表元数据
 class Index : virtual public Entity_object {
  public:
   typedef Collection<Index_element *> Index_elements;
   typedef Index_impl Impl;
+  // mysql.indexes
   typedef tables::Indexes DD_table;
 
  public:

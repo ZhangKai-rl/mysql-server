@@ -21,7 +21,7 @@
         "WITH_BOOST": "/Users/morphyzhang/Documents/Code/mysql-server/boost_1_77_0",
         "DOWNLOAD_BOOST": "1",
         "DOWNLOAD_BOOST_TIMEOUT": "600",
-        "WITH_SSL": "/opt/homebrew/Cellar/openssl@3/3.5.2",
+        "WITH_SSL": "/opt/homebrew/Cellar/openssl@3/3.6.1",
     },
     "git.ignoreLimitWarning": true,
     "files.associations": {
@@ -106,6 +106,7 @@
         "typeinfo": "cpp",
         "unordered_set": "cpp",
         "algorithm": "cpp",
-        "atomic": "cpp"
-    }
+        "atomic": "cpp",
+        "semaphore": "cpp"
+    },
 }

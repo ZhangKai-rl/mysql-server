@@ -42,7 +42,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "mtr0mtr.h"
 #include "rem0rec.h"
 
-/** The search info struct in an index */
+/* note: AHI, The search info struct in an index */
+// ques: btr_search_t 和 btr_search_sys_t 的关系？
 struct btr_search_t {
   /** Number of blocks in this index tree that have search index built i.e.
   block->ahi.index points to this index. */
@@ -91,6 +92,7 @@ constexpr uint32_t BTR_SEARCH_MAGIC_N = 1112765;
 #endif /* UNIV_DEBUG */
 
 /** The hash index system */
+// TODO: AHI sys!!!!! btr_search_sys_t -> search_part_t -> hash_table_t
 class btr_search_sys_t {
  public:
   btr_search_sys_t(size_t hash_size);
@@ -108,6 +110,8 @@ class btr_search_sys_t {
     on index pages. For any hash value at most one pointer is hold. Is protected
     by the part's latch. It is in a separate cache line to not collide with the
     possible multiple readers that are registering for the latching. */
+    // note：存储的为 hash(rec) -> leaf page
+    // XXXX: AHI的所谓 parts::latch, 不会使用hash_table_t::rw_lock?
     alignas(ut::INNODB_CACHE_LINE_SIZE) hash_table_t *hash_table;
     /** A pointer to a free block that the heap in the hash table may use for
     adding new hash nodes. Changes to nullptr are done under appropriate
@@ -117,6 +121,7 @@ class btr_search_sys_t {
   };
 
   /** Partitions of the AHI system. */
+  // note: ahi sys由多条hash table组成，每个hash table为一个hash part/slot
   ut::unique_ptr_aligned<search_part_t[]> parts;
 };
 

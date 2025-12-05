@@ -117,6 +117,7 @@ typename Collection<T>::iterator Collection<T>::find(const impl_type *item) {
  @endcond
 */
 
+// note
 template <typename T>
 template <typename Parent_item, typename Compare>
 bool Collection<T>::restore_items(Parent_item *parent,
@@ -134,17 +135,21 @@ bool Collection<T>::restore_items(Parent_item *parent,
   std::unique_ptr<Object_key> key_holder(key);
 
   std::unique_ptr<Raw_record_set> rs;
+  // note
   if (table->open_record_set(key, rs)) return true;
 
   // Process records.
 
   Raw_record *r = rs->current_record();
+  // 可能有多条索引的
   while (r) {
+    // 创建 index_impl
     Collection<T>::impl_type *item =
         Collection<T>::impl_type::restore_item(parent);
     item->set_ordinal_position(static_cast<uint>(m_items.size() + 1));
     m_items.push_back(item);
 
+    // 填充索引的属性                  || 读取下条索引信息
     if (item->restore_attributes(*r) || rs->next(r)) {
       clear_all_items();
       return true;
@@ -168,9 +173,12 @@ bool Collection<T>::restore_items(Parent_item *parent,
     This seem to serve the purpose. There seem to be no side
     effect of we splitting this loop into two.
   */
+  // note: 析构函数中进行了 close cursor.
   rs.reset();
 
   for (auto item : m_items) {
+    // 继续扫描dd表，填充每条索引的构成元素(mysql.index_column_usage)
+    // 第一阶段 while 循环只填充了直接子对象的属性（如 Index 的 name、type、algorithm 等标量字段）。但很多子对象自身还拥有更深层的子对象，需要递归加载。
     if (item->restore_children(otx) || item->validate()) {
       clear_all_items();
       return true;

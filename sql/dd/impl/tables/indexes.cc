@@ -45,6 +45,7 @@ const CHARSET_INFO *Indexes::name_collation() {
 
 ///////////////////////////////////////////////////////////////////////////
 
+// note
 Indexes::Indexes() {
   m_target_def.set_table_name("indexes");
 

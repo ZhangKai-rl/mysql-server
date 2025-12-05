@@ -158,10 +158,10 @@ class innodb_session_t {
   table_cache_t m_open_tables;
 
  private:
-  /** Current session's user temp tablespace */
+  /** #innodb_temp/.ibt Current session's user temp tablespace */
   ibt::Tablespace *m_usr_temp_tblsp;
 
-  /** Current session's optimizer temp tablespace */
+  /** ibtmp1 Current session's optimizer temp tablespace */
   ibt::Tablespace *m_intrinsic_temp_tblsp;
 };
 

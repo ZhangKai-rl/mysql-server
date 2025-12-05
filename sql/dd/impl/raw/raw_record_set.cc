@@ -46,6 +46,7 @@ namespace dd {
   @return true - on failure and error is reported.
   @return false - on success.
 */
+// TODO: 通过 ha_index_init + ha_index_read_map 定位, 进入innodb读取真正的表数据
 bool Raw_record_set::open() {
   DBUG_TRACE;
   uint index_no = 0;
@@ -53,6 +54,7 @@ bool Raw_record_set::open() {
   // Use specific index if key submitted.
   if (m_key) index_no = m_key->index_no;
 
+  // change_active_index
   int rc = m_table->file->ha_index_init(index_no, true);
 
   if (rc) {
@@ -61,6 +63,7 @@ bool Raw_record_set::open() {
   }
 
   if (m_key)
+    // TODO
     rc = m_table->file->ha_index_read_map(
         m_table->record[0], m_key->key, m_key->keypart_map, HA_READ_KEY_EXACT);
   else

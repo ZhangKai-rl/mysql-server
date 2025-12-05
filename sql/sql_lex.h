@@ -2029,6 +2029,7 @@ class Query_block : public Query_term {
     but also because change_to_use_tmp_fields() depends on it when mapping
     items to ref_item_array indexes. It would be good to get rid of this
     requirement in the future.
+    存储select 涉及的列
    */
   mem_root_deque<Item *> fields;
 
@@ -2672,7 +2673,7 @@ class Query_tables_list {
     the tables.
   */
   enum_sql_command sql_command;
-  /* Global list of all tables used by this statement */
+  /* note: Global list of all tables used by this statement */
   Table_ref *query_tables;
   /* Pointer to next_global member of last element in the previous list. */
   Table_ref **query_tables_last;
@@ -2681,6 +2682,7 @@ class Query_tables_list {
     next_global member of last own element in query table list (i.e. last
     table which was not added to it as part of preparation to prelocking).
     0 - indicates that this query does not need prelocking.
+    mark_as_requiring_prelocking
   */
   Table_ref **query_tables_own_last;
   /*
@@ -2751,6 +2753,7 @@ class Query_tables_list {
     Direct addition to the list of query tables.
     If you are using this function, you must ensure that the table
     object, in particular table->db member, is initialized.
+    note: 侵入式链表add
   */
   void add_to_query_tables(Table_ref *table) {
     *(table->prev_global = query_tables_last) = table;
@@ -4042,6 +4045,7 @@ struct LEX : public Query_tables_list {
   Item_sum *in_sum_func;
   udf_func udf;
   HA_CHECK_OPT check_opt;  // check/repair options
+  // note
   HA_CREATE_INFO *create_info;
   KEY_CREATE_INFO key_create_info;
   LEX_MASTER_INFO mi;  // used by CHANGE MASTER
@@ -4079,6 +4083,7 @@ struct LEX : public Query_tables_list {
   /// transformation.
   bool m_subquery_to_derived_is_impossible;
 
+  // note
   Sql_cmd *m_sql_cmd;
 
   /*

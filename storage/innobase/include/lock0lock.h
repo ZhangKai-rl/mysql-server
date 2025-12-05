@@ -980,7 +980,7 @@ constexpr uint32_t LOCK_WAIT = 256;
 /* Precise modes */
 /** this flag denotes an ordinary next-key lock in contrast to LOCK_GAP or
  LOCK_REC_NOT_GAP */
-// next key lock. 邻键锁
+// next key lock. 邻键锁. 左开右闭 （l, r]
 constexpr uint32_t LOCK_ORDINARY = 0;
 /** when this bit is set, it means that the lock holds only on the gap before
   the record; for instance, an x-lock on the gap does not give permission to

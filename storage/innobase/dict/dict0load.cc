@@ -361,6 +361,7 @@ static const char *dict_load_index_low(
              DICT_NUM_FIELDS__SYS_INDEXES - 1) {
     /* MERGE_THRESHOLD doesn't exist */
 
+    // note
     merge_threshold = DICT_INDEX_MERGE_THRESHOLD_DEFAULT;
   } else {
     return ("wrong number of columns in SYS_INDEXES record");
@@ -475,6 +476,7 @@ static const char *dict_load_index_low(
   }
 
   (*index)->id = id;
+  // note
   (*index)->page = mach_read_from_4(field);
   ut_ad((*index)->page);
   (*index)->merge_threshold = merge_threshold;

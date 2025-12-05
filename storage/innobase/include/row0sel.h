@@ -103,6 +103,7 @@ be needed in the query.
 @param[in]      rec_index           index of rec
 @param[in]      prebuilt_index      prebuilt->index
 @param[in]      offsets             array returned by rec_get_offsets(rec)
+note: clust_templ_for_sec : 解决 二级索引扫描 + 回表场景下的索引格式不匹配问题,通过字段编号映射和转换，使得可以用聚簇索引的模板正确地从二级索引记录中提取数据，避免了为二级索引单独构建模板的开销。
 @param[in]      clust_templ_for_sec true if rec belongs to secondary index
                                     but the prebuilt->template is in
                                     clustered index format and it

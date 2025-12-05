@@ -697,6 +697,22 @@ struct btr_cur_t {
   up_match and low_match values may exceed the correct values for comparison to
   the adjacent user record if that record is on a different leaf page! See the
   note in row_ins_duplicate_error_in_clust.  */
+  /*
+    单位为 字段数量， 值为 匹配的字段数量
+    对于 PAGE_CUR_LE 模式：表示搜索键与游标右侧第一条用户记录匹配的字段数量
+    对于 PAGE_CUR_GE 模式：表示搜索键与游标位置或右侧第一条用户记录匹配的字段数量
+    跨叶子页时up/low_match可能失效
+
+    示例：
+        (1, 'a')
+        (2, 'b')
+        (3, 'c')
+        (5, 'd') 
+        如果搜索键是 (3, 'x')，使用 PAGE_CUR_LE 模式：
+        游标会定位到 (3, 'c')
+        low_match = 1（第一个字段 3 匹配）
+        up_match = 0（右侧记录 (5, 'd) 的第一个字段就不匹配）
+  */
   ulint up_match{0};
   /** Number of matched bytes to the right at the time cursor positioned; only
   used internally in searches: not defined after the search. */
@@ -705,6 +721,8 @@ struct btr_cur_t {
   user record AT THE CURSOR or to the left of it after
   btr_cur_search_to_nth_level; NOT defined for PAGE_CUR_GE or any other search
   modes; see also the NOTE in up_match! */
+  /** 仅对 PAGE_CUR_LE 模式有效：表示搜索键与游标位置或左侧第一条用户记录匹配的字段数量 <=
+  对于其他搜索模式（如 PAGE_CUR_GE）：未定义 */
   ulint low_match{0};
   /** Number of matched bytes to the left at the time cursor positioned; only
   used internally in searches: not defined after the search. */

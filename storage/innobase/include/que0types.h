@@ -48,6 +48,7 @@ struct que_thr_t;
 /* Common struct at the beginning of each query graph node; the name of this
 substruct must be 'common' */
 
+// XXXXX: C实现的多态，必须放在子类第一个成员
 struct que_common_t {
   ulint type;          /*!< query node type */
   que_node_t *parent;  /*!< back pointer to parent node, or NULL */

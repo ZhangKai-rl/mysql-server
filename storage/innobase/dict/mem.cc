@@ -179,6 +179,7 @@ static bool dict_mem_table_is_system(const std::string name) {
   }
 }
 
+// 构造 dict_table_t
 dict_table_t *dict_mem_table_create(const char *name, space_id_t space,
                                     ulint n_cols, ulint n_v_cols,
                                     ulint n_m_v_cols, uint32_t flags,
@@ -316,7 +317,7 @@ dict_index_t *dict_mem_index_create(
   return (index);
 }
 
-/** Adds a column definition to a table. */
+/** Adds a column definition dict_col_t to a table. */
 void dict_mem_table_add_col(dict_table_t *table, mem_heap_t *heap,
                             const char *name, ulint mtype, ulint prtype,
                             ulint len, bool is_visible, uint32_t phy_pos,

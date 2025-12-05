@@ -144,6 +144,7 @@ static inline size_t btr_search_hash_index_id(const dict_index_t *index) {
   return ut::hash_uint64_pair(index->space, index->id);
 }
 
+// TODO
 static inline btr_search_sys_t::search_part_t &btr_get_search_part(
     const dict_index_t *index) {
   ut_ad(index != nullptr);

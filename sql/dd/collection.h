@@ -48,7 +48,9 @@ class Collection {
   // Abstract type.
   typedef typename std::remove_pointer<T>::type abstract_type;
   // Implementation type. Pointer to this type is actually stored in the vector.
+  // dd::Table_impl
   typedef typename abstract_type::Impl impl_type;
+  // 核心，即collection就是个vector, 内部存了dd::xxx_impl
   typedef std::vector<impl_type *> Array;
 
  private:

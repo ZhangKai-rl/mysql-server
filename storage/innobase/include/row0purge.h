@@ -105,6 +105,7 @@ struct purge_node_t {
 
   using Recs = std::list<rec_t, mem_heap_allocator<rec_t>>;
 
+  // note: c实现的多态， que_common_t 是 que_node_t 的基类, 必须放在子类第一个成员
   /** node type: QUE_NODE_PURGE */
   que_common_t common;
 

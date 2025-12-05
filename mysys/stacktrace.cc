@@ -250,6 +250,7 @@ static void my_demangle_symbols(char **addrs, int n) {
 
 #endif /* HAVE_ABI_CXA_DEMANGLE */
 
+// note: stack backtrace
 void my_print_stacktrace(const uchar *stack_bottom, ulong thread_stack) {
 #if defined(__FreeBSD__)
   static char procname_buffer[2048];

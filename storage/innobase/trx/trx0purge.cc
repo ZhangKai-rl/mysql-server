@@ -193,12 +193,37 @@ this query graph.
 @param[in]   trx               transaction
 @param[in]   n_purge_threads   number of purge threads
 @return own: the query graph */
+/*
+trx_purge()                                    // trx0purge.cc - purge 入口
+  └─ trx_purge_graph_build()                   // trx0purge.cc:197 - 构建 query graph
+  │    ├─ que_fork_create(QUE_FORK_PURGE)      // 创建 fork 根节点
+  │    └─ for each purge thread:
+  │         ├─ que_thr_create(fork)            // 创建 query thread
+  │         └─ thr->child = row_purge_node_create()  // 创建 purge 操作节点
+  └─ que_fork_scheduler_round_robin()          // 轮询调度选择 thr
+  └─ que_run_threads(thr)                      // que0que.cc:996 - 执行入口
+       └─ que_run_threads_low(thr)             // que0que.cc:942 - 执行循环
+            └─ do {
+                 log_free_check();
+                 next_thr = que_thr_step(thr); // que0que.cc:843 - 单步执行
+                 // 根据 node type 分发:
+                 // QUE_NODE_THR   → que_thr_node_step()
+                 // QUE_NODE_PURGE → row_purge_step()
+                 // QUE_NODE_UNDO  → row_undo_step()
+                 // QUE_NODE_SELECT → row_sel_step()
+                 // QUE_NODE_INSERT → row_ins_step()
+                 // QUE_NODE_UPDATE → row_upd_step()
+                 // ...
+               } while (next_thr != nullptr);
+*/
+// TODO
 static que_t *trx_purge_graph_build(trx_t *trx, ulint n_purge_threads) {
   ulint i;
   mem_heap_t *heap;
   que_fork_t *fork;
 
   heap = mem_heap_create(512, UT_LOCATION_HERE);
+  // note
   fork = que_fork_create(nullptr, nullptr, QUE_FORK_PURGE, heap);
   fork->trx = trx;
 
@@ -258,6 +283,7 @@ void trx_purge_sys_initialize(uint32_t n_purge_threads,
   purge_sys->trx->op_info = "purge trx";
   purge_sys->trx->purge_sys_trx = true;
 
+  // note
   purge_sys->query = trx_purge_graph_build(purge_sys->trx, n_purge_threads);
 
   new (&purge_sys->view) ReadView();
@@ -2024,6 +2050,7 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
 struct Purge_groups_t {
   Purge_groups_t(std::size_t n_threads, mem_heap_t *heap)
       : m_grpid_umap{n_threads, mem_heap_allocator<GroupBy::value_type>{heap}},
+        // note
         m_groups(n_threads, nullptr,
                  mem_heap_allocator<purge_node_t::Recs *>(heap)),
         m_heap(heap),
@@ -2093,7 +2120,8 @@ struct Purge_groups_t {
       mem_heap_allocator<std::pair<const table_id_t, std::size_t>>>;
 
   /** Given a table_id obtain the group id to which it belongs. */
-  // 根据table_id获取组id， 即m_groups[组id]存放这个table_id_t的recs
+  // 根据table_id hash获取组id， 即m_groups[组id]存放这个table_id_t的recs
+  // hash(table_id) = group id.
   GroupBy m_grpid_umap;
 
   /** Allocator used for the vector below. */
@@ -2247,6 +2275,7 @@ void Purge_groups_t::distribute_if_needed() {
     }
   }
 
+  // XXXXXXXXX: purge停的位置
   if (purge_sys->iter.trx_no >= purge_sys->view.low_limit_no()) {
     return nullptr;
   }
@@ -2277,6 +2306,7 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
   ut_a(n_purge_threads > 0);
   ut_a(n_purge_threads <= MAX_PURGE_THREADS);
 
+  // note:上一批已经purge完
   purge_sys->limit = purge_sys->iter;
 
   que_thr_t *run_thrs[MAX_PURGE_THREADS];
@@ -2450,6 +2480,7 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
 
   purge_sys->view_active = false;
 
+  // 取mvcc末的oldest view作为purge RV
   trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
 
   purge_sys->view_active = true;
@@ -2474,9 +2505,11 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
 
       ut_a(thr != nullptr);
 
+      // note: purge in srv_worker_threads
       srv_que_task_enqueue_low(thr);
     }
 
+    // set to running
     thr = que_fork_scheduler_round_robin(purge_sys->query, thr);
     ut_a(thr != nullptr);
 

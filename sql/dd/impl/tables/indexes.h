@@ -31,6 +31,8 @@
 namespace dd {
 class Object_key;
 
+// dd::tables 下的元数据表 都是单例模式的。
+// note: dd::tables 在构造函数中定义的
 namespace tables {
 
 ///////////////////////////////////////////////////////////////////////////
@@ -41,6 +43,7 @@ class Indexes : public Object_table_impl {
 
   static const CHARSET_INFO *name_collation();
 
+  // 见 show create table mysql.indexes.
   enum enum_fields {
     FIELD_ID,
     FIELD_TABLE_ID,
@@ -62,6 +65,7 @@ class Indexes : public Object_table_impl {
     NUMBER_OF_FIELDS  // Always keep this entry at the end of the enum
   };
 
+  // mysql.indexes 的三个索引
   enum enum_indexes {
     INDEX_PK_ID = static_cast<uint>(Common_index::PK_ID),
     INDEX_UK_TABLE_ID_NAME = static_cast<uint>(Common_index::UK_NAME),

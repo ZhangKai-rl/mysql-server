@@ -858,6 +858,30 @@ class Timestamp_timezone_guard {
 };
 
 // Get a dictionary object.
+/*
+Dictionary_client::acquire
+  // 从 local cache 中查找
+  |- m_registry_uncommitted.get
+  |- m_registry_committed.get
+  |- Shared_dictionary_cache::instance()->get
+    // 从 shared cache 中查找
+    |- m_map.get
+    // 如果从 shared cache 中没找到，则直接从磁盘上的 dd-table 表中读数据构建
+    |- get_uncached
+      |- Storage_adapter::get
+        // 1. 打开系统表
+        // 打开构建 dd::Table 所需的 mysql.columns / mysql.indexes 等系统表
+        // 这个函数会对每一个系统表生成 struct TABLE 对象，存储打开的系统表信息
+        |- trx.otx.open_tables()
+        // 2. 在系统表查找
+        // 根据表名在 mysql.tables 中查找这个表元信息数据行，并放在 mysql.tables
+        // 对应的 TABLE::record[0] 这个 buffer 中
+        |- t->find_record(key, r)
+        // 3. 生成 dd::Table 对象
+        // 读出 TABLE::record[0] 中的内容，并赋值给 dd::Table 中对应的成员变量
+        // - m_row_format、m_collation_id 等等
+        |- Entity_object_table_impl::restore_object_from_record
+*/
 template <typename K, typename T>
 bool Dictionary_client::acquire(const K &key, const T **object,
                                 bool *local_committed,

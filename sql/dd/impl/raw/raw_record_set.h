@@ -40,6 +40,7 @@ struct Raw_key;
 
 class Raw_record_set : private Raw_record {
  public:
+  // note: close cursor
   ~Raw_record_set();
 
   Raw_record *current_record() { return m_current_record; }

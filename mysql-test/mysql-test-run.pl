@@ -1803,6 +1803,7 @@ sub command_line_setup {
     'verbose'               => \$opt_verbose,
     'verbose-restart'       => \&report_option,
     'wait-all'              => \$opt_wait_all,
+    #  Getopt::Long 的特殊语法，表示该选项支持布尔取反. 是否调用 check-warnings.test -> mtr.check_warnings
     'warnings!'             => \$opt_warnings,
 
     # list-options is internal, not listed in help
@@ -5746,7 +5747,7 @@ sub extract_warning_lines ($$) {
 
 }
 
-# Run include/check-warnings.test
+# note: Run include/check-warnings.test
 #
 # RETURN VALUE
 #   0 OK
@@ -5768,6 +5769,7 @@ sub start_check_warnings ($$) {
 
   mtr_add_arg($args, "--defaults-file=%s",         $path_config_file);
   mtr_add_arg($args, "--defaults-group-suffix=%s", $exe->after($group_prefix));
+  # note
   mtr_add_arg($args, "--test-file=%s",  "include/check-warnings.test");
   mtr_add_arg($args, "--logdir=%s/tmp", $opt_vardir);
 

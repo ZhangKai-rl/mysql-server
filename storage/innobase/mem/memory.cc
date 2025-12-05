@@ -266,9 +266,11 @@ mem_block_t *mem_heap_create_block(mem_heap_t *heap, ulint n,
   len = MEM_BLOCK_HEADER_SIZE + MEM_SPACE_NEEDED(n);
 
 #if !defined(UNIV_LIBRARY) && !defined(UNIV_HOTBACKUP)
+  // 小块8k内存分配，从os malloc
   if (type == MEM_HEAP_DYNAMIC || len < UNIV_PAGE_SIZE / 2) {
     ut_ad(type == MEM_HEAP_DYNAMIC || n <= MEM_MAX_ALLOC_IN_BUF);
 
+    // for < 16KB or dynamic
     block = static_cast<mem_block_t *>(
         ut::malloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, len));
   } else {
@@ -330,6 +332,8 @@ mem_block_t *mem_heap_create_block(mem_heap_t *heap, ulint n,
   block->magic_n = MEM_BLOCK_MAGIC_N;
   mem_block_set_len(block, len);
   mem_block_set_type(block, type);
+  // 设置block的start和free， start和free都是header size
+  // start前为block hdr:  mem_block_info_t
   mem_block_set_start(block, MEM_BLOCK_HEADER_SIZE);
   mem_block_set_free(block, MEM_BLOCK_HEADER_SIZE);
 
@@ -370,6 +374,7 @@ mem_block_t *mem_heap_add_block(mem_heap_t *heap, /*!< in: memory heap */
   doubled until the standard size is reached. After that the size
   stays the same, except in cases where the caller needs more space. */
 
+  // note: 新 mem block为上一个的2倍
   new_size = 2 * mem_block_get_len(block);
 
   if (heap->type != MEM_HEAP_DYNAMIC) {

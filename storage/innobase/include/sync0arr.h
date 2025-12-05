@@ -40,6 +40,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 struct sync_cell_t;
 
 /** Synchronization wait array */
+// sync_array_t 是一个一维数组
 struct sync_array_t;
 
 /** Get an instance of the sync wait array and reserve a wait array cell in

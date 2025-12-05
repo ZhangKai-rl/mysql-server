@@ -228,6 +228,7 @@ dict_table_t::flags |     0     |    1    |     1      |    1
 @param[in]      fsp_flags       fil_space_t::flags
 @param[in]      compact         true if not Redundant row format
 @return tablespace flags (fil_space_t::flags) */
+// fil_space_t::flags -> dict_table_t::flags
 uint32_t fsp_flags_to_dict_tf(uint32_t fsp_flags, bool compact) {
   /* If the table in this file-per-table tablespace is Compact
   row format, the low order bit will not indicate Compact. */
@@ -540,6 +541,7 @@ static inline void xdes_init(xdes_t *descr, /*!< in: descriptor */
 the same as the tablespace header
 @return pointer to the extent descriptor, NULL if the page does not
 exist in the space or if the offset exceeds free limit */
+// XXXXX: 根据offset(page no)计算出XDES Entry的起始地址
 [[nodiscard]] static inline xdes_t *xdes_get_descriptor_with_space_hdr(
     fsp_header_t *sp_header, space_id_t space, page_no_t offset, mtr_t *mtr,
     bool init_space = false, buf_block_t **desc_block = nullptr) {
@@ -577,6 +579,7 @@ exist in the space or if the offset exceeds free limit */
 
   const page_size_t page_size(flags);
 
+  // 获取 page 所属 extent 的 xdes
   descr_page_no = xdes_calc_descriptor_page(page_size, offset);
 
   buf_block_t *block;
@@ -662,8 +665,10 @@ static inline page_no_t xdes_get_offset(
 {
   ut_ad(descr);
 
+  //                        XDES page
   return (page_get_page_no(page_align(descr)) +
           static_cast<page_no_t>(
+              //  XDES page的xdes arr中的索引
               ((page_offset(descr) - XDES_ARR_OFFSET) / XDES_SIZE) *
               FSP_EXTENT_SIZE));
 }
@@ -1485,8 +1490,12 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
   // 初始化所有extent
   while ((init_space && i < 1) ||
          ((i + FSP_EXTENT_SIZE <= size) && (count < FSP_FREE_ADD))) {
+    // note: 每256个extents为一组，这一组的特征是第一个页面为 XDES
+    // ques: init_space的作用？
+    // note: free_limit % 16384(64 * 256) == 0, 此为init_xdes！
     bool init_xdes = (ut_2pow_remainder(i, page_size.physical()) == 0);// ? 为啥这就是init_xdes? 每256extents为一组，这一组的特征是第一个页面为 XDES
 
+    // 一次增加一个extent. (free_limit, size) -> (free_list, free_limit) 
     space->free_limit = i + FSP_EXTENT_SIZE;
     mlog_write_ulint(header + FSP_FREE_LIMIT, i + FSP_EXTENT_SIZE, MLOG_4BYTES,
                      mtr);
@@ -1552,6 +1561,7 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
     xdes_init(descr, mtr);
 
     if (init_xdes) {
+      // xxxxx: 一定要注意！ init_xdes, 也就是每256个extents为一组，每组第一个extent(init_xdes)是要加入free_frag extent list中的(XDES page已用)，其余加入到free extent list中!
       fsp_init_xdes_free_frag(header, descr, mtr);
     } else {
       flst_add_last(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
@@ -1581,6 +1591,7 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
 
   header = fsp_get_space_header(space_id, page_size, mtr);
 
+  // 获取hint page所在extent的xdes entry 
   descr = xdes_get_descriptor_with_space_hdr(header, space_id, hint, mtr, false,
                                              &desc_block);
 
@@ -1654,6 +1665,8 @@ x-latched only by mtr, and freed in mtr in that case.
 @param[in]      rw_latch        RW_SX_LATCH, RW_X_LATCH
 @param[in,out]  mtr             Mini-transaction of the allocation
 @param[in,out]  init_mtr        Mini-transaction for initializing the page
+mtr：负责空间分配的元数据修改（修改 XDES、INODE、FSP header 等），是"分配事务"
+init_mtr：负责新分配页面的初始化（init page 内容），是"使用事务"
 @return block, initialized if init_mtr==mtr
 or rw_lock_x_lock_count(&block->lock) == 1 */
 static buf_block_t *fsp_page_create(const page_id_t &page_id,
@@ -2424,7 +2437,7 @@ pages are currently used.
 @param[in]      inode       File segment inode pointer
 @param[out]     used        Number of pages used (not more than reserved)
 @param[in,out]  mtr         Mini-transaction
-@return number of reserved pages */
+@return number of reserved(段总大小) pages */
 static ulint fseg_n_reserved_pages_low(space_id_t space_id,
                                        const page_size_t &page_size,
                                        fseg_inode_t *inode, ulint *used,
@@ -2528,6 +2541,7 @@ static void fseg_fill_free_list(fseg_inode_t *inode, space_id_t space,
     return;
   }
 
+  // 跟fsp_fill_free_list一样，每次fill free 都填充4个extent
   for (i = 0; i < FSEG_FREE_LIST_MAX_LEN; i++) {
     descr = xdes_get_descriptor(space, hint, page_size, mtr);
 
@@ -2614,6 +2628,7 @@ static xdes_t *fsp_get_last_free_frag_extent(fsp_header_t *header,
 @param[in,out]  inode           Segment to which extent is leased
 @param[in]      page_size       Page size
 @param[in,out]  mtr             Mini-transaction
+note: 虽然是 lease 但是仍会移动extent list链表
 @return extent descriptor or NULL */
 static xdes_t *fsp_alloc_xdes_free_frag(space_id_t space, fseg_inode_t *inode,
                                         const page_size_t &page_size,
@@ -2646,6 +2661,7 @@ static xdes_t *fsp_alloc_xdes_free_frag(space_id_t space, fseg_inode_t *inode,
 
   /* Transition the extent (and its ownership) to the segment. */
   seg_id = mach_read_from_8(inode + FSEG_ID);
+  // NOTE
   xdes_set_segment_id(descr, seg_id, XDES_FSEG_FRAG, mtr);
 
   /* Add to the end of FSEG_NOT_FULL list. */
@@ -2693,6 +2709,7 @@ static xdes_t *fseg_alloc_free_extent(fseg_inode_t *inode, space_id_t space,
 
     /* Check if we can allocate an extent from free frag
     list of tablespace. */
+    // 先查fsp free_frag
     descr = fsp_alloc_xdes_free_frag(space, inode, page_size, mtr);
 
     if (descr != nullptr) {
@@ -2728,6 +2745,7 @@ static buf_block_t *fseg_alloc_free_page_low(
   ulint used;
   ulint reserved;
   xdes_t *descr;                 /*!< extent of the hinted page */
+  // ques: page offset?
   page_no_t ret_page = FIL_NULL; /*!< the allocated page offset, FIL_NULL
                       if could not be allocated */
   xdes_t *ret_descr = nullptr;   /*!< the extent of the allocated page */
@@ -2752,11 +2770,13 @@ static buf_block_t *fseg_alloc_free_page_low(
 
   space_header = fsp_get_space_header(space_id, page_size, mtr);
 
+  // xdes_t
   descr = xdes_get_descriptor_with_space_hdr(space_header, space_id, hint, mtr);
   if (descr == nullptr) {
     /* Hint outside space or too high above free limit: reset
     hint */
     /* The file space header page is always allocated. */
+    /* NOTE: hint=0时, hint完全无用了，只为了descr != 0 */
     hint = 0;
     descr = xdes_get_descriptor(space_id, hint, page_size, mtr);
   }
@@ -2766,6 +2786,7 @@ static buf_block_t *fseg_alloc_free_page_low(
   if (xdes_in_segment(descr, seg_id, mtr) &&
       (xdes_mtr_get_bit(descr, XDES_FREE_BIT, hint % FSP_EXTENT_SIZE, mtr) ==
        true)) {
+      /* 条件： hint页所在extent属于本segment, 并且该页空闲 */
   take_hinted_page:
     /* 1. We can take the hinted page
     =================================*/
@@ -2780,6 +2801,7 @@ static buf_block_t *fseg_alloc_free_page_low(
   if (xdes_get_state(descr, mtr) == XDES_FREE &&
       reserved - used < reserved * (fseg_reserve_pct / 100) &&
       used >= FSEG_FRAG_LIMIT) {
+      /* 条件2: hint页位于fsp free_list上的extent, 段可用空间不足， 且大于32碎片页 */
     /* 2. We allocate the free extent from space and can take
     =========================================================
     the hinted page
@@ -2792,11 +2814,13 @@ static buf_block_t *fseg_alloc_free_page_low(
     flst_add_last(seg_inode + FSEG_FREE, ret_descr + XDES_FLST_NODE, mtr);
 
     /* Try to fill the segment free list */
+    /* 内部工作和上面一样，这里实际什么都不做，防御编程 */
     fseg_fill_free_list(seg_inode, space_id, page_size, hint + FSP_EXTENT_SIZE,
                         mtr);
     goto take_hinted_page;
     /*-----------------------------------------------------------*/
   }
+  /* NOTE: 弃用hint page*/
   if (direction != FSP_NO_DIR &&
       reserved - used < reserved * (fseg_reserve_pct / 100) &&
       used >= FSEG_FRAG_LIMIT) {
@@ -2808,11 +2832,13 @@ static buf_block_t *fseg_alloc_free_page_low(
       ========================================================
       highest page in it, depending on the direction
       ==============================================*/
+      // 本extent第一页
       ret_page = xdes_get_offset(ret_descr);
 
       if (direction == FSP_DOWN) {
         ret_page += FSP_EXTENT_SIZE - 1;
       } else if (xdes_get_state(ret_descr, mtr) == XDES_FSEG_FRAG) {
+        // 如果是从fsp free_frag过来的， 找到空闲页面
         ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, true, 0, mtr);
       }
 
@@ -3082,18 +3108,20 @@ if the table only occupies < FSP_EXTENT_SIZE pages. That is why we apply
 different rules in that special case, just ensuring that there are n_pages
 free pages available.
 
-@param[out]     n_reserved      Number of extents actually reserved; if we
+note: @param[out]     n_reserved      Number of extents actually reserved; if we
                                 return true and the tablespace size is <
                                 FSP_EXTENT_SIZE pages, then this can be 0,
                                 otherwise it is n_ext
 @param[in]      space_id    Tablespace identifier
-@param[in]      n_ext       Number of extents to reserve
+@param[in]      n_ext       Number of extents **want** to reserve
 @param[in]      alloc_type  Page reservation type (FSP_BLOB, etc)
 @param[in,out]  mtr         Mini-transaction
 @param[in]      n_pages     For small tablespaces (tablespace size is
-                                less than FSP_EXTENT_SIZE), number of free
-                                pages to reserve.
+                                less than FSP_EXTENT_SIZE 小于一个区extent的fsp), number of free
+                                pages to reserve. https://dev.mysql.com/doc/refman/8.0/en/innodb-tablespace-autoextend-size.html 的第一条规则。
 @return true if we were able to make the reservation */
+// ques:  
+// @brief: fsp扩容(以extent为单位)，如果fsp太小，可能扩容free_pages(fsp_reserve_free_pages)
 bool fsp_reserve_free_extents(ulint *n_reserved, space_id_t space_id,
                               ulint n_ext, fsp_reserve_t alloc_type, mtr_t *mtr,
                               page_no_t n_pages) {
@@ -3122,6 +3150,7 @@ try_again:
   size = mach_read_from_4(space_header + FSP_SIZE);
   ut_ad(size == space->size_in_header);
 
+  /* 非自动扩展时，根据这个rule： https://dev.mysql.com/doc/refman/8.0/en/innodb-tablespace-autoextend-size.html */
   if (space->autoextend_size_in_bytes > 0) {
     page_no_t autoextend_size_pages =
         space->autoextend_size_in_bytes / page_size.physical();
@@ -3144,7 +3173,9 @@ try_again:
       }
     }
   } else if (size < FSP_EXTENT_SIZE && n_pages < FSP_EXTENT_SIZE / 2) {
+    // rule1: fsp由碎片页<64pages组成, 每次扩展一页
     /* Use different rules for small single-table tablespaces */
+    /* 只扩展碎片页，不扩展完整extent */
     *n_reserved = 0;
     bool success =
         fsp_reserve_free_pages(space, space_header, size, mtr, n_pages);
@@ -3168,7 +3199,8 @@ try_again:
   will not be free extents */
 
   if (size >= free_limit) {
-    // 计算free extent
+    // 计算free extent: [free_limit, size) 这段区间内，可以容纳多少个完整 extent。
+    // note: 这些是已经扩展了space data file, 但是还没纳入free_limit的(没加入fsp_free!)
     n_free_up = (size - free_limit) / FSP_EXTENT_SIZE;
   } else {
     ut_ad(alloc_type == FSP_BLOB);
@@ -3176,12 +3208,16 @@ try_again:
   }
 
   if (n_free_up > 0) {
+    // 这里应该和extent分组的每组init_xdes有关了，不会加入free_list而是free_frag
+    // 扣减的是XDES descriptor page 所占用的 extent（即每 256 个 extent 一组，组头 extent 包含 XDES page，将来会被加入 FSP_FREE_FRAG 而非 FSP_FREE，所以不算作"可用的 free extent"）
     n_free_up--;
+    //                 note: 16384 = 256 extents per group * 64 pages per extent
     n_free_up -= n_free_up / (page_size.physical() / FSP_EXTENT_SIZE);
   }
 
   n_free = n_free_list_ext + n_free_up;
 
+  // 总共需要预留的为reserve个extent = fsp根据其类型本身需要一些，加上用户指定的n_ext
   switch (alloc_type) {
     case FSP_NORMAL:
       /* We reserve 1 extent + 0.5 % of the space size to undo logs
@@ -3191,6 +3227,7 @@ try_again:
       reserve = 2 + ((size / FSP_EXTENT_SIZE) * 2) / 200;
 
       if (n_free <= reserve + n_ext) {
+        /* note: 实际来看 reserve free extents 只是增加了data_file(n_free_up), 没增加 fsp_free(free_limit) */
         goto try_to_extend;
       }
       break;
@@ -3210,6 +3247,7 @@ try_again:
       ut_error;
   }
 
+  // xxxx: 核心, 具体的reserve extents op, 
   if (fil_space_reserve_free_extents(space_id, n_free, n_ext)) {
     return true;
   }
@@ -3267,6 +3305,7 @@ uintmax_t fsp_get_available_space_in_free_extents(const fil_space_t *space) {
   page_size_t page_size(space->flags);
   if (n_free_up > 0) {
     n_free_up--;
+    /* 16KB / 64(pages/extent) = 256, 即256个extent为一组区，该组区第一个extent的第一个page被额外使用为XDES page */
     n_free_up -= n_free_up / (page_size.physical() / FSP_EXTENT_SIZE);
   }
 
@@ -3333,6 +3372,7 @@ static void fseg_mark_page_used(space_id_t space_id,
 @param[in]      page_size       Page size
 @param[in]      ahi             Whether we may need to drop the adaptive
 hash index
+note: 即使extent空了也是移动到fsp_free/fsp_free_frag, 而不是 fseg free!
 @param[in,out]  mtr             Mini-transaction */
 static void fseg_free_page_low(fseg_inode_t *seg_inode,
                                const page_id_t &page_id,
@@ -3384,6 +3424,7 @@ static void fseg_free_page_low(fseg_inode_t *seg_inode,
       break;
     case XDES_FREE_FRAG:
     case XDES_FULL_FRAG:
+    /* note: 这两种情况是fseg < 32pages, 直接从fsp free_frag中分配 */
       /* The page is in the fragment pages of the segment */
 
       for (i = 0;; i++) {
@@ -3427,11 +3468,14 @@ static void fseg_free_page_low(fseg_inode_t *seg_inode,
     /* The fragment is full: move it to another list */
     flst_remove(seg_inode + FSEG_FULL, descr + XDES_FLST_NODE, mtr);
     flst_add_last(seg_inode + FSEG_NOT_FULL, descr + XDES_FLST_NODE, mtr);
+    /* 1: 当前释放的一页 */
     not_full_n_used += FSP_EXTENT_SIZE - 1;
   } else {
     ut_a(not_full_n_used > 0);
     not_full_n_used -= 1;
   }
+
+  /* 2. 处理 fseg not full 双向区链表 */
 
   const page_no_t bit = page_id.page_no() % FSP_EXTENT_SIZE;
 
@@ -3440,14 +3484,19 @@ static void fseg_free_page_low(fseg_inode_t *seg_inode,
 
   page_no_t n_used = xdes_get_n_used(descr, mtr);
 
+  /* note: 如果 extent 是 XDES_FSEG_FRAG 状态，那么当前释放的页一定不是 page 0 或 page 1。 
+    xdes_fseg_frag是fsp的free_frag借给fseg的，page0,1一定存fsp元数据： xdes + ibuf bitmap */
   ut_ad(state != XDES_FSEG_FRAG || (bit != 0 && bit != 1));
+  // 如果 extent 是 XDES_FSEG_FRAG 状态，那么释放当前页之后，extent 中已用页数 n_used 必须大于 1。
   ut_ad(state != XDES_FSEG_FRAG || n_used > 1);
+  /* lease 租约机制 */
   ut_ad(xdes_is_leasable(descr, page_size, mtr) ==
         (state == XDES_FSEG_FRAG && n_used == XDES_FRAG_N_USED));
 
   /* A leased fragment extent might have no more pages belonging to
   the segment.*/
   if (state == XDES_FSEG_FRAG && n_used == XDES_FRAG_N_USED) {
+    /* 这里利用n_used=0, 进入从not_full -> fsp_free_extent 的逻辑 */
     n_used = 0;
 
     ut_ad(not_full_n_used >= XDES_FRAG_N_USED);
@@ -3456,6 +3505,7 @@ static void fseg_free_page_low(fseg_inode_t *seg_inode,
 
   if (n_used == 0) {
     /* The extent has become free: free it to space */
+    // 归还给 fsp.
     flst_remove(seg_inode + FSEG_NOT_FULL, descr + XDES_FLST_NODE, mtr);
     fsp_free_extent(page_id, page_size, mtr);
   }
@@ -3568,6 +3618,7 @@ static void fseg_free_extent(fseg_inode_t *seg_inode, space_id_t space,
         if the page is found in the pool and
         is hashed */
 
+        /* 即使 innodb_adaptive_hash_index=OFF，每个被释放的页仍然要完整走一遍 mtr_start + buf_page_get_gen(RW_X_LATCH) + mtr_commit，产生不必要的 CPU 和锁开销。 */
         btr_search_drop_page_hash_when_freed(
             page_id_t(space, first_page_in_extent + i), page_size);
       }
@@ -3609,6 +3660,7 @@ bool fseg_free_step(
                            resides on the first page of the frag list
                            of the segment, this pointer becomes obsolete
                            after the last freeing step */
+    // 除purge 和 undo外, 其他情况ahi都为true!
     bool ahi,              /*!< in: whether we may need to drop
                            the adaptive hash index */
     mtr_t *mtr)            /*!< in/out: mini-transaction */

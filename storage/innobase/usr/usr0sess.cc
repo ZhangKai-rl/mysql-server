@@ -35,6 +35,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 
 /** Opens a session.
+ note
  @return own: session object */
 sess_t *sess_open(void) {
   sess_t *sess;

@@ -3368,6 +3368,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
     We do not flag "is DML" (TX_STMT_DML) here as replication expects us to
     test for LOCK TABLE etc. first. To rephrase, we try not to set TX_STMT_DML
     until we have the MDL, and LOCK TABLE could massively delay this.
+    note
   */
 
   switch (lex->sql_command) {
@@ -6114,6 +6115,7 @@ Table_ref *Query_block::add_table_to_list(
       element
       We don't use the offsetof() macro here to avoid warnings from gcc
     */
+    // 侵入式链表
     previous_table_ref =
         (Table_ref *)((char *)m_table_list.next -
                       ((char *)&(ptr->next_local) - (char *)ptr));
@@ -6133,6 +6135,7 @@ Table_ref *Query_block::add_table_to_list(
     previous table reference to 'ptr'. Here we also add one element to the
     list 'table_list'.
   */
+ // note
   m_table_list.link_in_list(ptr, &ptr->next_local);
   ptr->next_name_resolution_table = nullptr;
   ptr->partition_names = partition_names;
@@ -6141,6 +6144,7 @@ Table_ref *Query_block::add_table_to_list(
 
   // Pure table aliases do not need to be locked:
   if (!(table_options & TL_OPTION_ALIAS)) {
+    // ques
     MDL_REQUEST_INIT(&ptr->mdl_request, MDL_key::TABLE, ptr->db,
                      ptr->table_name, mdl_type, MDL_TRANSACTION);
   }

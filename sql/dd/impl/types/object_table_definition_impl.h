@@ -39,6 +39,7 @@ class Properties;
 
 ///////////////////////////////////////////////////////////////////////////
 
+// 建表语句, DDL builder
 class Object_table_definition_impl : public Object_table_definition {
  public:
   typedef std::map<String_type, int> Element_numbers;

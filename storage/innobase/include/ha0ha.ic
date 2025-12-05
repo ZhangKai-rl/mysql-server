@@ -67,6 +67,7 @@ static inline ha_node_t *ha_chain_get_next(
 }
 
 /** Gets the first node in a hash chain.
+note: 获取该hash value所在hash table的cell的冲突链首节点
  @return first node, NULL if none */
 static inline ha_node_t *ha_chain_get_first(
     hash_table_t *table, /*!< in: hash table */

@@ -234,6 +234,7 @@ struct AccessPath {
     ZERO_ROWS,
     ZERO_ROWS_AGGREGATED,
     MATERIALIZED_TABLE_FUNCTION,
+    // https://bugs.mysql.com/bug.php?id=112767 . 大宽表 count(*)时为负优化
     UNQUALIFIED_COUNT,
 
     // Joins.

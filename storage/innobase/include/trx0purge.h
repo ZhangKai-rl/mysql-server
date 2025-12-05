@@ -1012,6 +1012,15 @@ struct trx_purge_t {
   volatile purge_state_t state;
 
   /** The query graph which will do the parallelized purge operation */
+  // que_fork_t
+  /* note
+      que_fork_t(type=que_node_fork, fork_type=que_fork_purge)
+                 /                                \
+          que_thr_t(type=que_node_thr)         que_thr_t(type=que_node_thr)
+                |                                    |
+          purge_node_t(type_que_node_purge)    purge_node_t(type_que_node_purge)
+              
+  */
   que_t *query;
 
   /** The purge will not remove undo logs which are >= this view (purge view) */

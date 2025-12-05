@@ -2172,6 +2172,7 @@ bool PT_column_def::contextualize(Table_ddl_parse_context *pc) {
   // ensure any dynamic memory is released. This must be done whenever
   // leaving this scope since appliers may be added in
   // field_def->contextualize(pc).
+  // note: 这里应该是最后raii调用
   auto clr_appliers = create_scope_guard([&]() {
     pc->alter_info->cf_appliers = decltype(pc->alter_info->cf_appliers)();
   });
@@ -2203,6 +2204,7 @@ Sql_cmd *PT_create_table_stmt::make_cmd(THD *thd) {
 
   Parse_context pc(thd, lex->current_query_block());
 
+  // MDL
   Table_ref *table = pc.select->add_table_to_list(
       thd, table_name, nullptr, TL_OPTION_UPDATING, TL_WRITE, MDL_SHARED);
   if (table == nullptr) return nullptr;
@@ -2236,6 +2238,7 @@ Sql_cmd *PT_create_table_stmt::make_cmd(THD *thd) {
   } else {
     if (opt_table_element_list) {
       for (auto element : *opt_table_element_list) {
+        // note
         if (element->contextualize(&pc2)) return nullptr;
       }
     }
@@ -2306,6 +2309,7 @@ Sql_cmd *PT_create_table_stmt::make_cmd(THD *thd) {
       !pc2.create_info->db_type) {
     pc2.create_info->db_type =
         pc2.create_info->options & HA_LEX_CREATE_TMP_TABLE
+        // note: 这里选取temorary的默认存储引擎
             ? ha_default_temp_handlerton(thd)
             : ha_default_handlerton(thd);
     push_warning_printf(
@@ -4749,6 +4753,7 @@ PT_column_attr_base *make_column_engine_attribute(MEM_ROOT *mem_root,
 PT_column_attr_base *make_column_secondary_engine_attribute(MEM_ROOT *mem_root,
                                                             LEX_CSTRING attr) {
   return new (mem_root) PT_attribute<LEX_CSTRING, PT_column_attr_base>(
+      // 将lambda转换为普通函数指针
       attr, +[](LEX_CSTRING a, Column_parse_context *pc) {
         // Note that a std::function is created from the lambda and constructed
         // directly in the vector.

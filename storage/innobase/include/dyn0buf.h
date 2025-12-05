@@ -260,12 +260,14 @@ class dyn_buf_t {
     block_t *block =
         const_cast<block_t *>(const_cast<dyn_buf_t *>(this)->find(pos));
 
+    // 经过find后，pos已经是当前所需block的内部offset了
     return (reinterpret_cast<Type>(block->begin() + pos));
   }
 
   /**
   Returns a pointer to an element in the buffer. non const version.
   @param pos    position of element in bytes from start
+  note:         pos 是 memo size 而不是 index
   @return       pointer to element */
   template <typename Type>
   Type at(ulint pos) {
@@ -364,6 +366,7 @@ class dyn_buf_t {
   @param pos    absolute offset, it is updated to make it relative
                   to the block
   @return the block containing the pos. */
+  // find 的参数是引用 ulint &pos，它会在遍历过程中修改 pos 的值
   block_t *find(ulint &pos) {
     ut_ad(UT_LIST_GET_LEN(m_list) > 0);
 
@@ -372,6 +375,7 @@ class dyn_buf_t {
         return block;
       }
 
+      // note
       pos -= block->used();
     }
 

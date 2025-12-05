@@ -161,6 +161,7 @@ extern ulint sync_array_size;
 
 /** The global array of wait cells for implementation of the database's own
 mutexes and read-write locks */
+// NOTE: 二维数组
 extern sync_array_t **sync_wait_array;
 
 static inline void sync_array_exit(sync_array_t *a) { mutex_exit(&a->mutex); }

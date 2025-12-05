@@ -164,6 +164,7 @@ byte *row_mysql_store_true_var_len(
     ulint lenlen) /*!< in: storage length of len: either 1 or 2 bytes */
 {
   if (lenlen == 2) {
+    /* length of varchar, 256 * 256 = 65536 = 2^16 */
     ut_a(len < 256 * 256);
 
     mach_write_to_2_little_endian(dest, len);
@@ -386,6 +387,10 @@ byte *row_mysql_store_col_in_innobase_format(
     bool row_format_col,    /*!< true if the mysql_data is from
                              a MySQL row, false if from a MySQL
                              key value;
+    note: row_format_col = true：数据来自 MySQL 行记录（Row Format）; row_format_col = false：数据来自 MySQL 索引键值（Key Format）
+    VARCHAR 长度字段的存储方式不同
+      Row Format：完整行记录，存储在table::record[0]. 长度字段可以是 1 字节或 2 字节（取决于列定义）
+      Key Format：索引键值，存储在buf。长度字段总是 2 字节
                              in MySQL, a true VARCHAR storage
                              format differs in a row and in a
                              key value: in a key value the length
@@ -403,6 +408,7 @@ byte *row_mysql_store_col_in_innobase_format(
                             VARCHAR then this is irrelevant */
     ulint comp)             /*!< in: nonzero=compact format */
 {
+  // table::record[0]中的某列
   const byte *ptr = mysql_data;
   const dtype_t *dtype;
   ulint type;
@@ -704,6 +710,7 @@ handle_new_error:
       }
       /* MySQL will roll back the latest SQL statement */
       break;
+    // note
     case DB_LOCK_WAIT:
 
       trx_kill_blocking(trx);
@@ -1597,6 +1604,7 @@ run_again:
     /* FIXME: What's this ? */
     thr->lock_state = QUE_THR_LOCK_ROW;
 
+    // note: 如果是锁等待进入这里
     auto was_lock_wait = row_mysql_handle_errors(&err, trx, thr, &savept);
 
     thr->lock_state = QUE_THR_LOCK_NOLOCK;
@@ -1747,6 +1755,7 @@ upd_node_t *row_create_update_node_for_mysql(
 
   DBUG_TRACE;
 
+  // note: innodb query graph
   node = upd_node_create(heap);
 
   node->in_mysql_interface = true;

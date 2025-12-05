@@ -43,6 +43,7 @@ tests.Initially, BLOB field references are set to zero, in
 dtuple_convert_big_rec(). */
 extern const byte field_ref_zero[FIELD_REF_SIZE];
 
+/* 2^17 = 131072 = 128KB, 大于innodb最大64KB page */
 constexpr size_t PAGE_SIZE_T_SIZE_BITS = 17;
 
 /** Page size descriptor. Contains the physical and logical page size, as well
@@ -83,6 +84,7 @@ class page_size_t {
 
     /* If the logical page size is zero in fsp_flags, then use the
     legacy 16k page size. */
+    // ssize: shift size: ssize = log2(page_size) - 9，即"以 512 字节为基准的移位次数"。它是一种紧凑编码，用 4 bits 就能表示所有合法的页大小
     ssize = (0 == ssize) ? UNIV_PAGE_SSIZE_ORIG : ssize;
 
     /* Convert from a 'log2 minus 9' to a page size in bytes. */
@@ -117,6 +119,7 @@ class page_size_t {
   }
 
   /** Retrieve the physical page size (on-disk).
+   * 16384, 既是页面大小16KB，也是一组extent的页面数量16384个
   @return physical page size in bytes */
   inline size_t physical() const {
     ut_ad(m_physical > 0);

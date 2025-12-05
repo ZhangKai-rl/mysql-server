@@ -160,14 +160,17 @@ void ha_print_info(FILE *file, hash_table_t *table);
 
 #endif /* !UNIV_HOTBACKUP */
 
-/** The hash table external chain node */
+/*note: 链地址法的cell冲突链 The hash table external chain node */
+// XXXX: 这个是用于AHI的 node, 跟 page_hash的 node(buf_page_t)
 struct ha_node_t {
   /** hash value for the data  */
+  // 对比 buf_page_t::id
   uint64_t hash_value;
   /** next chain node or NULL if none */
   ha_node_t *next;
 #if defined UNIV_AHI_DEBUG || defined UNIV_DEBUG
   /** buffer block containing the data, or NULL */
+  // note: 可以看出 hash_table_t hash_value(rec_t)的对应结果为buf_block_t
   buf_block_t *block;
 #endif
   /** pointer to the data */

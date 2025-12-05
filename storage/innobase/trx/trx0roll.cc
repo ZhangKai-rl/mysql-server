@@ -1044,6 +1044,69 @@ trx_undo_rec_t *trx_roll_pop_top_rec_of_trx(
 @param[in,out]  trx                     transaction
 @param[in]      partial_rollback        true if partial rollback
 @return the query graph */
+/*
+note: trx_rollback_for_mysql
+外层 Graph:
+┌──────────────────────────────────────────────────────────────────────────┐
+│ que_fork_t (根)                                                         │
+│   type      = QUE_NODE_FORK                                             │
+│   fork_type = QUE_FORK_MYSQL_INTERFACE (10)                             │
+│   trx       = 0x7f...                                                   │
+│   graph     = self                                                      │
+│   state     = QUE_FORK_ACTIVE                                           │
+│   sym_tab   = nullptr (手工构建, 非 parser 生成)                          │
+│                                                                          │
+│   └── que_thr_t                                                          │
+│         type      = QUE_NODE_THR                                         │
+│         parent    = fork                                                 │
+│         prebuilt  = nullptr                                              │
+│         run_node  = roll_node (→ 后来变为 fork.parent 表示结束)           │
+│         prev_node = fork (→ 后来变为 roll_node)                          │
+│                                                                          │
+│         └── roll_node_t                                                  │
+│               type      = QUE_NODE_ROLLBACK (12)                         │
+│               parent    = thr                                            │
+│               partial   = false                                          │
+│               state     = ROLL_NODE_SEND → ROLL_NODE_WAIT                │
+│               savept    = {least_undo_no = 0}                            │
+│               undo_thr  ──────────────────────────────────┐              │
+│                                                           │              │
+└───────────────────────────────────────────────────────────│──────────────┘
+                                                            │
+                                                            ▼
+内层 Undo Graph (动态创建):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ que_fork_t (根)                                                         │
+│   type      = QUE_NODE_FORK                                             │
+│   fork_type = QUE_FORK_ROLLBACK (5)                                     │
+│   trx       = 0x7f... (同一个事务)                                       │
+│   graph     = self                                                      │
+│                                                                          │
+│   └── que_thr_t  ◄── roll_node->undo_thr 指向这里                       │
+│         type      = QUE_NODE_THR                                         │
+│         parent    = fork                                                 │
+│         run_node  = undo_node (循环执行)                                  │
+│         prev_node = (随执行推进)                                          │
+│                                                                          │
+│         └── undo_node_t                                                  │
+│               type      = QUE_NODE_UNDO (10)                             │
+│               parent    = thr                                            │
+│               trx       = 0x7f...                                        │
+│               state     = UNDO_NODE_FETCH_NEXT (循环状态机)               │
+│               roll_ptr  = (当前正在处理的 undo record 的 roll_ptr)        │
+│               undo_rec  = (当前 undo log record 指针)                    │
+│               undo_no   = 3 → 2 → 1 → 0 (逆序递减)                      │
+│               rec_type  = TRX_UNDO_DEL_MARK_REC / UPD_EXIST / INSERT    │
+│               table     = dict_table_t* (当前操作的表)                    │
+│               pcur      = btr_pcur_t (定位聚簇索引记录的持久游标)         │
+│               update    = upd_t* (undo 时的 update vector)               │
+│               ref       = dtuple_t* (行引用, 用于定位下一行)              │
+│               row       = dtuple_t* (行数据副本)                         │
+│               index     = dict_index_t* (下一个要处理的索引)              │
+│               heap      = mem_heap_t* (辅助内存, 每行处理后清空)          │
+│               partial   = false                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+*/
 static que_t *trx_roll_graph_build(trx_t *trx, bool partial_rollback) {
   mem_heap_t *heap;
   que_fork_t *fork;

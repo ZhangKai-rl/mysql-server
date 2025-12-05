@@ -322,6 +322,7 @@ int log_sink_trad(void *instance [[maybe_unused]], log_line *ll) {
         itself should be considered opaque; in particular, it
         may be non-numerical: [ <alpha> | <digit> | '_' | '.' | '-' ]
       */
+     // xxxx: mysql / innodb 的日志打印格式
       len =
           snprintf(buff_line, buff_size, "%.*s %u [%.*s] [MY-%06u] [%.*s] %.*s",
                    (int)iso_len, iso_timestamp, thread_id, (int)label_len,

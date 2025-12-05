@@ -2865,6 +2865,9 @@ bool create_key_part_field_with_prefix_length(TABLE *table, MEM_ROOT *root) {
   @retval 4    Error (see open_table_error)
   @retval 7    Table definition has changed in engine
   @retval 8    Table row format has changed in engine
+
+
+  @brief 两件事情： 1. 构造TABLE对象 2. ha_open se打开表实例
 */
 
 // 由线程共享的table_share生成线程独享的table对象. 调试时要设置条件断点。等待alias == 表名。
@@ -2919,6 +2922,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   /* Allocate handler */
   outparam->file = nullptr;
   if (!(prgflag & SKIP_NEW_HANDLER)) {
+    // note: 为TABLE创建 handler/innobase* file对象
     if (!(outparam->file = get_new_handler(share, share->m_part_info != nullptr,
                                            root, share->db_type())))
       goto err;
@@ -3062,7 +3066,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   outparam->default_column_bitmaps();
 
   /*
-    Process generated columns, if any.
+    note: Process generated columns, if any.
   */
   outparam->vfield = nullptr;
   if (share->vfields) {
@@ -3185,6 +3189,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
     }
 
     int ha_err;
+    // xxxx: se open
     if ((ha_err = (outparam->file->ha_open(
              outparam, share->normalized_path.str,
              (db_stat & HA_READ_ONLY ? O_RDONLY : O_RDWR),

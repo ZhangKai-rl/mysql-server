@@ -388,10 +388,24 @@ struct rw_lock_t
 
   /** NOTE: Holds the state of the lock. */
   /**
-   * lock_word > 0：有S锁持有者
-   * lock_word == 0：没有任何锁持有者，X锁可以生效
-   * lock_word < 0：有X锁或SX锁持有者
 note: 初始值为 lock_word = X_LOCK_DECR
+lock_word = X_LOCK_DECR                           无锁
+lock_word ∈ (X_LOCK_HALF_DECR, X_LOCK_DECR)      仅有 S 锁
+lock_word = X_LOCK_HALF_DECR                       1个 SX 锁 (可能有S锁)
+lock_word ∈ (0, X_LOCK_HALF_DECR)                 1个 SX 锁 + S 锁
+lock_word = 0                                      1个 X 锁（无SX）
+lock_word = -X_LOCK_HALF_DECR                      1个 X + 1个 SX（同线程递归）
+lock_word = -X_LOCK_DECR                           2个 X 锁（同线程递归）
+lock_word = -(X_LOCK_DECR + X_LOCK_HALF_DECR)     2个 X + 1个 SX（同线程递归）
+lock_word < -X_LOCK_DECR 且非上述值                 更多递归 X 锁 
+xxx: lock_word 当前的含义见 rw_lock_get_x_lock_count
+
+note: ****不同线程****的兼容矩阵：
+已持有 ↓ \ 请求 →	S	      SX	    X
+S	              ✅ 兼容	✅ 兼容	❌ 冲突
+SX	            ✅ 兼容	❌ 冲突	❌ 冲突
+X	              ❌ 冲突	❌ 冲突	❌ 冲突
+同线程可以出现 x+x+x / x+sx+sx+x的情况
    */
   std::atomic<int32_t> lock_word;
 
@@ -415,6 +429,7 @@ note: 初始值为 lock_word = X_LOCK_DECR
   /** Thread id of writer thread. Is only guaranteed to have non-stale value if
   recursive flag is set, otherwise it may contain native thread ID of a
   thread which already released or passed the lock. */
+  // ques: next writer?
   std::atomic<std::thread::id> writer_thread;
 
   /** XOR of reader threads' IDs. If there is exactly one reader it should allow

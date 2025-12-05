@@ -633,6 +633,7 @@ static int unlock_external(THD *thd, TABLE **table, uint count) {
   @param table_ptr          Pointer to tables that should be locks
   @param count              Number of tables
   @param flags              One of:
+  @return                   sql_lock->lock_count = 0, sql_lock->table_count = count
            - GET_LOCK_UNLOCK      : If we should send TL_IGNORE to store lock
            - GET_LOCK_STORE_LOCKS : Store lock info in TABLE
 */
@@ -662,6 +663,8 @@ static MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, size_t count,
     thr_mulit_lock(). This function reorders the lock data, but cannot
     update the table values. So the second part of the array is copied
     from the first part immediately before calling thr_multi_lock().
+    //note: 这里只是 file->lock_count()返回0，而lock_count依赖于count(table数量)!
+    ques: 为什么这么申请内存？ why *2 ?
   */
   if (!(sql_lock = (MYSQL_LOCK *)my_malloc(
             key_memory_MYSQL_LOCK,
@@ -669,6 +672,7 @@ static MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, size_t count,
                 sizeof(table_ptr) * lock_count,
             MYF(0))))
     return nullptr;
+  // nullptr
   locks = locks_buf = sql_lock->locks = (THR_LOCK_DATA **)(sql_lock + 1);
   to = table_buf = sql_lock->table = (TABLE **)(locks + tables * 2);
   sql_lock->table_count = lock_count;
@@ -684,6 +688,8 @@ static MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, size_t count,
     assert(lock_type != TL_WRITE_DEFAULT && lock_type != TL_READ_DEFAULT &&
            lock_type != TL_WRITE_CONCURRENT_DEFAULT);
     locks_start = locks;
+    // note: 不同引擎把自己需要参与 server 层表锁管理的锁对象（THR_LOCK_DATA）暴露出来，server 只是把它们收集成一个大数组。
+    /* 对 InnoDB：store_lock() 基本会“原样返回 to 指针”，不追加任何 lock data（因为 tables=0），所以 locks 不会变成 nullptr，只是 locks == locks_start，导致 table->lock_count = 0 */
     locks = table->file->store_lock(
         thd, locks, (flags & GET_LOCK_UNLOCK) ? TL_IGNORE : lock_type);
     if (flags & GET_LOCK_STORE_LOCKS) {

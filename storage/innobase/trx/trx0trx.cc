@@ -415,10 +415,45 @@ struct TrxPoolManagerLock {
 };
 
 /** Use explicit mutexes for the trx_t pool and its manager. */
+// TODO
+/**
+┌──────────────────────────────────────────────────────────────────┐
+│              trx_pool (Pool)  —  4MB zalloc                     │
+│                                                                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │  Element[0]  │  │  Element[1]  │  │  Element[2]  │  ...       │
+│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │             │
+│  │ │ m_pool  │ │  │ │ m_pool  │ │  │ │ m_pool  │ │             │
+│  │ ├─────────┤ │  │ ├─────────┤ │  │ ├─────────┤ │             │
+│  │ │ trx_t   │ │  │ │ trx_t   │ │  │ │ trx_t   │ │             │
+│  │ │ (本体)  │ │  │ │ (本体)  │ │  │ │ (本体)  │ │             │
+│  │ │         │ │  │ │         │ │  │ │         │ │             │
+│  │ │ lock.   │ │  │ │ lock.   │ │  │ │ lock.   │ │             │
+│  │ │ rec_pool│───┐│ │ rec_pool│───┐│ │ rec_pool│───┐          │
+│  │ │ tbl_pool│─┐│││ │ tbl_pool│─┐│││ │ tbl_pool│─┐│          │
+│  │ └─────────┘ │││││ └─────────┘ │││││ └─────────┘ │││          │
+│  └─────────────┘│││└─────────────┘│││└─────────────┘│││          │
+│                 ││││              ││││              ││││          │
+└─────────────────┼┼┼┼──────────────┼┼┼┼──────────────┼┼┼┼──────────┘
+                  ││││              ││││              ││││
+     外部 malloc  ↓↓↓↓              ↓↓↓↓              ↓↓↓↓
+     ┌────────────────────┐  ┌────────────────────┐
+     │ rec_lock cache     │  │ rec_lock cache     │  ...
+     │ 8 * (ib_lock_t+256)│  │ 8 * (ib_lock_t+256)│
+     │ ≈ 8 * ~360B        │  │                    │
+     │ ≈ 2.8KB            │  │                    │
+     └────────────────────┘  └────────────────────┘
+     ┌────────────────────┐  ┌────────────────────┐
+     │ table_lock cache   │  │ table_lock cache   │  ...
+     │ 8 * sizeof(ib_lock)│  │                    │
+     │ ≈ 8 * ~100B        │  │                    │
+     │ ≈ 0.8KB            │  │                    │
+     └────────────────────┘  └────────────────────┘
+ */
 typedef Pool<trx_t, TrxFactory, TrxPoolLock> trx_pool_t;
 typedef PoolManager<trx_pool_t, TrxPoolManagerLock> trx_pools_t;
 
-/** The trx_t pool manager */
+/* note: The trx_t pool manager */
 static trx_pools_t *trx_pools;
 
 /** Size of on trx_t pool in bytes. */
@@ -3512,6 +3547,7 @@ void trx_kill_blocking(trx_t *trx) {
   /** Kill the transactions in the lock acquisition order old -> new. */
   hit_list_t::reverse_iterator end = hit_list.rend();
 
+  // note
   for (hit_list_t::reverse_iterator it = hit_list.rbegin(); it != end; ++it) {
     trx_t *victim_trx = it->m_trx;
     auto version = it->m_version;
@@ -3538,6 +3574,7 @@ void trx_kill_blocking(trx_t *trx) {
 
     bool exited_innodb = false;
 
+    // note: 后台异步线程并发等待 TrxInInnodb
     while ((victim_trx->in_innodb & TRX_FORCE_ROLLBACK_MASK) > 0 &&
            victim_trx->version == version) {
       trx_mutex_exit(victim_trx);
@@ -3606,6 +3643,7 @@ void trx_kill_blocking(trx_t *trx) {
                                     sizeof(buffer), 512);
     id = victim_trx->id;
 #endif /* UNIV_DEBUG */
+    // note: 此时可以进行事务回滚了
     trx_rollback_for_mysql(victim_trx);
 
 #ifdef UNIV_DEBUG

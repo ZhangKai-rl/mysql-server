@@ -88,7 +88,9 @@ String_type Primary_id_key::str() const {
 // Parent_id_range_key
 ///////////////////////////////////////////////////////////////////////////
 
+// TODO
 Raw_key *Parent_id_range_key::create_access_key(Raw_table *db_table) const {
+  // 某个系统表dd::tables 的 TABLE
   TABLE *t = db_table->get_table();
 
   t->use_all_columns();

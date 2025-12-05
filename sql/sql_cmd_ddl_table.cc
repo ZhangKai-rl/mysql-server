@@ -230,6 +230,7 @@ bool Sql_cmd_create_table::execute(THD *thd) {
   }
   bool res = false;
 
+  // note: 类似处理select
   if (!query_block->field_list_is_empty())  // With select
   {
     /*

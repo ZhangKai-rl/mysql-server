@@ -36,6 +36,7 @@ namespace dd {
 class Object_table_impl : virtual public Object_table {
  protected:
   mutable uint m_last_dd_version;
+  // 建表语句, DDL builder
   Object_table_definition_impl m_target_def;
   mutable bool m_actual_present;
   mutable Object_table_definition_impl m_actual_def;

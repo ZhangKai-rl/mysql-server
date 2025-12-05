@@ -247,6 +247,10 @@ class Dictionary_client {
 
  private:
   std::vector<Entity_object *> m_uncached_objects;  // Objects to be deleted.
+  // Object_registry 类其实就是一个封装而已（Wrapper），主要有有若干个 map 保存 dd-object 对象
+  // m_registry_committed 表示已经持久化 dd-table 一致的 dd-object
+  // m_registry_uncommitted 表示已经修改的 dd-object(用户表，索引等) 但还未写回到 dd-table(mysql下的元数据表)
+  // m_registry_dropped 表示已经删除的 dd-object
   Object_registry m_registry_committed;    // Registry of committed objects.
   Object_registry m_registry_uncommitted;  // Registry of uncommitted objects.
   Object_registry m_registry_dropped;      // Registry of dropped objects.
@@ -1189,6 +1193,8 @@ class Dictionary_client {
 
     @retval false   The operation was successful.
     @retval true    There was an error.
+
+    @brief  dd_client()->store(...) 把对象树写入 mysql.* DD tables（= 持久化）
   */
 
   template <typename T>

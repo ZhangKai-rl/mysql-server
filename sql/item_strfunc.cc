@@ -1393,11 +1393,21 @@ String *Item_str_conv::val_str(String *str) {
     } else
       res = copy_if_not_alloced(str, res, res->length());
 
+    orig_res.copy(res->ptr(), res->length(), res->charset());
     len = converter(collation.collation, res->ptr(), res->length(), res->ptr(),
                     res->length());
+
+    if (len == -1) {
+      ++multiply;
+      res->swap(orig_res);
+      goto multiplyx;
+    }
+
     assert(len <= res->length());
     res->length(len);
   } else {
+
+multiplyx:
     size_t len = res->length() * multiply;
     tmp_value.alloc(len);
     tmp_value.set_charset(collation.collation);

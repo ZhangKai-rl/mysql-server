@@ -690,9 +690,9 @@ DB concept                      equivalent OS concept
 ----------                      ---------------------
 transaction             --      process;
 
-query thread            --      thread;
+query thread que_thr_t  --      thread;
 
-lock                    --      semaphore;
+lock         lock_t     --      semaphore;
 
 kernel                  --      kernel;
 
@@ -717,6 +717,7 @@ server. They run at normal priority.
 When there is no activity in the system, also the master thread
 suspends itself to wait for an event making the server totally silent.
 
+note
 There is still one complication in our server design. If a
 background utility thread obtains a resource (e.g., mutex) needed by a user
 thread, and there is also some other user activity in the system,
@@ -725,6 +726,7 @@ resource, as the OS does not schedule a background thread if
 there is some other runnable user thread. This problem is called
 priority inversion in real-time programming.
 
+note: 优先级反转, 优先级继承(未实现)
 One solution to the priority inversion problem would be to keep record
 of which thread owns which resource and in the above case boost the
 priority of the background thread so that it will be scheduled and it
@@ -1074,6 +1076,7 @@ ulint srv_release_threads(srv_thread_type type, /*!< in: thread type */
 
       ++srv_sys->n_threads_active[type];
 
+      // note
       os_event_set(slot->event);
 
       if (++count == n) {
@@ -2829,6 +2832,7 @@ static bool srv_task_execute(void) {
   mutex_exit(&srv_sys->tasks_mutex);
 
   if (thr != nullptr) {
+    // run purge in worker
     que_run_threads(thr);
 
     purge_sys->n_completed.fetch_add(1);
@@ -2867,6 +2871,7 @@ void srv_worker_thread() {
 
     os_event_wait(slot->event);
 
+    // NOTE: do purge
     if (srv_task_execute()) {
       /* If there are tasks in the queue, wakeup
       the purge coordinator thread. */
@@ -3201,10 +3206,13 @@ void srv_que_task_enqueue_low(que_thr_t *thr) /*!< in: query thread */
   ut_ad(!srv_read_only_mode);
   mutex_enter(&srv_sys->tasks_mutex);
 
+  // note
   UT_LIST_ADD_LAST(srv_sys->tasks, thr);
 
   mutex_exit(&srv_sys->tasks_mutex);
 
+  // set slot->event
+  // srv_worker_threads -> srv_task_execute -> do purge
   srv_release_threads(SRV_WORKER, 1);
 }
 

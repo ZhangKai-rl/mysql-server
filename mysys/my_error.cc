@@ -207,6 +207,7 @@ const char *my_get_err_msg(int nr) {
 
   @note
     Goes through the (sole) function registered in error_handler_hook
+    Send error to mysql client.
 
   @param nr        error number
   @param MyFlags   Flags

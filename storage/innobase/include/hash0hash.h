@@ -59,6 +59,8 @@ enum hash_table_sync_t {
 };
 
 struct hash_cell_t {
+  // hash table的cell链
+  // 实际的node, 如page_hash的 buf_page_t
   void *node; /*!< hash chain node, NULL if none */
 };
 
@@ -87,12 +89,16 @@ static inline hash_cell_t *hash_get_nth_cell(hash_table_t *table, size_t n);
 
 /** Inserts a struct to a hash table. */
 
+/* note: else为当前hash cell有冲突, 获取当前cell的node(第一个node), 通过该node->name遍历到下一个node，直到为空，将新node链接到上个node->name上 */
+/* hash表的插入，cell发生hash collision时链地址法进行解决 */
+/* @param[in] NAME hash cell的node的下一个链地址法node指针 */
 #define HASH_INSERT(TYPE, NAME, TABLE, HASH_VALUE, DATA)                    \
   do {                                                                      \
     hash_cell_t *cell3333;                                                  \
     TYPE *struct3333;                                                       \
     const uint64_t hash_value3333 = HASH_VALUE;                             \
                                                                             \
+    /* 确保持有hash table 的 x rwlock */                                        \
     hash_assert_can_modify(TABLE, hash_value3333);                          \
                                                                             \
     (DATA)->NAME = NULL;                                                    \
@@ -156,15 +162,26 @@ static inline hash_cell_t *hash_get_nth_cell(hash_table_t *table, size_t n);
 
 /** Gets the first struct in a hash chain, NULL if none. */
 
+// @return 节点类型 如 page_hash的 buf_page_t *
 static inline void *&hash_get_first(hash_table_t *table, size_t cell_id) {
   return hash_get_nth_cell(table, cell_id)->node;
 }
 
 /** Gets the next struct in a hash chain, NULL if none. */
 
+// buf_page_t->hash
 #define HASH_GET_NEXT(NAME, DATA) ((DATA)->NAME)
 
 /** Looks for a struct in a hash table. */
+/**
+ * @param[in] NAME hash cell的node的下一个链地址法node指针
+ * @param[in] TABLE hash table
+ * @param[in] HASH_VALUE hash value
+ * @param[in] TYPE struct type, 节点类型 如 page_hash的 buf_page_t *
+ * @param[in] DATA struct pointer
+ * @param[in] ASSERTION assertion
+ * @param[in] TEST test
+ */
 #define HASH_SEARCH(NAME, TABLE, HASH_VALUE, TYPE, DATA, ASSERTION, TEST)      \
   {                                                                            \
     const uint64_t hash_value3333 = HASH_VALUE;                                \
@@ -240,7 +257,8 @@ static inline size_t hash_get_n_cells(hash_table_t *table); /*!< in: table */
     heap of nodes by moving the top node in the place of NODE. */         \
                                                                           \
     if (NODE != top_node111) {                                            \
-      /* Copy the top node in place of NODE */                            \
+      /* XXXX:Copy the top node in place of NODE */                       \
+      /* 为什么这么做？ */                                                  \
                                                                           \
       *(NODE) = *top_node111;                                             \
                                                                           \
@@ -373,6 +391,7 @@ void hash_unlock_x_all_but(hash_table_t *table, rw_lock_t *keep_lock);
 #endif /* !UNIV_HOTBACKUP */
 
 /* The hash table structure */
+// note: 处理冲突的方式：链地址法， hash table -> cell -> ha_node_t(在每个tbl的cell中，冲突节点串成链表)
 class hash_table_t {
  public:
   hash_table_t(size_t n) {
@@ -455,6 +474,8 @@ class hash_table_t {
 #ifndef UNIV_HOTBACKUP
   /** if rw_locks != nullptr, then it's their number (must be a power of two).
   Otherwise, 0. Is zero iff the type is HASH_TABLE_SYNC_NONE. */
+  /* note: snnc obj 与 hash cell并不是11对应，而是n个sync obj保护m个cell */
+  /* 实际为： 1 sync obj -> n_cells/n_sync_obj个 hash cell */
   size_t n_sync_obj = 0;
   /** nullptr, or an array of n_sync_obj rw_locks used to protect segments of
   the hash table. Is nullptr iff the type is HASH_TABLE_SYNC_NONE. */

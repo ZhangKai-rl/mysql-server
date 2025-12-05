@@ -1004,6 +1004,7 @@ Information in the data-dictionary needs to be updated. */
 #define HA_NAMELEN 64          /* Max length of saved filename */
 #define NO_SUCH_KEY (~(uint)0) /* used as a key no. */
 
+/* 位图，标识用了联合索引的哪几列 */
 typedef ulong key_part_map;
 #define HA_WHOLE_KEY (~(key_part_map)0)
 
@@ -1144,6 +1145,7 @@ typedef my_off_t ha_rows;
 
 #define MAX_FILE_SIZE LLONG_MAX
 
+// net pack中，长度前缀的字节数
 #define HA_VARCHAR_PACKLENGTH(field_length) ((field_length) < 256 ? 1 : 2)
 
 #endif /* _my_base_h */

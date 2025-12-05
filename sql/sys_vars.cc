@@ -2073,10 +2073,21 @@ static Sys_var_charptr Sys_datadir(
     CMD_LINE(REQUIRED_ARG, 'h'), IN_FS_CHARSET, DEFAULT(mysql_real_data_home));
 
 #ifndef NDEBUG
+// 增加errlog信息，打印设置的dbug.
+static bool check_session_admin_for_debug(sys_var *self, THD *thd,
+                                          set_var *setv) {
+
+  const char* set_value = setv->save_result.string_value.str;
+  if (set_value != nullptr) {
+    LogErr(INFORMATION_LEVEL, ER_IB_MSG_1204, set_value);
+  }
+ 
+  return check_session_admin(self, thd, setv);
+}
 static Sys_var_dbug Sys_dbug("debug", "Debug log", sys_var::SESSION,
                              CMD_LINE(OPT_ARG, '#'), DEFAULT(""),
                              NO_MUTEX_GUARD, NOT_IN_BINLOG,
-                             ON_CHECK(check_session_admin));
+                             ON_CHECK(check_session_admin_for_debug));
 #endif
 
 /**

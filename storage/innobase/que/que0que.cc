@@ -78,13 +78,91 @@ que_thr_t->run_node to the loop node's parent node. This is noticed on the
 next call of que_thr_step() and execution proceeds to the node pointed to by
 the loop node's 'next' pointer.
 
-For example, the code:
+XXXX: For example, the code:
 
 X := 1;
 WHILE X < 5 LOOP
  X := X + 1;
  X := X + 1;
 X := 5
+
+note:
+
+que_fork_t [QUE_FORK_MYSQL_INTERFACE]
+│
+└── que_thr_t
+    │
+    └── proc_node_t [QUE_NODE_PROC]  (过程节点, 控制语句容器)
+        │   stat_list → 第一条语句
+        │
+        ├──(brother链)──────────────────────────────────────────────┐
+        │                                                           │
+        assign_node_t ──(next)──► while_node_t ──(next)──► assign_node_t
+        [QUE_NODE_ASSIGNMENT]     [QUE_NODE_WHILE]         [QUE_NODE_ASSIGNMENT]
+        "X := 1"                  "WHILE X < 5"            "X := 5"
+                                  │
+                                  │ (child: stat_list)
+                                  │
+                                  ├── assign_node_t ──(next)──► assign_node_t
+                                  │   [QUE_NODE_ASSIGNMENT]     [QUE_NODE_ASSIGNMENT]
+                                  │   "X := X + 1"             "X := X + 1"
+                                  │
+                                  └── search_cond:
+                                      func_node_t [QUE_NODE_FUNC]
+                                      "X < 5"
+                                      ├── sym_node_t "X"
+                                      └── int_node "5"
+
+que_fork_t [QUE_NODE_FORK, QUE_FORK_MYSQL_INTERFACE]
+│   graph = self, trx = trx_ptr, sym_tab = sym_tab_t*
+│
+└── que_thr_t [QUE_NODE_THR]
+    │   parent = fork
+    │   run_node = proc_node (初始)
+    │   prev_node = fork (初始)
+    │
+    └── proc_node_t [QUE_NODE_PROC | QUE_NODE_CONTROL_STAT]
+        │   parent = thr
+        │   brother = nullptr (thr 只有一个 child)
+        │
+        └── stat_list (第一条语句的指针):
+            │
+            ▼
+            assign_node_t [QUE_NODE_ASSIGNMENT]     ← "X := 1"
+            │   parent = proc_node
+            │   brother ──────────────────────────────────────────┐
+            │   val = func_node_t (表达式 "1")                    │
+            │   var = sym_node_t ("X")                            │
+            │                                                     │
+            │                                                     ▼
+            │                                              while_node_t [QUE_NODE_WHILE | QUE_NODE_CONTROL_STAT]
+            │                                              │   parent = proc_node
+            │                                              │   brother ──────────────────────────┐
+            │                                              │   cond = func_node_t ("X < 5")      │
+            │                                              │   │   ├── sym_node_t ("X")          │
+            │                                              │   │   └── literal_node (5)          │
+            │                                              │   │                                  │
+            │                                              │   └── stat_list:                     │
+            │                                              │       │                              │
+            │                                              │       ▼                              │
+            │                                              │   assign_node_t                      │
+            │                                              │   │   parent = while_node            │
+            │                                              │   │   "X := X + 1"                   │
+            │                                              │   │   brother ──┐                    │
+            │                                              │   │             ▼                    │
+            │                                              │   │   assign_node_t                  │
+            │                                              │   │       parent = while_node        │
+            │                                              │   │       "X := X + 1"               │
+            │                                              │   │       brother = nullptr          │
+            │                                              │                                      │
+            │                                              │                                      ▼
+            │                                              │                               assign_node_t
+            │                                              │                               │   parent = proc_node
+            │                                              │                               │   "X := 5"
+            │                                              │                               │   brother = nullptr
+            │                                              │                               │
+note
+
 
 will result in the following node hierarchy, with the X-axis indicating
 'next' links and the Y-axis indicating parent/child links:
@@ -120,7 +198,8 @@ static void que_thr_move_to_run_state(
 /** Creates a query graph fork node.
  @return own: fork node */
 que_fork_t *que_fork_create(
-    que_t *graph,       /*!< in: graph, if NULL then this
+    que_t *graph,       /*!< in: graph, 
+                        xxxx: if NULL then this
                         fork node is assumed to be the
                         graph root */
     que_node_t *parent, /*!< in: parent node */
@@ -143,6 +222,7 @@ que_fork_t *que_fork_create(
 
   fork->state = QUE_FORK_COMMAND_WAIT;
 
+  // 根节点指向自己
   fork->graph = (graph != nullptr) ? graph : fork;
 
   UT_LIST_INIT(fork->thrs);
@@ -166,6 +246,7 @@ que_thr_t *que_thr_create(que_fork_t *parent, mem_heap_t *heap,
 
   thr->graph = parent->graph;
 
+  // c类型多态，初始化基类
   thr->common.parent = parent;
 
   thr->magic_n = QUE_THR_MAGIC_N;
@@ -964,6 +1045,7 @@ static void que_run_threads_low(que_thr_t *thr) /*!< in: query thread */
     may change if, e.g., a subprocedure call is made */
 
     /*-------------------------*/
+    // XXXXXXXXXXXXXXXXXXX
     next_thr = que_thr_step(thr);
     /*-------------------------*/
 
@@ -1002,6 +1084,7 @@ loop:
   que_run_threads_low(thr);
 
   switch (thr->state) {
+    // 等待 round_robin_schedule -> init_commands
     case QUE_THR_RUNNING:
       /* There probably was a lock wait, but it already ended
       before we came here: continue running thr */

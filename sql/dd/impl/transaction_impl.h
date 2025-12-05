@@ -80,8 +80,10 @@ class Open_dictionary_tables_ctx {
 
   ~Open_dictionary_tables_ctx();
 
+  // 获取对应的dd::tables
   Raw_table *get_table(const String_type &name) const;
 
+  // 比如 T=Index, 则DD_table为 dd::Index::DD_table, 即 dd::tables::Indexes, 即 mysql.indexes
   template <typename T>
   Raw_table *get_table() const {
     return get_table(T::DD_table::instance().name());
@@ -120,6 +122,7 @@ class Open_dictionary_tables_ctx {
   THD *m_thd;
   thr_lock_type m_lock_type;
   bool m_ignore_global_read_lock;
+  // 这里存的是所有要访问的 dd::tables, 通过 register_tables 添加
   typedef std::map<String_type, Raw_table *> Object_table_map;
   Object_table_map m_tables;
 };

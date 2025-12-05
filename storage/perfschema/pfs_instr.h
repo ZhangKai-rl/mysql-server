@@ -523,6 +523,7 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice {
   /** Current index in the circular buffer @c m_waits_history. */
   uint m_waits_history_index;
   /**
+    NOTE: 这个buffer 是 rbuf， 默认10000条
     Waits history circular buffer.
     This member holds the data for the table
     PERFORMANCE_SCHEMA.EVENTS_WAITS_HISTORY.

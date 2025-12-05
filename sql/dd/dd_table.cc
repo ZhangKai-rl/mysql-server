@@ -2399,6 +2399,7 @@ std::unique_ptr<dd::Table> create_dd_user_table(
   return tab_obj;
 }
 
+// dd::create_table(...) 生成内存对象树 dd::Table
 std::unique_ptr<dd::Table> create_table(
     THD *thd, const dd::Schema &sch_obj, const dd::String_type &table_name,
     HA_CREATE_INFO *create_info, const List<Create_field> &create_fields,

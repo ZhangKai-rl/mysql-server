@@ -128,6 +128,21 @@ static void log_consider_sync_flush(log_t &log);
 /** Makes a checkpoint. Note that this function does not flush dirty blocks
 from the buffer pool. It only checks what is lsn of the oldest modification
 in the buffer pool, and writes information about the lsn in log files.
+
+redo log timeline:
+    |----- 已 checkpoint ------|---- checkpoint 到 lwm_lsn ----|---- 新 redo ----|
+    0                    checkpoint_lsn               lwm_lsn              current_lsn
+                                                         ↑
+                                        flush list 中最老脏页的 oldest_modification
+                                        （这些脏页还没刷盘！）
+
+    |<-- 这段 redo 对应的脏页 -->|<-- 这段 redo 对应的脏页 -->|
+          已经全部刷盘               还有脏页没刷盘
+
+@brief
+note:它不刷脏页。脏页是由 page cleaner 线程异步刷的，checkpoint 只是"确认"脏页已经刷完了。
+1. 计算当前可以安全做 checkpoint 的 LSN
+2. 把这个 LSN 写入 redo log 文件头的 checkpoint header
 @param[in,out]  log  redo log */
 static void log_checkpoint(log_t &log);
 

@@ -76,7 +76,7 @@ constexpr uint32_t IBUF_BITMAP = PAGE_DATA;
 #include "trx0sys.h"
 
 /*      STRUCTURE OF AN INSERT BUFFER RECORD
-
+xxxxx： 待阅读
 In versions < 4.1.x:
 
 1. The first field is the page number.

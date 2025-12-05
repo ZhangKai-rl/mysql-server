@@ -4755,6 +4755,7 @@ static void calculate_field_offsets(List<Create_field> *create_list) {
       has_vgc = true;
   }
   /* Update generated fields' offset*/
+  // 从这里看出 field 内存布局为 field1 ... fieldn | vgc1 ... vgcn
   if (has_vgc) {
     it.rewind();
     while ((sql_field = it++)) {
@@ -7178,6 +7179,7 @@ static bool prepare_preexisting_foreign_key(
   return false;
 }
 
+/* prepare_key()：把 Key_spec（parser 结构）变成 KEY + KEY_PART_INFO */
 static bool prepare_key(
     THD *thd, const char *error_schema_name, const char *error_table_name,
     HA_CREATE_INFO *create_info, List<Create_field> *create_list,
@@ -7913,6 +7915,29 @@ static bool column_exists_in_create_list(const char *column_name,
 }
 
 // Prepares the table and key structures for table creation.
+/**
+ * @brief 
+ * 
+ * @param thd 
+ * @param error_schema_name 
+ * @param error_table_name 
+ * @param create_info 
+ * @param alter_info 
+ * @param file 
+ * @param is_partitioned 
+ * @param[out] key_info_buffer  prepare_key 构造的KEY[], 后续 create_table_impl->rea_create_base_table()-> DD ->fill_dd_table_from_create_info -> dd::Index
+ * @param key_count 
+ * @param fk_key_info_buffer 
+ * @param fk_key_count 
+ * @param existing_fks 
+ * @param existing_fks_count 
+ * @param existing_fks_table 
+ * @param fk_max_generated_name_number 
+ * @param select_field_count 
+ * @param find_parent_keys 
+ * @return true 
+ * @return false 
+ */
 bool mysql_prepare_create_table(
     THD *thd, const char *error_schema_name, const char *error_table_name,
     HA_CREATE_INFO *create_info, Alter_info *alter_info, handler *file,
@@ -8011,6 +8036,9 @@ bool mysql_prepare_create_table(
 
   if (create_info->row_type == ROW_TYPE_DYNAMIC)
     create_info->table_options |= HA_OPTION_PACK_RECORD;
+
+
+    // xxxx: 下面prepare fields && keys
 
   /*
     Prepare fields, which must be done before calling
@@ -8151,6 +8179,7 @@ bool mysql_prepare_create_table(
   for (size_t i = 0; i < alter_info->key_list.size(); i++) {
     if (redundant_keys[i]) continue;  // Skip redundant keys
 
+    // parser获取的结构
     const Key_spec *key = alter_info->key_list[i];
 
     if (key->type == KEYTYPE_PRIMARY) {
@@ -8323,12 +8352,13 @@ bool mysql_prepare_create_table(
   /* If fixed row records, we need one bit to check for deleted rows */
   if (!(create_info->table_options & HA_OPTION_PACK_RECORD))
     create_info->null_bits++;
+  // note: null bits cal.
   ulong data_offset = (create_info->null_bits + 7) / 8;
   size_t reclength = data_offset;
   it.rewind();
   while ((sql_field = it++)) {
     size_t length = sql_field->pack_length();
-    if (sql_field->offset + data_offset + length > reclength) // 为什么这里create_field::offset为0，不是在calculate_field_offsets中设置过了吗？
+    if (sql_field->offset + data_offset + length > reclength) // 为什么这里create_field::offset为0，不是在calculate_field_offsets中设置过了吗？前面rewind了
       reclength = sql_field->offset + data_offset + length;
   }
   if (reclength > file->max_record_length()) {
@@ -8734,6 +8764,7 @@ static bool create_table_impl(
 
   partition_info *part_info = thd->work_part_info;
 
+  // note
   std::unique_ptr<handler, Destroy_only<handler>> file(get_new_handler(
       (TABLE_SHARE *)nullptr,
       (part_info ||
@@ -8899,6 +8930,7 @@ static bool create_table_impl(
        dd::get_dictionary()->is_system_table_name(db, error_table_name));
   if (is_whitelisted_table) thd->push_internal_handler(&error_handler);
 
+  // note
   bool prepare_error = mysql_prepare_create_table(
       thd, db, error_table_name, create_info, alter_info, file.get(),
       (part_info != nullptr), key_info, key_count, fk_key_info, fk_key_count,
@@ -8966,6 +8998,7 @@ static bool create_table_impl(
     If "no_ha_table" is false also create table in storage engine.
   */
   if (create_info->options & HA_LEX_CREATE_TMP_TABLE) {
+    // TODO
     if (rea_create_tmp_table(thd, path, schema, db, table_name, create_info,
                              alter_info->create_list, *key_count, *key_info,
                              keys_onoff,
@@ -9198,6 +9231,7 @@ bool mysql_create_table_no_lock(THD *thd, const char *db,
     }
   }
 
+  // ques: cf的填充位置？ PT_field/column_def -> PT::make_cmd: contextualize(tddlpc) -> alter_info::add_field
   for (const Create_field &sql_field : alter_info->create_list) {
     warn_on_deprecated_float_auto_increment(thd, sql_field);
   }
@@ -9214,6 +9248,7 @@ bool mysql_create_table_no_lock(THD *thd, const char *db,
 
   if (thd->is_plugin_fake_ddl()) no_ha_table = true;
 
+  // note
   return create_table_impl(
       thd, *schema, db, table_name, table_name, path, create_info, alter_info,
       false, select_field_count, find_parent_keys, no_ha_table, false, is_trans,
@@ -10120,6 +10155,7 @@ bool mysql_create_table(THD *thd, Table_ref *create_table,
   /*
     If mode to generate invisible primary key is active then, generate primary
     key for the table.
+    GIPK
   */
   if (is_generate_invisible_primary_key_mode_active(thd) &&
       is_candidate_table_for_invisible_primary_key_generation(create_info,

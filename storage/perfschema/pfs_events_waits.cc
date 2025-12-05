@@ -95,6 +95,7 @@ static inline void copy_events_waits(PFS_events_waits *dest,
 }
 
 /**
+  TODO
   Insert a wait record in table EVENTS_WAITS_HISTORY.
   @param thread             thread that executed the wait
   @param wait               record to insert

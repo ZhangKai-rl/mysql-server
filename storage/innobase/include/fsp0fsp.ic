@@ -210,11 +210,13 @@ static inline uint32_t fsp_flags_init(const page_size_t &page_size,
 }
 
 /** Calculates the descriptor index within a descriptor page(XDES页).
+@brief    根据page_no寻找所属extent的xdes结构在XDES page中的索引
 @param[in]      page_size       page size
 @param[in]      offset          page offset
 @return descriptor index */
 static inline ulint xdes_calc_descriptor_index(const page_size_t &page_size,
                                                ulint offset) {
+  // 取余 16384， 即该page在本组extents的页偏移， 再除64即为page所属extent在本组中的index
   return (ut_2pow_remainder(offset, page_size.physical()) / FSP_EXTENT_SIZE);
 }
 
@@ -243,6 +245,7 @@ static inline bool xdes_get_bit(
 @param[in]      page_size       page size
 @param[in]      offset          page offset
 @return descriptor page offset */
+// TODO: 加深理解， 为什么 page no / offset 向下取整16384 就是 xdes page no
 static inline page_no_t xdes_calc_descriptor_page(const page_size_t &page_size,
                                                   page_no_t offset) {
   static_assert(UNIV_PAGE_SIZE_MAX > XDES_ARR_OFFSET + (UNIV_PAGE_SIZE_MAX /
@@ -268,6 +271,7 @@ static inline page_no_t xdes_calc_descriptor_page(const page_size_t &page_size,
   }
 #endif /* UNIV_DEBUG */
 
+  // 向下取整到2的幂次方。 16384 = 256 * 64 = 2^14, 即一组extent有16384个page，据此算出该page属于哪一组extent(主要是XDES页的页号， 该page所在extent的XDES页号)
   return (ut_2pow_round(offset, page_size.physical()));
 }
 

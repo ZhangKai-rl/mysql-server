@@ -525,6 +525,8 @@ struct dict_col_t {
   /* End of definitions copied from dtype_t */
   /** @} */
 
+  // ques: index的缩写？具体是哪个index中的no
+  // 逻辑位置，列在create table中的定义顺序
   unsigned ind : 10;        /*!< table column position
                             (starting from 0) */
   unsigned ord_part : 1;    /*!< nonzero if this column
@@ -544,15 +546,15 @@ struct dict_col_t {
   /* Position of column on physical row.
   If column prefix is part of PK, it appears twice on row. First 2 bytes are
   for prefix position and next 2 bytes are for column position on row. */
-  // 这个可以查系统表。列物理位置，逻辑位置为dict_col_T::ind
+  // note: 这个可以查系统表。列物理位置(列在实际行记录中的存储offset,xxxx, 不是offset也是下标)，逻辑位置为dict_col_T::ind
 /*
-    31                    16 15              1  0
-    +------------------------+------------------+---+
-    |   prefix_phy_pos       | col_phy_pos      | F |
-    |   (高16位)              | (低15位)         |(标志)|
-    +------------------------+------------------+---+
+    31                       16      15                     0
+    +------------------------+--------+---------------------+
+    |   prefix_phy_pos       | F      | col_phy_pos         |
+    |   (高16位)              | (15bit)|(低15bit)            |
+    +------------------------+--------+---------------------+
 */
-  // 物理位置的意思是随着instant add/drop而改变，但是ind逻辑位置是不变的
+  // ques: 物理位置的意思是随着instant add/drop(add在末尾正常也不变，这里主要是drop后不变)而改变，但是ind逻辑位置是不变的
   uint32_t phy_pos{UINT32_UNDEFINED};
 
   /* Row version in which this column was added INSTANTly to the table */
@@ -574,7 +576,9 @@ struct dict_col_t {
   /* Set the physical position of column prefix on row. */
   void set_prefix_phy_pos(uint16_t prefix_pos) {
     phy_pos = prefix_pos;
+    /* 0xFFFF = 1 << 16 - 1 = 2^16 - 1 */
     phy_pos = phy_pos << 16;
+    // 设置标志位, prefix_mask = 0x8000. 或设置flag, 与非清除flag
     phy_pos |= 0x8000;
   }
 
@@ -1169,6 +1173,7 @@ struct dict_index_t {
 #endif
 
   /** array of field descriptions */
+  // ques: 貌似没有vfld?
   dict_field_t *fields;
 
   /** Array of field pos sorted as per their physical pos in record. Only
@@ -1870,6 +1875,7 @@ struct dict_vcol_templ_t {
   ulint n_v_col;
 
   /** array of templates for virtual col and their base columns */
+  // 该数组前n_col为base col, 后n_v_col为表的virtual col
   mysql_row_templ_t **vtempl;
 
   /** table's database name */
@@ -2451,6 +2457,7 @@ detect this and will eventually quit sooner. */
 #endif /* UNIV_DEBUG */
   /** mysql_row_templ_t for base columns used for compute the virtual
   columns */
+  // ques: what?
   dict_vcol_templ_t *vc_templ;
 
   /** remove the dict_table_t from cache after DDL operation */

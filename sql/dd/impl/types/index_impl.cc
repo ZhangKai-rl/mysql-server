@@ -133,6 +133,7 @@ bool Index_impl::validate() const {
 ///////////////////////////////////////////////////////////////////////////
 
 bool Index_impl::restore_children(Open_dictionary_tables_ctx *otx) {
+  // 从 mysql.index_column_usage 读取 Index_element
   return m_elements.restore_items(
       // Column will be resolved in restore_attributes() called from
       // Collection::restore_items().
@@ -415,9 +416,11 @@ const Object_table &Index_impl::object_table() const {
 
 ///////////////////////////////////////////////////////////////////////////
 
+// index_impl表示一个具体的索引实现。mysql.indexes也用这个也是一个index_impl
 void Index_impl::register_tables(Open_dictionary_tables_ctx *otx) {
   otx->add_table<Indexes>();
 
+  // mysql.indexes的子表： mysql.index_column_usage
   otx->register_tables<Index_element>();
 }
 

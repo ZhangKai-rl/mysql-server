@@ -36,11 +36,13 @@ class THD;
 struct TABLE;
 struct THR_LOCK_DATA;
 
+// note: 这里的内存分配方式和dtupele_t, dfield_t都是一样的，mysql_lock紧跟着thr_lock_data+table(pointer)的内存
 struct MYSQL_LOCK {
   TABLE **table;
   uint table_count, lock_count;
   THR_LOCK_DATA **locks;
 };
+
 
 MYSQL_LOCK *mysql_lock_tables(THD *thd, TABLE **table, size_t count,
                               uint flags);

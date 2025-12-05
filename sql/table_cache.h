@@ -179,7 +179,7 @@ class Table_cache_manager {
   void destroy();
 
   /** Get instance of table cache to be used by particular connection. */
-  // !!!!!!!!!!
+  // XXXX: !!!!!!!!!!
   Table_cache *get_cache(THD *thd) {
     return &m_table_cache[thd->thread_id() % table_cache_instances];
   }

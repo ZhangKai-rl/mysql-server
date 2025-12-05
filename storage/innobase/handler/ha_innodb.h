@@ -62,6 +62,7 @@ struct innodb_idx_translate_t {
 };
 
 /** InnoDB table share */
+// 存储在 hash table, innobase_open_tables中
 struct INNOBASE_SHARE {
   const char *table_name; /*!< InnoDB table name */
   uint use_count;         /*!< reference count,
@@ -69,7 +70,8 @@ struct INNOBASE_SHARE {
                           and decremented in
                           free_share() */
   void *table_name_hash;
-  /*!< hash table chain node */
+  /*!< note: hash table chain node */
+
   innodb_idx_translate_t idx_trans_tbl; /*!< index translation table between
                                         MySQL and InnoDB */
 };

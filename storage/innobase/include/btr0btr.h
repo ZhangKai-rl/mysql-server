@@ -80,10 +80,11 @@ enum btr_latch_mode : size_t {
   /** 范围查询。Start searching the entire B-tree. */
   BTR_SEARCH_TREE = 37,
   /** Continue searching the entire B-tree. */
+  /* 当前 mtr 已经在之前通过 BTR_MODIFY_TREE 对 index->lock 加了 SX/X lock，现在 SMO 过程中需要再次搜索这棵树（比如查找父节点），不需要重新对 index 加锁。*/
   BTR_CONT_SEARCH_TREE = 38
 };
 
-/* BTR_INSERT, BTR_DELETE and BTR_DELETE_MARK are mutually exclusive. */
+/* BTR_INSERT, BTR_DELETE(实际删除，类似非主键update的删除操作) and BTR_DELETE_MARK are mutually exclusive. */
 // 以上三个flag, /* 在 btr_latch_mode 中，表示 ibuf 相关操作 */
 
 /** If this is ORed to btr_latch_mode, it means that the search tuple
@@ -432,6 +433,7 @@ bool btr_check_node_ptr(dict_index_t *index, buf_block_t *block, mtr_t *mtr);
  tree height. It is assumed that mtr holds an x-latch on the tree and on the
  page. If cursor is on the leaf level, mtr must also hold x-latches to the
  brothers, if they exist.
+ TODO: merge
  @param[in,out] cursor cursor on the page to merge or lift; the page must not be
  empty: when deleting records, use btr_discard_page() if the page would become
  empty
@@ -497,6 +499,7 @@ page
 @retval block, rw_lock_x_lock_count(&block->lock) == 1 if allocation succeeded
 (init_mtr == mtr, or the page was not previously freed in mtr),
 returned block is not allocated nor initialized otherwise */
+// NOTE: private
 [[nodiscard]] buf_block_t *btr_page_alloc_priv(
     dict_index_t *index, page_no_t hint_page_no, byte file_direction,
     ulint level, mtr_t *mtr, mtr_t *init_mtr IF_DEBUG(, const ut::Location &loc)

@@ -676,6 +676,7 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
         row_purge_remove_multi_sec_if_poss(node, heap, false);
       } else {
         // 构造sec index entry(索引的输入，根据entry来索引(btr search)到具体的记录存储位置)
+        // note: row purge时，顺序为： clust rec -> sec rec
         dtuple_t *entry = row_build_index_entry_low(
             node->row, nullptr, node->index, heap, ROW_BUILD_FOR_PURGE);
         row_purge_remove_sec_if_poss(node, node->index, entry);
@@ -1257,6 +1258,7 @@ que_thr_t *row_purge_step(que_thr_t *thr) {
     node->roll_ptr = rec.roll_ptr;
     node->modifier_trx_id = rec.modifier_trx_id;
 
+    // note
     row_purge(node, rec.undo_rec, thr);
 
     if (node->recs->empty()) {

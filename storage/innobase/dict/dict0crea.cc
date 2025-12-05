@@ -143,6 +143,7 @@ dberr_t dict_build_tablespace(trx_t *trx, Tablespace *tablespace) {
              ? (tablespace->get_autoextend_size() / srv_page_size)
              : FIL_IBD_FILE_INITIAL_SIZE;
 
+  // note
   err = fil_ibd_create(space, tablespace->name(), datafile->filepath(),
                        tablespace->flags(), size);
 
@@ -224,7 +225,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table,
 
       filepath = Fil_path::make(path, table->name.m_name, IBD, true);
     } else {
-      /* Table resides in datadir */
+      /* note: Table resides in datadir */
       filepath = Fil_path::make_ibd_from_table_name(table->name.m_name);
     }
 
@@ -248,6 +249,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table,
       return err;
     }
 
+    // xxxxxxx
     /* We create a new single-table tablespace for the table.
     We initially let it be 4 pages:
     - page 0 is the fsp header and an extent descriptor page,
@@ -298,6 +300,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table,
       return (DB_ERROR);
     }
 
+    // note: SDI
     err = btr_sdi_create_index(table->space, false);
     return (err);
 
@@ -310,6 +313,7 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table,
 
       ut_ad(table->space == fil_space_get_id_by_name(table->tablespace()));
     } else if (table->is_temporary()) {
+      //note: for temporary table
       /* Use the shared temporary tablespace.
       Note: The temp tablespace supports all non-Compressed
       row formats whereas the system tablespace only

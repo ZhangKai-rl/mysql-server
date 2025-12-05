@@ -280,6 +280,54 @@ func_exit:
 
 /** Creates an update node for a query graph.
  @return own: update node */
+/*
+que_fork_t [QUE_FORK_MYSQL_INTERFACE]
+│
+└── que_thr_t
+    │   prebuilt = row_prebuilt_t*
+    │
+    └── upd_node_t [QUE_NODE_UPDATE]
+        │   type          = QUE_NODE_UPDATE
+        │   is_delete     = false (UPDATE) / true (DELETE)
+        │   searched_update = true
+        │   in_mysql_interface = true
+        │   table         = dict_table_t* ("t1")
+        │   update        = upd_t* (update vector: 哪些列改成什么值)
+        │   pcur          = btr_pcur_t* (MySQL 接口模式下直接使用)
+        │   state         = UPD_NODE_UPDATE_CLUSTERED → UPD_NODE_UPDATE_SOME_SEC
+        │   index         = dict_index_t* (当前正在更新的二级索引)
+        │   row           = dtuple_t* (旧行副本)
+        │   upd_row       = dtuple_t* (新行副本)
+        │   ext           = row_ext_t* (外部存储列前缀)
+        │   upd_ext       = row_ext_t* (更新后的外部存储列前缀)
+        │
+        │   ┌── select = sel_node_t* [QUE_NODE_SELECT]  (searched update 的游标子图)
+        │   │     parent     = upd_node
+        │   │     table_list = sym_node_t* → "t1"
+        │   │     n_tables   = 1
+        │   │     plans      = plan_t[1]
+        │   │     │   plan[0].table = dict_table_t* ("t1")
+        │   │     │   plan[0].index = dict_index_t* (聚簇索引)
+        │   │     │   plan[0].pcur  = btr_pcur_t (持久游标)
+        │   │     │   plan[0].n_exact_match = ...
+        │   │     search_cond = que_node_t* (WHERE 条件表达式树)
+        │   │     set_x_locks = true (UPDATE 需要 X 锁)
+        │   │     consistent_read = false
+        │   │     read_view  = nullptr
+        │   │
+        │   └── cascade_node = upd_node_t* (外键 CASCADE 时递归创建)
+        │         │   foreign = dict_foreign_t* (指向外键约束定义)
+        │         │   is_delete = true/false
+        │         │   table = dict_table_t* (子表)
+        │         │   update = upd_t* (级联更新 vector)
+        │         │
+        │         └── select = sel_node_t* (子表的 searched update 游标)
+        │               table_list → 子表
+        │               plans[0].table = 子表
+        │               ...
+        │
+        └── (cascade_node 可以继续递归, 形成 CASCADE 链)
+*/
 upd_node_t *upd_node_create(mem_heap_t *heap) /*!< in: mem heap where created */
 {
   upd_node_t *node;

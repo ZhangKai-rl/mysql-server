@@ -811,6 +811,7 @@ TABLE_SHARE *get_table_share(THD *thd, const char *db, const char *table_name,
         open_table_err = false;
       }
     } else {
+      // note: 从dd中成功能到了table obj dd::Table, 用其填充TALBE_SHARE
       assert(abstract_table->type() == dd::enum_table_type::BASE_TABLE);
       open_table_err = open_table_def(
           thd, share, *dynamic_cast<const dd::Table *>(abstract_table));
@@ -906,6 +907,7 @@ static TABLE_SHARE *get_table_share_with_discover(
     If share is not NULL, we found an existing share.
 
     If share is NULL, and there is no error, we're inside
+    ques: pre-locking?
     pre-locking, which silences 'ER_NO_SUCH_TABLE' errors
     with the intention to silently drop non-existing tables
     from the pre-locking list. In this case we still need to try
@@ -2801,6 +2803,8 @@ bool add_view_place_holder(THD *thd, Table_ref *table_list) {
   @retval false Success. Members of Table_ref structure are filled
   properly (e.g.  Table_ref::table is set for real tables and
                 Table_ref::view is set for views).
+
+  @brief 拿到了 table_share -> table, 完成了se open(dict_table_t)
 */
 
 bool open_table(THD *thd, Table_ref *table_list, Open_table_context *ot_ctx) {
@@ -3104,6 +3108,7 @@ bool open_table(THD *thd, Table_ref *table_list, Open_table_context *ot_ctx) {
       table_list->open_strategy == Table_ref::OPEN_FOR_CREATE) {
     bool exists;
 
+    // dd判断
     if (check_if_table_exists(thd, table_list, &exists)) return true;
 
     /*
@@ -3118,6 +3123,7 @@ bool open_table(THD *thd, Table_ref *table_list, Open_table_context *ot_ctx) {
 
         thd->push_internal_handler(&mdl_deadlock_handler);
 
+        // note: create table note exist, update S to X mdl
         DEBUG_SYNC(thd, "before_upgrading_lock_from_S_to_X_for_create_table");
         bool wait_result = thd->mdl_context.upgrade_shared_lock(
             table_list->mdl_request.ticket, MDL_EXCLUSIVE,
@@ -5390,6 +5396,7 @@ bool lock_table_names(THD *thd, Table_ref *tables_start, Table_ref *tables_end,
   MDL_request backup_lock_request;
   malloc_unordered_set<Table_ref *, schema_hash, schema_key_equal> schema_set(
       PSI_INSTRUMENT_ME);
+  // note
   bool need_global_read_lock_protection = false;
   bool acquire_backup_lock = false;
 
@@ -5430,9 +5437,11 @@ bool lock_table_names(THD *thd, Table_ref *tables_start, Table_ref *tables_end,
       */
       if (thd->lex->sql_command != SQLCOM_LOCK_TABLES &&
           table->mdl_request.type != MDL_SHARED_READ_ONLY)
+        // ques: 为啥这里需要 acquire_backup_lock
         acquire_backup_lock = true;
     }
 
+    // note: 普通ddl与ftwrl冲突？
     if (table->mdl_request.type != MDL_SHARED_READ_ONLY) {
       /* Write lock on normal tables is not allowed in a read only transaction.
        */
@@ -5777,7 +5786,7 @@ bool open_tables(THD *thd, Table_ref **start, uint *counter, uint flags,
   bool audit_notified = false;
 
 restart:
-  /*
+  /* note
     Close HANDLER tables which are marked for flush or against which there
     are pending exclusive metadata locks. This is needed both in order to
     avoid deadlocks and to have a point during statement execution at
@@ -5793,6 +5802,7 @@ restart:
   sroutine_to_open = &thd->lex->sroutines_list.first;
   *counter = 0;
 
+  // ques: 为啥排除 system tables
   if (!(thd->state_flags & Open_tables_state::SYSTEM_TABLES))
     THD_STAGE_INFO(thd, stage_opening_tables);
 
@@ -5800,6 +5810,7 @@ restart:
     If we are executing LOCK TABLES statement or a DDL statement
     (in non-LOCK TABLES mode) we might have to acquire upgradable
     semi-exclusive metadata locks (SNW or SNRW) on some of the
+    // note: semi-exclusive mdl ??
     tables to be opened.
     When executing CREATE TABLE .. If NOT EXISTS .. SELECT, the
     table may not yet exist, in which case we acquire an exclusive
@@ -5834,6 +5845,7 @@ restart:
            table = table->next_global) {
         if (table->mdl_request.is_ddl_or_lock_tables_lock_request() ||
             table->open_strategy == Table_ref::OPEN_FOR_CREATE)
+          // note: 前面可能拿了S mdl, 这里清空告诉后边， 后面需要什么锁，按当时的真实情况重新走获取/升级路径
           table->mdl_request.ticket = nullptr;
       }
     }

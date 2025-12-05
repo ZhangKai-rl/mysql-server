@@ -6539,6 +6539,7 @@ size_t Field_string::get_key_image(uchar *buff, size_t length,
 }
 
 /****************************************************************************
+xxxx: 这里说的是 row foramt的field data.
   VARCHAR type
   Data in field->ptr is stored as:
     1 or 2 bytes length-prefix-header  (from Field_varstring::length_bytes)

@@ -450,6 +450,7 @@ FILE_PAGE (the other is buf_page_get_gen). The page is latched by passed mtr.
 @param[in]      page_size       Page size
 @param[in]      rw_latch        RW_SX_LATCH, RW_X_LATCH
 @param[in]      mtr             Mini-transaction
+TODO
 @return pointer to the block, page bufferfixed */
 buf_block_t *buf_page_create(const page_id_t &page_id,
                              const page_size_t &page_size,
@@ -1543,6 +1544,7 @@ class buf_page_t {
   /** @} */
 #ifndef UNIV_HOTBACKUP
   /** Node used in chaining to buf_pool->page_hash or buf_pool->zip_hash */
+  // note: hash_table_t -> hash_cell_t -> node的实现. 侵入式链地址法
   buf_page_t *hash;
 #endif /* !UNIV_HOTBACKUP */
 
@@ -1603,6 +1605,7 @@ class buf_page_t {
   Flush_observer *m_flush_observer{};
 
   /** Tablespace instance that this page belongs to. */
+  // 不属于这个page，只是为了快速访问
   fil_space_t *m_space{};
 
   /** The value of buf_pool->freed_page_clock when this block was the last
@@ -1798,6 +1801,7 @@ struct buf_block_t {
     inline void assert_empty_on_init() const {}
 #endif /* UNIV_AHI_DEBUG || UNIV_DEBUG */
   } ahi;
+  // note: usage: block->ahi.index. 表示该block位于ahi中. ahi.index为dict_index_t, 该ahi对应的表索引
 
   /** Counter which controls how many times the current prefix recommendation
   would help in searches. If it is helpful enough, it will be used as the
@@ -2319,6 +2323,12 @@ struct buf_pool_t {
   avoid repeated scans of LRU list when we know that there is no free block
   available in the scan depth for eviction. Set to true whenever we flush a
   batch from the buffer pool. Accessed protected by memory barriers. */
+  /* 
+  try_LRU_scan 是一个无锁（lock-free）的 bool 标志位，用于在多个用户线程和 page_cleaner 线程之间通信：
+  写端（生产者）：page_cleaner 线程在 buf_flush_end() (buf0flu.cc 第 2033 行) 完成一批 LRU flush 后，将其设为 true，表示"LRU 链表上有新的可驱逐页了，值得去扫描"。
+  读端（消费者）：用户线程在 buf_LRU_get_free_block() 中读取该标志，决定是否要扫描 LRU 链表寻找 free block。
+  读端自己也会写：如果扫描失败（没找到可驱逐的 block），就将其设为 false，告诉其他线程"别再白扫了"。
+  */
   bool try_LRU_scan;
 
   /** Page Tracking start LSN. */
@@ -2336,8 +2346,8 @@ struct buf_pool_t {
   UT_LIST_BASE_NODE_T(buf_page_t, list) free;
 
   /** base node of the withdraw block list. It is only used during shrinking
-  buffer pool size, not to reuse the blocks will be removed.  Protected by
-  free_list_mutex */
+  buffer pool size, not to reuse the blocks will be removed.  
+  Protected by free_list_mutex */
   UT_LIST_BASE_NODE_T(buf_page_t, list) withdraw;
 
   /** Target length of withdraw block list, when withdrawing */
@@ -2465,6 +2475,7 @@ Use these instead of accessing buffer pool mutexes directly. */
   } while (0)
 
 /** Get appropriate page_hash_lock. */
+// 获取 hash table 的 cell rw lock
 inline rw_lock_t *buf_page_hash_lock_get(const buf_pool_t *buf_pool,
                                          const page_id_t page_id) {
   return hash_get_lock(buf_pool->page_hash, page_id.hash());
