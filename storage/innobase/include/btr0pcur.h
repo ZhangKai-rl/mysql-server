@@ -766,6 +766,7 @@ inline ulint btr_pcur_t::get_low_match() const {
   return (cur->low_match);
 }
 
+// 本页末尾record
 inline bool btr_pcur_t::is_after_last_on_page() const {
   ut_ad(m_pos_state == BTR_PCUR_IS_POSITIONED);
   ut_ad(m_latch_mode != BTR_NO_LATCHES);

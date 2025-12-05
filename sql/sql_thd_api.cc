@@ -645,6 +645,10 @@ void *thd_memdup(MYSQL_THD thd, const void *str, size_t size) {
   @param wait_type An enum value from the enum thd_wait_type (defined
                    in include/mysql/service_thd_wait.h) but passed as int
                    to preserve compatibility with exported service api.
+  @brief
+Thread Pool 收到通知后做的是：额外唤醒或创建一个新的 worker 线程来处理其他排队的请求。
+设置stall/wait state, 此时这个thd不占cpu需要新增pool worker处理新请求。
+MySQL 不是协程模型，没有办法"暂停"这个调用栈，让线程 A 去跑另一个用户的 do_command。
 */
 void thd_wait_begin(MYSQL_THD thd, int wait_type) {
   MYSQL_CALLBACK(Connection_handler_manager::event_functions, thd_wait_begin,

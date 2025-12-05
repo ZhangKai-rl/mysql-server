@@ -144,7 +144,7 @@ void btr_pcur_t::copy_stored_position(btr_pcur_t *dst, const btr_pcur_t *src) {
   dst->m_old_n_fields = src->m_old_n_fields;
 }
 
-// TODO
+// TODO: 双页left-to-right加锁
 bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
                                   ut::Location location) {
   dtuple_t *tuple;
@@ -354,6 +354,21 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
   ut_d(page_check_dir(next_page));
 }
 
+/**
+假设有leaf page 1,2,3,4. select * from a order by a.c1 desc;
+时间线 →
+                     MTR-1          MTR-2           MTR-3           MTR-4
+                 ┌─────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+Page 1           │          │  │            │ │            │  │ S──────S   │
+Page 2           │          │  │            │ │ S──────S   │  │ S──S ↑     │
+Page 3           │          │  │ S──────S   │ │ S──S ↑     │  │      释放   │
+Page 4           │ S──────S │  │ S──S ↑    │  │      释放   │  │            │
+                 └─────────┘  └────────────┘  └────────────┘  └────────────┘
+                  扫描 P4       P3+P4→释P4     P2+P3→释P3     P1+P2→释P2
+                               扫描 P3         扫描 P2         扫描 P1
+图例：S───S 表示持有 S-latch 的时间段
+      ↑ 表示释放
+ */
 void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   ut_ad(m_latch_mode != BTR_NO_LATCHES);
   ut_ad(is_before_first_on_page());
@@ -374,6 +389,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
 
   store_position(mtr);
 
+  /* note: 释放当前页的latch, 重新开一个mtr， 在restore_position中latch left&&current page. 遵循left-to-right innodb btr加锁规则 */
   mtr_commit(mtr);
 
   mtr_start(mtr);

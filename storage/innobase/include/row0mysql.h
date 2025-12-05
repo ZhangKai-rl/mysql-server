@@ -460,6 +460,8 @@ Innobase and MySQL. */
                  index (c));
  * 对于column a:普通列
 
+ ques: 下面是mysql_row_templ_t（列）的值，具体在哪里计算的？ innobase::build_template ->
+
 col_no = 0
 rec_field_no = 3
 clust_rec_field_no = 3
@@ -485,6 +487,7 @@ mysql_col_len = 4
 is_virtual = 0
  */
 struct mysql_row_templ_t {
+  // note
   ulint col_no;                 /*!< column number of the column */
   ulint rec_field_no;           /*!< field number of the column in an
                                 Innobase record in the current index;
@@ -599,6 +602,7 @@ struct row_prebuilt_t {
   unsigned null_bitmap_len : 10;           /*!< number of bytes in the SQL NULL
                                         bitmap at the start of a row in the
                                         MySQL format */
+  // 二级索引，是否需要回表(是否为非覆盖索引)
   unsigned need_to_access_clustered : 1;   /*!< if we are fetching
                                columns through a secondary index
                                and at least one column is not in

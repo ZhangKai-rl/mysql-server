@@ -413,6 +413,7 @@ class Item_str_conv : public Item_str_func {
   uint multiply;
   my_charset_conv_case converter;
   String tmp_value;
+  String orig_res;
 
  public:
   Item_str_conv(const POS &pos, Item *item) : Item_str_func(pos, item) {}

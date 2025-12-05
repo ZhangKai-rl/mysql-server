@@ -564,6 +564,7 @@ operation, we only do it every INNOBASE_WAKE_INTERVAL'th step. */
 constexpr uint32_t INNOBASE_WAKE_INTERVAL = 32;
 static ulong innobase_active_counter = 0;
 
+// note
 static hash_table_t *innobase_open_tables;
 
 /** Array of data files of the system tablespace */
@@ -3870,6 +3871,7 @@ dberr_t Validate_files::validate(const DD_tablespaces &tablespaces) {
 
   dict_sys_mutex_exit();
 
+  // ques: dd fsp?
   ib::info(ER_IB_MSG_532) << "Reading DD tablespace files";
 
   if (dc->fetch_global_components(&tablespaces)) {
@@ -3878,7 +3880,7 @@ dberr_t Validate_files::validate(const DD_tablespaces &tablespaces) {
     return (DD_FAILURE);
   }
 
-  // note
+  // TODO
   Validate_files validator;
   dberr_t err = validator.validate(tablespaces);
 
@@ -4130,6 +4132,7 @@ static void innobase_post_recover() {
     DBUG_EXECUTE_IF("DDL_Log_remove_inject_startup_error_2",
                     srv_inject_too_many_concurrent_trxs = true;);
 
+    // TODO: ddl recovery
     dberr_t err = log_ddl->recover();
 
     /* Abort post recovery startup if this is not successful. */
@@ -7165,6 +7168,9 @@ void ha_innobase::innobase_initialize_autoinc() {
 @param[in]      name            table name
 @param[in]      open_flags      flags for opening table from SQL-layer.
 @param[in]      table_def       dd::Table object describing table to be opened
+
+  @brief : ha_innobase::open() 是“打开 InnoDB 表”的真正落点：拿到/校验 dict_table_t，创建 row_prebuilt_t，把 InnoDB 访问路径需要的运行时对象准备好。
+
 @retval 1 if error
 @retval 0 if success */
 int ha_innobase::open(const char *name, int, uint open_flags,
@@ -7265,6 +7271,7 @@ int ha_innobase::open(const char *name, int, uint open_flags,
       dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
       dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
+      // note: ctor dict_table_t
       ib_table = dd_open_table(client, table, norm_name, table_def, thd);
       if (!ib_table) {
         set_my_errno(ENOENT);
@@ -10507,6 +10514,7 @@ int ha_innobase::change_active_index(
   the flag ROW_MYSQL_WHOLE_ROW below, but that caused unnecessary
   copying. Starting from MySQL-4.1 we use a more efficient flag here. */
 
+  // XXXXXXXXX
   build_template(false);
 
   return 0;
@@ -11718,6 +11726,7 @@ void innodb_base_col_setup_for_stored(const dict_table_t *table,
     fts_add_doc_id_column(table, heap);
   }
 
+  // note
   if (table->is_temporary()) {
     if (m_create_info->compress.length > 0) {
       push_warning_printf(m_thd, Sql_condition::SL_WARNING, HA_ERR_UNSUPPORTED,
@@ -14119,6 +14128,7 @@ int innobase_basic_ddl::create_impl(THD *thd, const char *name, TABLE *form,
     trx_start_if_not_started(trx, true, UT_LOCATION_HERE);
   }
 
+  // note
   create_table_info_t info(thd, form, create_info, norm_name, remote_path,
                            tablespace, file_per_table, skip_strict, old_flags,
                            old_flags2, false);
@@ -18612,6 +18622,9 @@ trx_t::isolation_level_t innobase_trx_map_isolation_level(
  to InnoDB that a new SQL statement has started and that we must store a
  savepoint to our transaction handle, so that we are able to roll back
  the SQL statement in case of an error.
+ @brief 这是 InnoDB 感知 statement/LOCK TABLES 边界、做一些会话/事务态准备的关键回调点（例如记录 m_mysql_has_locked、绑定 m_user_thd 等）。
+ external_lock() 总体定位：它是 InnoDB 感知“SQL 层表锁边界/语句边界”的 hook.
+ 扩散sql layer lock_type -> innodb prebuilt->select_lock_type
  @return 0 */
 
 // TODO
@@ -18681,12 +18694,13 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
     }
   }
 
+  // note
   m_prebuilt->sql_stat_start = true;
   m_prebuilt->hint_need_to_fetch_extra_cols = 0;
 
   reset_template();
 
-  /**
+  /** FTWRL
    * 处理FLUSH TABLES ... WITH READ LOCK命令
     实现表的静默（quiesce）状态，用于备份等场景
     确保表在备份期间不被修改 
@@ -18747,6 +18761,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
     innobase_register_trx(ht, thd, trx);
 
     /*
+    xxxx TODO
     For reads we will use LOCK_NONE, LOCK_S or LOCK_X according to this chart:
                          +-----------------------------------------+
                          | is_dd_table or skip_locking             |
@@ -18824,7 +18839,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
       if (sql_command == SQLCOM_LOCK_TABLES && THDVAR(thd, table_locks) &&
           thd_test_options(thd, OPTION_NOT_AUTOCOMMIT) &&
           thd_in_lock_tables(thd)) {
-        // note
+        // note: 锁定读external_lock语句开始时就上锁了
         dberr_t error = row_lock_table(m_prebuilt);
 
         if (error != DB_SUCCESS) {
@@ -19429,6 +19444,7 @@ static void free_share(
  "::store_lock()", "::start_stmt()" and "::external_lock()" methods for InnoDB
  tables. */
 
+// note
 uint ha_innobase::lock_count(void) const { return 0; }
 
 /** Supposed to convert a MySQL table lock stored in the 'lock' field of the
@@ -19443,6 +19459,8 @@ uint ha_innobase::lock_count(void) const { return 0; }
  SELECT the read lock is released early on the 'const' tables where we only
  fetch one row. MySQL does not call this when it releases all locks at the
  end of an SQL statement.
+ xxx: server层 get_lock_data -> store_lock获取select_lock_type,sql_lock 之后mysql_lock_tables -> external_lock
+ @brief 不提供 THR_LOCK，而是根据 thr_lock_type 设置 InnoDB 侧的 select_lock_type 等状态（为 external_lock()/start_stmt() 后续逻辑服务）。
  @return pointer to the current element in the 'to' array. */
 
 THR_LOCK_DATA **ha_innobase::store_lock(
@@ -23582,6 +23600,7 @@ dfield_t *innobase_get_field_from_update_vector(dict_foreign_t *foreign,
 @param[in]      foreign         foreign key information
 @return the field filled with computed value, or NULL if just want
 to store the value in passed in "my_rec" */
+// TODO
 dfield_t *innobase_get_computed_value(
     const dtuple_t *row, const dict_v_col_t *col, const dict_index_t *index,
     mem_heap_t **local_heap, mem_heap_t *heap, const dict_field_t *ifield,

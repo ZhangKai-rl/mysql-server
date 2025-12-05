@@ -102,6 +102,7 @@ dberr_t Tablespace::create() {
                      true,           /* is shared */
                      true);          /* is temporary */
 
+  // note
   dberr_t err = fil_ibt_create(m_space_id, file_name().c_str(), path().c_str(),
                                fsp_flags, FIL_IBT_FILE_INITIAL_SIZE);
 

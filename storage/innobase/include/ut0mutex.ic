@@ -47,6 +47,7 @@ Wait in the sync array.
 template <template <typename> class Policy>
 bool TTASEventMutex<Policy>::wait(const char *filename, uint32_t line,
                                   uint32_t spin) UNIV_NOTHROW {
+  // sync_array_t **sync_wait_arr;
   sync_cell_t *cell;
   sync_array_t *sync_arr;
 

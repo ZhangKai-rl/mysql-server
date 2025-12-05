@@ -182,6 +182,7 @@ extern MYSQL_PLUGIN_IMPORT const int LF_HASH_OVERHEAD;
  */
 typedef const uchar *(*hash_get_key_function)(const uchar *arg, size_t *length);
 
+/* todo: 跟innodb的ut_lock_free_hash_t的区别？ */
 struct LF_HASH {
   LF_DYNARRAY array;             /* hash itself */
   LF_ALLOCATOR alloc;            /* allocator for elements */

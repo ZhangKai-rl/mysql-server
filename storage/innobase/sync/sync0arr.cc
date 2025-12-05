@@ -233,6 +233,7 @@ sync_cell_t *sync_array_reserve_cell(sync_array_t *arr, void *object,
 
   /* Make sure the event is reset and also store the value of
   signal_count at which the event was reset. */
+  /* NOTE: sync cell 不实际拥有event, 而是用的cell中sync_obect自己的event */
   os_event_t event = sync_cell_get_event(cell);
   cell->signal_count = os_event_reset(event);
 
@@ -659,6 +660,7 @@ static bool sync_array_detect_deadlock_low(sync_array_t *arr, sync_cell_t *cell,
       ut_error;
   }
 }
+/* DFS 三色标记法环监测 */
 static bool sync_array_detect_deadlock(sync_array_t *const arr,
                                        sync_cell_t *const cell, size_t depth) {
   // there's an ongoing scan

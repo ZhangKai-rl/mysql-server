@@ -241,10 +241,12 @@ struct ut_list_base {
   @see Removable */
   Removable removable() { return Removable{*this}; }
 };
+/* note: 非类型模板参数，定义了一个成员指针, 不是普通指针，而是描述了"类型 Type 中某个 ut_list_node<Type> 成员的偏移量" */
 template <typename Type, ut_list_node<Type> Type::*node_ptr>
 struct ut_list_base_explicit_getter {
   static const ut_list_node<Type> &get_node(const Type &element) {
     return element.*node_ptr;
+    /* element.list */
   }
 };
 /** A type of a list storing pointers to t, chained by member m of t.

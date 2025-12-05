@@ -2495,10 +2495,13 @@ mysql_col_len, mbminlen, mbmaxlen
                                 or templ->icp_rec_field_no
 @param[in]      data            data to store
 @param[in]      len             length of the data
+@brief          for dql.        innodb format(big-endian) -> mysql format(little-endian), mysql little-endian
 @param[in]      sec_field       secondary index field no if the secondary index
                                 record but the prebuilt template is in
+                                // note: end range comparison
                                 clustered index format and used only for end
                                 range comparison. */
+
 void row_sel_field_store_in_mysql_format_func(
     byte *dest, const mysql_row_templ_t *templ, const dict_index_t *index,
     IF_DEBUG(ulint field_no, ) const byte *data,
@@ -2527,6 +2530,7 @@ void row_sel_field_store_in_mysql_format_func(
   switch (templ->type) {
     const byte *field_end;
     byte *pad;
+    /* innobase大端 -> mysql小端。 int4B逐字节转换 */
     case DATA_INT:
       /* Convert integer data from Innobase to a little-endian
       format, sign bit restored to normal */
@@ -2553,6 +2557,7 @@ void row_sel_field_store_in_mysql_format_func(
     case DATA_VARCHAR:
     case DATA_VARMYSQL:
     case DATA_BINARY:
+    /* 这几种类型都是按照Byte的，无需小大端转换 */
       field_end = dest + mysql_col_len;
 
       if (templ->mysql_type == DATA_MYSQL_TRUE_VARCHAR) {
@@ -3146,6 +3151,7 @@ TODO
 
   clust_index = sec_index->table->first_index();
 
+  // pcur定位到sec rec对应clust rec
   prebuilt->clust_pcur->open_no_init(clust_index, prebuilt->clust_ref,
                                      PAGE_CUR_LE, BTR_SEARCH_LEAF, 0, mtr,
                                      UT_LOCATION_HERE);
@@ -3158,8 +3164,10 @@ TODO
   low_match value the real match to the search tuple */
 
   if (!page_rec_is_user_rec(clust_rec) ||
-      prebuilt->clust_pcur->get_low_match() <
+      prebuilt->clust_pcur->get_low_match() < /* 回表 search_mode == page_cur_le */
           dict_index_get_n_unique(clust_index)) {
+    // 回表失败，没找到sec 对应 clust rec
+
     btr_cur_t *btr_cur = prebuilt->pcur->get_btr_cur();
 
     /* If this is a spatial index scan, and we are reading
@@ -3228,6 +3236,8 @@ TODO
       /* In a rare case it is possible that no clust
       rec is found for a delete-marked secondary index
       record: if in row0umod.cc in
+      ques: 这种情况就是 prebuilt->select_lock_type != LOCK_NONE(锁定读) ??
+      sec rec被delete mark + clust rec purged(顺序见row_purge_del_mark) + lock_none read(mvcc read)， 这种情况是合法的不会错误
       row_undo_mod_remove_clust_low() we have already removed
       the clust rec, while purge is still cleaning and
       removing secondary index records associated with

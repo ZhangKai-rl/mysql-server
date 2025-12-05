@@ -1,14 +1,19 @@
 {
     "configurations": [
         {
-            "name": "Mac",
+            "name": "MySQL Server",
+            "compileCommands": "${workspaceFolder}/build_vscode_8039/compile_commands.json",
             "includePath": [
                 "${workspaceFolder}/**",
-                ""
+                "${workspaceFolder}/build_vscode_8039/include",
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/sql",
+                "${workspaceFolder}/storage/innobase/include",
+                "${workspaceFolder}/storage/innobase"
             ],
-            "defines": [],
-            "macFrameworkPath": [
-                "/Library/Developer/CommandLineTools/SDKs/MacOSX14.sdk/System/Library/Frameworks"
+            "defines": [
+                "HAVE_CONFIG_H",
+                "MYSQL_SERVER"
             ],
             "cStandard": "c17",
             "cppStandard": "c++17",

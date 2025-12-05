@@ -50,8 +50,13 @@
 
 /*
   Mock thd_wait_begin/end functions
+  note: thread pool 调度通知
 */
 
+/**
+Thread Pool 收到通知后做的是：额外唤醒或创建一个新的 worker 线程来处理其他排队的请求。
+MySQL 不是协程模型，没有办法"暂停"这个调用栈，让线程 A 去跑另一个用户的 do_command。
+ */
 void thd_wait_begin(THD *, int) {}
 
 void thd_wait_end(THD *) {}

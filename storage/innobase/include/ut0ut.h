@@ -155,6 +155,7 @@ static inline int ut_ulint_cmp(ulint a, ulint b);
 #define ut_2pow_remainder(n, m) ((n) & ((m)-1))
 /** Calculates the biggest multiple of m that is not bigger than n
  when m is a power of two.  In other words, rounds n down to m * k.
+ @brief Rounds n down to m * k. 向下取整到m的倍数，从位运算理解就是把低位清零
  @param n in: number to round down
  @param m in: alignment, must be a power of two
  @return n rounded down to the biggest possible integer multiple of m */

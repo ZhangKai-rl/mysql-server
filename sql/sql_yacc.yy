@@ -1400,6 +1400,7 @@ void warn_on_deprecated_user_defined_collation(
 %token<lexer.keyword> BULK_SYM                   1201  /* MYSQL */
 %token<lexer.keyword> URL_SYM                    1202   /* MYSQL */
 %token<lexer.keyword> GENERATE_SYM               1203   /* MYSQL */
+// note: test tokens
 %token TEST_0528                                 1204
 
 /*

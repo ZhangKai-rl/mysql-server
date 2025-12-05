@@ -199,6 +199,7 @@ void rw_lock_create_func(rw_lock_t *lock,
   /* If this is the very first time a synchronization object is
   created, then the following call initializes the sync system. */
 
+  // note: lock_word 的初始值时 X_LOCK_DECR !!
   lock->lock_word = X_LOCK_DECR;
   lock->waiters = false;
 
@@ -378,6 +379,7 @@ static inline void rw_lock_x_lock_wait_func(rw_lock_t *lock,
   uint64_t count_os_wait = 0;
 
   os_rmb;
+  // X + n*S
   ut_ad(lock->lock_word <= threshold);
 
   while (lock->lock_word < threshold) {
@@ -451,6 +453,8 @@ static inline bool rw_lock_x_lock_low(
     const char *file_name, /*!< in: file name where lock requested */
     ulint line)            /*!< in: line where requested */
 {
+  // note: 先判断是否有可能上锁(只有s才行，根据兼容矩阵判断)，然后减lock_word，然后等待可以上锁
+  // 使用x_lock_half_decr判断，必须大于，表明只有S，后续等待s退出
   if (rw_lock_lock_word_decr(lock, X_LOCK_DECR, X_LOCK_HALF_DECR)) {
     /* lock->recursive == true implies that the lock->writer_thread is the
     current writer. As we are going to write our own thread id in that field it
@@ -461,15 +465,16 @@ static inline bool rw_lock_x_lock_low(
     /* Decrement occurred: we are writer or next-writer. */
     rw_lock_set_writer_id_and_recursion_flag(lock, !pass);
 
+    // 等待剩余的 S 锁释放（等到 lock_word == 0）。
     rw_lock_x_lock_wait(lock, pass, 0, file_name, line);
 
   } else {
-    // 此时decr失败！因为lock_word = 0 < X_LOCK_HALF_DECR(有了一个x锁了)
+    // 此时decr失败！因为lock_word = 0 < X_LOCK_HALF_DECR
 
     if (!pass && lock->recursive.load(std::memory_order_acquire) &&
         lock->writer_thread.load(std::memory_order_relaxed) ==
             std::this_thread::get_id()) {
-      // 同一线程重入加锁
+      // note: 同一线程重入加锁. 这种情况下可以 x+xs/ x+x 加锁
       /* Decrement failed: An X or SX lock is held by either
       this thread or another. Try to relock. */
       /* Other s-locks can be allowed. If it is request x
@@ -483,9 +488,11 @@ static inline bool rw_lock_x_lock_low(
 
         /* Wait for any the other S-locks to be
         released. */
+        // SX锁持有者升级为 X 锁，等 S 锁释放到 lock_word == -X_LOCK_HALF_DECR
         rw_lock_x_lock_wait(lock, pass, -X_LOCK_HALF_DECR, file_name, line);
 
       } else {
+        // 这是第 3 次及以后的 X 锁（已经有 ≥2 个 X 锁了）
         /* At least one X lock by this thread already
         exists. Add another. */
         if (lock->lock_word == 0 || lock->lock_word == -X_LOCK_HALF_DECR) {

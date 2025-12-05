@@ -56,6 +56,7 @@ enum lock_mode {
   LOCK_X,               /* exclusive */
   LOCK_AUTO_INC,        /* locks the auto-inc counter of a table
                         in an exclusive mode */
+  // note: 前面是锁定读，锁定读只锁**最新版本**rec
   LOCK_NONE,            /* this is used elsewhere to note consistent read */
   LOCK_NUM = LOCK_NONE, /* number of lock modes */
   LOCK_NONE_UNSET = 255

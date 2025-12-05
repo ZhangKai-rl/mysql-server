@@ -106,6 +106,20 @@
         "typeinfo": "cpp",
         "unordered_set": "cpp",
         "algorithm": "cpp",
-        "atomic": "cpp"
-    }
+        "atomic": "cpp",
+        "semaphore": "cpp"
+    },
+    "iwiki.boundDocuments": [
+        {
+            "pageId": "4008324132",
+            "title": "内核&存储",
+            "spaceKey": "TDSQLCforMySQL",
+            "spaceId": 1326219464,
+            "spaceName": "TDSQL-C for MySQL",
+            "isDirectory": true,
+            "spaceRoot": false,
+            "contentType": "DOC",
+            "syncPath": "/Users/morphyzhang/Documents/Code/.iwiki"
+        }
+    ]
 }

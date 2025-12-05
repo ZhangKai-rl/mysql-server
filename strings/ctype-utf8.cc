@@ -5058,6 +5058,7 @@ static size_t my_strxfrm_pad_unicode(uchar *str, uchar *strend) {
   function (ie., the function that converts multibyte characters to
   one wide character). This is inlined because the call overhead of
   mb_wc() would otherwise be quite large.
+  @param[in] uint nweights,             // 需要转换的字符数（逻辑长度）
 */
 template <class Mb_wc>
 static inline size_t my_strnxfrm_unicode_tmpl(const CHARSET_INFO *cs,
@@ -7343,14 +7344,21 @@ static size_t my_caseup_utf8mb4(const CHARSET_INFO *cs, char *src,
   char *srcend = src + srclen, *dstend = dst + dstlen, *dst0 = dst;
   const MY_UNICASE_INFO *uni_plane = cs->caseinfo;
   assert(src != dst || cs->caseup_multiply == 1);
+  bool inplace = (src == dst);
 
   while ((src < srcend) &&
          (srcres = my_mb_wc_utf8mb4(&wc, (uchar *)src, (uchar *)srcend)) > 0) {
     my_toupper_utf8mb4(uni_plane, &wc);
-    if ((dstres = my_wc_mb_utf8mb4(cs, wc, (uchar *)dst, (uchar *)dstend)) <= 0)
+    if (((dstres = my_wc_mb_utf8mb4(cs, wc, (uchar *)dst, (uchar *)dstend)) <= 0) && !inplace)
       break;
-    src += srcres;
-    dst += dstres;
+    if (srcres == dstres || !inplace) {
+      src += srcres;
+      dst += dstres;
+    } else {
+      // srcres have to equal to dstres in in-place case conversion(multiply == 1), if not try bigger buffer.
+      // Not enough space to do in-place case conversion, which means some unicode character's bytes changed in utf8mb4.
+      return -1;
+    }
   }
   return (size_t)(dst - dst0);
 }
@@ -7429,22 +7437,29 @@ static size_t my_casedn_utf8mb4(const CHARSET_INFO *cs, char *src,
   int srcres, dstres;
   char *srcend = src + srclen, *dstend = dst + dstlen, *dst0 = dst;
   const MY_UNICASE_INFO *uni_plane = cs->caseinfo;
+  // assert(src != dst || (cs->casedn_multiply == 1 && 大小写转换不改变字节数));
   assert(src != dst || cs->casedn_multiply == 1);
+  bool inplace = (src == dst);
 
   while ((src < srcend) &&
          (srcres = my_mb_wc_utf8mb4(&wc, (uchar *)src, (uchar *)srcend)) > 0) {
     // note: 关键在这。 对 general_ci 来说，  Ⱦ -> wc 574
     my_tolower_utf8mb4(uni_plane, &wc);
-    if ((dstres = my_wc_mb_utf8mb4(cs, wc, (uchar *)dst, (uchar *)dstend)) <= 0)
+    if (((dstres = my_wc_mb_utf8mb4(cs, wc, (uchar *)dst, (uchar *)dstend)) <= 0) && !inplace)
       break;
     // ques: 这里处理 Ⱦ 字符后，为什么src 由 Ⱦbbb变成了 (0xa6)bb.
     // 原因是 utf8mb4 编码下 Ⱦ 为 (utf8mb4: 0x c8 be, unicode wc: U+ 0x 02 3e(574)) 共2bytes, 其对应小写为 ⱦ (U+2C66(11366)，UTF-8: 0xE2 0xB1 0xA6)
     // 这里外层Item_str_conv::multiply == 1, 因此 dst 复用了 src 的地址. 所以 src += srcres(Ⱦ的2bytes) 后 src 变为 (0xa6)bb。
     // 接下来继续处理 src中的 0xa6, 在mb_wc转unicode时，0xa6开头为双字节utf，然而后续跟的b,是不合法的, return MY_CS_ILSEQ from my_mb_wc_utf8mb4(s=0xa6bb)
     // 然后退出了 while 循环, 接着退出了 my_casedn_utf8mb4
-    // 然后退出了 while 循环, 接着退出了 my_casedn_utf8mb4
-    src += srcres;
-    dst += dstres;
+    if (srcres == dstres || !inplace) {
+      src += srcres;
+      dst += dstres;
+    } else {
+      return -1;
+    }
+    // src += srcres;
+    // dst += dstres;
   }
   return (size_t)(dst - dst0);
 }

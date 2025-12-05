@@ -45,8 +45,10 @@ to warn if direction and hint parameters are switched in
 fseg_alloc_free_page) */
 /** @{ */
 /** alphabetically upwards */
+// 向上升序，从低到高
 constexpr byte FSP_UP = 111;
 /** alphabetically downwards */
+// 向下降序，从高到低，获取高方向
 constexpr byte FSP_DOWN = 112;
 /** no order */
 constexpr byte FSP_NO_DIR = 113;
@@ -83,6 +85,7 @@ constexpr uint32_t FSEG_PAGE_DATA = FIL_PAGE_DATA;
 The file segment header points to the inode describing the file segment. */
 /** @{ */
 /** 书中的segment header结构。 10B。 Data type for file segment header */
+// 用于索引inode(space_id, page_no, offset)
 typedef byte fseg_header_t;
 
 /** space id of the inode */
@@ -221,6 +224,12 @@ bool fsp_skip_sanity_check(space_id_t space_id);
 #endif /* UNIV_DEBUG */
 
 /** @defgroup fsp_flags InnoDB Tablespace Flag Constants
+XXXXX:
+bit:  0        1..4          5           6..9        10    11     12     13    14    15
+    +--------+-----------+-----------+------------+------+-------+------+-----+-----+-----+
+    | POST_  | ZIP_SSIZE | ATOMIC_   | PAGE_SSIZE | DATA | SHARED| TEMP | ENC | SDI | SM4 |
+    | ANTE.. | (4 bits)  | BLOBS     | (4 bits)   | _DIR |       |      |     |     |     |
+    +--------+-----------+-----------+------------+------+-------+------+-----+-----+-----+
 @{ */
 
 /** Width of the POST_ANTELOPE flag */
@@ -333,6 +342,7 @@ constexpr uint32_t FSP_FLAGS_HAS_ATOMIC_BLOBS(uint32_t flags) {
   return (flags & FSP_FLAGS_MASK_ATOMIC_BLOBS) >> FSP_FLAGS_POS_ATOMIC_BLOBS;
 }
 /** Return the value of the PAGE_SSIZE field */
+// 紧凑的对数编码（log2(size) - 9）
 constexpr uint32_t FSP_FLAGS_GET_PAGE_SSIZE(uint32_t flags) {
   return (flags & FSP_FLAGS_MASK_PAGE_SSIZE) >> FSP_FLAGS_POS_PAGE_SSIZE;
 }

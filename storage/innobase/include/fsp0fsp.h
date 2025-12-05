@@ -180,6 +180,7 @@ constexpr uint32_t FSP_HEADER_SIZE = 32 + 5 * FLST_BASE_NODE_SIZE;
 
 /** This many free extents are added to the free list from above FSP_FREE_LIMIT
  at a time */
+ // 注意单位为 extensts, 4extents
 constexpr uint32_t FSP_FREE_ADD = 4;
 
 /** @} */
@@ -204,6 +205,20 @@ constexpr uint32_t FSEG_INODE_PAGE_NODE = FSEG_PAGE_DATA;
 /* the list node for linking
 segment inode pages */
 
+/*
+偏移         字段                   说明
+─────────────────────────────────────────────
+  0         FSEG_ID (8B)          段 ID，0 表示未使用
+  8         FSEG_NOT_FULL_N_USED  NOT_FULL 链表中已用页数
+ 12         FSEG_FREE             空闲 extent 链表头 (FLST_BASE_NODE_SIZE=16)
+ 28         FSEG_NOT_FULL         部分使用 extent 链表头
+ 44         FSEG_FULL             满 extent 链表头
+ 60         FSEG_MAGIC_N (4B)     ← 魔数字段，存放 97937874
+ 64         FSEG_FRAG_ARR         32 个零散页面槽位
+*/
+
+/* 见INODE类型页面 ，这里是inode entry array的起始offset */
+//                                   fil hdr 16B    + inode page list node 12B
 constexpr uint32_t FSEG_ARR_OFFSET = FSEG_PAGE_DATA + FLST_NODE_SIZE;
 /*-------------------------------------*/
 /* 8 bytes of segment id: if this is 0,  it means that the header is unused */
@@ -225,6 +240,7 @@ constexpr uint32_t FSEG_FRAG_ARR = 16 + 3 * FLST_BASE_NODE_SIZE;
 #define FSEG_FRAG_ARR_N_SLOTS (FSP_EXTENT_SIZE / 2)
 /** a fragment page slot contains its  page number within space, FIL_NULL means
  that the slot is not in use */
+// inode entry结构的 fseg frag page array(最多32碎片页)每个slot存的是段碎片页的page no，因此4B
 constexpr uint32_t FSEG_FRAG_SLOT_SIZE = 4;
 
 /*-------------------------------------*/
@@ -253,6 +269,7 @@ constexpr double FSEG_RESERVE_PCT_DFLT = 12.50;
 constexpr double FSEG_RESERVE_PCT_MIN = 0.03;
 constexpr double FSEG_RESERVE_PCT_MAX = 40.00;
 
+/* 段有32个frag page */
 #define FSEG_FRAG_LIMIT FSEG_FRAG_ARR_N_SLOTS
 
 /** If the reserved size of a segment is at least this many extents, we allow
@@ -282,6 +299,10 @@ constexpr uint32_t XDES_STATE = FLST_NODE_SIZE + 8;
 constexpr uint32_t XDES_BITMAP = FLST_NODE_SIZE + 12;
 
 /*-------------------------------------*/
+/**
+ * @brief xdes entry 的 page_state_map 
+ * 一个extent 64pages，每个pages有2个bit，一个表示free，一个表示clean，总共128bit16B
+ */
 
 /** How many bits are there per page */
 constexpr uint32_t XDES_BITS_PER_PAGE = 2;
@@ -301,6 +322,7 @@ enum xdes_state_t {
   XDES_FREE = 1,
 
   /** extent is in free fragment list of space */
+  // note: XDES_FSEG_FRAG 与之前讨论的 XDES_FREE_FRAG / XDES_FULL_FRAG 碎片页机制不同。Lease 机制是 MySQL 8.0 的优化，它是把一个整个 extent 从 FSP 的 **free_frag** 链表转移给段，而不是像碎片页那样只借用单个页。
   XDES_FREE_FRAG = 2,
 
   /** extent is in full fragment list of space */
@@ -310,6 +332,11 @@ enum xdes_state_t {
   XDES_FSEG = 4,
 
   /** fragment extent leased to segment */
+  // ques: ?第五种状态？表示从 fsp free_frag 租借lease的 fseg frag(每组extent的头一页)
+  // fseg从fsp free_frag中获取的extent
+  // 见： fsp_alloc_xdes_free_frag
+  // note: 是 MySQL 8.0 引入的一种 extent 状态，表示从 FSP 的 free_frag 链表租借（lease）给段使用的碎片 extent。
+  // note : lease extent 本质上是从 FSP 的 free_frag 借来的，它的 page 0 和 page 1 是 FSP 的系统元数据页（XDES page + IBUF bitmap page），段只是临时使用了 page 2~63。当段把借来的页都释放后，自然要还回给 FSP。
   XDES_FSEG_FRAG = 5
 };
 
@@ -329,6 +356,7 @@ enum xdes_state_t {
 constexpr uint32_t XDES_ARR_OFFSET = FSP_HEADER_OFFSET + FSP_HEADER_SIZE;
 
 /** The number of reserved pages in a fragment extent. */
+// note page0: xdes, page1: ibuf bitmap
 const ulint XDES_FRAG_N_USED = 2;
 
 /** @} */

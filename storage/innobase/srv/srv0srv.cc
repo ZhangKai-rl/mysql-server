@@ -690,9 +690,9 @@ DB concept                      equivalent OS concept
 ----------                      ---------------------
 transaction             --      process;
 
-query thread            --      thread;
+query thread que_thr_t  --      thread;
 
-lock                    --      semaphore;
+lock         lock_t     --      semaphore;
 
 kernel                  --      kernel;
 
@@ -717,6 +717,7 @@ server. They run at normal priority.
 When there is no activity in the system, also the master thread
 suspends itself to wait for an event making the server totally silent.
 
+note
 There is still one complication in our server design. If a
 background utility thread obtains a resource (e.g., mutex) needed by a user
 thread, and there is also some other user activity in the system,
@@ -725,6 +726,7 @@ resource, as the OS does not schedule a background thread if
 there is some other runnable user thread. This problem is called
 priority inversion in real-time programming.
 
+note: 优先级反转, 优先级继承(未实现)
 One solution to the priority inversion problem would be to keep record
 of which thread owns which resource and in the above case boost the
 priority of the background thread so that it will be scheduled and it

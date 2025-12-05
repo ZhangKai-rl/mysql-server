@@ -3372,6 +3372,7 @@ void MDL_lock::object_lock_notify_conflicting_locks(MDL_context *ctx,
   @retval  true    Failure (Out of resources or waiting is aborted),
 */
 
+// TODO
 bool MDL_context::acquire_lock(MDL_request *mdl_request,
                                Timeout_type lock_wait_timeout) {
   // in order to test bug#34594035 call functions that before the fix

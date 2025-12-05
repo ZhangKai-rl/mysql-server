@@ -2793,6 +2793,8 @@ class Table_function;
        ;
 */
 
+// note: sql_i_list侵入式链表的节点, 通过内部table_ref指针，一个节点可同时挂多条 intrusive list
+// ques: table_ref 如何知道自己在哪个sql_i_list中？无法得知
 class Table_ref {
  public:
   Table_ref() = default;
@@ -3487,6 +3489,7 @@ class Table_ref {
     Created at parse time in Query_block::add_table_to_list() ->
     table_list.link_in_list().
     local意味着变形只在当前Query_block进行
+    // note: 头节点在哪？链表的头节点在哪？
   */
   Table_ref *next_local{nullptr};
   /* link in a global list of all queries tables */

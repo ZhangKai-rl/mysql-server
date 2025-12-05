@@ -73,6 +73,7 @@ bool innobase_deadlock_detect = true;
 static const ulint REC_LOCK_CACHE = 8;
 
 /** Maximum record lock size in bytes */
+// note: 256? 256*8bit = 2^7 * 2^3 = 2^10 = 1024, 工程经验认为1页1024rec
 static const ulint REC_LOCK_SIZE = sizeof(ib_lock_t) + 256;
 
 /** Total number of cached table locks */
@@ -6514,6 +6515,8 @@ void lock_trx_alloc_locks(trx_t *trx) {
   constructed, but how can we (the lock-sys) "know" about it and why risk? */
   trx_mutex_enter(trx);
   ulint sz = REC_LOCK_SIZE * REC_LOCK_CACHE;
+  // note: trx_pool 中的 trx_t 是从pool中分配的，但是trx_t::lock是malloc的不在pool中
+  // ques: 内存生命周期问题。trx_pool中的trx, trx::lock都是要复用的，lock_heap 每个事务结束都会被清空，而 rec_pool/table_pool 需要跨事务存活。事务结束 trx_init, mem_heap_empty(lock_heap)此时rec_pool的lock_t bitmap依旧存活在池子。
   byte *ptr = reinterpret_cast<byte *>(
       ut::malloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, sz));
 

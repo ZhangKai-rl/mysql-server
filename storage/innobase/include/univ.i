@@ -280,6 +280,7 @@ constexpr size_t UNIV_WORD_SIZE = SIZEOF_LONG;
 
 /** The following alignment is used in memory allocations in memory heap
 management to ensure correct alignment for doubles etc. */
+// bug here
 constexpr uint32_t UNIV_MEM_ALIGNMENT = 8;
 
 /*
@@ -443,6 +444,7 @@ constexpr ulint ULINT_MAX = std::numeric_limits<ulint>::max() - 1;
 typedef uint64_t ib_id_t;
 constexpr ib_id_t IB_ID_MAX = std::numeric_limits<uint64_t>::max();
 
+// NOTE: 都是4B
 /** Page number */
 typedef uint32_t page_no_t;
 /** Tablespace identifier */
@@ -547,6 +549,12 @@ typedef void *os_thread_ret_t;
 #include "ut0lst.h"
 #include "ut0ut.h"
 
+/*
+free list 中:  UNIV_MEM_FREE(frame)    → Valgrind 标记为 NOACCESS（不可读写）
+取出使用时:    UNIV_MEM_ALLOC(frame)   → Valgrind 标记为 UNDEFINED（可写，读需先写）
+写入数据后:    UNIV_MEM_VALID(frame)   → Valgrind 标记为 DEFINED（可读可写）
+归还 free list: UNIV_MEM_FREE(frame)   → 再次标记为 NOACCESS
+*/
 #ifdef UNIV_DEBUG_VALGRIND
 #include <valgrind/memcheck.h>
 

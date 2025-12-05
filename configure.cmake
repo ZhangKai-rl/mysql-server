@@ -742,6 +742,50 @@ IF(LINUX)
         SET(HAVE_ARMV8_CRC32_INTRINSIC 1)
       ENDIF()
 
+      # for arm sve优化
+      # Check for ARM SVE (Scalable Vector Extension) support
+      # SVE is available in ARMv8.2-A and later (e.g., Huawei Kunpeng 920)
+      CHECK_CXX_SOURCE_COMPILES(
+      "
+      #include <arm_sve.h>
+      int main() {
+        svbool_t pg = svptrue_pat_b8(SV_VL32);
+        svuint8_t vec = svdup_u8(0x20);
+        svbool_t cmp = svcmpne_n_u8(pg, vec, 0x20);
+        int flag = svptest_any(pg, cmp);
+        return 0;
+      }"
+      HAVE_ARMV8_SVE)
+
+      IF (NOT HAVE_ARMV8_SVE)
+        CMAKE_PUSH_CHECK_STATE(RESET)
+        set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+sve")
+        CHECK_CXX_SOURCE_COMPILES(
+        "
+        #include <arm_sve.h>
+        int main() {
+          svbool_t pg = svptrue_pat_b8(SV_VL32);
+          svuint8_t vec = svdup_u8(0x20);
+          svbool_t cmp = svcmpne_n_u8(pg, vec, 0x20);
+          int flag = svptest_any(pg, cmp);
+          return 0;
+        }"
+        HAVE_ARMV8_SVE_WITH_ARCH_EXTN)
+        CMAKE_POP_CHECK_STATE()
+        if (HAVE_ARMV8_SVE_WITH_ARCH_EXTN)
+          STRING_APPEND(CMAKE_CXX_FLAGS " -march=armv8.2-a+sve")
+          STRING_APPEND(CMAKE_C_FLAGS " -march=armv8.2-a+sve")
+        ENDIF()
+      ENDIF()
+
+      IF (HAVE_ARMV8_SVE OR HAVE_ARMV8_SVE_WITH_ARCH_EXTN)
+        MESSAGE(STATUS "ARMv8 SVE intrinsic support available")
+        SET(HAVE_ARMV8_SVE_INTRINSIC 1)
+      ELSE()
+        MESSAGE(STATUS "ARMv8 SVE intrinsic support not available")
+        SET(HAVE_ARMV8_SVE_INTRINSIC 0)
+      ENDIF()
+
     ENDIF() # arm_acle.h
   ENDIF() # aarch64
 ENDIF() # linux

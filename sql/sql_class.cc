@@ -3060,7 +3060,8 @@ bool THD::sql_parser() {
 
   Parse_tree_root *root = nullptr;
   // https://zhuanlan.zhihu.com/p/716898493
-  // 参数见 sql_yacc.yy %parse-param (THD[in], Parse_tree_root[out])
+  // note: 参数见 sql_yacc.yy %parse-param (THD[in], Parse_tree_root[out])
+  // mysqlparse的具体实现见 sql_yacc.cc, yyparse
   // 具体看规则有两个办法： 1. 开启debug +=  
   // note:              2. 在 sql_yacc.cc 中 switch (yyn) 处打断点，从而进入 sql_yacc.yy
   if (MYSQLparse(this, &root) || is_error()) {
@@ -3318,6 +3319,7 @@ void Transactional_ddl_context::post_ddl() {
   m_tablename = "";
 }
 
+// TODO
 void my_ok(THD *thd, ulonglong affected_rows, ulonglong id,
            const char *message) {
   thd->set_row_count_func(affected_rows);

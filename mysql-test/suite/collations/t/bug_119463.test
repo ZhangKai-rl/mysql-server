@@ -1,0 +1,551 @@
+# ============================================
+# Title     : Unicode case conversion function test - Bug#119463
+# Author    : ALADIN
+# Date      : 2023-11-15
+# Updated   : 2025-12-24
+# SQLType   : ns
+# Level     : P0
+# Parallel  : True
+# DBVersion : all
+# Version   : 8.0
+# Bug       : String truncation when using utf8mb4_0900_ai_ci collation
+# ============================================
+
+--connection default
+CREATE DATABASE IF NOT EXISTS test_unicode_case;
+USE test_unicode_case;
+
+--echo #
+--echo # Save original parameters
+--echo #
+SET @saved_collation_connection = @@collation_connection;
+SET @saved_character_set_client = @@character_set_client;
+SET @saved_character_set_results = @@character_set_results;
+
+######################################################
+# Module 1: Basic Bug Reproduction Test
+######################################################
+
+--echo #
+--echo # CASE-1: Reproduce the original bug - String truncation with utf8mb4_0900_ai_ci
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# The original bug: lower('aaaȾbbb') was truncated to 'aaaⱦ'
+# After fix, it should return 'aaaⱦbbb'
+SELECT lower('aaaȾbbb') AS result;
+# Verify the result is correct
+SELECT lower('aaaȾbbb') = 'aaaⱦbbb' AS is_correct;
+
+--echo # End of CASE-1
+
+######################################################
+# Module 2: Comprehensive Character Testing
+######################################################
+
+--echo #
+--echo # CASE-2: Test all known characters with byte-length-changing case conversion
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# U+023F (Ȿ, 2 bytes) -> U+2C7F (ȿ, 3 bytes)
+SELECT 'U+023F' AS unicode_point, 'Ȿ' AS original, lower('Ȿ') AS lowered,
+       HEX('Ȿ') AS hex_original, HEX(lower('Ȿ')) AS hex_lowered,
+       LENGTH('Ȿ') AS len_original, LENGTH(lower('Ȿ')) AS len_lowered;
+
+
+# IMPORTANT: Test reverse conversion (uppercase bytes > lowercase bytes)
+# This tests the fix in my_caseup_utf8mb4 function
+
+# U+2C7F (ɀ, 3 bytes) -> U+0240 (Ɀ, 2 bytes)
+SELECT 'U+2C7F->U+0240' AS conversion, 'ɀ' AS original, upper('ɀ') AS uppered,
+       HEX('ɀ') AS hex_original, HEX(upper('ɀ')) AS hex_uppered,
+       LENGTH('ɀ') AS len_original, LENGTH(upper('ɀ')) AS len_uppered;
+
+# Test reverse conversion in string context (similar to original bug scenario)
+# Original bug: lower('aaaȾbbb') was truncated
+# Now test: upper('aaaɀbbb') should NOT be truncated
+SELECT upper('aaaɀbbb') AS result;
+# Verify the result is correct (3 bytes -> 2 bytes conversion)
+SELECT upper('aaaɀbbb') = 'aaaȺbbb' AS is_correct;
+
+# Test with ⱦ (U+2C66, 3 bytes) -> Ⱦ (U+023E, 2 bytes) in string
+SELECT upper('xxxⱦyyy') AS result;
+
+# Test with ȿ (U+2C7F, 3 bytes) -> Ȿ (U+023F, 2 bytes) in string
+SELECT upper('pppȿqqq') AS result;
+
+# Test multiple reverse conversions in one string
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_reverse;
+
+# Test mixed reverse conversions
+SELECT upper('ⱦaȿbɀc') AS mixed_reverse;
+
+--echo # End of CASE-2
+
+######################################################
+# Module 3: Edge Cases and Boundary Testing
+######################################################
+
+--echo #
+--echo # CASE-3: Edge cases - Empty, single char, multiple special chars
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Empty string
+SELECT lower('') AS empty_lower, upper('') AS empty_upper;
+
+# Single special character
+SELECT lower('Ⱦ') AS single_lower, upper('ⱦ') AS single_upper;
+
+# Multiple consecutive special characters
+SELECT lower('ȾȾȾȾ') AS multiple_lower;
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_upper;
+
+# Mixed special characters
+SELECT lower('ȾȾȾ') AS mixed_lower;
+SELECT lower('ȾȾȾ') AS mixed_lower2;
+
+# Special characters at different positions
+SELECT lower('Ⱦabc') AS at_start;
+SELECT lower('abcȾ') AS at_end;
+SELECT lower('aȾbȾc') AS in_middle;
+SELECT lower('ȾaȾbȾcȾ') AS multiple_positions;
+
+# Very long string with special character in the middle
+SELECT LENGTH(lower(CONCAT(REPEAT('a', 100), 'Ⱦ', REPEAT('b', 100)))) AS long_string_length;
+SELECT SUBSTRING(lower(CONCAT(REPEAT('a', 100), 'Ⱦ', REPEAT('b', 100))), 98, 7) AS long_string_middle;
+
+# String with only special characters
+SELECT lower('ȾȾ') AS only_special;
+
+# ===== Reverse conversion tests (uppercase bytes > lowercase bytes) =====
+
+# Single reverse conversion character (3 bytes -> 2 bytes)
+SELECT upper('ⱦ') AS single_reverse_upper;
+SELECT upper('ɀ') AS single_reverse_upper2;
+
+# Multiple consecutive reverse conversion characters
+SELECT upper('ⱦⱦⱦⱦ') AS multiple_reverse_upper;
+SELECT upper('ɀɀɀɀ') AS multiple_reverse_upper2;
+
+# Reverse conversion at different positions
+SELECT upper('ⱦabc') AS reverse_at_start;
+SELECT upper('abcⱦ') AS reverse_at_end;
+SELECT upper('aⱦbⱦc') AS reverse_in_middle;
+SELECT upper('ⱦaⱦbⱦcⱦ') AS reverse_multiple_positions;
+
+# Very long string with reverse conversion character in the middle
+SELECT LENGTH(upper(CONCAT(REPEAT('a', 100), 'ⱦ', REPEAT('b', 100)))) AS long_reverse_length;
+SELECT SUBSTRING(upper(CONCAT(REPEAT('a', 100), 'ⱦ', REPEAT('b', 100))), 98, 7) AS long_reverse_middle;
+
+# String with only reverse conversion characters
+SELECT upper('ⱦⱦɀɀ') AS only_reverse_special;
+
+# Mixed forward and reverse conversions
+SELECT lower(upper('ⱦⱦⱦ')) AS reverse_roundtrip;
+SELECT upper(lower('ȾȾȾ')) AS forward_roundtrip;
+
+--echo # End of CASE-3
+
+######################################################
+# Module 4: Collation Comparison Testing
+######################################################
+
+--echo #
+--echo # CASE-4: Compare behavior across different collations
+--echo #
+
+# Test with utf8mb4_0900_ai_ci (should convert)
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT 'utf8mb4_0900_ai_ci' AS collation, lower('aaaȾbbb') AS result;
+
+# Test with utf8mb4_general_ci (should NOT convert Ⱦ)
+SET NAMES utf8mb4 COLLATE utf8mb4_general_ci;
+SELECT 'utf8mb4_general_ci' AS collation, lower('aaaȾbbb') AS result;
+
+# Test with utf8mb4_bin (should convert)
+SET NAMES utf8mb4 COLLATE utf8mb4_bin;
+SELECT 'utf8mb4_bin' AS collation, lower('aaaȾbbb') AS result;
+
+# Test with utf8mb4_unicode_ci (should NOT convert Ⱦ)
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+SELECT 'utf8mb4_unicode_ci' AS collation, lower('aaaȾbbb') AS result;
+
+# Test with utf8mb4_0900_as_cs (should convert)
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs;
+SELECT 'utf8mb4_0900_as_cs' AS collation, lower('aaaȾbbb') AS result;
+
+--echo # End of CASE-4
+
+######################################################
+# Module 5: Table and Column Testing
+######################################################
+
+--echo #
+--echo # CASE-5: Test with table columns and WHERE clauses
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Create test table with various column types
+CREATE TABLE test_case_conversion (
+    id INT NOT NULL AUTO_INCREMENT,
+    str_col VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+    text_col TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,
+    PRIMARY KEY (id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Insert test data
+INSERT INTO test_case_conversion(str_col, text_col) VALUES 
+('aaaȾbbb', 'aaaȾbbb'),
+('Ⱦ', 'Ⱦ'),
+('ȾxxxȾ', 'ȾxxxȾ'),
+('Ȿ', 'Ȿ'),
+('ȾȾȾȾ', 'ȾȾȾȾ'),
+('normaltext', 'normaltext'),
+('MixedȾCase', 'MixedȾCase'),
+-- Reverse conversion test data (lowercase with 3 bytes)
+('aaaⱦbbb', 'aaaⱦbbb'),
+('ⱦ', 'ⱦ'),
+('ⱦxxxⱦ', 'ⱦxxxⱦ'),
+('ɀ', 'ɀ'),
+('ⱦⱦⱦⱦ', 'ⱦⱦⱦⱦ'),
+('Mixedⱦcase', 'Mixedⱦcase');
+
+# Test LOWER on VARCHAR column
+SELECT id, str_col, lower(str_col) AS lowered FROM test_case_conversion ORDER BY id;
+
+# Test UPPER on TEXT column
+SELECT id, text_col, upper(text_col) AS uppered FROM test_case_conversion WHERE text_col LIKE '%Ⱦ%' ORDER BY id;
+
+# Test in WHERE clause
+SELECT id, str_col FROM test_case_conversion WHERE lower(str_col) = 'aaaⱦbbb';
+
+# Test reverse conversion in WHERE clause (UPPER with 3-byte to 2-byte conversion)
+SELECT id, str_col FROM test_case_conversion WHERE upper(str_col) = 'AAAȾBBB';
+
+# Test UPPER on VARCHAR column (reverse conversion)
+SELECT id, str_col, upper(str_col) AS uppered FROM test_case_conversion WHERE str_col LIKE '%ⱦ%' ORDER BY id;
+
+# Test in JOIN condition
+CREATE TABLE test_lookup (
+    lookup_str VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_lookup VALUES ('aaaⱦbbb'), ('ⱦ'), ('normaltext');
+
+SELECT t1.id, t1.str_col, t2.lookup_str 
+FROM test_case_conversion t1 
+INNER JOIN test_lookup t2 ON lower(t1.str_col) = t2.lookup_str
+ORDER BY t1.id;
+
+DROP TABLE test_lookup;
+
+# Test reverse conversion in JOIN condition
+CREATE TABLE test_lookup_reverse (
+    lookup_str VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_lookup_reverse VALUES ('AAAȾBBB'), ('Ⱦ'), ('NORMALTEXT');
+
+SELECT t1.id, t1.str_col, t2.lookup_str 
+FROM test_case_conversion t1 
+INNER JOIN test_lookup_reverse t2 ON upper(t1.str_col) = t2.lookup_str
+ORDER BY t1.id;
+
+DROP TABLE test_lookup_reverse;
+
+--echo # End of CASE-5
+
+
+######################################################
+# Module 7: Data Integrity and Comparison Testing
+######################################################
+
+--echo #
+--echo # CASE-7: Verify data integrity and comparison operations
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Verify round-trip conversion
+SELECT upper(lower('ȾȾȾ')) = 'ȾȾȾ' AS roundtrip_upper;
+SELECT lower(upper('ⱦⱦⱦ')) = 'ⱦⱦⱦ' AS roundtrip_lower;
+
+# Test comparison with original
+SELECT 'Ⱦ' = lower('Ⱦ') AS case_insensitive_equal;
+SELECT BINARY 'Ⱦ' = BINARY lower('Ⱦ') AS binary_not_equal;
+
+# Test sorting with case-converted values
+CREATE TABLE test_sort (
+    id INT,
+    val VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_sort VALUES 
+(1, 'Ⱦaaa'),
+(2, 'ⱦbbb'),
+(3, 'Ⱦccc'),
+(4, 'aaaa'),
+(5, 'zzzz');
+
+SELECT id, val, lower(val) AS lowered FROM test_sort ORDER BY lower(val);
+
+DROP TABLE test_sort;
+
+# Test GROUP BY with case conversion
+SELECT lower(str_col) AS lowered, COUNT(*) AS cnt 
+FROM test_case_conversion 
+GROUP BY lower(str_col)
+HAVING COUNT(*) > 0
+ORDER BY lowered;
+
+# Test DISTINCT with case conversion
+SELECT DISTINCT lower(str_col) AS distinct_lowered 
+FROM test_case_conversion 
+ORDER BY distinct_lowered;
+
+# ===== Reverse conversion data integrity tests =====
+
+# Verify reverse round-trip conversion (3 bytes -> 2 bytes -> 3 bytes)
+SELECT lower(upper('ⱦⱦⱦ')) = 'ⱦⱦⱦ' AS reverse_roundtrip_lower;
+SELECT upper(lower('ɀɀɀ')) = 'ɀɀɀ' AS reverse_roundtrip_upper;
+
+# Test comparison with original (reverse conversion)
+SELECT 'ⱦ' = upper('ⱦ') AS reverse_case_insensitive_equal;
+SELECT BINARY 'ⱦ' = BINARY upper('ⱦ') AS reverse_binary_not_equal;
+
+# Test sorting with reverse case-converted values
+CREATE TABLE test_sort_reverse (
+    id INT,
+    val VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+INSERT INTO test_sort_reverse VALUES 
+(1, 'ⱦaaa'),
+(2, 'Ⱦbbb'),
+(3, 'ⱦccc'),
+(4, 'aaaa'),
+(5, 'zzzz'),
+(6, 'ɀddd');
+
+SELECT id, val, upper(val) AS uppered FROM test_sort_reverse ORDER BY upper(val);
+
+DROP TABLE test_sort_reverse;
+
+# Test GROUP BY with reverse case conversion
+SELECT upper(str_col) AS uppered, COUNT(*) AS cnt 
+FROM test_case_conversion 
+GROUP BY upper(str_col)
+HAVING COUNT(*) > 0
+ORDER BY uppered;
+
+# Test DISTINCT with reverse case conversion
+SELECT DISTINCT upper(str_col) AS distinct_uppered 
+FROM test_case_conversion 
+ORDER BY distinct_uppered;
+
+# Verify byte length changes are handled correctly
+SELECT 
+    'Forward' AS direction,
+    'Ⱦ' AS original,
+    lower('Ⱦ') AS converted,
+    LENGTH('Ⱦ') AS original_bytes,
+    LENGTH(lower('Ⱦ')) AS converted_bytes,
+    LENGTH(lower('Ⱦ')) - LENGTH('Ⱦ') AS byte_diff
+UNION ALL
+SELECT 
+    'Reverse' AS direction,
+    'ⱦ' AS original,
+    upper('ⱦ') AS converted,
+    LENGTH('ⱦ') AS original_bytes,
+    LENGTH(upper('ⱦ')) AS converted_bytes,
+    LENGTH(upper('ⱦ')) - LENGTH('ⱦ') AS byte_diff;
+
+--echo # End of CASE-7
+
+######################################################
+# Module 8: Performance and Large Data Testing
+######################################################
+
+--echo #
+--echo # CASE-8: Test with larger datasets
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Create a table with many rows
+CREATE TABLE test_performance (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    data VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+);
+
+# Insert multiple rows with special characters
+INSERT INTO test_performance(data) 
+SELECT CONCAT('test_', n, '_Ⱦ_', n) 
+FROM (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+    UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+) numbers;
+
+# Verify all conversions are correct
+SELECT COUNT(*) AS total_rows FROM test_performance;
+SELECT COUNT(*) AS correct_conversions 
+FROM test_performance 
+WHERE lower(data) LIKE '%ⱦ%';
+
+# Test with UPDATE statement
+UPDATE test_performance SET data = lower(data) WHERE id <= 5;
+SELECT id, data FROM test_performance WHERE id <= 5 ORDER BY id;
+
+# Test with subquery
+SELECT id, data FROM test_performance 
+WHERE data IN (SELECT lower(str_col) FROM test_case_conversion WHERE str_col LIKE '%Ⱦ%')
+ORDER BY id;
+
+DROP TABLE test_performance;
+
+--echo # End of CASE-8
+
+######################################################
+# Module 9: Mixed Character Set Testing
+######################################################
+
+--echo #
+--echo # CASE-9: Test with mixed character sets
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# ASCII + Special Unicode
+SELECT lower('HelloȾWorld') AS ascii_unicode_mix;
+
+# CJK + Special Unicode
+SELECT lower('中文Ⱦ测试') AS cjk_unicode_mix;
+
+# Emoji + Special Unicode (if supported)
+SELECT lower('😀Ⱦ😀') AS emoji_unicode_mix;
+
+# Multiple scripts
+SELECT lower('ПриветȾWorld中文') AS multi_script;
+
+# Numbers + Special Unicode
+SELECT lower('123Ⱦ456') AS numbers_unicode;
+
+# Punctuation + Special Unicode
+SELECT lower('!!!Ⱦ???') AS punctuation_unicode;
+
+--echo # End of CASE-9
+
+
+######################################################
+# Module 11: Stored Procedure and Function Testing
+######################################################
+
+--echo #
+--echo # CASE-11: Test with stored procedures and functions
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Create a stored function
+DELIMITER //;
+CREATE FUNCTION test_lower_func(input_str VARCHAR(255))
+RETURNS VARCHAR(255)
+DETERMINISTIC
+BEGIN
+    RETURN lower(input_str);
+END//
+DELIMITER ;//
+
+SELECT test_lower_func('aaaȾbbb') AS func_result;
+SELECT test_lower_func('ȾȾȾȾ') AS func_result2;
+
+# Create a stored procedure
+DELIMITER //;
+CREATE PROCEDURE test_lower_proc(IN input_str VARCHAR(255), OUT output_str VARCHAR(255))
+BEGIN
+    SET output_str = lower(input_str);
+END//
+DELIMITER ;//
+
+CALL test_lower_proc('aaaȾbbb', @result);
+SELECT @result AS proc_result;
+
+CALL test_lower_proc('ȾȾȾ', @result2);
+SELECT @result2 AS proc_result2;
+
+DROP FUNCTION test_lower_func;
+DROP PROCEDURE test_lower_proc;
+
+--echo # End of CASE-11
+
+######################################################
+# Module 12: View Testing
+######################################################
+
+--echo #
+--echo # CASE-12: Test with views
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Create a view with case conversion
+CREATE VIEW test_view AS
+SELECT id, str_col, lower(str_col) AS lowered, upper(str_col) AS uppered
+FROM test_case_conversion;
+
+SELECT * FROM test_view WHERE str_col LIKE '%Ⱦ%' ORDER BY id;
+
+# Test view in subquery
+SELECT * FROM test_view WHERE lowered IN ('aaaⱦbbb', 'ⱦ') ORDER BY id;
+
+DROP VIEW test_view;
+
+--echo # End of CASE-12
+
+######################################################
+# Module 13: Regression Testing - Ensure Normal Cases Still Work
+######################################################
+
+--echo #
+--echo # CASE-13: Regression test - Verify normal ASCII case conversion still works
+--echo #
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+# Mixed ASCII
+SELECT lower('HeLLo WoRLd') = 'hello world' AS mixed_ascii;
+
+# ASCII with numbers and punctuation
+SELECT lower('ABC123XYZ!!!') = 'abc123xyz!!!' AS ascii_with_special;
+
+
+# Common European characters (should work in all collations)
+SELECT lower('ÀÁÂÃÄÅÆÇÈÉÊË') AS european_chars;
+
+--echo # End of CASE-13
+
+######################################################
+# Module 14: Cleanup
+######################################################
+
+--echo #
+--echo # Restore original parameters and clean up
+--echo #
+
+# Restore original collation settings
+SET collation_connection = @saved_collation_connection;
+SET character_set_client = @saved_character_set_client;
+SET character_set_results = @saved_character_set_results;
+
+# Drop test tables
+DROP TABLE IF EXISTS test_case_conversion;
+
+# Drop test database
+DROP DATABASE IF EXISTS test_unicode_case;
+
+--echo #
+--echo # Bug#119463: Test completed successfully
+--echo # All case conversion operations with byte-length-changing characters work correctly
+--echo #

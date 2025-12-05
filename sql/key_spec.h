@@ -205,6 +205,7 @@ class Key_part_spec {
   bool m_has_expression;
 };
 
+// parser获取的结构, 在 mysql_prepare_create_table prepare_key变成 key + key_part_info
 class Key_spec {
  public:
   const keytype type;

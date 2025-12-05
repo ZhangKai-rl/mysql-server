@@ -985,6 +985,10 @@ void ha_pre_dd_shutdown(void) {
  ======================= TRANSACTIONS ===================================*/
 
 /**
+ * 
+   xxxxxxx
+   TODO
+ * 
   Transaction handling in the server
   ==================================
 
@@ -1183,6 +1187,8 @@ void ha_pre_dd_shutdown(void) {
 
   Roles and responsibilities
   --------------------------
+
+  note: 见external_lock
 
   The server has no way to know that an engine participates in
   the statement and a transaction has been started
@@ -3227,7 +3233,9 @@ int handler::handle_records_error(int error, ha_rows *num_rows) {
   index scan and without calling ha_index_init. In this case the
   ha_index_read_map is on the same index as the previous ha_index_scan.
   This is particularly used in conjunction with multi read ranges.
+
   根据keypart_map来使用索引定位记录
+  InnoDB handler 做 B+Tree index lookup
 */
 
 int handler::ha_index_read_map(uchar *buf, const uchar *key,
@@ -4005,6 +4013,7 @@ void handler::get_auto_increment(ulonglong offset [[maybe_unused]],
     *nb_reserved_values = ULLONG_MAX;
   } else {
     uchar key[MAX_KEY_LENGTH];
+    // note: key format!!
     key_copy(key, table->record[0],
              table->key_info + table->s->next_number_index,
              table->s->next_number_key_offset);
@@ -5230,6 +5239,7 @@ int ha_create_table(THD *thd, const char *path, const char *db,
 
   name = get_canonical_filename(table.file, share.path.str, name_buff);
 
+  // 结束sql layer 工作 for create table
   error = table.file->ha_create(name, &table, create_info, table_def);
 
   if (error) {

@@ -166,6 +166,7 @@ struct Pool {
 
     for (size_t i = 0; i < n_elems; ++i, ++m_last) {
       m_last->m_pool = this;
+      // note
       Factory::init(&m_last->m_type);
       m_pqueue.push(m_last);
     }
@@ -193,6 +194,9 @@ struct Pool {
   LockStrategy m_lock_strategy;
 };
 
+/* usage: trx_pools_t */
+/* design pattern: 策略模式（插拔式锁策略）， 工厂模式，对象池模式 */
+/* @brief: 使用LockStrategy管理多个Pool */
 template <typename Pool, typename LockStrategy>
 struct PoolManager {
   typedef Pool PoolType;

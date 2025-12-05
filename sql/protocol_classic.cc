@@ -61,6 +61,8 @@
   Fixed-Length Integer Types
   ============================
 
+  xxxxxxxx: note 这里是mysql的网络vio包内容(mysql protocol规定)。正常的网络字节序是大端字节序如tcp/ip，但是mysql使用mysql format小端字节序
+
   A fixed-length unsigned integer stores its value in a series of
   bytes with the least significant byte first.
 

@@ -584,7 +584,7 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
 
   // fast path复用trx->read_view失败，走slow path
 
-  // note: 优化点： trx_sys_mutex锁, 生成rv时
+  // note: SCN优化中点： trx_sys_mutex锁, 生成rv（rv::prepare）时
   trx_sys_mutex_enter();
 
   if (view != nullptr) {
@@ -595,6 +595,7 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
   }
 
   if (view != nullptr) {
+    // note: 填充rv
     view->prepare(trx->id);
 
     // 从这里判断 mvcc 的 m_view 是按照创建时间trx_id顺序排的 新的rv在前

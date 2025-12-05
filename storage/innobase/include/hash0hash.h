@@ -59,6 +59,7 @@ enum hash_table_sync_t {
 };
 
 struct hash_cell_t {
+  // hash table的cell链
   void *node; /*!< hash chain node, NULL if none */
 };
 
@@ -87,12 +88,16 @@ static inline hash_cell_t *hash_get_nth_cell(hash_table_t *table, size_t n);
 
 /** Inserts a struct to a hash table. */
 
+/* note: else为当前hash cell有冲突, 获取当前cell的node(第一个node), 通过该node->name遍历到下一个node，直到为空，将新node链接到上个node->name上 */
+/* hash表的插入，cell发生hash collision时链地址法进行解决 */
+/* @param[in] NAME hash cell的node的下一个链地址法node指针 */
 #define HASH_INSERT(TYPE, NAME, TABLE, HASH_VALUE, DATA)                    \
   do {                                                                      \
     hash_cell_t *cell3333;                                                  \
     TYPE *struct3333;                                                       \
     const uint64_t hash_value3333 = HASH_VALUE;                             \
                                                                             \
+    /* 确保持有hash table 的 x rwlock */                                        \
     hash_assert_can_modify(TABLE, hash_value3333);                          \
                                                                             \
     (DATA)->NAME = NULL;                                                    \
@@ -373,6 +378,7 @@ void hash_unlock_x_all_but(hash_table_t *table, rw_lock_t *keep_lock);
 #endif /* !UNIV_HOTBACKUP */
 
 /* The hash table structure */
+// note: 处理冲突的方式：链地址法， hash table -> cell -> ha_node_t(在每个tbl的cell中，冲突节点串成链表)
 class hash_table_t {
  public:
   hash_table_t(size_t n) {
@@ -455,6 +461,8 @@ class hash_table_t {
 #ifndef UNIV_HOTBACKUP
   /** if rw_locks != nullptr, then it's their number (must be a power of two).
   Otherwise, 0. Is zero iff the type is HASH_TABLE_SYNC_NONE. */
+  /* note: snnc obj 与 hash cell并不是11对应，而是n个sync obj保护m个cell */
+  /* 实际为： 1 sync obj -> n_cells/n_sync_obj个 hash cell */
   size_t n_sync_obj = 0;
   /** nullptr, or an array of n_sync_obj rw_locks used to protect segments of
   the hash table. Is nullptr iff the type is HASH_TABLE_SYNC_NONE. */

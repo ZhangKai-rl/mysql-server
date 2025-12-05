@@ -81,6 +81,7 @@ UT_MUTEX_TYPE(TTASFutexMutex, BlockMutexPolicy, BlockFutexMutex)
 UT_MUTEX_TYPE(OSTrackMutex, GenericPolicy, SysMutex)
 UT_MUTEX_TYPE(OSTrackMutex, BlockMutexPolicy, BlockSysMutex)
 
+// ques: futex的实现逻辑呢？
 UT_MUTEX_TYPE(TTASEventMutex, GenericPolicy, SyncArrayMutex)
 UT_MUTEX_TYPE(TTASEventMutex, BlockMutexPolicy, BlockSyncArrayMutex)
 
@@ -96,6 +97,7 @@ typedef BlockSysMutex ib_bpmutex_t;
 #define MUTEX_TYPE "Uses system mutexes"
 #elif defined(MUTEX_EVENT)
 typedef SyncArrayMutex ib_mutex_t;
+// 也就是说 BlockMutexPolicy 一般是用于bp中mutex的实现的。
 typedef BlockSyncArrayMutex ib_bpmutex_t;
 #define MUTEX_TYPE "Uses event mutexes"
 #else

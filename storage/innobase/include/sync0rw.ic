@@ -150,6 +150,7 @@ static inline ulint rw_lock_get_reader_count(
 
 /** Returns the value of writer_count for the lock. Does not reserve the lock
  mutex, so the caller must be sure it is not changed during the call.
+XXXXXXXXXXXX: 这里对理解 lock_word 非常有帮助！
  @return value of writer_count */
 static inline ulint rw_lock_get_x_lock_count(
     const rw_lock_t *lock) /*!< in: rw-lock */
@@ -308,6 +309,7 @@ static inline bool rw_lock_x_lock_func_nowait(rw_lock_t *lock,
   if (lock->lock_word.compare_exchange_strong(x_lock_decr, 0)) {
     rw_lock_set_writer_id_and_recursion_flag(lock, true);
   } else if (lock->recursive.load(std::memory_order_acquire) &&
+            /* 允许本线程重入 */
              lock->writer_thread.load(std::memory_order_relaxed) ==
                  std::this_thread::get_id()) {
     /* Relock: this lock_word modification is safe since no other

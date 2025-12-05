@@ -1005,6 +1005,7 @@ extern dict_persist_t *dict_persist;
 // innodb层表定义缓存
 struct dict_sys_t {
 #ifndef UNIV_HOTBACKUP
+  // note: 保护dict_table_t, dict_index_t
   DictSysMutex mutex;          /*!< mutex protecting the data
                                dictionary; protects also the
                                disk-based dictionary system tables;
@@ -1098,6 +1099,137 @@ struct dict_sys_t {
   static constexpr space_id_t s_invalid_space_id = 0xFFFFFFFF;
 
   /** The data dictionary tablespace ID. */
+  /** dd/mysqld 表空间布局
+dd_create_hardcoded(s_dict_space_id, "mysql.ibd")
+  ├── fil_ibd_create()           // 创建物理文件，初始7个pages
+  ├── fsp_header_init()          // 初始化Page 0 (FSP_HDR)
+  │     ├── 写入 FIL_PAGE_TYPE = FIL_PAGE_TYPE_FSP_HDR
+  │     ├── 写入 FSP Header 所有字段
+  │     └── fsp_fill_free_list() // 初始化extent 0的XDES
+  │           ├── Page 0: FSP_HDR  (XDES页,已用) → extent 0 加入 FSP_FREE_FRAG
+┌──────────────────────────────────────────────────────────────┐
+│  Page 0 (FSP_HDR)  总大小: 16384 bytes (默认16KB page)       │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  [0, 38) FIL Header (38 bytes)                               │
+│    ├── [0, 4)   FIL_PAGE_SPACE_OR_CHKSUM  checksum           │
+│    ├── [4, 8)   FIL_PAGE_OFFSET           page_no = 0        │
+│    ├── [8, 12)  FIL_PAGE_SRV_VERSION      server version      │
+│    ├── [12,16)  FIL_PAGE_SPACE_VERSION    space version        │
+│    ├── [16,24)  FIL_PAGE_LSN              最新修改LSN          │
+│    ├── [24,26)  FIL_PAGE_TYPE             = 8 (FSP_HDR)       │
+│    ├── [26,34)  FIL_PAGE_FILE_FLUSH_LSN   (系统表空间才用)     │
+│    └── [34,38)  FIL_PAGE_SPACE_ID         = 0xFFFFFFFE        │
+│                                                              │
+│  [38, 150) FSP Header (112 bytes = 32 + 5*16)                │
+│    ├── [38, 42)  FSP_SPACE_ID     = 0xFFFFFFFE               │
+│    ├── [42, 46)  FSP_NOT_USED     (历史遗留，未使用)           │
+│    ├── [46, 50)  FSP_SIZE         表空间当前大小(pages)        │
+│    ├── [50, 54)  FSP_FREE_LIMIT   已初始化extent的边界         │
+│    ├── [54, 58)  FSP_SPACE_FLAGS  表空间标志(含SDI标记)        │
+│    ├── [58, 62)  FSP_FRAG_N_USED  FSP_FREE_FRAG链表中已用页数  │
+│    ├── [62, 78)  FSP_FREE         空闲extent链表  (16B)        │
+│    ├── [78, 94)  FSP_FREE_FRAG    部分使用碎片extent链表 (16B)  │
+│    ├── [94,110)  FSP_FULL_FRAG    满碎片extent链表 (16B)       │
+│    ├── [110,118) FSP_SEG_ID       下一个可用段ID (8B)          │
+│    ├── [118,134) FSP_SEG_INODES_FULL  满INODE页链表 (16B)      │
+│    └── [134,150) FSP_SEG_INODES_FREE  有空闲slot的INODE页链表   │
+│                                                              │
+│  [150, 150+256*40=10390) XDES Array (256个XDES Entry)         │
+│    ├── XDES Entry [0]  → 描述 extent 0 (pages 0~63)          │
+│    ├── XDES Entry [1]  → 描述 extent 1 (pages 64~127)        │
+│    ├── ...                                                    │
+│    └── XDES Entry [255]→ 描述 extent 255 (pages 16320~16383) │
+│    (每个XDES Entry = 40 bytes)                                │
+│                                                              │
+│  [10390, 10390+Encryption::INFO_MAX_SIZE) Encryption Info     │
+│    └── 加密密钥信息 (约 260~264 bytes)                         │
+│                                                              │
+│  [≈10654, ≈10662) SDI Header (8 bytes)                        │
+│    ├── [+0, +4) SDI_VERSION = 1                               │
+│    └── [+4, +8) SDI_ROOT_PAGE_NUM  SDI B-tree根页号            │
+│                                                              │
+│  [≈10662, ≈10667) Encryption Progress Info                    │
+│    ├── OPERATION_INFO_SIZE (1 byte)                           │
+│    └── PROGRESS_INFO_SIZE  (4 bytes)                          │
+│                                                              │
+│  (剩余空间未使用)                                              │
+│                                                              │
+│  [16376, 16384) FIL Trailer (8 bytes)                         │
+│    ├── [+0, +4) Old-style checksum                            │
+│    └── [+4, +8) FIL_PAGE_LSN 低4字节                          │
+└──────────────────────────────────────────────────────────────┘
+  │           └── Page 1: IBUF_BITMAP (已用)
+  └── btr_sdi_create_index()     // 创建SDI B-tree
+        ├── btr_sdi_create()     // 分配SDI根页(通常为Page 5或更高)
+        └── fsp_sdi_write_root_to_page()  // 将SDI根页号写入Page 0
+
+Page 0	FIL_PAGE_TYPE_FSP_HDR (8)	表空间头页：FSP Header + XDES Array + 加密信息 + SDI Header
+Page 1	FIL_PAGE_IBUF_BITMAP (5)	Insert Buffer 位图页，每 256 extent（16384 pages）重复一次
+Page 2	FIL_PAGE_INODE (3)	第一个 INODE 页 FSP_FIRST_INODE_PAGE_NO = 2，存放段(Segment)的 Inode Entry
+Page 3+	FIL_PAGE_SDI (17853) / FIL_PAGE_INDEX (17855)	SDI B-tree 根页和各 DD 表的聚簇/二级索引根页及数据页
+
+dd表：
+InnoDB自有DD表(5个):                   MySQL DD表(28个):
+├── dd_properties (1个索引)            ├── catalogs (2)
+├── innodb_dynamic_metadata (1)        ├── character_sets (3)
+├── innodb_table_stats (1)             ├── check_constraints (3)
+├── innodb_index_stats (1)             ├── collations (3)
+├── innodb_ddl_log (2)                 ├── column_statistics (3)
+                                       ├── column_type_elements (1)
+                                       ├── columns (5)
+                                       ├── events (6)
+                                       ├── foreign_key_column_usage (3)
+                                       ├── foreign_keys (4)
+                                       ├── index_column_usage (3)
+                                       ├── index_partitions (3)
+                                       ├── index_stats (1)
+                                       ├── indexes (3)
+                                       ├── parameter_type_elements (1)
+                                       ├── parameters (3)
+                                       ├── resource_groups (2)
+                                       ├── routines (7)
+                                       ├── schemata (3)
+                                       ├── st_spatial_reference_systems (3)
+                                       ├── table_partition_values (1)
+                                       ├── table_partitions (7)
+                                       ├── table_stats (1)
+                                       ├── tables (10)
+                                       ├── tablespace_files (2)
+                                       ├── tablespaces (2)
+                                       ├── triggers (7)
+                                       ├── view_routine_usage (2)
+                                       └── view_table_usage (2)
+
+初始化过程：
+innobase_init_files()                              // ha_innodb.cc
+  └── dd_create_hardcoded(s_dict_space_id, "mysql.ibd")  // ha_innodb.cc:5399
+        ├── fil_ibd_create(0xFFFFFFFE, "mysql", "mysql.ibd", flags, 7)
+        │     └── 创建物理文件，初始 7 pages (112KB)
+        │
+        ├── fsp_header_init(0xFFFFFFFE, 7, &mtr)  // fsp0fsp.cc:998
+        │     ├── buf_page_create(page_id(0xFFFFFFFE, 0))
+        │     ├── 写入 FIL_PAGE_TYPE = FIL_PAGE_TYPE_FSP_HDR
+        │     ├── 写入 FIL_PAGE_SRV_VERSION, FIL_PAGE_SPACE_VERSION
+        │     ├── 初始化 FSP Header 所有字段 (size=7, free_limit=0, seg_id=1)
+        │     ├── flst_init() × 5 个链表
+        │     └── fsp_fill_free_list(init_space=true)  // fsp0fsp.cc:1449
+        │           ├── init_xdes=true (i=0, page_no=0 对齐到 page_size)
+        │           ├── 初始化 Page 1 (IBUF Bitmap)
+        │           ├── xdes_init(XDES Entry[0])       // 初始化extent 0描述符
+        │           ├── fsp_init_xdes_free_frag()       // extent 0 → FSP_FREE_FRAG
+        │           └── free_limit = 64
+        │
+        └── btr_sdi_create_index(0xFFFFFFFE, false)    // btr0btr.cc:4685
+              ├── dict_sdi_get_table()     // 创建SDI表的dict_table_t对象
+              ├── btr_sdi_create()         // 创建SDI B-tree根页
+              │     └── fseg_create() + btr_create()
+              │           // 分配INODE Entry + 分配根页(Page 3~5之一)
+              ├── fsp_sdi_write_root_to_page()  // fsp0fsp.cc:3930
+              │     // 将SDI根页号写入Page 0的SDI Header区域
+              └── fsp_flags_set_sdi(fsp_flags)
+                    // 在FSP_SPACE_FLAGS中设置SDI标志位
+   */
   static constexpr space_id_t s_dict_space_id = 0xFFFFFFFE;
 
   /** The innodb_temporary tablespace ID. */

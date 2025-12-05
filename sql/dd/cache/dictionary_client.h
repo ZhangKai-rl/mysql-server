@@ -1189,6 +1189,8 @@ class Dictionary_client {
 
     @retval false   The operation was successful.
     @retval true    There was an error.
+
+    @brief  dd_client()->store(...) 把对象树写入 mysql.* DD tables（= 持久化）
   */
 
   template <typename T>

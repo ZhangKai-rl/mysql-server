@@ -1356,6 +1356,7 @@ loop:
   MONITOR_INC(MONITOR_LRU_GET_FREE_LOOPS);
 
   freed = false;
+  // for buf_pool->try_LRU_scan
   os_rmb;
   if (buf_pool->try_LRU_scan || n_iterations > 0) {
     /* If no block was in the free list, search from the

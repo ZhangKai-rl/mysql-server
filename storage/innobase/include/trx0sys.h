@@ -474,6 +474,7 @@ struct trx_sys_t {
 
   /** Length of the TRX_RSEG_HISTORY list (update undo logs for committed
   transactions). */
+  // ques: 只有一条history list?并非，这里是所有undo fsp的所有rsegs的history list总长度
   std::atomic<uint64_t> rseg_history_len;
 
   /** @} */
@@ -534,6 +535,7 @@ struct trx_sys_t {
 
   /** List of active and committed in memory read-write transactions, sorted
   on trx id, biggest first. Recovered transactions are always on this list. */
+  // note : rw_trx_list ? in_rw_trx_list
   UT_LIST_BASE_NODE_T(trx_t, trx_list) rw_trx_list;
 
   char pad6[ut::INNODB_CACHE_LINE_SIZE];
@@ -549,6 +551,7 @@ struct trx_sys_t {
   take a snapshot of these transactions whose changes are not visible to it.
   We should remove transactions from the list before committing in memory and
   releasing locks to ensure right order of removal and consistent snapshot. */
+  // committed_in_memory前的active rw trx.
   trx_ids_t rw_trx_ids;
 
   char pad7[ut::INNODB_CACHE_LINE_SIZE];

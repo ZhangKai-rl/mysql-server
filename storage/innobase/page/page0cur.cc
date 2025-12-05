@@ -323,7 +323,7 @@ static bool page_cur_has_null(const rec_t *rec, const dict_index_t *index) {
 @param[in] mode PAGE_CUR_L, PAGE_CUR_LE, PAGE_CUR_G, or PAGE_CUR_GE
 @param[in,out] iup_matched_fields Already matched fields in upper limit record
 @param[in,out] ilow_matched_fields Already matched fields in lower limit record
-@param[out] cursor Page cursor
+xxxx: @param[out] cursor Page cursor
 @param[in,out] rtr_info Rtree search stack */
 /**
   // 二分查找，返回：

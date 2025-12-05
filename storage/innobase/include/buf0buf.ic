@@ -821,6 +821,7 @@ static inline void buf_block_buf_fix_dec(
 @return buffer pool */
 static inline buf_pool_t *buf_pool_get(const page_id_t &page_id) {
   /* 2log of BUF_READ_AHEAD_AREA (64) */
+  /* ques: why6?, 1 << 6 = 64, extent size, make sure in same bp ins if page in same extent for read-ahead */
   page_no_t ignored_page_no = page_id.page_no() >> 6;
 
   page_id_t id(page_id.space(), ignored_page_no);

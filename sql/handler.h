@@ -3091,6 +3091,7 @@ struct HA_CREATE_INFO {
   uint stats_sample_pages{0}; /* number of pages to sample during
                            stats estimation, if used, otherwise 0. */
   enum_stats_auto_recalc stats_auto_recalc{HA_STATS_AUTO_RECALC_DEFAULT};
+  // for myisam. mysql merge table
   SQL_I_List<Table_ref> merge_list;
   handlerton *db_type{nullptr};
   /**
@@ -3115,7 +3116,7 @@ struct HA_CREATE_INFO {
   */
   bool m_hidden{false};
 
-  /*
+  /* 在 start transaction语句中
     A flag to indicate if this table should be created but not committed at
     the end of statement.
   */
@@ -4496,6 +4497,7 @@ class handler {
   bool m_virt_gcol_in_end_range = false;
   uint errkey; /* Last dup key */
   uint key_used_on_scan;
+  // 在用的index编号
   uint active_index;
   /** Length of ref (1-8 or the clustered key length) */
   uint ref_length;

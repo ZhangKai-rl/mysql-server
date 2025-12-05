@@ -5838,6 +5838,7 @@ longlong Item_func_sleep::val_int() {
 
   error = 0;
   thd_wait_begin(thd, THD_WAIT_SLEEP);
+  /* 5s轮询实现kill检测可被killed */
   while (!thd->killed) {
     error = timed_cond.wait(&cond, &LOCK_item_func_sleep);
     if (is_timeout(error)) break;

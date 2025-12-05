@@ -450,6 +450,7 @@ MySQL clients support the protocol:
 
   @startuml
 
+  note : create table 语句的语法词法解析过程
   actor ddl as "CREATE TABLE Query"
   participant server as "MySQL Server"
   participant parser as "SQL Parser"

@@ -3939,7 +3939,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
   uint32_t c_r_v = 0;
 
   dd_table_get_column_counters(dd_tab->table(), i_c, c_c, t_c, c_r_v);
-  /* Create the dict_table_t */
+  /* note: new / Create the dict_table_t */
   dict_table_t *m_table = dict_mem_table_create(norm_name, 0, n_cols, n_v_cols,
                                                 n_m_v_cols, 0, 0, t_c - c_c);
 
@@ -5102,6 +5102,7 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
   bool first_index = true;
 
   /* Create dict_table_t for the table */
+  // note: 直到这里dict_table_t都只是一个4b pointer, 还没ctor dict_table_t ob
   dict_table_t *m_table = dd_fill_dict_table(
       dd_table, table, norm_name, nullptr, zip_allowed, strict, thd, implicit);
 

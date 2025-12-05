@@ -738,6 +738,7 @@ class Field {
 
   // Length of field. Never write to this member directly; instead, use
   // set_field_length().
+  // play load的length(当前字符集下最大字节数), 单位为byte. 如(c vachar(12)), Field::field_length = (12 * mbmaxlen)
   uint32 field_length;
   virtual void set_field_length(uint32 length) { field_length = length; }
 

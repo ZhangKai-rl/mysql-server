@@ -99,8 +99,11 @@ class Primary_id_key : public Object_key {
 ///////////////////////////////////////////////////////////////////////////
 
 // Entity_object-id partial key for looking for containing objects.
+// 总结：create_key_by_table_id 构造了一个「联合索引前缀范围查找 key」，核心思路是：指定使用哪个索引（INDEX_UK_TABLE_ID_NAME）、查哪个字段（FIELD_TABLE_ID）、查什么值（table_id），然后在 create_access_key 中只取联合索引的第 1 列做前缀匹配，实现"通过父表 ID 查出所有子对象"的范围查询。
 class Parent_id_range_key : public Object_key {
  public:
+  // note: 使用 mysql.indexes的第id_index_no个索引，查询mysql.indexes的第id_column_no个字段，返回值为object_id的
+  // select (第id_column_no列) from mysql.indexes where table_id = 1 use index(第id_index_no个索引);
   Parent_id_range_key(int id_index_no, int id_column_no, Object_id object_id)
       : m_id_index_no(id_index_no),
         m_id_column_no(id_column_no),
@@ -112,9 +115,9 @@ class Parent_id_range_key : public Object_key {
   String_type str() const override;
 
  private:
-  int m_id_index_no;
-  int m_id_column_no;
-  Object_id m_object_id;
+  int m_id_index_no;   // 要使用的索引的序号
+  int m_id_column_no;  // 查询条件所在的字段序号
+  Object_id m_object_id; // 查询的具体值
 };
 
 ///////////////////////////////////////////////////////////////////////////

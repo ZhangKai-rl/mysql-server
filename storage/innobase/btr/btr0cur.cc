@@ -100,7 +100,7 @@ enum btr_op_t {
   BTR_NO_OP = 0,               /*!< Not buffered */
   BTR_INSERT_OP,               /*!< Insert, do not ignore UNIQUE */
   BTR_INSERT_IGNORE_UNIQUE_OP, /*!< Insert, ignoring UNIQUE */
-  BTR_DELETE_OP,               /*!< Purge a delete-marked record */
+  BTR_DELETE_OP,               /*!< note: Purge a delete-marked record */
   BTR_DELMARK_OP               /*!< Mark a record for deletion */
 };
 
@@ -293,6 +293,7 @@ btr_latch_leaves_t btr_cur_latch_leaves(buf_block_t *block,
       return (latch_leaves);
 
     // 访问/修改 前一个页面, 对本页面和左兄弟都上锁
+    // note: 关键：锁定顺序始终是 left → right（从左到右）
     case BTR_SEARCH_PREV:
     case BTR_MODIFY_PREV:
       mode = latch_mode == BTR_SEARCH_PREV ? RW_S_LATCH : RW_X_LATCH;
@@ -341,6 +342,7 @@ btr_latch_leaves_t btr_cur_latch_leaves(buf_block_t *block,
 @param[in]      line            Line where called
 @param[in]      mtr             Mini-transaction
 @return true if success */
+// TODO
 bool btr_cur_optimistic_latch_leaves(buf_block_t *block, uint64_t modify_clock,
                                      ulint *latch_mode, btr_cur_t *cursor,
                                      const char *file, ulint line, mtr_t *mtr) {
@@ -359,6 +361,7 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block, uint64_t modify_clock,
       mode = *latch_mode == BTR_SEARCH_PREV ? RW_S_LATCH : RW_X_LATCH;
 
       rw_lock_s_lock(&block->lock, UT_LOCATION_HERE);
+      // mtr_commit -> mtr_start中间current page被修改了，需要从心从btr root search
       if (block->modify_clock != modify_clock) {
         rw_lock_s_unlock(&block->lock);
         return false;
@@ -370,12 +373,14 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block, uint64_t modify_clock,
         const page_id_t page_id(dict_index_get_space(cursor->index),
                                 left_page_no);
 
+        // latch order, latch prev page first
         cursor->left_block = buf_page_get_gen(
             page_id, dict_table_page_size(cursor->index->table), mode, nullptr,
             Page_fetch::POSSIBLY_FREED, UT_LOCATION_HERE, mtr);
       } else {
         cursor->left_block = nullptr;
       }
+      // latch order, latch current page then.
       if (buf_page_optimistic_get(mode, block, modify_clock,
                                   cursor->m_fetch_mode, file, line, mtr)) {
         if (btr_page_get_prev(buf_block_get_frame(block), mtr) ==
@@ -708,8 +713,39 @@ n_releases	ulint	已释放的页面数量	1
   bool detected_same_key_root = false;
 
   // 和 btr_search_mode 的 BTR_SEARCH_PREV/BTR_MODIFY_PREV. 回溯锁定 prev sibling page
+  /**
+   * 为什么最左记录需要回溯？ 
+B-tree 结构（两层非叶子）：
+[Root]
+                   /      \
+Level 1:    [1]           [10, 20, 30]     ← node_ptr=10 是最左记录！
+             |            /    |     \
+Level 0:  [1-9]      [10-19] [20-29] [30-39]
+                        ↑
+                     目标页        prev page=[1-9]，但它在 Level 1 的另一个页面中！
+            
+搜索 key=10：在 Level 1 中定位到 node_ptr=10，它指向 [10-19]。
+问题来了：[10-19] 的 prev page 是 [1-9]，而 [1-9] 是由 node_ptr=1 指向的。当 node_ptr=10 是当前 non-leaf page 的第一条记录（最左记录）时，它的 prev page 对应的 node_ptr 不在当前 non-leaf page 里，而是在父节点的前一个 non-leaf page 中！
+
+搜索 key=10, BTR_SEARCH_PREV:
+=== 第一次遍历 ===
+Root → [10,20,30]   (node_ptr=10 是最左记录! leftmost_from_level=1)
+     → 到达 height=0，触发回溯
+=== 回溯 ===
+释放 [10,20,30] 的 latch
+回退到 Level 1，重新从 Root 开始
+=== 第二次遍历（retrying_for_search_prev=true）===
+Root → [10,20,30]   同时获取 prev page [1] 的 latch
+     → [10-19]      同时获取 prev page [1-9] 的 latch  ✓
+最终结果：同时持有 [10-19] 和 [1-9] 的 latch，避免死锁
+
+ques: 为什么需要prev page?
+为了避免 latch ordering 死锁。InnoDB 的 B-tree 叶子页面之间通过 prev/next 指针连接，如果一个线程持有 page A 的 latch 再去获取 page B 的 latch，而另一个线程按相反顺序操作，就会死锁。
+所以设计上要求：在从 root 向下遍历树的过程中，就一次性锁住目标叶子页和它的 prev page，而不是先锁叶子页再去锁 prev page。
+   * 
+   */
   bool retrying_for_search_prev = false;
-  ulint leftmost_from_level = 0; // 从哪一层开始需要锁定 prev_page 
+  ulint leftmost_from_level = 0; // 从哪一层开始需要锁定 prev_page, 是最左记录, 如果是，说明 prev leaf page 的路径不在当前遍历路径上。
   buf_block_t **prev_tree_blocks = nullptr;
   ulint *prev_tree_savepoints = nullptr;
   ulint prev_n_blocks = 0;
@@ -755,6 +791,7 @@ n_releases	ulint	已释放的页面数量	1
   /* 判断是不是ibuf的op. These flags are mutually exclusive, they are lumped together
   with the latch mode for historical reasons. It's possible for
   none of the flags to be set. */
+  // expect(a, x), 告诉gcc a大概率等于x。这里就是说大概率不是ibuf的操作
   switch (UNIV_EXPECT(latch_mode & (BTR_INSERT | BTR_DELETE | BTR_DELETE_MARK),
                       0)) {
     case 0:
@@ -837,7 +874,7 @@ n_releases	ulint	已释放的页面数量	1
   DBUG_EXECUTE_IF("non_ahi_search",
                   assert(!strcmp(index->table->name.m_name, "test/t1")););
 
-  /* If the hash search did not succeed, do binary search down the
+  /* If the hash search(AHI) did not succeed, do binary search down the
   tree */
 
   if (has_search_latch) {
@@ -856,7 +893,7 @@ n_releases	ulint	已释放的页面数量	1
       /* Most of delete-intended operations are purging.
       Free blocks and read IO bandwidth should be prior
       for them, when the history list is glowing huge.
-      特殊情况1：Purge 操作且 history list 很长  */
+      特殊情况1：Purge 操作且 history list(所有hlst总长度) 很长  */
       if (lock_intention == BTR_INTENTION_DELETE &&
           trx_sys->rseg_history_len.load() > BTR_CUR_FINE_HISTORY_LENGTH &&
           buf_get_n_pending_read_ios()) {
@@ -869,10 +906,11 @@ n_releases	ulint	已释放的页面数量	1
 
         mtr_x_lock(dict_index_get_lock(index), mtr, UT_LOCATION_HERE);
       } else {
-        // 默认情况index上 sx lock，允许并发读
+        // 默认情况smo时，index上 sx lock，允许并发读
+        /* 8.0的优化，smo时只x search path node, index使用sx+latch coupling增加并发读 */
         mtr_sx_lock(dict_index_get_lock(index), mtr, UT_LOCATION_HERE);
       }
-      // 上层页面用 X-latch
+      // smo时search path页面用 X
       upper_rw_latch = RW_X_LATCH;
       break;
     case BTR_CONT_MODIFY_TREE:
@@ -923,7 +961,7 @@ n_releases	ulint	已释放的页面数量	1
 
   /* Start with the root page. */
   page_id_t page_id(space, dict_index_get_page(index));
-// 这里和 root page latch 为什么有关？
+// 这里和 root page latch 为什么有关？x大概率在进行smo, 当大于node ptr max size时split
   if (root_leaf_rw_latch == RW_X_LATCH) {
     node_ptr_max_size = dict_index_node_ptr_max_size(index);
   }
@@ -942,22 +980,34 @@ n_releases	ulint	已释放的页面数量	1
   // step4: 转换搜索模式（传入的btr_search_mode是leaf page的, 这里根据leaf page search mode, 判断 non-leaf page的btr_search_mode)
 
   /**
-  B-tree 结构：
-          [10, 20, 30]  ← 非叶子节点（存储分隔键）
-          /    |    |   \
-      [1-9] [10-19] [20-29] [30-39]  ← 叶子节点
+  InnoDB B-tree node pointer semantics:
+  每个 node_ptr 的 key 是其子页面中最小记录的前缀。每个 node_ptr 是一个 (key, child_page_no) 的完整记录
+  Each node_ptr key P points to a child page storing records in [P, P1),
+  where P1 is the next node_ptr key. P is the min key (lower bound) of
+  its child page, NOT the upper bound.
 
-  搜索 key=15, mode=PAGE_CUR_GE (>=):
-  1. 非叶子层：用 PAGE_CUR_L (<)
-    - 找到第一个 > 15 的键：20
-    - 定位到 20 的左子树 → [10-19]
-    
-  2. 叶子层：用 PAGE_CUR_GE (>=)
-    - 在 [10-19] 中找到 >= 15 的第一个记录
+  B-tree structure:
+       [min_rec,  10,     20,     30   ]  <- non-leaf (node pointers)
+          |        |       |       |
+       [1-9]   [10-19] [20-29] [30-39]   <- leaf pages
+  InnoDB 风格：
+    (min_rec → page5)  (10 → page8)  (20 → page3)  (30 → page7)
+        |                  |              |              |
+      [1-9]             [10-19]        [20-29]        [30-39] 
 
-  如果非叶子层也用 PAGE_CUR_GE：
-    - 会找到 >= 15 的第一个键：20
-    - 定位到 20 的子树 → [20-29]  ← 错误！跳过了 15
+  Search key=15, leaf mode=PAGE_CUR_GE (>=):
+  1. Non-leaf: use PAGE_CUR_L (<)
+    - Find the largest node_ptr strictly < 15 -> node_ptr 10
+    - node_ptr 10 points to child page [10-19], range [10, 20)
+    - 15 in [10, 20), correct!
+
+  2. Leaf: use original PAGE_CUR_GE (>=)
+    - Find the first record >= 15 in [10-19]
+
+  If non-leaf also uses PAGE_CUR_GE:
+    - Find the first node_ptr >= 15 -> node_ptr 20
+    - node_ptr 20 points to child page [20-29], range [20, 30)
+    - 15 NOT in [20, 30), wrong! Missed key 15.
    */
 
   switch (mode) { // ques: why?原mode用于search leaf, page_mode用于search non-leaf
@@ -984,7 +1034,7 @@ n_releases	ulint	已释放的页面数量	1
   // latched blocks: left, target, right block.
   /* Loop and search until we arrive at the desired level */
   btr_latch_leaves_t latch_leaves = {{nullptr, nullptr, nullptr}, {0, 0, 0}};
-/* note: 开始search */
+/* xxxx: 开始search */
 search_loop:
   fetch = cursor->m_fetch_mode;
   rw_latch = RW_NO_LATCH;
@@ -1064,19 +1114,24 @@ retry_page_get:
 
         break;
 
+      // notre: 对于undo purge, purge sec index时会用ibuf缓存del op, 并在page_hash设置watch
       case BTR_DELETE_OP:
         ut_ad(fetch == Page_fetch::IF_IN_POOL_OR_WATCH);
         ut_ad(!dict_index_is_spatial(index));
 
+        // note: 这是purge worker处理sec idx时，不在bp内，进行了ibuf watch。这里获取到然后进行继续purge
         if (!row_purge_poss_sec(cursor->purge_node, index, tuple)) {
           /* The record cannot be purged yet. */
+          // 记录不能被 purge（还有活跃版本引用）
           cursor->flag = BTR_CUR_DELETE_REF;
         } else if (ibuf_insert(IBUF_OP_DELETE, tuple, index, page_id, page_size,
                                cursor->thr)) {
           /* The purge was buffered. */
+          // 删除操作成功缓冲到 Change Buffer
           cursor->flag = BTR_CUR_DELETE_IBUF;
         } else {
           /* The purge could not be buffered. */
+          // 缓冲失败，需要实际读页面
           buf_pool_watch_unset(page_id);
           break;
         }
@@ -1101,12 +1156,12 @@ retry_page_get:
     /* also latch left sibling */
     /**
       第一次搜索：
-              [10, 20, 30]
+          [1, 10, 20, 30]
               /
           [10-19]  ← node_ptr=10 是最左记录，检测到需要回溯
 
       第二次搜索（retrying_for_search_prev=true）：
-              [10, 20, 30]
+              [1, 10, 20, 30]
               /    \
           [1-9]  [10-19]  ← 同时锁定两个页面
           ↑       ↑
@@ -1139,7 +1194,7 @@ retry_page_get:
     }
 
     /* release RW_NO_LATCH page and lock with RW_S_LATCH */
-    // // 重新锁定当前页面
+    // 重新锁定当前页面
     mtr_release_block_at_savepoint(mtr, tree_savepoints[n_blocks],
                                    tree_blocks[n_blocks]);
 
@@ -1343,7 +1398,7 @@ retry_page_get:
                                      page_cursor);
   } else {
     /* Search for complete index fields. */
-    // 标准 B-tree 搜索：二分查找
+    // note: 标准 B-tree 搜索：二分查找
     up_bytes = low_bytes = 0;
     page_cur_search_with_match(block, index, tuple, page_mode, &up_match,
                                &low_match, page_cursor,
@@ -1389,12 +1444,15 @@ retry_page_get:
 
     height--;
 
+
+/* 当前仍在 non-leaf page, page_cur 存储的 rec 是 node_ptr 记录,
+   包含 index key 的前缀(用于确定搜索方向) + 最后一个字段为 4 字节的 child_page_no */
     node_ptr = page_cur_get_rec(page_cursor);
 
     offsets = rec_get_offsets(node_ptr, index, offsets, ULINT_UNDEFINED,
                               UT_LOCATION_HERE, &heap);
 
-    /* If the rec is the first or last in the page for
+    /* note: If the rec is the first or last in the page for
     pessimistic delete intention, it might cause node_ptr insert
     for the upper level. We should change the intention and retry.
     */
@@ -1537,7 +1595,7 @@ retry_page_get:
       ut_ad(upper_rw_latch == RW_X_LATCH);
       ut_ad(n_releases <= n_blocks);
 
-      /* // 不会触发 SMO，可以释放上层页面锁. we can release upper blocks */
+      /* 不会触发 SMO，可以释放上层页面锁. we can release upper blocks */
       for (; n_releases < n_blocks; n_releases++) {
         if (n_releases == 0) {
           /* we should not release root page
@@ -1573,8 +1631,8 @@ retry_page_get:
     BTR_MODIFY_PREV latches prev_page of the leaf page. */
     /**
       B-tree 结构：
-              [10, 20, 30]
-              /    |    |   \
+              [1,  10, 20,     30]
+              /    |    |       \
           [1-9] [10-19] [20-29] [30-39]
 
       搜索 key=10, mode=BTR_SEARCH_PREV:
@@ -1592,7 +1650,7 @@ retry_page_get:
       if (btr_page_get_prev(page, mtr) != FIL_NULL &&
           page_rec_is_first(node_ptr, page)) {
         if (leftmost_from_level == 0) {
-          leftmost_from_level = height + 1; // // 记录需要回溯的层级
+          leftmost_from_level = height + 1; // 记录需要回溯的层级
         }
       } else {
         leftmost_from_level = 0;
@@ -1642,7 +1700,7 @@ retry_page_get:
       }
     }
 
-    /* Go to the child node */
+    /* xxxx: Go to the child node */
     page_id.reset(space, btr_node_ptr_get_child_page_no(node_ptr, offsets));
 
     n_blocks++;
@@ -1912,6 +1970,7 @@ void btr_cur_search_to_nth_level_with_no_latch(dict_index_t *index, ulint level,
       page_mode = mode;
     }
 
+    // note
     page_cur_search_with_match(block, index, tuple, page_mode, &up_match,
                                &low_match, page_cursor, nullptr);
 
@@ -1954,6 +2013,7 @@ void btr_cur_search_to_nth_level_with_no_latch(dict_index_t *index, ulint level,
 @param[in] level Level to search for (0=leaf)
 @param[in] location Location where called
 @param[in,out] mtr Mini-transaction */
+// @brief: 从index root开始，找到leaf层的最左或者最右节点
 void btr_cur_open_at_index_side(bool from_left, dict_index_t *index,
                                 ulint latch_mode, btr_cur_t *cursor,
                                 ulint level, ut::Location location,

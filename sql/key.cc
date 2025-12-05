@@ -126,12 +126,13 @@ int find_ref_key(KEY *key, uint key_count, uchar *record, Field *field,
     key into to_key. If length == 0 then copy all bytes from the record that
     form a key.
 
-  @param to_key      buffer that will be used as a key
-  @param from_record full record to be copied from
+  @param to_key      buffer that will be used as a key. key buffer!!!!!
+  @param from_record full record to be copied from. record[0], row format
   @param key_info    descriptor of the index
   @param key_length  specifies length of all keyparts that will be copied
 */
 
+// 从record[0] row foramt构造key foramt
 void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
               uint key_length) {
   uint length;
@@ -139,6 +140,7 @@ void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
 
   if (key_length == 0) key_length = key_info->key_length;
   for (key_part = key_info->key_part; (int)key_length > 0; key_part++) {
+    // note: for key foramt, 如果可空每个key part前都有一个null byte
     if (key_part->null_bit) {
       bool key_is_null =
           from_record[key_part->null_offset] & key_part->null_bit;
@@ -157,6 +159,7 @@ void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
       const CHARSET_INFO *cs = field->charset();
       size_t bytes = field->get_key_image(to_key, length, Field::itRAW);
       if (bytes < length)
+      // note
         cs->cset->fill(cs, (char *)to_key + bytes, length - bytes, ' ');
     }
     to_key += length;
@@ -170,6 +173,7 @@ void key_copy(uchar *to_key, const uchar *from_record, const KEY *key_info,
     This function converts a key into record format. It can be used in cases
     when we want to return a key as a result row.
 
+  @brief Restore a key from some buffer to record. key foramt -> row format
   @param to_record   record buffer where the key will be restored to
   @param from_key    buffer that contains a key
   @param key_info    descriptor of the index

@@ -160,6 +160,7 @@ bool Raw_table::open_record_set(const Object_key *key,
   std::unique_ptr<Raw_record_set> rs1(
       new (std::nothrow) Raw_record_set(get_table(), access_key));
 
+  // note
   if (rs1->open()) return true;
 
   rs = std::move(rs1);

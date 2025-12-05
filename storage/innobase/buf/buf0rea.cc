@@ -63,6 +63,7 @@ read-ahead is not done: this is to prevent flooding the buffer pool with
 i/o-fixed buffer blocks */
 static constexpr uint32_t BUF_READ_AHEAD_PEND_LIMIT = 2;
 
+/* note: BP IO */
 ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
                         const page_id_t &page_id, const page_size_t &page_size,
                         bool unzip) {
@@ -109,6 +110,7 @@ ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
   ut_ad(!mutex_own(&buf_pool_from_bpage(bpage)->LRU_list_mutex));
 
   if (sync) {
+    // 告诉 thread pool 有wait/stall thd
     thd_wait_begin(nullptr, THD_WAIT_DISKIO);
   }
 
@@ -124,7 +126,7 @@ ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
 
   IORequest request(type | IORequest::READ);
 
-  // TODO
+  // TODO: BP IO
   *err = fil_io(request, sync, page_id, page_size, 0, page_size.physical(), dst,
                 bpage);
 

@@ -979,6 +979,7 @@ class THD : public MDL_context_owner,
   std::unique_ptr<LEX> main_lex;
 
  public:
+  // ques: 在哪里赋值的？
   LEX *lex;                                        // parse tree descriptor
   dd::cache::Dictionary_client *dd_client() const  // Get the dictionary client.
   {
@@ -1991,6 +1992,9 @@ class THD : public MDL_context_owner,
     read-only attachable transaction in SE, finalize it and then restore
     state of original transaction back. Also serves as a base class for
     read-write attachable transaction implementation.
+     attachable trx 是被当成“读系统表的专用事务框架”来用的。
+     note: attachable transaction 是 MySQL SQL-layer 提供的一种“临时挂载在当前 THD 上的、独立于用户事务的内部事务上下文”，主要用于 DD/system tables 的读取（以及少量内部场景）。
+     有相关的内核月报
   */
   class Attachable_trx {
    public:

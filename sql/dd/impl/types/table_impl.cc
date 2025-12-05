@@ -248,6 +248,58 @@ bool Table_impl::reload_foreign_key_parents(THD *thd) {
 
 ///////////////////////////////////////////////////////////////////////////
 
+// https://zhuanlan.zhihu.com/p/646295396
+/*
+Table_impl::restore_children()                    // table_impl.cc:265
+└── m_indexes.restore_items(this, otx, table, key) // collection.cc:118
+    │
+    │ ── Phase 1: 打开 cursor 扫描 mysql.indexes ──
+    │
+    ├── Raw_table::open_record_set(key, rs)        // raw_table.cc:148
+    │   ├── key->create_access_key(this)            // 创建 InnoDB 索引查找 key
+    │   └── Raw_record_set::open()                  // 通过 ha_index_init + ha_index_read_map 定位
+    │       └── TABLE::file->ha_index_read_map()    // InnoDB handler 做 B+Tree index lookup
+    │
+    │ ── Phase 2: 遍历每条匹配行，创建 Index_impl 并填充属性 ──
+    │
+    ├── while (r = rs->current_record()) {
+    │   ├── Index_impl::restore_item(parent=this)   // index_impl.h:257
+    │   │   └── new Index_impl(table)               // 工厂方法，创建空的 Index_impl
+    │   ├── m_items.push_back(item)                 // 加入 vector
+    │   ├── item->restore_attributes(*r)            // index_impl.cc:165
+    │   │   ├── restore_id(r, FIELD_ID)             // 读取 index 在 DD 中的 Object_id
+    │   │   ├── restore_name(r, FIELD_NAME)         // 读取 index name
+    │   │   ├── m_type = r.read_int(FIELD_TYPE)     // PRIMARY/UNIQUE/MULTIPLE/...
+    │   │   ├── m_algorithm = r.read_int(FIELD_ALGORITHM) // BTREE/RTREE/...
+    │   │   ├── set_se_private_data(r.read_str(FIELD_SE_PRIVATE_DATA))
+    │   │   │   // ← 这里读入了 "id=789;root=4;space_id=55;table_id=1068;trx_id=0;"
+    │   │   ├── m_tablespace_id = r.read_ref_id(FIELD_TABLESPACE_ID)
+    │   │   ├── m_engine = r.read_str(FIELD_ENGINE)
+    │   │   └── ... (comment, options, hidden, is_generated, ...)
+    │   └── rs->next(r)                             // 移到下一行
+    │   }
+    │
+    │ ── Phase 3: 关闭 cursor (rs.reset())，然后逐个 restore 子对象 ──
+    │
+    ├── rs.reset()                                   // 释放 record_set cursor
+    │   // 注释说明：必须先完成扫描再 restore children，
+    │   // 因为同一个 DD table 的 handler 不能同时维护两个 scan context
+    │
+    ├── for (auto item : m_items) {
+    │   ├── item->restore_children(otx)              // index_impl.cc:134
+    │   │   └── m_elements.restore_items(            // 从 mysql.index_column_usage 读取 Index_element
+    │   │       this, otx, otx->get_table<Index_element>(),
+    │   │       Index_column_usage::create_key_by_index_id(this->id()))
+    │   │       // 递归调用 Collection::restore_items，读取每个索引列的信息
+    │   └── item->validate()                         // 校验合法性
+    │   }
+    │
+    │ ── Phase 4: 按 ordinal_position 排序 ──
+    │
+    └── std::sort(m_items.begin(), m_items.end(), item_compare)
+        // 确保 indexes 按创建时的顺序排列
+TODO
+*/
 bool Table_impl::restore_children(Open_dictionary_tables_ctx *otx) {
   // NOTE: the order of restoring collections is important because:
   //   - Index-objects reference Column-objects
@@ -266,6 +318,9 @@ bool Table_impl::restore_children(Open_dictionary_tables_ctx *otx) {
           bootstrap::DD_VERSION_80016));
 
   return (
+  // 其中 m_indexes.restore_items 就是从 mysql.index 表中构建出索引的 dd-object
+  // 最终会调用到 Collection<T>::restore_items 函数，这个函数里有典型的初始化 cursor
+  // 来扫描 B-Tree 的实现
       Abstract_table_impl::restore_children(otx) ||
       m_indexes.restore_items(this, otx, otx->get_table<Index>(),
                               Indexes::create_key_by_table_id(this->id())) ||

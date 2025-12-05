@@ -106,6 +106,7 @@ static ulint btr_hash_seed_for_record(const dict_index_t *index) {
 A table is selected from an array of tables using pair of index-id, space-id.
 @param[in]      index   index handler
 @return hash table */
+// 在ahi sys中拿index所在的 hash table slot
 static inline hash_table_t *btr_get_search_table(const dict_index_t *index) {
   /* One can't use the returned table if these latches are not taken. Any resize
   of the AHI that is run in meantime will delete it. Note that btr_ahi_parts
@@ -1003,6 +1004,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
   return true;
 }
 
+// TODO
 void btr_search_drop_page_hash_index(buf_block_t *block, bool force) {
   for (;;) {
     /* Do a dirty check on block->index, return if the block is
@@ -1076,6 +1078,7 @@ void btr_search_drop_page_hash_index(buf_block_t *block, bool force) {
     ut_ad(!btr_search_own_any(RW_LOCK_X));
 
     block->ahi.validate();
+    // ques?
     const auto prefix_info = block->ahi.prefix_info.load();
 
     ut_ad(!index->disable_ahi);
@@ -1210,6 +1213,7 @@ void btr_search_drop_page_hash_index(buf_block_t *block, bool force) {
     if (block->ahi.prefix_info.load() == prefix_info) {
       const auto hash_table = btr_get_search_table(index);
       for (size_t i = 0; i < n_cached; i++) {
+        // note: 根据page的rec的hash value在相应hash table中drop entry
         ha_remove_a_node_to_page(hash_table, hashes[i], page);
       }
 
@@ -1256,6 +1260,7 @@ void btr_search_set_block_not_cached(buf_block_t *block) {
   MONITOR_ATOMIC_INC(MONITOR_ADAPTIVE_HASH_PAGE_REMOVED);
 }
 
+// TODO: ahi drop 的核心
 void btr_search_drop_page_hash_when_freed(const page_id_t &page_id,
                                           const page_size_t &page_size) {
   buf_block_t *block;
@@ -1294,6 +1299,7 @@ void btr_search_drop_page_hash_when_freed(const page_id_t &page_id,
   mtr_commit(&mtr);
 }
 
+// TODO
 static void btr_drop_next_batch(const page_size_t &page_size,
                                 const dict_index_t **first,
                                 const dict_index_t **last) {

@@ -1299,6 +1299,8 @@ static bool consume_comment(Lex_input_stream *lip,
   - MY_LEX_END			Found end of query
 */
 
+// note: mysqllex -> yylex; mysqlparse -> yyparse
+// yylex(yacc) 被 sql_yacc.cc 中的bison(yyparse)调用解析词法
 int MYSQLlex(YYSTYPE *yacc_yylval, YYLTYPE *yylloc, THD *thd) {
   auto *yylval = reinterpret_cast<Lexer_yystype *>(yacc_yylval);
   Lex_input_stream *lip = &thd->m_parser_state->m_lip;
@@ -1326,6 +1328,7 @@ int MYSQLlex(YYSTYPE *yacc_yylval, YYLTYPE *yylloc, THD *thd) {
     return token;
   }
 
+  // note: 解析一个token
   token = lex_one_token(yylval, thd);
   yylloc->cpp.start = lip->get_cpp_tok_start();
   yylloc->raw.start = lip->get_tok_start();
@@ -4966,7 +4969,7 @@ static void unsafe_mixed_statement(LEX::enum_stmt_accessed_table a,
 bool LEX::make_sql_cmd(Parse_tree_root *parse_tree) {
   if (!will_contextualize) return false;
 
-  // ques: LEX::THD啥时候设置的？
+  // ques: LEX::THD啥时候设置的？ sql_yacc.yy中bison设置
   m_sql_cmd = parse_tree->make_cmd(thd);
   if (m_sql_cmd == nullptr) return true;
 

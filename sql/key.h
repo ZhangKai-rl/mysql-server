@@ -58,6 +58,7 @@ class KEY_PART_INFO { /* Info about a key part */
  public:
   Field *field{nullptr};
   uint offset{0};      /* offset in record (from 0) */
+  // record[0] null bitmap不是固定在开头吗？是的，这里是这个key part在null bitmap中的offset
   uint null_offset{0}; /* Offset to null_bit in record */
   /* Length of key part in bytes, excluding NULL flag and length bytes */
   uint16 length{0};
