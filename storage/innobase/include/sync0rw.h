@@ -407,6 +407,7 @@ SX	            ✅ 兼容	❌ 冲突	❌ 冲突
 X	              ❌ 冲突	❌ 冲突	❌ 冲突
 同线程可以出现 x+x+x / x+sx+sx+x的情况
    */
+  // xxxx: 非常重要！核心！！！
   std::atomic<int32_t> lock_word;
 
   /** 1: there are waiters */

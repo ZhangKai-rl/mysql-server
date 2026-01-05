@@ -1567,6 +1567,7 @@ static bool trx_serialisation_number_get(
   new trx_t::no can't be less than any trx_t::no
   already in the rollback segment. User threads only
   produce events when a rollback segment is empty. */
+  // note: last_page_no, 这里保证目前的pq中还没有改rseg, 需要加入pq
   if ((redo_rseg != nullptr && redo_rseg->last_page_no == FIL_NULL) ||
       (temp_rseg != nullptr && temp_rseg->last_page_no == FIL_NULL)) {
     TrxUndoRsegs elem;
@@ -1581,6 +1582,7 @@ static bool trx_serialisation_number_get(
 
     mutex_enter(&purge_sys->pq_mutex);
 
+    // note
     added_trx_no = trx_add_to_serialisation_list(trx);
 
     elem.set_trx_no(trx->no);
@@ -1943,6 +1945,7 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialised) {
         lock_rec_convert_impl_to_expl_for_trx() when deciding for the final time
         if we really want to create explicit lock on behalf of implicit lock
         holder. */
+    // note: 这里将trx的状态改为TRX_STATE_COMMITTED_IN_MEMORY
     trx->state.store(TRX_STATE_COMMITTED_IN_MEMORY, std::memory_order_relaxed);
     trx_mutex_exit(trx);
   };
@@ -2237,6 +2240,7 @@ void trx_commit_low(trx_t *trx, mtr_t *mtr) {
     in the file-based data structures (undo logs etc.) happens
     here.
 
+    xxxx: 这里也验证了只有涉及undate_undo的trx才有trx no
     NOTE that transaction numbers, which are assigned only to
     transactions with an update undo log, do not necessarily come
     in exactly the same order as commit lsn's, if the transactions
@@ -2584,8 +2588,10 @@ void trx_print_low(FILE *f,
                    ulint max_query_len,
                    /*!< in: max query length to print,
                    must be positive */
+                   // n_rec_locks = 5 是指当前事务的所有 lock_t 中，属于行锁类型的 lock_t 所锁定的行记录总数
                    ulint n_rec_locks,
                    /*!< in: lock_number_of_rows_locked(&trx->lock) */
+                   // 当前事务总共有 3 个 lock_t 结构（可能包含表锁和行锁）
                    ulint n_trx_locks,
                    /*!< in: length of trx->lock.trx_locks */
                    ulint heap_size)

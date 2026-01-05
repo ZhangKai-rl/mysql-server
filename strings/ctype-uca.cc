@@ -9575,6 +9575,7 @@ CHARSET_INFO my_charset_utf8mb4_0900_ai_ci = {
     nullptr,                                 /* to_lower     */
     nullptr,                                 /* to_upper     */
     nullptr,                                 /* sort_order   */
+    // 排序权重表。 3级权重 primary secondary tertiary
     &my_uca_v900,                            /* uca_900      */
     nullptr,                                 /* tab_to_uni   */
     nullptr,                                 /* tab_from_uni */

@@ -978,10 +978,10 @@ static_assert((LOCK_MODE_MASK & LOCK_TYPE_MASK) == 0,
  granted, it is just waiting for its  turn in the wait queue */
  // note: 如果设置了 → 这个 lock_t 是一个等待中的锁请求（还没被授予）
 constexpr uint32_t LOCK_WAIT = 256;
-/* Precise modes */
+/* Precise modes, lock_mode */
 /** this flag denotes an ordinary next-key lock in contrast to LOCK_GAP or
  LOCK_REC_NOT_GAP */
-// next key lock. 邻键锁. 左开右闭 （l, r]
+// note: next key lock. 邻键锁. 左开右闭 （l, r]. 在innodb rec lock中，默认锁为 lock_ordinary 即 next-key lock
 constexpr uint32_t LOCK_ORDINARY = 0;
 /** when this bit is set, it means that the lock holds only on the gap before
   the record; for instance, an x-lock on the gap does not give permission to

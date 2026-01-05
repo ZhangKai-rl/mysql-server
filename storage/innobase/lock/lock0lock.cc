@@ -3485,6 +3485,7 @@ static inline lock_t *lock_table_create(
 #endif /* HAVE_PSI_DATA_LOCK_INTERFACE */
 #endif /* HAVE_PSI_THREAD_INTERFACE */
 
+  // note
   locksys::add_to_trx_locks(lock);
 
   ut_list_append(table->locks, lock);

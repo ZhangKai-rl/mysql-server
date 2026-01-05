@@ -19878,8 +19878,9 @@ static uint get_weight_for_mbchar(const CHARSET_INFO *cs, const uchar *src,
   /* Make sure the max 4-byte gb18030 code has the max weight */
   if (code == 0xFE39FE39) return 0xFFFFFFFF;
 
+  // // 1. 检查是否为中文字符
   weight = get_weight_if_chinese_character(code);
-  if (weight > PINYIN_WEIGHT_BASE) return weight;
+  if (weight > PINYIN_WEIGHT_BASE) return weight; // // 是中文，返回拼音权重
 
   caseup_code = get_casefolded_code(cs, src, mblen, 1);
   if (caseup_code == 0) caseup_code = code;

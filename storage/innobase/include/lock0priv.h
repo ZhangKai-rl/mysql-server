@@ -152,6 +152,7 @@ struct lock_t {
   trx_t *trx;
 
   /** list of the locks of the transaction */
+  // note: 事务锁链表的节点。基节点为 trx_lock_list_t trx_lock_t::trx_locks
   UT_LIST_NODE_T(lock_t) trx_locks;
 
   /** Index for a record lock */

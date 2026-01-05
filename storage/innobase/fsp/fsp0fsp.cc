@@ -1363,6 +1363,7 @@ static UNIV_COLD ulint fsp_try_extend_data_file(fil_space_t *space,
     return false;
   }
 
+  // ques: 如果size + size_increase > uint32是否会触发bug？
   if (!fil_space_extend(space, size + size_increase)) {
     return false;
   }

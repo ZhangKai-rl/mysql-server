@@ -1876,6 +1876,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
 [[nodiscard]] static dberr_t row_ins_scan_sec_index_for_duplicate(
     ulint flags,         /*!< in: undo logging and locking flags */
     dict_index_t *index, /*!< in: non-clustered unique index */
+    // note: entry: 要插入的index entry. 区别于rec，page_cur定位到的已经存在的index rec.
     dtuple_t *entry,     /*!< in: index entry */
     que_thr_t *thr,      /*!< in: query thread */
     bool s_latch,        /*!< in: whether index->lock is being held */
@@ -1900,6 +1901,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
   n_unique first fields is NULL, a unique key violation cannot occur,
   since we define NULL != NULL in this case */
 
+  // 如果innodb index 认为 null != null， 那么插入的dtuple中如果有null，那么直接返回成功
   if (!index->nulls_equal) {
     for (ulint i = 0; i < n_unique; i++) {
       if (UNIV_SQL_NULL == dfield_get_len(dtuple_get_nth_field(entry, i))) {
@@ -1914,6 +1916,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
 
   dtuple_set_n_fields_cmp(entry, n_unique);
 
+  // 使用 page_cur_mode_t::PAGE_CUR_GE 定位第一个 >= entry 的记录
   pcur.open(index, 0, entry, PAGE_CUR_GE,
             s_latch ? BTR_SEARCH_LEAF | BTR_ALREADY_S_LATCHED : BTR_SEARCH_LEAF,
             mtr, UT_LOCATION_HERE);
@@ -1922,6 +1925,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
   const bool skip_gap_locks = index->table->skip_gap_locks();
   /* Scan index records and check if there is a duplicate */
 
+  // xxx: 扫描所有相等的记录并加锁（s lock ?)
   do {
     const rec_t *rec = pcur.get_rec();
     const buf_block_t *block = pcur.get_block();
@@ -1940,7 +1944,9 @@ static bool row_allow_duplicates(que_thr_t *thr) {
                               UT_LOCATION_HERE, &offsets_heap);
 
     const bool is_supremum = page_rec_is_supremum(rec);
+    // note: is_next = true: dtuple(待插入) < rec（定位）
     const bool is_next =
+        // rec是page_cur定位到的index rec。 retval < 0: dtuple < rec
         !is_supremum && (cmp_dtuple_rec(entry, rec, index, offsets) < 0);
     if (flags & BTR_NO_LOCKING_FLAG) {
       /* Set no locks when applying log
@@ -1987,6 +1993,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
         /* Only gap lock is required on next record. */
         lock_type = LOCK_GAP;
       } else {
+        // note: 相等的记录 lock_mode == lock_ordinary == next-key lock
         /* Next key lock for all equal keys. */
         lock_type = LOCK_ORDINARY;
       }
@@ -1998,6 +2005,7 @@ static bool row_allow_duplicates(que_thr_t *thr) {
       anything at all in case there wasn't any matching record, which is fine,
       because the B-tree page latch will be released only after inserting the
       implicitly locked record, so no protection is needed.*/
+      // note: 上面确定好了lock_mode, 这里表明lock_type为 S！
       err = row_ins_set_rec_lock(LOCK_S, lock_type, block, rec, index, offsets,
                                  thr);
     }

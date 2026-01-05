@@ -58,6 +58,7 @@ typedef pthread_mutex_t sys_mutex_t;
 
 /*
            xxxx:LATCHING ORDER WITHIN THE DATABASE
+           note
                 ==================================
 
 The mutex or latch in the central memory object, for instance, a rollback

@@ -424,6 +424,7 @@ struct trx_lock_t {
   a change if it occurred while it was reacquiring latches.
   Protected by trx->mutex. */
   // 用于验证释放trx->mutex期间，此trx_lock_t是否发生了改变(trx_lock_t::trx_locks_version++)
+  // 用于无锁
   // 每次添加/删除事务锁链表(trx_lock_t::trx_locks)时递增
   uint64_t trx_locks_version;
 
@@ -745,6 +746,8 @@ struct trx_t {
 
   trx_id_t id; /*!< transaction id */
 
+  // xxxx: 只有事务产生undate_undo时才有trx no，用于purge操作！！！！
+  // trx_no 主要用于 purge 系统判断旧版本数据何时可以被清理
   trx_id_t no; /*!< transaction serialization number:
                max trx id shortly before the
                transaction is moved to
@@ -838,6 +841,7 @@ struct trx_t {
 
   /** Information about the transaction locks and state.
   Protected by trx->mutex or lock_sys latches or both */
+  // note
   trx_lock_t lock;
 
   /**

@@ -703,6 +703,7 @@ of a row */
 struct upd_node_t {
   que_common_t common; /*!< node type: QUE_NODE_UPDATE */
   bool is_delete;      /* true if delete, false if update */
+  // 是不是search update? search update就是普通的update whhere语句；对应的就是cursor语句，无需搜索直接进行cursor open即可，即 cursor open -> searched_update = false
   bool searched_update;
   /* true if searched update, false if
   positioned */

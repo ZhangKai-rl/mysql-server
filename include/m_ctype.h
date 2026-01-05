@@ -428,7 +428,9 @@ struct CHARSET_INFO {
   const char *csname;
   const char *m_coll_name;
   const char *comment;
+  // 用于定制特定语言或地区的排序规则。它允许在 Unicode 标准排序规则（UCA - Unicode Collation Algorithm）的基础上，针对特定语言的需求进行调整。
   const char *tailoring;
+  // 排序参数
   struct Coll_param *coll_param;
   /* ctype, to_lower, to_upper 都是 查表 + mask实现的 */
   const uchar *ctype;
@@ -456,6 +458,7 @@ struct CHARSET_INFO {
   bool escape_with_backslash_is_dangerous;
   uchar levels_for_compare;
 
+  // cset coll 相关的函数回调
   MY_CHARSET_HANDLER *cset; /* cs->cset */
   MY_COLLATION_HANDLER *coll;
 

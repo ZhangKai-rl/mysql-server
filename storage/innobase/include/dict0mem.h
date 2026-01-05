@@ -1109,6 +1109,7 @@ struct dict_index_t {
   unsigned allow_duplicates : 1;
 
   /** if true, SQL NULL == SQL NULL */
+  // 是否认为 null 值是重复的
   unsigned nulls_equal : 1;
 
   /** if true, then disable AHI. Currently limited to intrinsic temporary table

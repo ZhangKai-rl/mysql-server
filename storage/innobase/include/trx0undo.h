@@ -337,6 +337,7 @@ constexpr uint32_t TRX_UNDO_PREPARED_IN_TC = 7;
 in the corresponding transaction object */
 
 // 这个和undo header page 的 undo log header很像
+// 上面理解有误，这个应该是undo page list.
 struct trx_undo_t {
   /** Undo log may could be allocated to store transaction GTIDs. */
   enum class Gtid_storage {
@@ -373,6 +374,8 @@ struct trx_undo_t {
   inline bool is_prepared() const;
 
   /*-----------------------------*/
+  // note: 这个是这条undo page list(一组undo log rec: 同一个事务向一个Undo页面链表中写入的undo日志算是一个组)
+  // 在rseg slot的位置
   ulint id;        /*!< undo log slot number within the
                    rollback segment */
   ulint type;      /*!< TRX_UNDO_INSERT or

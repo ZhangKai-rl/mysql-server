@@ -47,6 +47,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 constexpr uint32_t MUTEX_MAGIC_N{0xb251b04bU};
 
+// todo
 template <typename Mutex>
 class MutexDebug {
  public:

@@ -229,6 +229,8 @@ class SysTablespace : public Tablespace {
 
   /* DATA MEMBERS */
 
+  // innodb_data_file_path = ibdata1:12M;ibdata2:50M:autoextend
+
   /** if true, then we auto-extend the last data file */
   bool m_auto_extend_last_file;
 

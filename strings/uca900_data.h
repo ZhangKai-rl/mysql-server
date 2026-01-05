@@ -11759,6 +11759,8 @@ Char_grp_info char_grp_infos[]= {
 #define UCA900_DISTANCE_BETWEEN_LEVELS 256
 #define UCA900_DISTANCE_BETWEEN_WEIGHTS (MY_UCA_900_CE_SIZE * 256)
 
+/*
+*/
 uint16 uca900_p000[]= {
   /* Number of CEs for each character. */
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
@@ -270943,7 +270945,7 @@ MY_UCA_INFO my_uca_v900 = {
 
     0x10FFFF,                      /* maxchar           */
     nullptr,                       /* length - not used */
-    uca900_weight, false, nullptr, /* contractions      */
+    uca900_weight, false, nullptr, /* contractions  缩写    */
     nullptr,
 
     0x0009,  /* first_non_ignorable       p != ignore                       */

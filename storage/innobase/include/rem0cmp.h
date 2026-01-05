@@ -118,6 +118,7 @@ int cmp_dtuple_rec_with_gis_internal(const dtuple_t *dtuple, const rec_t *rec,
                                      const dd::Spatial_reference_system *srs);
 
 /** Compare a data tuple to a physical record.
+note:  dtuple待插入记录， rec定位的已存在的索引记录
 @param[in]      dtuple          data tuple
 @param[in]      rec             record
 @param[in]      index           index
@@ -125,6 +126,7 @@ int cmp_dtuple_rec_with_gis_internal(const dtuple_t *dtuple, const rec_t *rec,
 @param[in]      n_cmp           number of fields to compare
 @param[in,out]  matched_fields  number of completely matched fields
 @return the comparison result of dtuple and rec
+// note: retval
 @retval 0 if dtuple is equal to rec
 @retval negative if dtuple is less than rec
 @retval positive if dtuple is greater than rec */

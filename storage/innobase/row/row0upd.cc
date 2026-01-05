@@ -3118,6 +3118,7 @@ func_exit:
                             UT_LOCATION_HERE, &heap);
 
   if (!node->has_clust_rec_x_lock) {
+    // 申请 record X lock
     err = lock_clust_rec_modify_check_and_lock(flags, pcur->get_block(), rec,
                                                index, offsets, thr);
     if (err != DB_SUCCESS) {
@@ -3324,6 +3325,7 @@ que_thr_t *row_upd_step(que_thr_t *thr) /*!< in: query thread */
     node->state = UPD_NODE_SET_IX_LOCK;
   }
 
+  // update执行时上表ix锁的步骤
   if (node->state == UPD_NODE_SET_IX_LOCK) {
     if (!node->has_clust_rec_x_lock) {
       /* It may be that the current session has not yet
@@ -3336,6 +3338,7 @@ que_thr_t *row_upd_step(que_thr_t *thr) /*!< in: query thread */
       }
     }
 
+    // sm, 进入下一个state
     node->state = UPD_NODE_UPDATE_CLUSTERED;
 
     if (node->searched_update) {

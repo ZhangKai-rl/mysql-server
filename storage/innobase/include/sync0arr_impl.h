@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
                         WAIT ARRAY
                         ==========
 
+todo
 The wait array consists of cells each of which has an an event object created
 for it. The threads waiting for a mutex, for example, can reserve a cell
 in the array and suspend themselves to wait for the event to become signaled.
