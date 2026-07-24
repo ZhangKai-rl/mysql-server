@@ -1650,7 +1650,7 @@ void PT_set_operation::merge_descendants(Parse_context *pc,
   setop->m_first_distinct = first_distinct;
 }
 
-// 这里要结合parse tree来看： https://iwiki.woa.com/p/4015115123/edit
+// 这里要结合parse tree来看： 词法parse、语义contextualize/resolver && 解析器prepare
 bool PT_set_operation::contextualize_setop(Parse_context *pc,
                                            Query_term_type setop_type,
                                            Surrounding_context context) {
