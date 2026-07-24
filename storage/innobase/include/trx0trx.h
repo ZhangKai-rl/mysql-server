@@ -412,6 +412,7 @@ struct trx_lock_t {
   /** Default constructor. */
   trx_lock_t() = default;
 
+  // 注意是 query graph threads
   ulint n_active_thrs; /*!< number of active query threads */
 
   trx_que_t que_state; /*!< valid when trx->state
@@ -550,6 +551,7 @@ struct trx_lock_t {
   manner (in current implementation length of the list is stored explicitly so
   one can read it without risking unsafe pointer operations) */
   // note: base node of trx_lock_t 某个事务的锁链表基节点。 该链表元素为lock_t
+  // ut_list_base. getter = lock_t::trx_locks
   trx_lock_list_t trx_locks;
 
   /** AUTOINC locks held by this transaction.

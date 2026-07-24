@@ -1948,11 +1948,13 @@ static void row_upd_store_v_row(upd_node_t *node, const upd_t *update, THD *thd,
             } else {
               dfield_dup(dfield, node->heap);
             }
+            // 如果旧值不是 NULL，就不需要调用. 如果 dfield 不是 NULL，说明从 old_vrow 拿到了有效的旧值，直接用就行，不需要调用 innobase_get_computed_value，也就不存在破坏 new_val 的风险，所以也不需要提前 dup new_val。
             if (dfield_is_null(dfield)) {
               if (!new_val_v_cols_dup) {
                 row_upd_dup_v_new_vals(update);
                 new_val_v_cols_dup = true;
               }
+              // upd 的old val没缓存计算下
               innobase_get_computed_value(node->row, col, index, &heap,
                                           node->heap, nullptr, thd, mysql_table,
                                           nullptr, nullptr, nullptr);

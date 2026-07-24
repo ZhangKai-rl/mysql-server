@@ -331,6 +331,7 @@ dberr_t Loader::load() noexcept {
 
     for (size_t i = 1; i < m_ctx.m_max_threads; ++i) {
       try {
+        // note
         threads.push_back(std::thread{fn, i});
       } catch (...) {
         ib::warn(ER_DDL_MSG_1);
@@ -340,6 +341,7 @@ dberr_t Loader::load() noexcept {
     }
   }
 
+  // note
   auto err = m_taskq->execute();
 
   if (!sync) {
@@ -348,6 +350,7 @@ dberr_t Loader::load() noexcept {
     }
 
     for (auto &thread : threads) {
+      // user thd 完成自己的 taskq 后，等待其他 ddl threads 完成
       thread.join();
     }
   }
@@ -425,6 +428,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
 
 #endif /* UNIV_DEBUG */
 
+  // ctx 见 inplace_alter_table_impl
   auto cursor = Cursor::create_cursor(m_ctx);
 
   if (cursor == nullptr) {
@@ -447,7 +451,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     } else {
       /* Read clustered index of the table and create files for secondary
       index entries for merge sort and bulk build of the indexes. */
-      // todo
+      // todo: parallel read
       err = cursor->scan(m_builders);
     }
 
@@ -460,7 +464,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     DEBUG_SYNC_C("ddl_after_scan");
 
     if (err == DB_SUCCESS) {
-      // todo
+      // todo: parallel sort and build
       err = load();
     }
 

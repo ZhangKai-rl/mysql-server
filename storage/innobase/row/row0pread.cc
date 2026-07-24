@@ -154,6 +154,8 @@ dberr_t Parallel_reader::Ctx::split() {
   /* Setup the sub-range. */
   Scan_range scan_range(m_range.first->m_tuple, m_range.second->m_tuple);
 
+  // NOTE: process of partition sub-btree
+
   /* S lock so that the tree structure doesn't change while we are
   figuring out the sub-trees to scan. */
   m_scan_ctx->index_s_lock();
@@ -583,6 +585,7 @@ Parallel_reader::Scan_ctx::create_persistent_cursor(
   /* Make a copy of the rec. */
   copy_row(rec, iter.get());
 
+  // cursor position
   iter->m_pcur->open_on_user_rec(page_cursor, PAGE_CUR_GE,
                                  BTR_ALREADY_S_LATCHED | BTR_SEARCH_LEAF);
 
@@ -611,6 +614,7 @@ bool Parallel_reader::Ctx::move_to_next_node(PCursor *pcursor) {
   }
 }
 
+// pread 是不走handler row_seach_mvcc 的
 dberr_t Parallel_reader::Ctx::traverse() {
   /* Take index lock if the requested read level is on a non-leaf level as the
   index lock is required to access non-leaf page.  */
@@ -625,6 +629,7 @@ dberr_t Parallel_reader::Ctx::traverse() {
   auto &from = m_range.first;
 
   PCursor pcursor(from->m_pcur, &mtr, m_scan_ctx->m_config.m_read_level);
+  // NOTE: fetch page, 如果 没 modify_clock 直接用block， 如果有重新fetch page
   pcursor.restore_position();
 
   dberr_t err{DB_SUCCESS};
@@ -750,6 +755,7 @@ dberr_t Parallel_reader::Ctx::traverse_recs(PCursor *pcursor, mtr_t *mtr) {
       m_offsets = offsets;
       m_block = cur->block;
 
+      // note: 见parallel_check_table, reader.add_scan.
       err = m_scan_ctx->m_f(this);
 
       if (err != DB_SUCCESS) {
@@ -855,6 +861,7 @@ void Parallel_reader::worker(Parallel_reader::Thread_ctx *thread_ctx) {
 
       ctx->m_thread_ctx = thread_ctx;
 
+      // 子树 < pread workers, split again!
       if (ctx->m_split) {
         err = ctx->split();
         /* Tell the other threads that there is work to do. */
@@ -867,6 +874,7 @@ void Parallel_reader::worker(Parallel_reader::Thread_ctx *thread_ctx) {
         }
 
         if (cb_err == DB_SUCCESS && err == DB_SUCCESS) {
+          // NOTE: cb
           err = ctx->traverse();
         }
 
@@ -1026,6 +1034,7 @@ void Parallel_reader::Scan_ctx::create_range(Ranges &ranges,
   ranges.push_back(Range(iter, std::make_shared<Iter>()));
 }
 
+// 划分子树的过程
 dberr_t Parallel_reader::Scan_ctx::create_ranges(const Scan_range &scan_range,
                                                  page_no_t page_no,
                                                  size_t depth,
@@ -1045,6 +1054,7 @@ dberr_t Parallel_reader::Scan_ctx::create_ranges(const Scan_range &scan_range,
 
   page_id_t page_id(index->space, page_no);
 
+  // chkpt 的作用？
   Savepoint savepoint({mtr->get_savepoint(), nullptr});
 
   auto block = block_get_s_latched(page_id, mtr, __LINE__);
@@ -1087,6 +1097,7 @@ dberr_t Parallel_reader::Scan_ctx::create_ranges(const Scan_range &scan_range,
 
   Savepoints savepoints{};
 
+  // 类似 btr_cur_search_to_nth_level
   while (!page_cur_is_after_last(&page_cursor)) {
     const auto rec = page_cur_get_rec(&page_cursor);
 
@@ -1311,6 +1322,7 @@ void Parallel_reader::parallel_read() {
         return;
       }
       m_thread_ctxs.emplace_back(ptr);
+      // create parallel_read_threads 个 pread worker.
       m_parallel_read_threads.emplace_back(
           os_thread_create(parallel_read_thread_key, i + 1,
                            &Parallel_reader::worker, this, m_thread_ctxs[i]));
@@ -1372,6 +1384,7 @@ dberr_t Parallel_reader::run(size_t n_threads) {
     ut_a(m_n_threads == 0);
     return is_error_set() ? m_err.load() : DB_SUCCESS;
   } else {
+    // user thd 阻塞在join, 等待pread workers finish task.
     join();
 
     if (err != DB_SUCCESS) {
@@ -1413,6 +1426,7 @@ dberr_t Parallel_reader::add_scan(trx_t *trx,
 
   scan_ctx->index_s_lock();
 
+  // 构建 pread sub-btree
   Parallel_reader::Scan_ctx::Ranges ranges{};
   dberr_t err{DB_SUCCESS};
 
@@ -1425,6 +1439,7 @@ dberr_t Parallel_reader::add_scan(trx_t *trx,
     return (err);
   }
 
+  // 递归
   err = scan_ctx->create_contexts(ranges);
 
   scan_ctx->index_s_unlock();

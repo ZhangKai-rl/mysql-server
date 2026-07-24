@@ -445,6 +445,7 @@ struct Trx_shard {
   /** Mapping from trx->id to trx of active rw transactions.
   The peek() interface can only be used safely for the min_id().
   Use latch_and_execute() interface to access other members. */
+  // 为什么有两个活跃事务表。这个是为了加速查找的, trx_sys_t::trx_ids_t 是o(n)的vector
   ut::Cacheline_padded<ut::Guarded<Trx_by_id_with_min, LATCH_ID_TRX_SYS_SHARD>>
       active_rw_trxs;
 };
@@ -464,6 +465,7 @@ struct trx_sys_t {
   and added to the end under a read lock. They are deleted under a write
   lock while the vector is adjusted. They are created and destroyed in
   single-threaded mode. */
+  // 包含 系统表空间 的Rsegs,  见 trx_rsegs_init
   Rsegs rsegs;
 
   /** Vector of pointers to rollback segments within the temp tablespace;
@@ -535,7 +537,7 @@ struct trx_sys_t {
 
   /** List of active and committed in memory read-write transactions, sorted
   on trx id, biggest first. Recovered transactions are always on this list. */
-  // note : rw_trx_list ? in_rw_trx_list
+  // note : rw_trx_list ? in_rw_trx_list 活跃的读写事务（包括内部/系统事务和恢复事务）
   UT_LIST_BASE_NODE_T(trx_t, trx_list) rw_trx_list;
 
   char pad6[ut::INNODB_CACHE_LINE_SIZE];
@@ -545,6 +547,7 @@ struct trx_sys_t {
   recovered transactions that will not be in the mysql_trx_list.
   Additionally, mysql_trx_list may contain transactions that have not yet
   been started in InnoDB. */
+  // mysql 层创建的事务，无论是否已经开始. INFORMATION_SCHEMA.INNODB_TRX、SHOW ENGINE INNODB STATUS 中的事务列表
   UT_LIST_BASE_NODE_T(trx_t, mysql_trx_list) mysql_trx_list;
 
   /** Array of Read write transaction IDs for MVCC snapshot. A ReadView would

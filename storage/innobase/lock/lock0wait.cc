@@ -142,6 +142,7 @@ static srv_slot_t *lock_wait_table_reserve_slot(
   ut_ad(lock_wait_mutex_own());
   ut_ad(trx_mutex_own(thr_get_trx(thr)));
 
+  // 为某个 que_thr_t 对象分配一个 slot 进行 lock wait
   slot = lock_sys->waiting_threads;
 
   for (uint32_t i = srv_max_n_threads; i--; ++slot) {
@@ -294,6 +295,7 @@ void lock_wait_suspend_thread(que_thr_t *thr) {
 
   DEBUG_SYNC_C("lock_wait_will_wait");
 
+  // 锁等待，等待线程为？user thd?
   os_event_wait(slot->event);
 
   DEBUG_SYNC_C("lock_wait_has_finished_waiting");
@@ -317,6 +319,7 @@ void lock_wait_suspend_thread(que_thr_t *thr) {
 
   /* Release the slot for others to use */
 
+  // 被放锁线程精确唤醒 or timeout
   lock_wait_table_release_slot(slot);
 
   if (thr->lock_state == QUE_THR_LOCK_ROW) {

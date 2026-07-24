@@ -345,6 +345,7 @@ class System_tables {
     - The PFS tables are not needed by the data dictionary, but the
       server manages these based on requests from the performance schema.
   */
+  // note: mysql 库下的表类型
   enum class Types {
     INERT,
     CORE,

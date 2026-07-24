@@ -38,7 +38,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 namespace ddl {
 
-/** Build indexes on a table by reading a clustered index, creating a temporary
+/* note: Build indexes on a table by reading a clustered index, creating a temporary
 file containing index entries, merge sorting these index entries and inserting
 sorted index entries to indexes. */
 class Loader {

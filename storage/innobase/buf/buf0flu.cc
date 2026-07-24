@@ -1192,6 +1192,7 @@ static void buf_flush_write_block_low(buf_page_t *bpage, buf_flush_t flush_type,
   flush_list or LRU_list. */
   ut_ad(!buf_flush_list_mutex_own(buf_pool));
   ut_ad(!buf_page_get_mutex(bpage)->is_owned());
+  // 啥时候 fix 的？ buf_page_io_fix
   ut_ad(bpage->is_io_fix_write());
   ut_ad(bpage->is_dirty());
 
@@ -1245,6 +1246,7 @@ static void buf_flush_write_block_low(buf_page_t *bpage, buf_flush_t flush_type,
         frame = ((buf_block_t *)bpage)->frame;
       }
 
+      // note
       buf_flush_init_for_writing(
           reinterpret_cast<const buf_block_t *>(bpage),
           reinterpret_cast<const buf_block_t *>(bpage)->frame,

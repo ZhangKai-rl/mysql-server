@@ -12652,7 +12652,7 @@ int Update_rows_log_event::do_exec_row(const Relay_log_info *const rli) {
        ^                     ^
        m_curr_row            m_curr_row_end
 
-    BI found in the table is stored in record[0]. We copy it to record[1]
+    NOTE: BI found in the table is stored in record[0]. We copy it to record[1]
     and unpack AI to record[0].
    */
 

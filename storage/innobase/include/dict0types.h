@@ -229,6 +229,7 @@ DICT_IBUF_ID_MIN plus the space id */
 constexpr uint64_t DICT_IBUF_ID_MIN = 0xFFFFFFFF00000000ULL;
 
 /** Table or partition identifier (unique within an InnoDB instance). */
+// note: uint64_t, 8B
 typedef ib_id_t table_id_t;
 /** Index identifier (unique within a tablespace). */
 typedef ib_id_t space_index_t;

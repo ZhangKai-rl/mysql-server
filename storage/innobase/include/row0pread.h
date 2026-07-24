@@ -55,6 +55,8 @@ struct dict_table_t;
 #include "rem0types.h"
 #include "ut0mpmcbq.h"
 
+// NOTE: pread 的实现思路
+
 /** The core idea is to find the left and right paths down the B+Tree.These
 paths correspond to the scan start and scan end search. Follow the links
 at the appropriate btree level from the left to right and split the scan
@@ -655,6 +657,7 @@ class Parallel_reader::Scan_ctx {
   const trx_t *m_trx{};
 
   /** Callback function. */
+  // pread worker 扫描到了具体做的操作。
   F m_f;
 
   /** Depth of the Btree. */

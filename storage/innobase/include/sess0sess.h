@@ -68,6 +68,7 @@ typedef std::map<
     ut::allocator<std::pair<const std::string, dict_intrinsic_table_t *>>>
     table_cache_t;
 
+// 存在 thd->ha_data[innobase->slot]->ha_ptr 中
 class innodb_session_t {
  public:
   /** Constructor */

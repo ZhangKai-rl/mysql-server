@@ -27,6 +27,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** @file include/usr0sess.h
  Sessions
+ 遗留设计，仅purge 用
 
  Created 6/25/1996 Heikki Tuuri
  *******************************************************/
@@ -49,7 +50,7 @@ sess_t *sess_open(void);
 /** Closes a session, freeing the memory occupied by it. */
 void sess_close(sess_t *sess); /* in, own: session object */
 
-/* The session handle. This data structure is only used by purge and is
+/* note: The session handle. This data structure is only used by purge and is
 not really necessary. We should get rid of it. */
 struct sess_t {
   ulint state; /*!< state of the session */

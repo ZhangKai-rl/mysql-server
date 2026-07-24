@@ -309,6 +309,7 @@ struct buf_block_t;
 
 /** The info structure stored at the beginning of a heap block */
 // note: mem_block_t == mem_block_info_t
+// HEAP 的生命周期？？？
 struct mem_block_info_t {
   /** Magic number for debugging. */
   uint64_t magic_n;

@@ -2646,6 +2646,7 @@ void dd_write_table(dd::Object_id dd_space_id, Table *dd_table,
     dd_table->set_tablespace_id(dd_space_id);
   }
 
+  // note: set table_id_t for dd::Table
   dd_table->set_se_private_id(table->id);
 
   if (DICT_TF_HAS_DATA_DIR(table->flags)) {

@@ -305,6 +305,14 @@ static inline trx_t *row_vers_impl_x_locked_low(
   mem_heap_t *heap;
 
   /** Here's my best understanding of what this code is doing.
+  // NOTE:  二级索引隐式锁判断方式推导过程
+
+    S       = 二级索引页上的那条记录（当前状态）
+    C[t]    = 聚簇索引记录的第 t 个版本（t=0 是最老的，t=current_version 是最新的）
+    S.f     = S 中字段 f 的值
+    C[t].f  = C 第 t 版本中字段 f 的值
+    S.deleted = S 是否被 delete mark
+    C[t].deleted = C[t] 是否被 delete mark
 
   When we call this function we already have `sec_rec` - a row from secondary
   index `sec_index`, which includes:

@@ -2103,6 +2103,7 @@ struct Purge_groups_t {
     const table_id_t id = trx_undo_rec_get_table_id(rec.undo_rec);
     std::size_t grpid;
 
+    // 决定 table_id -> grpid
     GroupBy::iterator lb = m_grpid_umap.find(id);
     if (lb != m_grpid_umap.end()) {
       grpid = lb->second;
@@ -2122,6 +2123,7 @@ struct Purge_groups_t {
   /** Given a table_id obtain the group id to which it belongs. */
   // 根据table_id hash获取组id， 即m_groups[组id]存放这个table_id_t的recs
   // hash(table_id) = group id.
+  // table_id -> grpid
   GroupBy m_grpid_umap;
 
   /** Allocator used for the vector below. */
@@ -2201,10 +2203,12 @@ bool Purge_groups_t::is_grouping_uniform() const {
 
 void Purge_groups_t::distribute() {
   const std::size_t n_purge_threads = m_groups.size();
+  // 上取整每个组最多max_n个undo记录
   const std::size_t max_n =
       (m_total_rec + n_purge_threads - 1) / n_purge_threads;
 
   for (std::size_t i = 0; i < 2; ++i) {
+    // 是否需要第二趟处理尾巴
     bool need_second_pass = false;
     for (std::size_t grpid = 0; grpid < n_purge_threads; ++grpid) {
       std::size_t grp_count = m_groups[grpid]->size();
@@ -2246,6 +2250,7 @@ void Purge_groups_t::distribute_if_needed() {
 
   /* If the history list length is greater than maximum allowed purge lag,
   then distribute the workload across all purge threads. */
+  // ques: 只有这时候才 distribute 吗？
   if (srv_max_purge_lag > 0 && rseg_history_len > srv_max_purge_lag) {
     distribute();
   }
@@ -2368,6 +2373,7 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
       break;
     }
 
+    // 单条undo rec, 一定是同一table_id
     purge_groups.add(rec);
   }
 

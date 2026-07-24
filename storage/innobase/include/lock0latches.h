@@ -101,7 +101,7 @@ This class does not expose too many public functions, as the intention is to
 rather use friend guard classes, like the Shard_latches_guard demonstrated.
 */
 // https://leviathan.vip/2020/12/22/mysql-understand-trx-lock/
-// WL#10314: https://dev.mysql.com/worklog/task/?id=10314
+// 8021 shared trx mutex, WL#10314: https://dev.mysql.com/worklog/task/?id=10314
 class Latches {
  private:
   using Lock_mutex = ib_mutex_t;

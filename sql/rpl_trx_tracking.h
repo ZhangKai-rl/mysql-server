@@ -44,6 +44,14 @@ class THD;
 */
 class Logical_clock {
  private:
+
+/*
+  note: for sequence number,  和last committed 没关系
+  std::atomic<int64> state;   // 全局绝对计数器，一直递增，不重置
+  int64 offset;               // 当前 binlog 文件开始时的 state 快照
+*/
+
+  // for sequence number
   std::atomic<int64> state;
   /*
     Offset is subtracted from the actual "absolute time" value at
@@ -237,7 +245,9 @@ class Transaction_dependency_tracker {
   void update_max_committed(THD *thd);
   int64 get_max_committed_timestamp();
 
+  // 推进 全局state
   int64 step();
+  // 更新 binlog file 的 offset state
   void rotate();
 
  public:

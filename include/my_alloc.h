@@ -79,6 +79,7 @@ extern "C" void sql_alloc_error_handler();
  *
  * For C compatibility reasons, MEM_ROOT is a struct, even though it is
  * logically a class and follows the style guide for classes.
+ * Area allocator
  */
 struct MEM_ROOT {
  private:
@@ -155,6 +156,7 @@ struct MEM_ROOT {
     //
     // but it would invoke undefined behavior, and in particular be prone
     // to wraparound on 32-bit platforms.
+    // note: bump allocator
     if (static_cast<size_t>(m_current_free_end - m_current_free_start) >=
         length) {
       void *ret = m_current_free_start;

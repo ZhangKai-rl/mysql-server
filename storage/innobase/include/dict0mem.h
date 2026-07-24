@@ -1858,6 +1858,8 @@ std::ostream &operator<<(std::ostream &s, const table_name_t &table_name);
 /** List of locks that different transactions have acquired on a table. This
 list has a list node that is embedded in a nested union/structure. We have to
 generate a specific template for it. */
+// ut_list_base. getter == lock_table_t::locks
+// note: 表锁链表
 struct TableLockGetNode;
 typedef ut_list_base<lock_t, TableLockGetNode> table_lock_list_t;
 #endif /* !UNIV_HOTBACKUP */

@@ -2447,6 +2447,8 @@ err_exit:
   rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
 
   // note: missing_history = true说明purge sys清理了undo，丢失了rec的历史版本。
+  // 正常这里是判 rec 对 rv 的可见性，但是注意这里是purge_sys->view 是系统最老的read view，也是 purge 边界
+  // 因此当 purge_sys->view 都可见这个 rec，那这个 rec 的版本就可以被清理掉了。
   missing_history = purge_sys->view.changes_visible(trx_id, name);
   if (!missing_history) {
     // ques: todo. 当前版本记录对rv是不可见的，根据undo往前回滚版本
@@ -2493,6 +2495,7 @@ bool trx_undo_prev_version_build(
   ut_ad(rec_offs_validate(rec, index, offsets));
   ut_a(index->is_clustered());
 
+  // 7B
   roll_ptr = row_get_rec_roll_ptr(rec, index, offsets);
 
   *old_vers = nullptr;

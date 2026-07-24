@@ -1243,6 +1243,16 @@ static void buf_pool_create(buf_pool_t *buf_pool, ulint buf_pool_size,
 
     buf_pool->chunks = reinterpret_cast<buf_chunk_t *>(ut::zalloc_withkey(
         UT_NEW_THIS_FILE_PSI_KEY, buf_pool->n_chunks * sizeof(*chunk)));
+
+    if (buf_pool->chunks == nullptr) {
+      ib::error(ER_IB_MSG_64) << "buffer pool " << instance_no
+                              << " : failed to allocate"
+                                 " the chunk array.";
+      err = DB_ERROR;
+      mutex_exit(&buf_pool->chunks_mutex);
+      return;
+    }
+
     buf_pool->chunks_old = nullptr;
 
     UT_LIST_INIT(buf_pool->LRU);
@@ -5466,6 +5476,12 @@ static std::ostream &operator<<(std::ostream &outs, const buf_io_fix io_fix) {
 for transition.
 @see buf_page_t::Latching_rules_helpers::get_owned_latches() for the meaning of
 the numbers on edges.
+
+
+编号	含义	保护什么
+0	buf_page_get_mutex(&page) = block mutex	页级字段（io_fix/state/buf_fix_count 等）
+1	buf_pool->flush_state_mutex（buf0buf.h:2204）	刷脏批次状态：init_flush[]/n_flush[]/no_flush[]（:2298-2307，不是 flush_list 链表本身）
+2	io_responsibility.current_thread_is_responsible()	I/O 责任令牌（哪个线程正负责该页 I/O，非传统锁，供 io 完成线程免锁检查）
 
 +-----------+                       +------------+
 |BUF_IO_NONE|   --------0&&2----->  |BUF_IO_READ |

@@ -521,6 +521,8 @@ using Rsegs_array = std::array<trx_rseg_t *, N>;
 
 /** Rollback segments from a given transaction with trx-no
 scheduled for purge. */
+// 一个回滚段只可能属于一个事务，一个事务最多 2 Rsegs.
+// 因此这里 Rseg_array<2>
 class TrxUndoRsegs {
  public:
   explicit TrxUndoRsegs(trx_id_t trx_no) : m_trx_no(trx_no) {
@@ -577,7 +579,9 @@ class TrxUndoRsegs {
   @param lhs first element to compare
   @param rhs second element to compare
   @return true if elem1 > elem2 else false.*/
+  // 注意重载了 （） 运算符, 作为 pq 的比较器。 与默认max-heap 相反为min-heap
   bool operator()(const TrxUndoRsegs &lhs, const TrxUndoRsegs &rhs) {
+    // note: 反而是 trx no小顶堆
     return (lhs.m_trx_no > rhs.m_trx_no);
   }
 
@@ -610,5 +614,6 @@ struct TrxVersion {
   uint64_t m_version;
 };
 
+//  用于rb。 hit_list 是一个 回滚事务列表，存放当前阻塞高优先级事务的所有低优先级事务
 typedef std::vector<TrxVersion, ut::allocator<TrxVersion>> hit_list_t;
 #endif /* trx0types_h */

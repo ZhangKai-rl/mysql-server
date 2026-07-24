@@ -52,7 +52,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "my_dbug.h"
 
-/* Short introduction to query graphs
+/* XXXXXXXXXXX: Short introduction to query graphs
    ==================================
 
 A query graph consists of nodes linked to each other in various ways. The
@@ -286,6 +286,7 @@ que_thr_t *que_thr_end_lock_wait(trx_t *trx) /*!< in: transaction with que_state
 
   bool const was_active = thr->is_active;
 
+  // lock_wait -> running
   que_thr_move_to_run_state(thr);
 
   trx->lock.que_state = TRX_QUE_RUNNING;
@@ -725,6 +726,7 @@ static void que_thr_dec_refer_count(
   ut_ad(trx_mutex_own(trx));
 
   if (thr->state == QUE_THR_RUNNING) {
+    // NOTE: 调用 que_thr_stop  停止当前查询图线程
     if (!que_thr_stop(thr)) {
       ut_a(next_thr != nullptr && *next_thr == nullptr);
 
@@ -1033,6 +1035,7 @@ static void que_run_threads_low(que_thr_t *thr) /*!< in: query thread */
 
   trx = thr_get_trx(thr);
 
+  // 查询图循环
   do {
     /* Check that there is enough space in the log to accommodate
     possible log entries by this query step; if the operation can
@@ -1045,7 +1048,7 @@ static void que_run_threads_low(que_thr_t *thr) /*!< in: query thread */
     may change if, e.g., a subprocedure call is made */
 
     /*-------------------------*/
-    // XXXXXXXXXXXXXXXXXXX
+    // XXXXXXXX next_thr XXXXXXXXXXX
     next_thr = que_thr_step(thr);
     /*-------------------------*/
 
@@ -1053,12 +1056,14 @@ static void que_run_threads_low(que_thr_t *thr) /*!< in: query thread */
 
     ut_a(next_thr == nullptr || trx->error_state == DB_SUCCESS);
 
+    // 锁等待场景
     if (next_thr != thr) {
       ut_a(next_thr == nullptr);
 
       /* This can change next_thr to a non-NULL value
       if there was a lock wait that already completed. */
 
+      // 设置 thr_state
       que_thr_dec_refer_count(thr, &next_thr);
 
       if (next_thr != nullptr) {
@@ -1092,6 +1097,7 @@ loop:
       goto loop;
 
     case QUE_THR_LOCK_WAIT:
+    // 这里会实际挂起线程（不是协程）
       lock_wait_suspend_thread(thr);
 
       trx_mutex_enter(thr_get_trx(thr));

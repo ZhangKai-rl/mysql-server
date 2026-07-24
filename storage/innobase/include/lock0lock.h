@@ -963,7 +963,7 @@ void lock_trx_alloc_locks(trx_t *trx);
 /** @{ */
 /** mask used to extract mode from the  type_mode field in a lock. 最后4bit表示lockmode(IS, IX, S, X, AUTO_INC)*/
 constexpr uint32_t LOCK_MODE_MASK = 0xF;
-/** Lock types */
+/** NOTE: 两种Lock types, 区分lock mode */
 /** table lock */
 constexpr uint32_t LOCK_TABLE = 16;
 /** record lock */
@@ -976,6 +976,7 @@ static_assert((LOCK_MODE_MASK & LOCK_TYPE_MASK) == 0,
 
 /** Waiting lock flag; when set, it  means that the lock has not yet been
  granted, it is just waiting for its  turn in the wait queue */
+ // note: 如果设置了 → 这个 lock_t 是一个等待中的锁请求（还没被授予）
 constexpr uint32_t LOCK_WAIT = 256;
 /* Precise modes */
 /** this flag denotes an ordinary next-key lock in contrast to LOCK_GAP or
@@ -998,6 +999,7 @@ constexpr uint32_t LOCK_REC_NOT_GAP = 1024;
    conflicting locks by other transactions on the gap; note that this flag
    remains set when the waiting lock is granted, or if the lock is inherited to
    a neighboring record */
+   // 注意这个粒度是 行锁！声明"我要在这个 gap 里插入"
 constexpr uint32_t LOCK_INSERT_INTENTION = 2048;
 /** Predicate lock */
 constexpr uint32_t LOCK_PREDICATE = 8192;
@@ -1028,7 +1030,34 @@ struct lock_sys_t {
 
   /** The hash table of the record (LOCK_REC) locks, except for predicate
   (LOCK_PREDICATE) and predicate page (LOCK_PRDT_PAGE) locks */
+  /*
+    rec_hash[page_id]
+      └─ lock_t (A的锁, granted, heap_no bit=1)
+      └─ lock_t (B的锁, LOCK_WAIT, heap_no bit=1)
+            └─ lock->trx = trx_B
+                  └─ trx_B->lock.blocking_trx = trx_A     ← "我被A阻塞"
+                  └─ trx_B->lock.wait_thr = thr_B
+                        └─ thr_B->slot = srv_slot_t
+                              └─ slot->event = os_event_t  ← B 睡在这个 event 上
+  */
+  // note: see lock_t::hash for hash cell
+  /* 
+    桶 [hash(page_A)]
+    │
+    ├── lock_t (trx_X, IX锁了page_A的第3、5行)
+    │   ├── rec_lock.page_id = page_A
+    │   ├── rec_lock.n_bits = 108
+    │   ├── bitmap: ...00101000...  ← bit 3 和 bit 5 为 1
+    │   └── hash → 指向桶内下一个 lock
+    │
+    └── lock_t (trx_Y, S锁了page_A的第3行)
+        ├── rec_lock.page_id = page_A
+        ├── rec_lock.n_bits = 108
+        ├── bitmap: ...00100000...  ← 只有 bit 3 为 1
+        └── hash → nullptr（桶尾）
+  */
   hash_table_t *rec_hash;
+  // note: 没有 table_hash, tabke lock 不是以hash table 组织的而是使用链表组织locks
 
   /** The hash table of predicate (LOCK_PREDICATE) locks */
   hash_table_t *prdt_hash;
@@ -1045,7 +1074,7 @@ struct lock_sys_t {
 
   /** Array of user threads suspended while waiting for locks within InnoDB.
   Protected by the lock_sys->wait_mutex. */
-  // note
+  // note: 等待 睡眠的锁
   srv_slot_t *waiting_threads;
 
   /** The highest slot ever used in the waiting_threads array.

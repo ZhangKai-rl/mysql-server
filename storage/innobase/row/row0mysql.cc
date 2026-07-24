@@ -390,7 +390,9 @@ byte *row_mysql_store_col_in_innobase_format(
     note: row_format_col = true：数据来自 MySQL 行记录（Row Format）; row_format_col = false：数据来自 MySQL 索引键值（Key Format）
     VARCHAR 长度字段的存储方式不同
       Row Format：完整行记录，存储在table::record[0]. 长度字段可以是 1 字节或 2 字节（取决于列定义）
-      Key Format：索引键值，存储在buf。长度字段总是 2 字节
+      Key Format：索引键值，存储在buf。长度字段总是 2 字节, 搜：In a MySQL key value, lenlen is always 2
+Row Format：完整行记录，mysql_data 来自 table::record[0]，VARCHAR 长度字段可以是 1 字节或 2 字节（取决于列定义）
+Key Format：索引键值，mysql_data 来自索引键缓冲区，VARCHAR 长度字段总是 2 字节    
                              in MySQL, a true VARCHAR storage
                              format differs in a row and in a
                              key value: in a key value the length
@@ -423,6 +425,7 @@ byte *row_mysql_store_col_in_innobase_format(
     sign bit negated if the data is a signed integer. In MySQL,
     integers are stored in a little-endian format. */
 
+    // note: 存在buf中
     byte *p = buf + col_len;
 // note: DATA_INT类型，由mysql little-endian field format -> innodb  big-endian field format的转换逻辑，逐字节转换
     for (;;) {
@@ -435,6 +438,18 @@ byte *row_mysql_store_col_in_innobase_format(
     }
 
     if (!(dtype->prtype & DATA_UNSIGNED)) {
+      // XOR 0x80, 翻转最高byte 的最高bit, 注意只翻转了最高 byte 一个 byte
+      // QUES： 原理？ OFFSET BINARY / EXCESS-N ENCODING!!!!! 本质为补码的数轴平移到无符号空间
+      /**
+补码表示:     -2^31  ...  -1    0    1   ...  2^31-1
+最高位:         1          1    0    0          0
+
+XOR 0x80后:     0          0    1    1          1
+无符号值:       0   ...  0x7F  0x80 0x81 ... 0xFF...
+
+对应无符号大小:  最小 ←——————————————————————→ 最大
+
+       */
       *buf ^= 128;
     }
 
@@ -453,6 +468,7 @@ byte *row_mysql_store_col_in_innobase_format(
           lenlen = 1;
         }
       } else {
+        // NOTE
         /* In a MySQL key value, lenlen is always 2 */
         lenlen = 2;
       }
@@ -1248,6 +1264,7 @@ run_again:
 
   trx_start_if_not_started_xa(trx, false, UT_LOCATION_HERE);
 
+  // note
   err =
       lock_table(0, prebuilt->table,
                  static_cast<enum lock_mode>(prebuilt->select_lock_type), thr);
@@ -1259,6 +1276,7 @@ run_again:
 
     auto was_lock_wait = row_mysql_handle_errors(&err, trx, thr, nullptr);
 
+    // lock wait 时，直接去到下一个 query thread, 唤醒是根据事务来
     if (was_lock_wait) {
       goto run_again;
     }
@@ -4373,6 +4391,7 @@ dberr_t row_mysql_parallel_select_count_star(
   dberr_t err{DB_SUCCESS};
 
   for (auto index : indexes) {
+    // 划分子树的位置
     Parallel_reader::Config config(FULL_SCAN, index);
 
     err = reader.add_scan(trx, config, [&](const Parallel_reader::Ctx *ctx) {
@@ -4441,6 +4460,15 @@ static dberr_t parallel_check_table(trx_t *trx, dict_index_t *index,
   Parallel_reader::Config config(full_scan, index);
 
   auto err = reader.add_scan(trx, config, [&](const Parallel_reader::Ctx *ctx) {
+    // check table ctx cb 的具体实现。定义了check table 对每个record 做的处理。
+/**
+
+call: Parallel_reader::Ctx::traverse_recs, m_scan_ctx->m_f
+worker() → dequeue() → ctx->traverse()
+                          ↓ 对每条 rec
+                        callback(ctx)   ← ctx 中包含当前记录、block、thread_id 等
+
+ */
     const auto rec = ctx->m_rec;
     const auto block = ctx->m_block;
     const auto id = ctx->thread_id();
@@ -4517,6 +4545,7 @@ static dberr_t parallel_check_table(trx_t *trx, dict_index_t *index,
     prev_tuples.resize(n_threads);
     prev_blocks.resize(n_threads);
 
+    // XXXXX pread run
     err = reader.run(n_threads);
   }
 

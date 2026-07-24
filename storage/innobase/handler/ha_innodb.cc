@@ -9304,6 +9304,7 @@ static void innobase_get_multi_value_and_diff(
 
 /** Checks which fields have changed in a row and stores information
  of them to an update vector.
+  对于 multi-valued key, upd 时一般不需要更新所有的sec entry tuple, 因此计算diff, to set bitmap
  @return DB_SUCCESS or error code */
 static dberr_t calc_row_difference(
     upd_t *uvect,             /*!< in/out: update vector */
@@ -9782,6 +9783,7 @@ int ha_innobase::update_row(const uchar *old_row, uchar *new_row) {
     m_upd_buf_size =
         table->s->reclength + table->s->max_key_length + MAX_REF_PARTS * 3;
 
+    // NOTE: 生命周期
     m_upd_buf = reinterpret_cast<uchar *>(
         my_malloc(PSI_INSTRUMENT_ME, m_upd_buf_size, MYF(MY_WME)));
 
@@ -14153,6 +14155,7 @@ int innobase_basic_ddl::create_impl(THD *thd, const char *name, TABLE *form,
     goto cleanup;
   }
 
+  // 更新全局dd table: mysql.tables 中写入本表一行的dd::Table
   error = info.create_table_update_global_dd(dd_tab);
   if (error) {
     goto cleanup;
@@ -23508,6 +23511,7 @@ innobase_index_cond(ha_innobase *h) /*!< in/out: pointer to ha_innobase */
     return ICP_OUT_OF_RANGE;
   }
 
+  // note: handler 用了 sql 层的 Item
   return h->pushed_idx_cond->val_int() ? ICP_MATCH : ICP_NO_MATCH;
 }
 

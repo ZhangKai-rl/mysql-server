@@ -758,6 +758,7 @@ in a traditional Unix implementation. */
 struct srv_sys_t {
   ib_mutex_t tasks_mutex; /*!< variable protecting the
                           tasks queue */
+  // note: 全局的query thread 就绪队列
   UT_LIST_BASE_NODE_T(que_thr_t, queue)
   tasks; /*!< task queue */
 
@@ -2841,7 +2842,7 @@ static bool srv_task_execute(void) {
   return (thr != nullptr);
 }
 
-/** Worker thread that reads tasks from the work queue and executes them. */
+/* note: Worker thread that reads tasks from the work queue and executes them. */
 void srv_worker_thread() {
   srv_slot_t *slot;
 
@@ -3206,7 +3207,7 @@ void srv_que_task_enqueue_low(que_thr_t *thr) /*!< in: query thread */
   ut_ad(!srv_read_only_mode);
   mutex_enter(&srv_sys->tasks_mutex);
 
-  // note
+  // note: for srv worker in srv_sys
   UT_LIST_ADD_LAST(srv_sys->tasks, thr);
 
   mutex_exit(&srv_sys->tasks_mutex);

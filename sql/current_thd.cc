@@ -23,6 +23,7 @@
 
 #include "sql/current_thd.h"
 
+//  获取thd 的fast path
 thread_local THD *current_thd = nullptr;
 
 #if defined(_WIN32)

@@ -371,6 +371,15 @@ struct btr_pcur_t {
   the cursor id before the first in an EMPTY tree, or after the last
   in an EMPTY tree. NOTE that the page where the cursor is positioned
   must not be empty if the index tree is not totally empty!
+  // 保存 cursor 当前位置的逻辑快照，使得在释放 page latch 后仍能重新定位回来。
+   乐观快照机制保存，restore 时使用 m_modify_lock 判断
+
+保存字段	恢复时用途
+m_block_when_stored	乐观恢复：直接访问这个 block 指针，不走 B-tree 搜索
+m_modify_clock	乐观判断：如果 clock 没变，说明页面内容未被修改，直接用 offset 定位
+m_old_rec（key 副本）	悲观恢复：如果 clock 变了（页面被修改/淘汰），用 key 从 root 重新搜索定位
+m_rel_pos	恢复后微调：如果是 BEFORE/AFTER，需要 move_to_next/prev 调整到正确位置
+
   @param[in,out]        mtr                   Mini-transaction. */
   void store_position(mtr_t *mtr);
 

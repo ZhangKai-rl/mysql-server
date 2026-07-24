@@ -868,6 +868,7 @@ class MDL_request {
   }
 
   /** Is this a request for a strong, DDL/LOCK TABLES-type, of lock? */
+  // https://developer.aliyun.com/article/41137 : 判断是否是一个强优先级的，例如DDL, LOCK TABLE之类的请求 type   >= MDL_SHARED_UPGRADABLE;
   bool is_ddl_or_lock_tables_lock_request() const {
     return type >= MDL_SHARED_UPGRADABLE;
   }

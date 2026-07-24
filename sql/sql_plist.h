@@ -194,6 +194,7 @@ class I_P_List_iterator {
   of T should be used for participating in a intrusive list.
 */
 
+// 这里也用了非类型模板参数： ** 成员指针 ** ， 见 ut0lst.h
 template <typename T, T *T::*next, T **T::*prev>
 struct I_P_List_adapter {
   static inline T **next_ptr(T *el) { return &(el->*next); }

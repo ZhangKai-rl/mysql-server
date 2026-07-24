@@ -62,6 +62,7 @@ static_assert(sizeof(std::atomic<void *>) == sizeof(void *),
       allocated by another thread. If we're unlucky that other thread may
       set PTR to point to this object again. This is ABA problem.
    2. Create a local pointer LOCAL_PTR.
+   // NOTE:  核心协议解决 ABA 问题
    3. Pin the PTR in a loop:
       do
       {
@@ -176,6 +177,7 @@ LF_PINS *lf_pinbox_get_pins(LF_PINBOX *pinbox) {
     incremented). Versioning prevents the ABA problem.
   */
   top_ver = pinbox->pinstack_top_ver;
+  // do while 解决 ABA 问题
   do {
     if (!(pins = top_ver % LF_PINBOX_MAX_PINS)) {
       /* the stack of free elements is empty */

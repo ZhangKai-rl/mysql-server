@@ -3091,7 +3091,8 @@ bool row_sel_store_mysql_rec(byte *mysql_rec, row_prebuilt_t *prebuilt,
 }
 
 /** Helper class to cache clust_rec and old_ver */
-// 二级索引的回表操作, 见： https://iwiki.woa.com/p/4015184929?from=iWiki_search#%E4%B8%80%E4%BA%9B%E7%96%91%E9%97%AE
+// 二级索引的回表操作, 见： que_thr_t 内部查询图分析
+// 对比 Row_sel_get_clust_rec_for_mysql Functor 和 row_sel_get_clust_rec 函数的区别
 class Row_sel_get_clust_rec_for_mysql {
   const rec_t *cached_clust_rec;
   rec_t *cached_old_vers;
@@ -4413,7 +4414,10 @@ so it employs technique that can help re-construct the rows that
 transaction is suppose to see.
 It also has optimization such as pre-caching the rows, using AHI, etc.
 
+QUES: search 的 cursor 的范围是多少？
+
 @param[out]     buf             buffer for the fetched row in MySQL format
+每次调用只读取一行，放到buf 中
 @param[in]      mode            search mode PAGE_CUR_L
 @param[in,out]  prebuilt        prebuilt struct for the table handler;
                                 this contains the info to search_tuple,
@@ -4432,6 +4436,8 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
                         const ulint direction) {
   DBUG_TRACE;
 
+  // NOTE: search cursor range
+  // QUES: where to set?
   ib::morphy_info() << "[MORPHY] search_tuple is: " << (*prebuilt->search_tuple);
   ib::morphy_info() << "[MORPHY] m_stop_tuple is: " << (*prebuilt->m_stop_tuple);
 

@@ -3350,6 +3350,7 @@ automatically when the hash table becomes full.
 @param[out]  read_upto_lsn  scanning succeeded up to this lsn
 @return true if not able to scan any more in this log */
 #ifndef UNIV_HOTBACKUP
+// TODO
 static bool recv_scan_log_recs(log_t &log,
 #else  /* !UNIV_HOTBACKUP */
 bool meb_scan_log_recs(

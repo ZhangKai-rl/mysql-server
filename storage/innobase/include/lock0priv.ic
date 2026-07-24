@@ -84,6 +84,7 @@ static inline void lock_rec_set_nth_bit(lock_t *lock, /*!< in: record lock */
 }
 
 /** Gets the first or next record lock on a page.
+// 如果不为空，说明有其他事务也在请求这个页面上的行锁
  @return        next lock, NULL if none exists */
 static inline lock_t *lock_rec_get_next_on_page(
     lock_t *lock) /*!< in: a record lock */

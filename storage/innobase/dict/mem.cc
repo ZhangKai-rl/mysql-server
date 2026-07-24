@@ -209,6 +209,7 @@ dict_table_t *dict_mem_table_create(const char *name, space_id_t space,
 
   ut_d(table->magic_n = DICT_TABLE_MAGIC_N);
 
+  // ques: table->id 呢？
   table->flags = (unsigned int)flags;
   table->flags2 = (unsigned int)flags2;
   table->name.m_name = mem_strdup(name);

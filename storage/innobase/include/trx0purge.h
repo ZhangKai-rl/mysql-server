@@ -985,6 +985,7 @@ class Truncate {
 /** The control structure used in the purge operation */
 struct trx_purge_t {
   /** System session running the purge query */
+  // usr0sess
   sess_t *sess;
 
   /** System transaction running the purge query: this trx is not in the trx
@@ -1014,6 +1015,7 @@ struct trx_purge_t {
   /** The query graph which will do the parallelized purge operation */
   // que_fork_t
   /* note
+     xxxx
       que_fork_t(type=que_node_fork, fork_type=que_fork_purge)
                  /                                \
           que_thr_t(type=que_node_thr)         que_thr_t(type=que_node_thr)
@@ -1025,6 +1027,7 @@ struct trx_purge_t {
 
   /** The purge will not remove undo logs which are >= this view (purge view) */
   // ques: 看着是在truncate(处理undo rec而不是purge user rec)的时候起作用
+  // 控制purge的readview，每次purge开始前调用clone_oldest_view进行赋值
   ReadView view;
 
   /** true if view is active */
@@ -1050,6 +1053,7 @@ struct trx_purge_t {
   /** Limit up to which we have read and parsed the UNDO log records.  Not
   necessarily purged from the indexes.  Note that this can never be less than
   the limit below, we check for this invariant in trx0purge.cc */
+  // 当前进行purge的TrxUndoRsegs的迭代器
   purge_iter_t iter;
 
   /** The 'purge pointer' which advances during a purge, and which is used in
@@ -1068,20 +1072,24 @@ struct trx_purge_t {
 
   /** Rollback segment for the next undo record to purge */
   // TrxUndoRsegsIterator::set_next()
+  // 下一个需要被purge的undo log的回滚段
   trx_rseg_t *rseg;
 
   /** Page number for the next undo record to purge, page number of the log
   header, if dummy record */
+  // 下一个需要被purge的undo log的log header所在页面
   page_no_t page_no;
 
   /** Page offset for the next undo record to purge, 0 if the dummy record */
+  // 下一个需要被purge的undo log的页面偏移
   ulint offset;
 
   /** Header page of the undo log where the next record to purge belongs */
+  // 下一个需要被purge的undo log的undo header所在页面
   page_no_t hdr_page_no;
 
   /** Header byte offset on the page */
-  // ques: 待确定
+  // 下一个需要被purge的undo log的undo header页面偏移
   ulint hdr_offset;
 
   /** Iterator to get the next rseg to process */
@@ -1090,7 +1098,7 @@ struct trx_purge_t {
 
   /** Binary min-heap, ordered on TrxUndoRsegs::trx_no. It is protected
   by the pq_mutex */
-  // ques: 待purge的undo段? 具体是undo段还是回滚段？ 应该是回滚段, 通过回滚段再去索引undo段(undo page list).
+  // 待purge的 事务回滚段pg。按照事务号从老到新进行purge
   purge_pq_t *purge_queue;
 
   /** Mutex protecting purge_queue */

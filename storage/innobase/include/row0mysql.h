@@ -428,6 +428,7 @@ dberr_t row_mysql_parallel_select_count_star(
     ulint *n_rows);
 
 /** Scans an index for either COUNT(*) or CHECK TABLE.
+NOTE: only for select count(*) or check table.
 If CHECK TABLE; Checks that the index contains entries in an ascending order,
 unique constraint is not broken, and calculates the number of index entries
 in the read view of the current transaction.
@@ -680,7 +681,8 @@ struct row_prebuilt_t {
   // create in: pars_complete_graph_for_exec
   que_fork_t *sel_graph;  /*!< dummy query graph used in
                           selects */
-  // 见 ha_innobase::change_active_index -> init_search_tuple_types
+  // NOTE: set: 见 ha_innobase::change_active_index -> init_search_tuple_types
+  // optimizer(start_key, end_key) --convert_mysql_key_to_innobase--> innodb(search_tuple, m_stop_tuple)
   // note: 这个就是 search tuple，如 select * from t where a = 1, 保存这个 a=1 这个 search tuple
   // 比如在 show databases; 时，会检索 mysql.tables dd table, 同时走索引 schema_id(UNIQUE KEY `schema_id` (`schema_id`,`name`)); 此处的  n_fields = 2; n_fields_cmp = 2
   dtuple_t *search_tuple; /*!< prebuilt dtuple used in selects */

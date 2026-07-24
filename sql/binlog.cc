@@ -8387,7 +8387,7 @@ void MYSQL_BIN_LOG::init_thd_variables(THD *thd, bool all, bool skip_commit) {
     - Everything in the transaction structure is reset when calling
       ha_commit_low since that calls Transaction_ctx::cleanup.
   */
-  // note: 进入 bgc ordered_commit 了， follower会根据这个 cond_wait
+  // xxxx: 进入 bgc ordered_commit 了， follower会根据这个 cond_wait. bgc的核心flag, 见enroll_for
   thd->tx_commit_pending = true;
   thd->commit_error = THD::CE_NONE;
   thd->next_to_commit = nullptr;
@@ -8434,7 +8434,8 @@ THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
 
   if (!check_and_skip_flush_logs ||
       (check_and_skip_flush_logs && commit_order_thd != nullptr)) {
-    // TODO: leader如何做到帮忙把followers的redo一起flush的？是log_write_up_to（到最新lsn）的作用
+    // leader如何做到帮忙把followers的redo一起flush的？是log_write_up_to（到最新lsn）的作用
+    // leader如何做到帮忙把followers的binlog cache(thd->ha_data[i])一起flush的？
     /*
       We flush prepared records of transactions to the log of storage
       engine (for example, InnoDB redo log) in a group right before
@@ -8469,6 +8470,7 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
   CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_write_binlog");
   assign_automatic_gtids_to_flush_group(first_seen);
   /* Flush thread caches to binary log. */
+  // note: leader 负责处理此group,  串行 flush_thread_cache.
   for (THD *head = first_seen; head; head = head->next_to_commit) {
     Thd_backup_and_restore switch_thd(current_thd, head);
     const auto [error, flushed_bytes] = flush_thread_caches(head);
@@ -8559,6 +8561,7 @@ void MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first) {
   */
   gtid_state->update_commit_group(first);
 
+  // 串行处理followers
   for (THD *head = first; head; head = head->next_to_commit) {
     Thd_backup_and_restore switch_thd(thd, head);
     auto all = head->get_transaction()->m_flags.real_commit;
@@ -8623,7 +8626,7 @@ bool MYSQL_BIN_LOG::change_stage(THD *thd [[maybe_unused]],
     enroll_for will release the leave_mutex once the sessions are
     queued.
   */
-  // note
+  // note: leader选举
   if (!Commit_stage_manager::get_instance().enroll_for(
           stage, queue, leave_mutex, enter_mutex)) {
     assert(!thd_get_cache_mngr(thd)->dbug_any_finalized());
@@ -8711,6 +8714,7 @@ int MYSQL_BIN_LOG::finish_commit(THD *thd) {
 
   if (thd->get_transaction()->sequence_number != SEQ_UNINIT) {
     mysql_mutex_lock(&LOCK_replica_trans_dep_tracker);
+    // note: 每个事物提交后更新
     m_dependency_tracker.update_max_committed(thd);
     mysql_mutex_unlock(&LOCK_replica_trans_dep_tracker);
   }
@@ -8847,8 +8851,6 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
   }
 }
 
-// http://mysql.taobao.org/monthly/2020/05/07/
-// TODO
 int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   DBUG_TRACE;
   int flush_error = 0, sync_error = 0;
@@ -8909,7 +8911,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   */
 
   if (change_stage(thd, Commit_stage_manager::BINLOG_FLUSH_STAGE, thd, nullptr,
-                  /* enter_mutex */
+                  /* note: enter_mutex */
                    &LOCK_log)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                           thd->commit_error));
@@ -9004,6 +9006,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
 
   if (flush_error == 0 && total_bytes > 0) {
     DEBUG_SYNC(thd, "before_sync_binlog_file");
+    // note: sync stage func
     std::pair<bool, bool> result = sync_binlog_file(false);
     sync_error = result.first;
   }
@@ -9013,6 +9016,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     const char *binlog_file = nullptr;
     my_off_t pos = 0;
 
+    // note
     while (tmp_thd != nullptr) {
       if (tmp_thd->commit_error == THD::CE_NONE) {
         tmp_thd->get_trans_fixed_pos(&binlog_file, &pos);

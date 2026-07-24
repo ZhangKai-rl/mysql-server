@@ -61,6 +61,7 @@ enum hash_table_sync_t {
 struct hash_cell_t {
   // hash table的cell链
   // 实际的node, 如page_hash的 buf_page_t
+  // 也就是说，node 要有 next/hash 成员的
   void *node; /*!< hash chain node, NULL if none */
 };
 
@@ -90,6 +91,7 @@ static inline hash_cell_t *hash_get_nth_cell(hash_table_t *table, size_t n);
 /** Inserts a struct to a hash table. */
 
 /* note: else为当前hash cell有冲突, 获取当前cell的node(第一个node), 通过该node->name遍历到下一个node，直到为空，将新node链接到上个node->name上 */
+// cell->node. 如 page_hash，用的buf_block_t::page
 /* hash表的插入，cell发生hash collision时链地址法进行解决 */
 /* @param[in] NAME hash cell的node的下一个链地址法node指针 */
 #define HASH_INSERT(TYPE, NAME, TABLE, HASH_VALUE, DATA)                    \
@@ -98,7 +100,7 @@ static inline hash_cell_t *hash_get_nth_cell(hash_table_t *table, size_t n);
     TYPE *struct3333;                                                       \
     const uint64_t hash_value3333 = HASH_VALUE;                             \
                                                                             \
-    /* 确保持有hash table 的 x rwlock */                                        \
+    /* 确保持有hash table 的 x rwlock */                                      \
     hash_assert_can_modify(TABLE, hash_value3333);                          \
                                                                             \
     (DATA)->NAME = NULL;                                                    \
@@ -470,6 +472,7 @@ class hash_table_t {
   - modified when holding X-latches on all n_sync_obj
   - read when holding an S-latch for at least one n_sync_obj
   */
+  // XXXXXXXXXXX 桶！
   ut::unique_ptr<hash_cell_t[]> cells;
 #ifndef UNIV_HOTBACKUP
   /** if rw_locks != nullptr, then it's their number (must be a power of two).

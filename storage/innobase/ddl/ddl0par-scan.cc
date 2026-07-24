@@ -322,6 +322,9 @@ dberr_t Parallel_cursor::scan(Builders &builders) noexcept {
     return DB_ERROR;
   });
 
+  
+  // NOTE: 下边才准备开始并行
+
   Parallel_reader::Config config(FULL_SCAN, index());
 
   /* Called for each row during the scan. */
@@ -371,6 +374,7 @@ dberr_t Parallel_cursor::scan(Builders &builders) noexcept {
       });
 
   if (err == DB_SUCCESS) {
+    // parallel read
     err = reader.run(n_threads);
 
     if (err == DB_OUT_OF_RESOURCES) {

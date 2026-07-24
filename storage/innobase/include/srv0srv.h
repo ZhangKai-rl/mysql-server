@@ -962,6 +962,7 @@ extern ulong srv_debug_compress;
 /** Types of threads existing in the system. */
 enum srv_thread_type {
   SRV_NONE,   /*!< None */
+  // for query worker
   SRV_WORKER, /*!< threads serving parallelized
               queries and queries released from
               lock wait */
@@ -1225,6 +1226,7 @@ struct export_var_t {
 
 #ifndef UNIV_HOTBACKUP
 /** Thread slot in the thread table.  */
+// 注意区分下 sync_array_t
 struct srv_slot_t {
   /** Thread type: user, utility etc. */
   srv_thread_type type;
@@ -1247,6 +1249,7 @@ struct srv_slot_t {
   This can be used to determine if the wait was unfairly long, and it is time to
   boost trx->lock.schedule_weight.
   Protected by lock->wait_mutex. */
+  // ABA version.
   uint64_t reservation_no;
 
   /** Wait time that if exceeded the thread will be timed out.
@@ -1257,6 +1260,7 @@ struct srv_slot_t {
   os_event_t event;
 
   /** Suspended query thread (only used for user threads). */
+  // 在等待/挂起的 que_thr_t
   que_thr_t *thr;
 };
 #endif /* !UNIV_HOTBACKUP */

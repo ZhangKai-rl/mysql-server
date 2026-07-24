@@ -38,6 +38,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** The byte offsets on a file page for various variables. */
 
+// note: file header: from 0 to 37
+
 /** MySQL-4.0.14 space id the page belongs to (== 0) but in later
 versions the 'new' checksum of the page */
 constexpr uint32_t FIL_PAGE_SPACE_OR_CHKSUM = 0;

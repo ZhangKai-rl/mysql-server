@@ -162,6 +162,7 @@ void Gtid_state::update_commit_group(THD *first_thd) {
     session.
   */
   DEBUG_SYNC(first_thd, "update_gtid_state_before_global_sid_lock");
+  // note: sid lock
   global_sid_lock->rdlock();
   DEBUG_SYNC(first_thd, "update_gtid_state_after_global_sid_lock");
 
@@ -409,6 +410,7 @@ bool Gtid_state::wait_for_gtid_set(THD *thd, Gtid_set *wait_for, double timeout,
   return false;
 }
 
+// 在 executed_gtids 的区间间隙中，找一个未被 owned_gtids 占用的 GNO。
 rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const {
   DBUG_TRACE;
   assert_sidno_lock_owner(sidno);

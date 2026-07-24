@@ -1443,7 +1443,7 @@ struct TABLE {
   /// Count of hidden fields, if internal temporary table; 0 otherwise.
   uint hidden_field_count{0};
 
-  // 不包含 vcol, 但是包含 scol. 存储到 se 的 row data.
+  // note:不包含 vcol, 但是包含 scol. 存储到 se 的 row data.
   uchar *record[2]{nullptr, nullptr}; /* Pointer to records. mysql format的行数据 */
   uchar *write_row_record{nullptr};   /* Used as optimisation in
                                  THD::write_row */

@@ -3965,6 +3965,7 @@ struct LEX : public Query_tables_list {
 
   List<LEX_USER> users_list;
   List<LEX_COLUMN> columns;
+  // 什么是动态权限？ 比如connection_admin?
   List<LEX_CSTRING> dynamic_privileges;
   List<LEX_USER> *default_roles;
 

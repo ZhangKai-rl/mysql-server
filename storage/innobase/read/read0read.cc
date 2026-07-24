@@ -134,6 +134,7 @@ in the view. If this is not true we build based on undo_rec previous
 version of the record. This record is found because purge can't remove
 records accessed by active transaction. Thus we see correct version. Q. E. D.
 -------------------------------------------------------------------------------
+NOTE: 选取 purge_sys->view->low_limit_no 作为 purge 边界的原因
 FACT C: Purge does not remove any delete-marked row that is visible
 -------
 in any cursor read view.
@@ -552,26 +553,47 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
     这段注释指出了 AC-NL-RO 事务的 Fast Path 复用 与 Purge 线程 之间存在固有的竞态条件。*/
     // ques: 如何理解这个race condition with purge thread?
     /*
-        时间线    AC-NL-RO 线程                    Purge 线程
-        ------    ----------------                 ------------
-        T1        view->m_closed = false          
-        T2        检查 m_low_limit_id              
-        T3        发现不匹配，需要回滚             
-        T4                                         trx_sys_mutex_enter()
-        T5                                         get_oldest_view()
-        T6                                         看到 m_closed = false ✅
-        T7                                         copy_prepare(*view)
-        T8        view->m_closed = true (回滚)    
-        T9                                         使用了即将失效的 view
+      时间    AC-NL-RO 线程                      Purge 线程
+      ----    ----------------------              ----------------------
+      T1      m_closed = false（无锁）
+                        ↓ 此时 view 的 m_low_limit_id 是上次的旧值
+      T2      检查 m_low_limit_id ==
+              trx_sys_get_next_trx_id_or_no()
+      T3      不匹配（有新 RW 事务产生），准备回滚
+      T4                                        trx_sys_mutex_enter()
+      T5                                        get_oldest_view()
+      T6                                        看到 m_closed==false → 选中此 view
+      T7                                        copy_prepare(*view)
+                                                → 拷贝了过时的 m_low_limit_id / m_low_limit_no
+                                                trx_sys_mutex_exit()
+      T8      m_closed = true（回滚）
+      T9                                        用过时的 view 作为 purge_sys->view
 
-      后果：
+
+      后果： bug# 117553
         Purge 使用的 m_low_limit_no 可能过于保守
         本应该清理的 undo log 被保留了
         先设置为closed然后再检查，可能回退。后果可控，可能有些undo log没被清理
+
+        MVCC::view_open fast path 无锁设置 m_closed=false
+                            ↓
+        purge clone_oldest_view 拷贝到中间状态的 view（过时的 m_low_limit_id）
+                            ↓
+        purge_sys->view 回退（m_low_limit_no 变小）
+                            ↓
+         这里是关键，上个purge view 已经将事务判死因此truncate 掉了undo，但是这里回退了 错判missing_history
+        changes_visible 对已 purge 的事务误判为"不可见"（missing_history=false）
+                            ↓
+        代码尝试读取已被 purge 的 undo page
+                            ↓
+        CRASH
+
     */
 
     if (trx_is_autocommit_non_locking(trx) && view->empty()) {
       // 注意这里没持有 trx_sys_t::mutex
+      // note: 这是社区对单语句自动提交只读事务 AC-NL-RO 的一个优化 fast path view
+      // 为什么要做这个优化，收益有多大？造成了什么问题？
       view->m_closed = false;
 
       if (view->m_low_limit_id == trx_sys_get_next_trx_id_or_no()) {

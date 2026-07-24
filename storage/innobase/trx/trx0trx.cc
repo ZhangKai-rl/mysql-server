@@ -1990,7 +1990,7 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialised) {
   lock_trx_release_locks(trx);
 }
 
-/** Commits a transaction in memory. */
+/** NOTE: 内存提交(对外可见)！2PL 放锁过程 Commits a transaction in memory. */
 static void trx_commit_in_memory(
     trx_t *trx,       /*!< in/out: transaction */
     const mtr_t *mtr, /*!< in: mini-transaction of
@@ -2041,6 +2041,7 @@ written */
     trx->state.store(TRX_STATE_NOT_STARTED, std::memory_order_relaxed);
 
   } else {
+    // 2PL shrinking
     trx_release_impl_and_expl_locks(trx, serialised);
 
     /* Removed the transaction from the list of active transactions.
@@ -2970,6 +2971,7 @@ bool trx_weight_ge(const trx_t *a, /*!< in: transaction to be compared */
 }
 
 /** Prepares a transaction for given rollback segment.
+ *  实际为转换undo state: TRX_UNDO_ACTIVE -> TRX_UNDO_PREPARED
  @return lsn_t: lsn assigned for commit of scheduled rollback segment */
 static lsn_t trx_prepare_low(
     trx_t *trx,               /*!< in/out: transaction */
@@ -3032,6 +3034,7 @@ bool trx_is_mysql_xa(const trx_t *trx) {
 }
 
 /** Prepares a transaction.
+ *  undo state + trx state -> prepared
 @param[in]     trx the transction to prepare. */
 static void trx_prepare(trx_t *trx) {
   ut_ad(trx_can_be_handled_by_current_thread_or_is_hp_victim(trx));
@@ -3070,6 +3073,7 @@ static void trx_prepare(trx_t *trx) {
 
   /* Release read locks after PREPARE for READ COMMITTED
   and lower isolation. */
+  // QUES??
   if (trx->releases_gap_locks_at_prepare()) {
     /* Stop inheriting GAP locks. */
     trx->skip_lock_inheritance = true;
@@ -3513,6 +3517,7 @@ void trx_kill_blocking(trx_t *trx) {
   if (!trx_is_high_priority(trx)) {
     return;
   }
+  // 这是什么？
   hit_list_t hit_list;
   lock_make_trx_hit_list(trx, hit_list);
   if (hit_list.empty()) {

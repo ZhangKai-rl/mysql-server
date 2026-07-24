@@ -86,12 +86,17 @@ struct lock_rec_t {
   /** The id of the page on which records referenced by this lock's bitmap are
   located. */
   page_id_t page_id;
+  
+  // ques: 为什么没有 ut_list_node_t<lock_t> locks;
+  // 因为表锁数量少，所以可以用链表, 但是行锁大量，因此 用 hash table.
+
   /** number of bits in the lock bitmap;
   Must be divisible by 8.
   NOTE: the lock bitmap is placed immediately after the lock struct */
   // xxxx: 位图	紧跟在结构体(lock_t而不是lock_rec_t，见RecLock::create)后面的内存区域
   // 假设一个页面有 100 条记录
   // n_bits = 100 + LOCK_PAGE_BITMAP_MARGIN (8) = 108
+  // gap rec lock 锁的是记录前面的 gap。
   uint32_t n_bits;
 
   /** Print the record lock into the given output stream
@@ -140,6 +145,8 @@ static inline bool lock_rec_get_nth_bit(const lock_t *lock, ulint i);
 /** Lock struct; protected by lock_sys latches */
 // lock_t ib_lock_t
 // note: 具体的内部实现可能是 union: table_lock/RecLock
+// 注意这里有两个链表的： 1. lock_t::trx_locks 链表 2. lock_table_t::locks 链表
+// 注意这不是全局锁，类似mdl_request, 而不是mdl_lock 全局
 struct lock_t {
   /** transaction owning the lock */
   trx_t *trx;
@@ -152,6 +159,7 @@ struct lock_t {
 
   /** Hash chain node for a record lock. The link node in a singly
   linked list, used by the hash table. */
+  // note:  侵入式cell chain only for lock_rec_t!
   lock_t *hash;
 
   union {
@@ -174,7 +182,24 @@ struct lock_t {
 
   /** The lock type and mode bit flags.
   LOCK_GAP or LOCK_REC_NOT_GAP, LOCK_INSERT_INTENTION, wait flag, ORed */
-  // note: https://iwiki.woa.com/p/4014532215#%E5%8A%A0%E9%94%81%E6%A8%A1%E5%BC%8F%E5%8F%8A%E5%8A%A0%E9%94%81%E6%B5%81%E7%A8%8B
+  // note: 
+  /*
+    | bit  | 常量 | 值 | 含义 |
+    |------|------|-----|------|
+    | 31-15 | — | 0 | 保留 |
+    | **14** | `LOCK_PRDT_PAGE` | 16384 | 谓词页锁 |
+    | **13** | `LOCK_PREDICATE` | 8192 | 谓词锁 |
+    | 12 | — | — | 保留 |
+    | **11** | `LOCK_INSERT_INTENTION` | 2048 | 插入意向锁 |
+    | **10** | `LOCK_REC_NOT_GAP` | 1024 | 仅锁记录（非间隙） |
+    | **9** | `LOCK_GAP` | 512 | 只锁间隙 |
+    | **8** | `LOCK_WAIT` | 256 | 等待中（未授予） |
+    | 7 | — | — | 保留 |
+    | 6 | — | — | 保留 |
+    | **5** | `LOCK_REC` | 32 | 记录锁类型 |
+    | **4** | `LOCK_TABLE` | 16 | 表锁类型 |
+    | **3-0** | `LOCK_MODE_MASK` | 0xF | 锁模式：IS=0, IX=1, S=2, X=3, AUTO_INC=4 |
+  */
   uint32_t type_mode;
 
 #if defined(UNIV_DEBUG)
@@ -263,6 +288,7 @@ struct lock_t {
 };
 
 // ut_list_base_Node_t_extern 链表基节点的 Node_getter定义
+// note: lock_t::trx_locks
 UT_LIST_NODE_GETTER_DEFINITION(lock_t, trx_locks)
 
 /** Convert the member 'type_mode' into a human readable string.
@@ -552,7 +578,17 @@ waiting, in its lock queue. Solution: We can copy the locks as gap type
 locks, so that also the waiting locks are transformed to granted gap type
 locks on the inserted record. */
 
-/* LOCK COMPATIBILITY MATRIX
+
+// XXXXXXX
+/*
+  请求 ↓ / 已有 →	GAP X	REC_NOT_GAP X	INSERT INT X	ORDINARY (next-key) X
+  GAP X	✅	✅	✅	❌
+  REC_NOT_GAP X	✅	❌	❌	❌
+  INSERT INTENT X	✅	❌	✅	❌
+  ORDINARY X	❌	❌	❌	❌
+*/
+
+/*  XXXXXXXXX : LOCK COMPATIBILITY MATRIX
     IS IX S  X  AI
  IS +    +  +  -  +
  IX +    +  -  -  +
@@ -575,7 +611,7 @@ static const byte lock_compatibility_matrix[5][5] = {
     /* X  */ {false, false, false, false, false},
     /* AI */ {true, true, false, false, false}};
 
-/* STRONGER-OR-EQUAL RELATION (mode1=row, mode2=column)
+/* note: 锁强度矩阵 STRONGER-OR-EQUAL RELATION (mode1=row, mode2=column)
     IS IX S  X  AI
  IS +  -  -  -  -
  IX +  +  -  -  -
@@ -583,6 +619,9 @@ static const byte lock_compatibility_matrix[5][5] = {
  X  +  +  +  +  +
  AI -  -  -  -  +
  See lock_mode_stronger_or_eq().
+ X > S > IX > IS
+    X > AI（X 最强，覆盖一切）
+    AI 只 ≥ AI（AUTO_INC 很特殊，只和自己等价）
  */
 static const byte lock_strength_matrix[5][5] = {
     /**         IS     IX       S     X       AI */
@@ -733,6 +772,7 @@ class RecLock {
   }
 
   /**
+  https://leviathan.vip/2020/02/02/mysql-deadlock-check/
   Enqueue a lock wait for a transaction. If it is a high priority transaction
   (cannot rollback) then try to jump ahead in the record lock wait queue. Also
   check if async rollback was request for our trx.

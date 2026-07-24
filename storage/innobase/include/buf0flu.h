@@ -265,7 +265,16 @@ bool buf_are_flush_lists_empty_validate();
 create index(btr0load.cc).Since we disable redo logging during a index build,
 we need to make sure that all dirty pages modified by the index build are
 flushed to disk before any redo logged operations go to the index. */
-
+/**
+    Flush_observer 是 InnoDB 为 DDL 批量操作（如建索引、表重建）设计的优化机制。
+    作用
+    DDL 批量写入大量脏页时，不走正常的 redo log + checkpoint 路径，而是：
+    跳过 redo log：批量加载的页面用 mtr.set_log_mode(MTR_LOG_NO_REDO) 不写 redo
+    Flush_observer 跟踪这些脏页：记录哪些页面被修改了
+    DDL 结束时调用 observer->flush()：把所有跟踪到的脏页强制刷盘
+    刷完后 DDL 才算完成：此时数据已持久化，不需要 redo 来保证 crash recovery
+ */
+// 见 ddl::Context::cleanup
 class Flush_observer {
  public:
   /** Constructor

@@ -1876,6 +1876,7 @@ page_t *trx_undo_set_state_at_prepare(trx_t *trx, trx_undo_t *undo,
   }
 
   ut_ad(undo->state == TRX_UNDO_ACTIVE);
+  // XXXXXXXXX: 设置undo state为TRX_UNDO_PREPARED
   undo->set_prepared(trx->xid);
 
   mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, undo->state, MLOG_2BYTES, mtr);

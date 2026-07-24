@@ -60,8 +60,9 @@ enum class Page_fetch {
   NORMAL,
 
   /** Same as NORMAL, but hint that the fetch is part of a large scan.
-  Try not to flood the buffer pool with pages that may not be accessed again
+  Try not to flood(污染) the buffer pool with pages that may not be accessed again
   any time soon. */
+  // 如 check table
   SCAN,
 
   /** get if in pool */
@@ -1544,7 +1545,7 @@ class buf_page_t {
   /** @} */
 #ifndef UNIV_HOTBACKUP
   /** Node used in chaining to buf_pool->page_hash or buf_pool->zip_hash */
-  // note: hash_table_t -> hash_cell_t -> node的实现. 侵入式链地址法
+  // note: hash_table_t -> hash_cell_t -> node的实现. 侵入式链地址法. buf_page_t* buf_page_t::hash 是链表的next ptr.
   buf_page_t *hash;
 #endif /* !UNIV_HOTBACKUP */
 
@@ -2246,6 +2247,7 @@ struct buf_pool_t {
   /** Hash table of buf_page_t or buf_block_t file pages, buf_page_in_file() ==
   true, indexed by (space_id, offset).  page_hash is protected by an array of
   mutexes. */
+  // note
   hash_table_t *page_hash;
 
   /** Hash table of buf_block_t blocks whose frames are allocated to the zip

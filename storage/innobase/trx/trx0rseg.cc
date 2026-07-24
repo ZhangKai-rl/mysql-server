@@ -341,6 +341,7 @@ page_no_t trx_rseg_get_page_no(space_id_t space_id, ulint rseg_id) {
 /** Thread to initialize rollback segments in parallel.
 @param[in]      arg             purge queue
 @param[in]      gtid_trx_no     GTID to be set in the rollback segment */
+// note: 启动时并行扫描所有回滚段的 history list，构建 purge queue，让 purge 线程启动后能立即开始清理崩溃前未完成的事务
 void trx_rseg_init_thread(void *arg, trx_id_t gtid_trx_no) {
   trx_rseg_t *rseg = nullptr;
   purge_pq_t *purge_queue = (purge_pq_t *)arg;
@@ -576,6 +577,7 @@ void trx_rsegs_parallel_init(purge_pq_t *purge_queue) /*!< in: rseg queue */
 
   mtr.commit();
 
+  //  和 gtid 什么关系？
   auto &gtid_persistor = clone_sys->get_gtid_persistor();
   gtid_persistor.set_oldest_trx_no_recovery(gtid_trx_no);
 

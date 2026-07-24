@@ -77,11 +77,16 @@ struct LF_PINBOX {
   lf_pinbox_free_func *free_func;
   void *free_func_arg;
   uint free_ptr_offset;
+  /*
+    |------- 高 16 位 -------|------- 低 16 位 -------|
+    |      version (版本)     |    index (数组索引)     |
+  */
   std::atomic<uint32> pinstack_top_ver; /* this is a versioned pointer */
   std::atomic<uint32> pins_in_array;    /* number of elements in array */
 };
 
 struct LF_PINS {
+  // why 4?
   std::atomic<void *> pin[LF_PINBOX_PINS];
   LF_PINBOX *pinbox;
   void *purgatory;
@@ -184,7 +189,10 @@ typedef const uchar *(*hash_get_key_function)(const uchar *arg, size_t *length);
 
 /* todo: 跟innodb的ut_lock_free_hash_t的区别？ */
 struct LF_HASH {
+  // lf hash 中只有一条链表，这条链表被多个dummy node 分成了多个bkt，每个bkt 在dynarray 中进行索引
+  // 对 lf_hash 而言，lf_dynarray::level 的类型是 lf_slist
   LF_DYNARRAY array;             /* hash itself */
+  // ?
   LF_ALLOCATOR alloc;            /* allocator for elements */
   hash_get_key_function get_key; /* see HASH */
   CHARSET_INFO *charset;         /* see HASH */

@@ -251,6 +251,7 @@ static inline void mach_write_to_2_little_endian(byte *dest, ulint n);
 
 /** Convert integral type from storage byte order (big endian) to host byte
 order.
+在解码 excess-N
 @param[in]      src             where to read from
 @param[in]      len             length of src
 @param[in]      unsigned_type   signed or unsigned flag

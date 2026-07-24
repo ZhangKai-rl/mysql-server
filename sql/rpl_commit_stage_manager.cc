@@ -336,6 +336,7 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     to release it before going to sleep.
   */
   if (!leader) {
+    // NOTE: follower
     CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_follower_wait");
     mysql_mutex_lock(&m_lock_done);
 #ifndef NDEBUG

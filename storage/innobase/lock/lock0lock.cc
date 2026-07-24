@@ -304,6 +304,7 @@ void lock_sys_create(
 
   lock_sys_sz = sizeof(*lock_sys) + srv_max_n_threads * sizeof(srv_slot_t);
 
+  // lock sys 真正 创建了 srv_slot_t! 区分purge 用的 srv_sys->sys_threads
   lock_sys = static_cast<lock_sys_t *>(
       ut::zalloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, lock_sys_sz));
 
@@ -486,6 +487,7 @@ enum class Conflict {
 @retval CAN_BYPASS  the trx does not have to wait for lock2, as it can bypass it
 @retval HAS_TO_WAIT the trx has to wait for lock2
 */
+// lock type 兼容性矩阵检查
 static inline Conflict rec_lock_check_conflict(const trx_t *trx,
                                                ulint type_mode,
                                                const lock_t *lock2,
@@ -497,6 +499,7 @@ static inline Conflict rec_lock_check_conflict(const trx_t *trx,
   ut_ad(lock_get_type_low(lock2) == LOCK_REC);
 
   if (trx == lock2->trx ||
+      // 先判断 lock_mode S, X 之类的兼容性
       lock_mode_compatible(static_cast<lock_mode>(LOCK_MODE_MASK & type_mode),
                            lock_get_mode(lock2))) {
     return Conflict::NO_CONFLICT;
@@ -511,6 +514,8 @@ static inline Conflict rec_lock_check_conflict(const trx_t *trx,
 
   /* We have somewhat complex rules when gap type record locks
   cause waits */
+
+  // note: 判断精确 type conflict
 
   if ((lock_is_on_supremum || (type_mode & LOCK_GAP)) &&
       !(type_mode & LOCK_INSERT_INTENTION)) {
@@ -1478,6 +1483,7 @@ static void lock_create_wait_for_edge(const lock_t *waiting_lock,
   lock_wait_request_check_for_cycles() once it insert the trx to a
   slot.*/
   waiter->lock.blocking_trx.store(blocker);
+  // NOTE: 上报行锁到server MDL
   lock_report_wait_for_edge_to_server(waiting_lock, blocking_lock);
 }
 
@@ -2023,10 +2029,12 @@ transaction. The caller must hold lock_sys latch for the shard containing the
 lock, but not the lock->trx->mutex.
 @param[in,out]    lock    waiting lock request
  */
+// note: 这时候已经切换到锁的被唤醒方了：lock_grant 中的 trx 和 thr 确实是被唤醒方
 static void lock_grant(lock_t *lock) {
   ut_ad(locksys::owns_lock_shard(lock));
   ut_ad(!trx_mutex_own(lock->trx));
 
+  // note:  lock->trx 是即将被授予 lock_t 的 trx_t
   trx_mutex_enter(lock->trx);
 
   if (lock_get_mode(lock) == LOCK_AUTO_INC) {
@@ -2204,6 +2212,7 @@ heap_no-th bit. For each waiting lock which was blocked by in_lock->trx it
 checks if it can be granted now. It iterates on waiting locks in order favoring
 high-priority transactions and then transactions of high
 trx->lock.schedule_weight.
+note: in_lock,  正在被释放的锁
 @param[in]    in_lock   Lock which was released, or
                         partially released by modifying its type/mode
                         (see lock_trx_release_read_locks) or
@@ -2211,6 +2220,7 @@ trx->lock.schedule_weight.
                         (see lock_rec_release)
 @param[in]    heap_no   Heap number within the page on which the
 lock was (or still is) held */
+// note: 锁唤醒
 static void lock_rec_grant_by_heap_no(lock_t *in_lock, ulint heap_no) {
   const auto hash_table = in_lock->hash_table();
 
@@ -2232,6 +2242,9 @@ static void lock_rec_grant_by_heap_no(lock_t *in_lock, ulint heap_no) {
 #ifdef UNIV_DEBUG
   bool seen_waiting_lock = false;
 #endif
+  // Lock_iter::for_each 遍历 hash table 中同一 (page_id, heap_no) 的所有 lock_t。对每个锁：
+  // 已授予的 → 放入 granted 列表（当前仍持有的锁）。
+  // note: 等待中的 → 检查它的 blocking_trx 是否等于 in_trx（释放锁的事务）。只有被当前释放事务阻塞的等待锁才是候选者。被其他事务阻塞的不动。
   Lock_iter::for_each(
       rec_id,
       [&](lock_t *lock) {
@@ -2261,7 +2274,7 @@ static void lock_rec_grant_by_heap_no(lock_t *in_lock, ulint heap_no) {
             trx->lock.blocking_trx.load(std::memory_order_relaxed);
         /* No one should be WAITING without good reason! */
         ut_ad(blocking_trx);
-        /* We will only consider granting the `lock`, if we are the reason it
+        /* note: We will only consider granting the `lock`, if we are the reason it
         was waiting. */
         if (blocking_trx != in_trx) {
           return (true);
@@ -2310,6 +2323,7 @@ static void lock_rec_grant_by_heap_no(lock_t *in_lock, ulint heap_no) {
 
   granted.reserve(granted.size() + waiting.size());
 
+  // note: 切换到等待锁，执行授予: 此时操作对象从 in_lock（释放锁）变成了 wait_lock（等待锁）。
   for (lock_t *wait_lock : waiting) {
     /* Check if the transactions in the waiting queue have
     to wait for locks granted above. If they don't have to
@@ -2490,6 +2504,7 @@ void lock_rec_free_all_from_discard_page(
   lock_rec_free_all_from_discard_page_low(page_id, lock_sys->prdt_page_hash);
 }
 
+// QUES: 事务锁的 分裂、继承、迁移？？？？
 /*============= RECORD LOCK MOVING AND INHERITING ===================*/
 
 /** Resets the lock bits for a single record. Releases transactions waiting for
@@ -2654,6 +2669,7 @@ static void lock_rec_move_low(
   ut_ad(locksys::owns_page_shard(receiver->get_page_id()));
   ut_ad(locksys::owns_page_shard(donator->get_page_id()));
 
+  // 谓词锁？
   /* If the lock is predicate lock, it resides on INFIMUM record */
   ut_ad(lock_rec_get_first(lock_hash, receiver, receiver_heap_no) == nullptr ||
         lock_hash == lock_sys->prdt_hash ||
@@ -2705,6 +2721,7 @@ static void lock_move_granted_locks_to_front(trx_lock_list_t &lock_list) {
 
 /** Moves the locks of a record to another record and resets the lock bits of
  the donating record. */
+ // 锁迁移
 static inline void lock_rec_move(
     const buf_block_t *receiver, /*!< in: buffer block containing
                                  the receiving record */
@@ -3448,6 +3465,7 @@ static inline lock_t *lock_table_create(
   } else {
     auto ptr = mem_heap_alloc(trx->lock.lock_heap, sizeof(*lock));
     ut_a(ut::is_aligned_as<lock_t>(ptr));
+    // note: 创建lock_t
     lock = static_cast<lock_t *>(ptr);
   }
   lock->type_mode = uint32_t(type_mode | LOCK_TABLE);
@@ -6183,6 +6201,7 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   ut_ad(!trx_is_referenced(trx));
   trx_mutex_exit(trx);
 
+  // 事务提交放锁
   while (!locksys::try_release_all_locks(trx)) {
     std::this_thread::yield();
   }

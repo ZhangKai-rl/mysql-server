@@ -2620,6 +2620,7 @@ struct Page_track_t {
   savepoint_*, prepare, recover, and *_by_xid pointers can be 0.
 */
 // NOTE: handler layer接口层，区别于innodb内核层的srv, SE单例实现
+// handlerton -> innobase_hton; handler -> ha_innobase
 struct handlerton {
   /**
     Historical marker for if the engine is available or not.

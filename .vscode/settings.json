@@ -1,14 +1,4 @@
 {
-    /*    
-    -DWITH_BOOST=/Users/morphyzhang/Documents/Code/mysql-server/boost_1_77_0
-    -DWITH_SSL=/opt/homebrew/Cellar/openssl@3/3.5.2
-    -DWITH_DEBUG=1
-    -DCMAKE_INSTALL_PREFIX=8039_install
-    -DMYSQL_DATADIR=8039_install/data
-    -DSYSCONFDIR=8039_install/etc
-    -DMYSQL_TCP_PORT=3309
-    -DMYSQL_UNIX_ADDR=mysql-debug.sock */
-
     "cmake.cmakePath": "/usr/local/bin/cmake3",
     "cmake.buildBeforeRun": true,
     "cmake.buildDirectory": "/Users/morphyzhang/Documents/Code/mysql-server/build_vscode_8039",
@@ -21,7 +11,7 @@
         "WITH_BOOST": "/Users/morphyzhang/Documents/Code/mysql-server/boost_1_77_0",
         "DOWNLOAD_BOOST": "1",
         "DOWNLOAD_BOOST_TIMEOUT": "600",
-        "WITH_SSL": "/opt/homebrew/Cellar/openssl@3/3.6.1",
+        "WITH_SSL": "/opt/homebrew/Cellar/openssl@3/3.6.2"
     },
     "git.ignoreLimitWarning": true,
     "files.associations": {
@@ -109,4 +99,19 @@
         "atomic": "cpp",
         "semaphore": "cpp"
     },
+    "files.exclude": {
+        "**/build_*/**": false
+    },
+    "C_Cpp.exclusionPolicy": "checkFolderSettings",
+    "C_Cpp.files.exclude": {
+        "${workspaceFolder}/mysql-test/**": true,
+        "${workspaceFolder}/unittest/**": true,
+        "${workspaceFolder}/extra/**": true,
+        "${workspaceFolder}/man/**": true,
+        "${workspaceFolder}/packaging/**": true,
+        "${workspaceFolder}/scripts/**": true,
+        "${workspaceFolder}/testclients/**": true
+    },
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.intelliSenseCachePath": "${workspaceFolder}/.vscode/.cache"
 }

@@ -625,6 +625,7 @@ static bool btr_cur_need_opposite_intention(const page_t *page,
  immediately after the cursor. Thus, the cursor may end up on a user record,
  or on a page infimum record. */
  // note: for insert, PAGE_CUR_LE, cursor positioned to left, then insert after cursor.
+ // @brief: 标准的 B-tree top-down search：从 root 逐层 page_cur_search 比较 key → 取 child pointer → 下一层 → 直到 leaf page 定位到具体 rec。
 void btr_cur_search_to_nth_level(
     dict_index_t *index,   /*!< in: index */
     ulint level,           /*!< in: the tree level of search */
@@ -2013,7 +2014,12 @@ void btr_cur_search_to_nth_level_with_no_latch(dict_index_t *index, ulint level,
 @param[in] level Level to search for (0=leaf)
 @param[in] location Location where called
 @param[in,out] mtr Mini-transaction */
-// @brief: 从index root开始，找到leaf层的最左或者最右节点
+// @brief: 从index root开始，找到leaf层的最左或者最右节点. 
+/**
+定位到索引的最左端或最右端（不是搜索某个 key）。用于全索引扫描的起始定位。
+
+NOTE: 它最终定位到的是叶子页上的一条 rec（infimum 之后的第一条 user rec，或 supremum 之前的最后一条），不只是 leaf page。
+ */
 void btr_cur_open_at_index_side(bool from_left, dict_index_t *index,
                                 ulint latch_mode, btr_cur_t *cursor,
                                 ulint level, ut::Location location,

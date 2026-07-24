@@ -508,6 +508,7 @@ dberr_t Context::read_init(Cursor *cursor) noexcept {
   return setup_pk_sort(cursor);
 }
 
+// NOTE: ddl 核心
 dberr_t Context::build() noexcept {
   Loader loader{*this};
 

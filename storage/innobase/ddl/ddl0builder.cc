@@ -1286,6 +1286,7 @@ dberr_t Builder::insert_direct(Cursor &cursor, size_t thread_id) noexcept {
     auto p = cursor.m_tuple_heap.get();
     auto fields = key_buffer->back();
 
+    // m_prev_fields 只cpy 了m_n_uniq 字段
     memcpy(cursor.m_prev_fields, fields, m_ctx.m_n_uniq * sizeof(dfield_t));
 
     for (size_t i = 0; i < m_ctx.m_n_uniq; ++i) {
@@ -2130,7 +2131,7 @@ void Builder::set_next_state() noexcept {
 }
 
 // todo: 看着是个状态机？
-// xxxxxx
+// xxxxxx: merge_sort + btr build
 dberr_t Loader::Task::operator()() noexcept {
   dberr_t err;
 

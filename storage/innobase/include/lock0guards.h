@@ -127,6 +127,7 @@ class Shard_latch_guard {
 };
 
 /**
+那两把行锁的情况，如btr split or merge, 需要同时latch两个shard的mutex, 这个为了避免死锁
 A RAII helper which latches the mutexes protecting specified shards for the
 duration of its scope.
 It makes sure to take the latches in correct order and handles the case where

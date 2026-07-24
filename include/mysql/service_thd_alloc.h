@@ -44,6 +44,7 @@ class THD;
 
 #include <mysql/mysql_lex_string.h>
 
+// 因为 service 是通过函数指针表传递的，必须保证函数指针类型签名跨编译器一致??
 extern "C" struct thd_alloc_service_st {
   void *(*thd_alloc_func)(MYSQL_THD, size_t);
   void *(*thd_calloc_func)(MYSQL_THD, size_t);

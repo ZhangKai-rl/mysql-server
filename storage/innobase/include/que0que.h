@@ -116,6 +116,7 @@ void que_run_threads(que_thr_t *thr); /*!< in: query thread */
  the wait state of a query thread waiting for a lock or a stored procedure
  completion.
  @return query thread instance of thread to wakeup or NULL */
+// 唤醒查询图query thread
 que_thr_t *que_thr_end_lock_wait(trx_t *trx); /*!< in: transaction in the
                                               QUE_THR_LOCK_WAIT state */
 /** Starts execution of a command in a query fork. Picks a query thread which
@@ -284,6 +285,7 @@ struct que_thr_t {
   UT_LIST_NODE_T(que_thr_t)
   trx_thrs; /*!< lists of threads in wait list of
             the trx */
+  // note: for srv workers, base node in srv_sys_t::tasks。 应该是只用于后台线程不会用于usr thd 的？
   UT_LIST_NODE_T(que_thr_t)
   queue;                    /*!< list of runnable thread nodes in
                             the server task queue */

@@ -99,6 +99,7 @@ struct Compare_key {
       }
 
       if (report) {
+        // Bug#37822992
         m_dups->report(lhs);
       }
     }

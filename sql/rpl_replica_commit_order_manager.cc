@@ -98,6 +98,7 @@ bool Commit_order_manager::wait_on_graph(Slave_worker *worker) {
 
     Commit_order_lock_graph ticket{worker_thd->mdl_context, *this,
                                    static_cast<std::uint32_t>(worker->id)};
+    // 把 worker 的等待注册进 MDL 死锁图
     worker_thd->mdl_context.will_wait_for(&ticket);
     worker_thd->mdl_context.find_deadlock();
     raii::Sentry<> ticket_guard{
@@ -105,6 +106,7 @@ bool Commit_order_manager::wait_on_graph(Slave_worker *worker) {
 
     struct timespec abs_timeout;
     set_timespec(&abs_timeout, LONG_TIMEOUT);  // Wait for a year
+    // 等待前一个worker 调用 finish one
     auto wait_status = worker_thd->mdl_context.m_wait.timed_wait(
         worker_thd, &abs_timeout, true,
         &stage_worker_waiting_for_its_turn_to_commit);

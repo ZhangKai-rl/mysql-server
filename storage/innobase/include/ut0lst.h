@@ -274,6 +274,7 @@ in code which knows that get_node exists also knows its implementation.*/
 #define UT_LIST_NODE_GETTER_DEFINITION(t, m) \
   struct UT_LIST_NODE_GETTER(t, m)           \
       : public ut_list_base_explicit_getter<t, &t::m> {};
+        // note: 一定是取地址，称为 成员指针 非类型模板参数
 
 /** A variant of UT_LIST_BASE_NODE_T to be used in rare cases where the full
 definition of t is not yet in scope, and thus UT_LIST_BASE_NODE_T can't be used

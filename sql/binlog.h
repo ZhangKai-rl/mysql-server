@@ -548,6 +548,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
     @param[in] leave_mutex  Mutex that will be released when changing stage
     @param[in] enter_mutex  Mutex that will be taken when changing stage
 
+    NOTE: True for follower, False if leader.
     @retval true  In case this thread did not become leader, the function
                   returns true *after* the leader has completed the commit
                   on its behalf, so the thread should continue doing the
@@ -611,7 +612,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
   /**
     Flush and commit the transaction.
 
-    TODO
+    TODO : http://mysql.taobao.org/monthly/2020/05/07/
 
     This will execute an ordered flush and commit of all outstanding
     transactions and is the main function for the binary log group

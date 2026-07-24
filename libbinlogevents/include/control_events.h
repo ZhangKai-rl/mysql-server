@@ -1012,6 +1012,12 @@ class Gtid_event : public Binary_log_event {
     Note: Transaction_ctx is in the MySQL server code.
     // used for MTS
   */
+  /*
+  last commit from store_commit_parent
+  sequence from bgc
+   都是binlog file 级别的相对值，last committed 为某个事务的sequence number
+   两个值都是在同一时间线上取值
+  */
   long long int last_committed;
   long long int sequence_number;
   /** GTID flags constants */

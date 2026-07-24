@@ -243,6 +243,7 @@ struct CODE_STATE {
 /*
   The test below is so we could call functions with DBUG_ENTER before
   my_thread_init().
+  get CS if cs == 0.
 */
 #define get_code_state_if_not_set_or_return \
   if (!cs && !((cs = code_state()))) return
@@ -322,18 +323,21 @@ static CODE_STATE *code_state(void) {
   CODE_STATE *cs, **cs_ptr;
 
   if (!init_done) {
+    // 初始化 dbug
     init_done = true;
     native_mutex_init(&THR_LOCK_dbug, nullptr);
     native_mutex_init(&THR_LOCK_gcov, nullptr);
     native_rw_init(&THR_LOCK_init_settings);
     memset(&init_settings, 0, sizeof(init_settings));
     init_settings.out_file = stderr;
+    // note
     init_settings.flags = OPEN_APPEND;
   }
 
   if (!(cs_ptr = my_thread_var_dbug()))
     return nullptr; /* Thread not initialised */
   if (!(cs = *cs_ptr)) {
+    // 初始化 CS* THR_mysys->dbug
     cs = (CODE_STATE *)DbugMalloc(sizeof(*cs));
     memset(cs, 0, sizeof(*cs));
     cs->process = db_process ? db_process : "dbug";

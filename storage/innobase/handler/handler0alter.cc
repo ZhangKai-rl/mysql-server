@@ -298,7 +298,7 @@ struct ha_innobase_inplace_ctx : public inplace_alter_handler_ctx {
     mem_heap_free(heap);
   }
 
-  /** Determine if the table will be rebuilt.
+  /** NOTE: Determine if the table will be rebuilt.
   @return whether the table will be rebuilt */
   bool need_rebuild() const { return (old_table != new_table); }
 
@@ -2196,6 +2196,7 @@ static void innobase_col_to_mysql(
       }
 
       if (!field->is_flag_set(UNSIGNED_FLAG)) {
+        // 有符号数的 excess-n decoding, encoding 见 row_mysql_store_col_in_innobase_format
         ((byte *)dest)[len - 1] ^= 0x80;
       }
 
@@ -6345,7 +6346,7 @@ bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
                    eval_table, thd_ddl_buffer_size(m_prebuilt->trx->mysql_thd),
                    thd_ddl_threads(m_prebuilt->trx->mysql_thd));
 
-  // todo: 核心
+  // todo: 核心. ddl::Context::build() 中进行了索引的创建
   const auto err = clean_up(ddl.build());
 
   trx->isolation_level = old_isolation_level;
