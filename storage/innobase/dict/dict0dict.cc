@@ -2651,6 +2651,12 @@ static void dict_index_remove_from_cache_low(
   ut_ad(table->magic_n == DICT_TABLE_MAGIC_N);
   ut_ad(index->magic_n == DICT_INDEX_MAGIC_N);
   ut_ad(dict_sys_mutex_own());
+  /* 删除dict_index_t(remove dict_index_t from dict_sys lru cache)时必须持有dict sys mutex有以下原因
+      保护 AHI 引用计数：等待所有 AHI 引用归零
+      防止 use-after-free：其他线程可能通过 block->ahi.index 访问索引
+      保护表的索引链表：防止并发修改 table->indexes
+      保护全局字典状态：更新 dict_sys->size
+  */
 
   /* No need to acquire the dict_index_t::lock here because
   there can't be any active operations on this index (or table). */

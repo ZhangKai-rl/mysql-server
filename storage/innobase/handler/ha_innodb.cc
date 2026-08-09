@@ -2034,6 +2034,7 @@ const char *thd_innodb_tmpdir(THD *thd) {
 @param[in,out]  thd     MySQL thread handler.
 @return reference to transaction pointer */
 
+// THD → ha_data[innodb_slot] → innodb_session_t* → m_trx
 [[nodiscard]] trx_t *&thd_to_trx(THD *thd) {
   innodb_session_t *&innodb_session = thd_to_innodb_session(thd);
   ut_ad(innodb_session != nullptr);

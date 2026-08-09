@@ -759,6 +759,8 @@ struct srv_sys_t {
   ib_mutex_t tasks_mutex; /*!< variable protecting the
                           tasks queue */
   // note: 全局的query thread 就绪队列
+  // ques: 啥时候投递purge task的？
+  // ques: task和srv_slot_t::thr是一个指针吗？
   UT_LIST_BASE_NODE_T(que_thr_t, queue)
   tasks; /*!< task queue */
 
@@ -1078,6 +1080,7 @@ ulint srv_release_threads(srv_thread_type type, /*!< in: thread type */
       ++srv_sys->n_threads_active[type];
 
       // note
+      // 在这里唤醒了srv_slot_t线程（如purge worker, 然后执行srv_task_execute)
       os_event_set(slot->event);
 
       if (++count == n) {
@@ -2809,6 +2812,7 @@ static bool srv_purge_should_exit(
 }
 
 /** Fetch and execute a task from the work queue.
+  todo
  @return true if a task was executed */
 static bool srv_task_execute(void) {
   que_thr_t *thr = nullptr;
@@ -3214,6 +3218,8 @@ void srv_que_task_enqueue_low(que_thr_t *thr) /*!< in: query thread */
 
   // set slot->event
   // srv_worker_threads -> srv_task_execute -> do purge
+  // note: 取出srv_sys的slot来执行其tasks，并唤醒srv_slot_t
+  // purge worker thd一直在后台睡眠在srv_worker_thread上。
   srv_release_threads(SRV_WORKER, 1);
 }
 

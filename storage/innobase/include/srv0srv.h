@@ -1225,7 +1225,19 @@ struct export_var_t {
 };
 
 #ifndef UNIV_HOTBACKUP
-/** Thread slot in the thread table.  */
+/** Thread slot in the thread table.
+ * 锁rec/table lock线程等待槽, lock_sys->waiting_threads
+                   srv_slot_t
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+  lock_sys->waiting_threads      srv_sys->sys_threads
+  (用户线程锁等待)                 (系统后台线程)
+        │                               │
+        ├─ reserve_slot                 ├─ Master 线程 (slot 0)
+        ├─ suspend_thread               ├─ Purge 协调器 (slot 1)
+        └─ release_thread               └─ Purge Worker (slot 2+)
+*/
 // 注意区分下 sync_array_t
 struct srv_slot_t {
   /** Thread type: user, utility etc. */
@@ -1250,6 +1262,23 @@ struct srv_slot_t {
   boost trx->lock.schedule_weight.
   Protected by lock->wait_mutex. */
   // ABA version.
+  // todo: 在lock_wait_get_slot_if_still_reserved判断版本号， 解决aba问题：slot 指针没变，但内容已经完全不同了
+  /** 
+   * reservation_no 的生命周期：
+┌────────────────────────────────────────────────────────────────┐
+│ lock_wait_table_reserve_slot()                                 │
+│   slot->reservation_no = lock_wait_table_reservations++;       │
+│ ↓ 线程挂起等待                                                   │
+│ lock_wait_snapshot_waiting_threads()                           │
+│   记录 {slot, reservation_no} 到快照                             │
+│ lock_wait_compute_initial_weights()                            │
+│   用差值判断是否等太久 → 决定是否 BOOST                             │
+│ lock_wait_find_latest_pos_on_cycle()                           │
+│   找 reservation_no 最大者 → 辅助选择回滚对象                      │
+│ lock_wait_get_slot_if_still_reserved()                         │
+│   验证 reservation_no → 防止 ABA                                │
+└────────────────────────────────────────────────────────────────┘
+   */
   uint64_t reservation_no;
 
   /** Wait time that if exceeded the thread will be timed out.
@@ -1261,6 +1290,7 @@ struct srv_slot_t {
 
   /** Suspended query thread (only used for user threads). */
   // 在等待/挂起的 que_thr_t
+  // 这个slot执行的query, 也就是task
   que_thr_t *thr;
 };
 #endif /* !UNIV_HOTBACKUP */

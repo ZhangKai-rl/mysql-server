@@ -50,6 +50,7 @@ static inline sync_array_t *sync_array_get() {
       sync_wait_array[default_indexer_t<>::get_rnd_index() % sync_array_size]);
 }
 
+// note: void* object c式范型，可以存TTASEventMutex
 static inline sync_array_t *sync_array_get_and_reserve_cell(
     void *object, ulint type, ut::Location location, sync_cell_t **cell) {
   sync_array_t *sync_arr = nullptr;

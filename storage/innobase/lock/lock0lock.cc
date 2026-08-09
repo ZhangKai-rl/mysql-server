@@ -457,6 +457,7 @@ static inline ulint lock_rec_get_insert_intention(
 
   return (lock->type_mode & LOCK_INSERT_INTENTION);
 }
+// TODO
 namespace locksys {
 
 enum class Conflict {
@@ -2221,6 +2222,7 @@ note: in_lock,  正在被释放的锁
 @param[in]    heap_no   Heap number within the page on which the
 lock was (or still is) held */
 // note: 锁唤醒
+// TODO
 static void lock_rec_grant_by_heap_no(lock_t *in_lock, ulint heap_no) {
   const auto hash_table = in_lock->hash_table();
 

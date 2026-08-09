@@ -3123,6 +3123,7 @@ note: @param[out]     n_reserved      Number of extents actually reserved; if we
 @return true if we were able to make the reservation */
 // ques:  
 // @brief: fsp扩容(以extent为单位)，如果fsp太小，可能扩容free_pages(fsp_reserve_free_pages)
+// 确保无力文件是足够大的
 bool fsp_reserve_free_extents(ulint *n_reserved, space_id_t space_id,
                               ulint n_ext, fsp_reserve_t alloc_type, mtr_t *mtr,
                               page_no_t n_pages) {

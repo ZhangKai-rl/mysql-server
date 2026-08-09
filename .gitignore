@@ -33,7 +33,7 @@ scalability_jobs_*
 .settings/
 # build
 .idea
-.codebuddy
+# .codebuddy
 # .vscode
 build*
 boost_1_77_0/

@@ -1293,6 +1293,8 @@ void btr_search_drop_page_hash_when_freed(const page_id_t &page_id,
       /* In all our callers, the table handle should
       be open, or we should be in the process of
       dropping the table (preventing eviction). */
+      // ques: 为什么要满足这个条件？删除ahi为什么要持有 dict sys mutex? 防止索引（index）结构在操作过程中被释放? 哪里操作了？
+      // note: 看函数开头的注释，这里只是那dict_index_t指针，要防止uaf
       ut_ad(index->table->n_ref_count > 0 || dict_sys_mutex_own());
       // note
       btr_search_drop_page_hash_index(block);

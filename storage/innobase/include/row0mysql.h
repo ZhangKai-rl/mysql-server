@@ -471,7 +471,7 @@ mysql_col_len = 4
 is_virtual = 0
 对于column b:virtual generated column
 
-// todo: 后续要解析下这里
+// todo: 后续要解析下这里. 以及和 clust_templ_for_sec的关系
 col_no = 14902075604643794638
 rec_field_no = 0
 clust_rec_field_no = 0

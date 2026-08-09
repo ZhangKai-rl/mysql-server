@@ -85,6 +85,7 @@ struct LF_PINBOX {
   std::atomic<uint32> pins_in_array;    /* number of elements in array */
 };
 
+// hazard pointer
 struct LF_PINS {
   // why 4?
   std::atomic<void *> pin[LF_PINBOX_PINS];
@@ -188,7 +189,77 @@ extern MYSQL_PLUGIN_IMPORT const int LF_HASH_OVERHEAD;
 typedef const uchar *(*hash_get_key_function)(const uchar *arg, size_t *length);
 
 /* todo: 跟innodb的ut_lock_free_hash_t的区别？ */
+// TODO: sql层hash table(lock free)实现区别，innodb hash_table_t. 适合读多写少多并发场景如mdl, innodb hash_table_t
+// 适合写多的。hash_table_t是经典的链地址法实现hash table; LF_HASH是一条链，用dummy node区分cell/bucket
+/* note: Usage: mdl; pfs hash table; acl cache */
+/* 
+┌────────────────────────────────────────────────────────────────────┐
+│                         LF_HASH (Lock-Free)                         │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   采用 Split-Ordered List 算法                                       │
+│                                                                     │
+│   Bucket 0 ──→ [Dummy] ──→ [Node] ──→ [Node] ──→ ...               │
+│                   │                                                 │
+│   Bucket 1 ──────→ [Dummy] ──→ [Node] ──→ [Node] ──→ ...           │
+│                       │                                             │
+│   Bucket 2 ──────────→ [Dummy] ──→ [Node] ──→ ...                  │
+│                                                                     │
+│   特点:                                                              │
+│   • 使用 CAS (Compare-And-Swap) 原子操作                            │
+│   • 无需加锁，线程不会阻塞                                           │
+│   • 使用 Hazard Pointer (LF_PINS) 进行安全内存回收                   │
+│   • 链表按 reversed hash value 排序                                  │
+│   • 支持动态扩容（无需全局锁）                                       │
+└────────────────────────────────────────────────────────────────────┘
+Split-Ordered List：所有元素存储在一个全局有序链表中
+Dummy Node：每个 bucket 用一个哨兵节点标记位置
+CAS 操作：插入、删除使用 atomic_compare_exchange_strong
+Hazard Pointer (LF_PINS && LF_PINBOX)：安全地回收被删除节点的内存
+innodb BP也用到了 HP HP解决的是UAF问题，LF的ABA问题用version/link来解决
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Hazard Pointer 机制                                │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│   Thread 1 pins        Thread 2 pins        Thread 3 pins                  │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                 │
+│   │ pin[0]: A   │     │ pin[0]: C   │     │ pin[0]: NULL│                 │
+│   │ pin[1]: B   │     │ pin[1]: NULL│     │ pin[1]: A   │                 │
+│   │ pin[2]: NULL│     │ pin[2]: D   │     │ pin[2]: NULL│                 │
+│   │ pin[3]: NULL│     │ pin[3]: NULL│     │ pin[3]: NULL│                 │
+│   └─────────────┘     └─────────────┘     └─────────────┘                 │
+│                                                                            │
+│   想要 free(A) ? → 扫描所有 pins → Thread1.pin[0]=A, Thread3.pin[1]=A     │
+│                 → 发现 A 被 pin 住 → 不能释放，放入 purgatory             │
+│                                                                            │
+│   想要 free(E) ? → 扫描所有 pins → 没有线程 pin 住 E                      │
+│                 → 可以安全释放                                             │
+└───────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│                       Hazard Pointer 工作流程                               │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                    │
+│   │   访问对象   │───→│   Pin 对象   │───→│   操作对象   │                    │
+│   └─────────────┘    └─────────────┘    └─────────────┘                    │
+│                            │                    │                           │
+│                            ↓                    ↓                           │
+│                    lf_pin(pins, N, addr)    Unpin: lf_unpin(pins, N)       │
+│                                                                             │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌───────────┐  │
+│   │   删除对象   │───→│ 加入 Purgatory │───→│  扫描所有 Pins │───→│ 真正释放 │  │
+│   └─────────────┘    └─────────────┘    └─────────────┘    └───────────┘  │
+│                            │                    │               │          │
+│                            ↓                    ↓               ↓          │
+│                   lf_pinbox_free()        match_and_save()   free_func()  │
+│                  (延迟到 purgatory)     (检查是否被 pin)   (批量释放)     │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+*/
 struct LF_HASH {
+  // cell array
   // lf hash 中只有一条链表，这条链表被多个dummy node 分成了多个bkt，每个bkt 在dynarray 中进行索引
   // 对 lf_hash 而言，lf_dynarray::level 的类型是 lf_slist
   LF_DYNARRAY array;             /* hash itself */

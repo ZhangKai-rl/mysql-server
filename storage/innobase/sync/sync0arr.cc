@@ -177,6 +177,7 @@ static os_event_t sync_cell_get_event(
   }
 }
 
+// TODO
 sync_cell_t *sync_array_reserve_cell(sync_array_t *arr, void *object,
                                      ulint type, ut::Location location) {
   sync_cell_t *cell;
@@ -234,6 +235,7 @@ sync_cell_t *sync_array_reserve_cell(sync_array_t *arr, void *object,
   /* Make sure the event is reset and also store the value of
   signal_count at which the event was reset. */
   /* NOTE: sync cell 不实际拥有event, 而是用的cell中sync_obect自己的event */
+  // 这里就是TTASEventMutex::m_event, 上边赋值过了
   os_event_t event = sync_cell_get_event(cell);
   cell->signal_count = os_event_reset(event);
 

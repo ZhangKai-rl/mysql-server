@@ -308,6 +308,24 @@ void mem_heap_validate(const mem_heap_t *heap);
 struct buf_block_t;
 
 /** The info structure stored at the beginning of a heap block */
+/**
+mem_heap_t (heap)
+  │
+  ├── block 1 (第一个block，同时也是heap的根)
+  │     ├── mem_block_info_t 头部
+  │     ├── [0xCE×16] alloc_1 数据 [0xDF×16] [对齐]
+  │     ├── [0xCE×16] alloc_2 数据 [0xDF×16] [对齐]
+  │     ├── [0xCE×16] alloc_3 数据 [0xDF×16] [对齐]
+  │     └── (剩余空闲空间...)
+  │
+  ├── block 2 (不够用了，追加的)
+  │     ├── mem_block_info_t 头部
+  │     ├── [0xCE×16] alloc_4 数据 [0xDF×16] [对齐]
+  │     └── ...
+  │
+  └── block 3
+        └── ...
+ */
 // note: mem_block_t == mem_block_info_t
 // HEAP 的生命周期？？？
 struct mem_block_info_t {
@@ -379,6 +397,7 @@ TODO: 理解 ut extern list
 
   /* if this block has been allocated from the buffer pool, this contains the
   buf_block_t handle; otherwise, this is NULL */
+  // For mem_heap_buffer type, allocate mem from bp.
   buf_block_t *buf_block;
 };
 /* We use the UT_LIST_BASE_NODE_T_EXTERN instead of simpler UT_LIST_BASE_NODE_T

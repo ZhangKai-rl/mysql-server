@@ -1027,6 +1027,7 @@ struct trx_purge_t {
 
   /** The purge will not remove undo logs which are >= this view (purge view) */
   // ques: 看着是在truncate(处理undo rec而不是purge user rec)的时候起作用
+  // 并不是哈
   // 控制purge的readview，每次purge开始前调用clone_oldest_view进行赋值
   ReadView view;
 

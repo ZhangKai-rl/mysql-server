@@ -1642,6 +1642,7 @@ void Log_DDL::replay_free_tree_log(space_id_t space_id, page_no_t page_no,
   }
 
   /* This is required by dropping hash index afterwards. */
+  // ques: 这里是为了保护ahi drop？？？？是的，见btr_search_drop_page_hash_when_freed
   dict_sys_mutex_enter();
 
   mtr_t mtr;

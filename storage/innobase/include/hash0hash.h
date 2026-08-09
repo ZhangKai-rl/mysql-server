@@ -62,6 +62,7 @@ struct hash_cell_t {
   // hash table的cell链
   // 实际的node, 如page_hash的 buf_page_t
   // 也就是说，node 要有 next/hash 成员的
+  // 链地址法
   void *node; /*!< hash chain node, NULL if none */
 };
 
@@ -394,6 +395,29 @@ void hash_unlock_x_all_but(hash_table_t *table, rw_lock_t *keep_lock);
 
 /* The hash table structure */
 // note: 处理冲突的方式：链地址法， hash table -> cell -> ha_node_t(在每个tbl的cell中，冲突节点串成链表)
+/* note: Usage: btr_search(AHI);  bp hash table
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              hash_table_t                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   n_cells = 1024 (哈希桶总数)                                                │
+│   n_sync_obj = 4 (锁的数量，2的幂)                                           │
+│                                                                              │
+│   cells (哈希桶数组)                                                         │
+│   ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬─────────┐   │
+│   │ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │ 6  │ 7  │ 8  │ 9  │ 10 │ 11 │ ...1023 │   │
+│   └─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─┬──┴─────────┘   │
+│     │    │    │    │    │    │    │    │    │    │    │    │                 │
+│     └────┼────┼────┘    └────┼────┼────┘    └────┼────┼────┘                 │
+│          │    │              │    │              │    │                      │
+│     Shard 0   │         Shard 1   │         Shard 2   │                      │
+│   (cells 0,4,8,12...)  (cells 1,5,9,13...)  (cells 2,6,10,14...)            │
+│          │                   │                   │                           │
+│          ↓                   ↓                   ↓                           │
+│     rw_locks[0]         rw_locks[1]         rw_locks[2]      rw_locks[3]    │
+└─────────────────────────────────────────────────────────────────────────────┘
+*/
+// TODO
 class hash_table_t {
  public:
   hash_table_t(size_t n) {
@@ -473,8 +497,14 @@ class hash_table_t {
   - read when holding an S-latch for at least one n_sync_obj
   */
   // XXXXXXXXXXX 桶！
+ // note
   ut::unique_ptr<hash_cell_t[]> cells;
 #ifndef UNIV_HOTBACKUP
+
+  /* note: 结合前面的图，可以看出hash_table_t并不是一个cell一个sync obj，而是进行了sharded分片锁
+    多个cell共享一个sync obj(即下面的rw_locks数组中的一个rw_lock_t)，目的是为了提升并发度。
+  */
+
   /** if rw_locks != nullptr, then it's their number (must be a power of two).
   Otherwise, 0. Is zero iff the type is HASH_TABLE_SYNC_NONE. */
   /* note: snnc obj 与 hash cell并不是11对应，而是n个sync obj保护m个cell */

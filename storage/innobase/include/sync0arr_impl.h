@@ -121,6 +121,7 @@ OS or database mutex), but all changes (set or reset) to the state of
 the event must be made while owning the mutex. */
 
 /** Synchronization array */
+// note: TTASEventMutex used
 struct sync_array_t {
   /** Constructor
   Creates a synchronization wait array. It is protected by a mutex

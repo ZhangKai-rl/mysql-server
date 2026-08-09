@@ -424,6 +424,7 @@ void Deadlock_detection_visitor::opt_change_victim_to(MDL_context *new_victim) {
   in its descendants.
 */
 
+// MDL用了lf_hash实现的
 class MDL_lock {
  public:
   typedef unsigned short bitmap_t;
@@ -2875,8 +2876,10 @@ bool MDL_context::try_acquire_lock_impl(MDL_request *mdl_request,
     and ready for future attempts elements from MDL_map container (which
     might happen during lock release).
   */
+  // 这里分配pins为了后续在lf mdl_map中查locks
   if (fix_pins()) return true;
 
+  // 准备发起 mdl 申请
   if (!(ticket = MDL_ticket::create(this, mdl_request->type
 #ifndef NDEBUG
                                     ,
@@ -2888,7 +2891,7 @@ bool MDL_context::try_acquire_lock_impl(MDL_request *mdl_request,
   /*
     Get increment for "fast path" or indication that this is
     request for "obtrusive" type of lock outside of critical section.
-    非侵入式 mdl lock type, 走slow path, 同时需要物化之前fast path mdl
+    现在申请侵入式 mdl lock type, 走slow path, 同时需要物化之前fast path mdl
   */
   unobtrusive_lock_increment =
       MDL_lock::get_unobtrusive_lock_increment(mdl_request);
@@ -3163,10 +3166,12 @@ slow_path:
     mysql_prlock_unlock(&lock->m_rwlock);
 
     m_ticket_store.push_front(mdl_request->duration, ticket);
+    // 拿到锁
     mdl_request->ticket = ticket;
 
     mysql_mdl_set_status(ticket->m_psi, MDL_ticket::GRANTED);
   } else
+    // 无法授予,出现锁等待
     *out_ticket = ticket;
 
   return false;
@@ -3395,6 +3400,7 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
     */
     if (try_acquire_lock(mdl_request)) return true;
 
+    // 当拿到锁后，mdl_request->ticket不为nullptr， nullptr表示没拿到
     if (!mdl_request->ticket) {
       /* We have failed to acquire lock instantly. */
       DEBUG_SYNC(get_thd(), "mdl_acquire_lock_wait");
@@ -3413,9 +3419,8 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
   /* Do some work outside the critical section. */
   set_timespec(&abs_timeout, lock_wait_timeout);
 
+  // return true 是发生了错误
   if (try_acquire_lock_impl(mdl_request, &ticket)) return true;
-
-  /* MDL_lock::can_grant_lock return false. 无法授予这个锁，加入waiting，检查死锁 */
 
   if (mdl_request->ticket) {
     /*
@@ -3425,6 +3430,8 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
     */
     return false;
   }
+
+  /* MDL_lock::can_grant_lock return false. 无法授予这个锁，加入waiting，检查死锁 */
 
   /*
     Our attempt to acquire lock without waiting has failed.
@@ -3505,6 +3512,8 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
     assert(lock->needs_connection_check());
     delayed_find_deadlock = true;
   }
+
+  // note：下面进行真正的timed_wait
 
   if (lock->needs_notification(ticket) || lock->needs_connection_check()) {
     struct timespec abs_shortwait;

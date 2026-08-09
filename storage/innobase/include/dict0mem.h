@@ -1098,7 +1098,7 @@ struct dict_index_t {
   static_assert(1 << MAX_KEY_LENGTH_BITS >= MAX_KEY_LENGTH,
                 "1<<MAX_KEY_LENGTH_BITS) < MAX_KEY_LENGTH");
 
-  /* 以下在 月报 instant add column功能解析 中有 */
+  /* 以下在 月报: instant add column功能解析 中有 */
 
   /** number of columns the user defined to be in the index: in the internal
   representation we add more columns */

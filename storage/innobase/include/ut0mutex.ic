@@ -44,6 +44,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 Wait in the sync array.
 @return true if the mutex acquisition was successful. */
 
+// TODO
 template <template <typename> class Policy>
 bool TTASEventMutex<Policy>::wait(const char *filename, uint32_t line,
                                   uint32_t spin) UNIV_NOTHROW {

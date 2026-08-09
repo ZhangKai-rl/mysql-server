@@ -286,6 +286,7 @@ struct que_thr_t {
   trx_thrs; /*!< lists of threads in wait list of
             the trx */
   // note: for srv workers, base node in srv_sys_t::tasks。 应该是只用于后台线程不会用于usr thd 的？
+  // note: 比如purge, syv_sys_t::tasks为基节点
   UT_LIST_NODE_T(que_thr_t)
   queue;                    /*!< list of runnable thread nodes in
                             the server task queue */

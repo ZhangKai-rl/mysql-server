@@ -87,6 +87,7 @@ class Mem_root_allocator {
 
   explicit Mem_root_allocator() : m_memroot(nullptr) {}
 
+  // 实现mem root作为stl allocator必须实现rebind, rebind时会使用到这个模板拷贝构造函数。
   template <class U>
   Mem_root_allocator(const Mem_root_allocator<U> &other)
       : m_memroot(other.memroot()) {}
@@ -131,6 +132,26 @@ class Mem_root_allocator {
     return std::numeric_limits<size_t>::max() / sizeof(T);
   }
 
+  /** stl中只有vector不需要rebind
+    // std::list 内部源码（简化版）
+    template <class T, class Allocator = std::allocator<T>>
+    class list {
+        // 用户给的 Allocator 是 Mem_root_allocator<int>
+        // 但我需要分配 _List_node，不是 int
+        // 所以我通过 rebind 得到分配 _List_node 的 allocator 类型：
+        
+        using _Node_alloc_type = 
+            typename Allocator::template rebind<_List_node>::other;
+        //                                      ^^^^^^^^^^
+        //                                      把 T 换成 _List_node
+                // 展开后就是：
+        // Mem_root_allocator<int>::rebind<_List_node>::other
+        //   => Mem_root_allocator<_List_node>     ✅ 这就是我们需要的！
+        
+        _Node_alloc_type _node_allocator;  // 用这个来分配节点
+    };
+    rebind 解决的核心问题：用户给容器的是 Allocator<T>，但容器内部需要分配的不是 T，而是容器自己的内部节点类型。rebind 就是一个"类型转换配方"，告诉容器如何从 Allocator<T> 推导出 Allocator<InternalNodeType>，同时通过模板拷贝构造函数把底层内存源（m_memroot）传递给新的 allocator。
+   */
   template <class U>
   struct rebind {
     typedef Mem_root_allocator<U> other;

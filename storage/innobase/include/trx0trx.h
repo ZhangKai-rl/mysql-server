@@ -450,6 +450,7 @@ struct trx_lock_t {
   value, i.e. test if it is not-null, and points to a valid trx.
   To make any definite judgments one needs to latch the lock_sys shard
   containing the trx->lock.wait_lock. */
+  // 该事务在等待锁，该锁被blocking_trx持有了
   std::atomic<trx_t *> blocking_trx;
 
   /** The lock request of this transaction is waiting for.

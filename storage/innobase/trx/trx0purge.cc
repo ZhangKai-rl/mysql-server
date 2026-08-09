@@ -2083,8 +2083,10 @@ struct Purge_groups_t {
 
   std::ostream &print(std::ostream &out) const;
 
+  // note
   void assign(que_thr_t **thrs) {
     const std::size_t n_purge_threads = m_groups.size();
+    // 这里设置了 thr和purge_group的关系
     for (std::size_t grpid = 0; grpid < n_purge_threads; ++grpid) {
       purge_node_t *node = static_cast<purge_node_t *>(thrs[grpid]->child);
       ut_a(que_node_get_type(node) == QUE_NODE_PURGE);
@@ -2346,6 +2348,8 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
 
   mem_heap_empty(heap);
 
+  // 一个srv_slot_t(purge worker thd) 处理一个purge_group_t
+  // 也就是说purge worker所属srv_slot_t的tasks就是thr, 这里设置了thr的任务为purge_group_t
   Purge_groups_t purge_groups(n_purge_threads, heap);
   purge_groups.init();
 
@@ -2374,6 +2378,7 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
     }
 
     // 单条undo rec, 一定是同一table_id
+    // 将 undo records 分组到 purge_groups 
     purge_groups.add(rec);
   }
 
@@ -2511,6 +2516,7 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
 
       ut_a(thr != nullptr);
 
+      // todo: 投递purge task(thr), thr中有一个purge_group
       // note: purge in srv_worker_threads
       srv_que_task_enqueue_low(thr);
     }
