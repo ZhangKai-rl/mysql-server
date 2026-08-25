@@ -41,6 +41,9 @@ boost_1_59_0/
 build_out/
 cmake-build-debug
 cmake-build-8039-debug
+clion*
+.codegraph
+Docs/
 
 # for mac
 .DS_Store

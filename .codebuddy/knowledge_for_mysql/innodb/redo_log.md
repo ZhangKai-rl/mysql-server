@@ -1,6 +1,6 @@
 # InnoDB Redo Log 深度解析
 
-> 基于 MySQL 8.0.39 源码，涵盖 redo 组织结构（LSN 空间 → 文件 → block → record 层级）、内存 buffer 布局（log_t）、mtr 生命周期与 log mode、mtr commit 写入路径、8.0 无锁化并发模型、checkpoint 机制、文件管理与 resize（水位线与容量体系）、sn/lsn 序号体系。
+> 基于 MySQL 8.0.39 源码，涵盖 redo 组织结构（LSN 空间 → 文件 → block → record 层级）、内存 buffer 布局（log_t）、mtr 生命周期与 log mode、mtr commit 写入路径、8.0 无锁化并发模型、checkpoint 机制、文件管理与 resize（水位线与容量体系）、文件级 redo 与 DDL（DROP/TRUNCATE）、sn/lsn 序号体系。
 
 ## 目录
 
@@ -18,6 +18,7 @@
 - [8.0 无锁化并发模型](#80-无锁化并发模型)
 - [checkpoint 机制](#checkpoint-机制)
 - [文件管理与 resize（水位线与容量体系）](#文件管理与-resize水位线与容量体系)
+- [文件级 redo 与 DDL（DROP/TRUNCATE）](#文件级-redo-与-ddldroptruncate)
 - [Misc](#misc)
 - [关键源码位置速查](#关键源码位置速查)
 
@@ -373,7 +374,30 @@ flowchart TD
 - 后台线程：`log_writer`（写盘）、`log_flusher`（fsync）、`log_write_notifier` / `log_flush_notifier`（通知等待的用户线程）、`log_checkpointer`（log0chkp.cc）、`log_files_governor`（8.0.30 文件管理，log0files_governor.cc）
 - 等待/唤醒按 lsn 分槽（`log.write_events[]`，notify 见 log0write.cc:1590）
 
-> 待补充：Link_buf 内部结构、write-ahead 细节。
+### Link_buf 内部结构（ut0link_buf.h:78）
+
+无锁并发区间完成度跟踪的环形数组，是 8.0 无锁化的核心数据结构：
+
+- `m_links[]`：`atomic<Distance>` 数组，容量必须为 2 的幂（:205），按 `position % capacity` 定址（`slot_index`）
+- `m_tail`：`atomic<Position>`，缓存行对齐（:194），表示**已连续完成的水位**
+- `add_link(from, to)`（:253）：在 `slot[from % cap]` 写 `to`，标记"from→to 这段已完成"
+- `add_link_advance_tail(from, to)`（:277）：写 link 后尝试推进 tail——若 `from == tail` 直接 store 推进（**无锁快路径**），否则调 `advance_tail_until` 顺着已形成的连续 link 链向前走
+- `advance_tail`（:306-387）：从 tail 出发沿 link 链跳，遇到空槽（`next <= position`）即停——水位就是"连续完成的最大前缀"
+- `has_space(position)`（:407）：`tail + capacity > position` 才允许 add；`log_buffer_reserve` 用它判断 buffer 是否有空间
+
+语义：生产者（用户线程）**乱序完成区间**并 `add_link`，消费者（log_writer / checkpointer）只需读 `m_tail` 就拿到"已连续完成到哪"。`recent_written` 跟踪 lsn→lsn（buffer 拷贝完成），`recent_closed` 跟踪 lsn→lsn（脏页挂 flush list 完成）。
+
+### write-ahead 机制（log0write.cc）
+
+目的：避免 sub-page 写触发 read-modify-write。文件以 `srv_log_write_ahead_size` 为单位提前填零，后续写在已 zero-fill 的区域可直接 `pwrite` 不需先读。
+
+- `compute_write_size`（:1416）：决定本次从 `log.buf` 直接写多少。若不满足 write-ahead 需求或不足一个 block，则只写完整 block 部分，剩余走 write-ahead
+- `current_write_ahead_enough`（:1487）：当前 write-ahead 区间够不够
+- `compute_next_write_ahead_end`（:1491）：下一个 write-ahead 边界（对齐 `srv_log_write_ahead_size`）
+- `copy_to_write_ahead_buffer`（:1617）：把 `log.buf` 内容 + 填零拷到 `write_ahead_buf`，凑齐 write-ahead 边界
+- `prepare_for_write_ahead`（:1671）：实际 `pwrite` 填零区域
+
+`write_ahead_buf` 的双重用途（内存布局章已述）：① 凑 write-ahead 边界填零；② 拷"未完成块"快照写盘（mtr 可并发往该块追加记录）。
 
 ---
 
@@ -544,6 +568,63 @@ logical_size ≤ soft < hard ≤ (32−2)/32 × physical − overhead
 
 ---
 
+## 文件级 redo 与 DDL（DROP/TRUNCATE）
+
+### MLOG_FILE_* 记录格式
+
+`fil_op_write_log`（fil0fil.cc:4416-4473）写文件级逻辑日志（格式 8.0.11 引入）：
+
+```
+| type (1B) | space_id | page_no(=0) | [flags 4B, 仅 CREATE] | 2B len | path | [2B len | new path, 仅 RENAME] |
+```
+
+四种：`MLOG_FILE_DELETE`(35) / `MLOG_FILE_CREATE`(33) / `MLOG_FILE_RENAME`(34) / `MLOG_FILE_EXTEND`(65)（mtr0types.h:150-179）。
+
+### DROP TABLE：一条 MLOG_FILE_DELETE
+
+```
+ha_innobase::delete_table
+→ innobase_basic_ddl::delete_impl (ha_innodb.cc:14226)
+→ row_drop_table_for_mysql (row0mysql.cc:3771)
+→ fil_delete_tablespace (fil0fil.cc:4490)
+→ Fil_shard::space_delete (fil0fil.cc:4493)
+   ├─ mtr.start() → fil_op_write_log(MLOG_FILE_DELETE)   # :4568
+   ├─ mtr.commit() → commit_lsn
+   ├─ log_write_up_to(commit_lsn, true)                  # :4582 ★redo 先强制落盘
+   └─ os_file_delete                                     # 再删文件
+```
+
+- 整表页面**不记任何页面级 redo**，只写一条 `MLOG_FILE_DELETE`
+- WAL 顺序（:4576-4580 注释）：先持久化"文件将被删除"，再执行删除——崩溃在中间时，恢复重放会再删一次（幂等）
+- 共享表空间中的表走 `btr_free` 页面级路径 + `BUF_REMOVE` 清 buffer pool
+
+### TRUNCATE TABLE = rename + drop + create
+
+`innobase_truncate<Table>::exec`（ha_innodb.cc:14748）→ `truncate()`（:14558）：
+
+1. `rename_tablespace()`（:14653）：`fil_rename_tablespace`（fil0fil.cc:5404）把 .ibd 改为临时名 `#sql-ib<tid>` → **MLOG_FILE_RENAME**
+2. `innobase_basic_ddl::delete_impl`（:14585）：走 DROP 路径删旧表 → **MLOG_FILE_DELETE**（先落盘再删）
+3. 清 dd `se_private_id` / index `se_private_data`（:14595-14600）
+4. `innobase_basic_ddl::create_impl`（:14620）：**新 space_id**，`fil_ibd_create` 写 **MLOG_FILE_CREATE**（fil0fil.cc:5744）；每索引 `btr_create` 建根页 → 页面级 redo
+
+**效果**：truncate 后表获得新 space_id，旧文件整体废弃——redo 总量为几条文件级记录 + 每索引一条建根页记录，**与表大小无关**。
+
+### 恢复侧：扫描阶段立即执行
+
+`MLOG_FILE_*` 不进 hash 按页应用，而是 `recv_parse_or_apply_log_rec_body`（log0recv.cc:1582）**解析时直接执行**（`fil_tablespace_redo_delete/create/rename/extend`，:1590-1608）——页面级 redo 的应用要求文件已处于正确状态（该在的在、该没的没、名字正确）。全部幂等。
+
+### 边界情形
+
+- 临时表：`dict_disable_redo_if_temporary`（dict0dict.ic:1055）→ NO_REDO，drop/truncate 不写 redo
+- 全局 redo 关闭窗口（`ALTER INSTANCE DISABLE INNODB REDO_LOG`）：文件级 redo 同样不写
+- 临时表 DELETE 全表（row0mysql.cc:2506-2518）：truncate 索引重建，`btr_create` 用 `MTR_LOG_NO_REDO`
+
+### 设计思想
+
+**文件级逻辑日志**——`MLOG_PAGE_REORGANIZE` 思路从"页"升到"文件"：一条记录替代海量物理日志，恢复时重放 = 重跑整个文件操作；配合"先日志后操作"（`log_write_up_to(..., true)`）保证崩溃后可补做未完成的那半步。
+
+---
+
 ## Misc
 
 ### redo 里没有 timestamp
@@ -612,3 +693,11 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 | `log0recv.cc:3069` | `recv_multi_rec`：两阶段组解析，不完整组不入 hash |
 | `log0recv.cc:3390` | `recv_scan_log_recs`：块 checksum 失败即停扫（abrupt end） |
 | `log0recv.cc:2099` | 恢复时重放 `MLOG_PAGE_REORGANIZE` |
+| `fil0fil.cc:4416` | `fil_op_write_log`：MLOG_FILE_* 文件级记录格式 |
+| `fil0fil.cc:4493` | `Fil_shard::space_delete`：DROP 写 MLOG_FILE_DELETE，先落盘再删文件 |
+| `fil0fil.cc:5404` | `fil_rename_tablespace`：TRUNCATE 第一步 rename 为临时名 |
+| `fil0fil.cc:5744` | `fil_ibd_create`：写 MLOG_FILE_CREATE |
+| `ha_innodb.cc:14558` | `innobase_truncate::truncate`：rename+drop+create 流程 |
+| `log0recv.cc:1590` | `recv_parse_or_apply_log_rec_body`：MLOG_FILE_* 扫描期立即执行 |
+| `ut0link_buf.h:78` | `Link_buf` 模板：无锁区间完成度跟踪（m_links 环形数组 + m_tail） |
+| `log0write.cc:1416` | `compute_write_size`：write-ahead 决策 |

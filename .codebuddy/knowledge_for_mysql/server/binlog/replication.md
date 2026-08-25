@@ -15,6 +15,7 @@
 - [从库调度机制](#从库调度机制)
 - [Writeset 生成](#writeset-生成)
 - [生产实践要点](#生产实践要点)
+- [生产案例：无主键表引发的同步延迟](#生产案例无主键表引发的同步延迟)
 - [关键源码位置速查](#关键源码位置速查)
 
 ---
@@ -536,6 +537,85 @@ Worker 完成事务后推进 LWM 并 `signal` 条件变量，唤醒等待的 coo
 - **级联复制并行度衰减**：LOGICAL_CLOCK 可能使离 master 越远的 slave 并行性越差
 - **slave_preserve_commit_order 版本要求**：5.7.18 无法保证提交顺序一致，5.7.19 才修复，生产环境须 >= 5.7.19
 - **主库负载低时退化**：组提交效率不高时每组可能只有 1 个事务，从库开启并行复制性能反而比单线程差
+
+---
+
+## 生产案例：无主键表引发的同步延迟
+
+> 案例来源：腾讯云开发者社区（cloud.tencent.com/developer/article/1688866）
+
+### 问题现象
+
+ROW 模式 binlog 下，无主键大表执行批量 UPDATE/DELETE，灾备实例、备库、只读实例均出现巨大同步延迟。binlog 落后 size 可能不大，但主从延迟时间不为 0 且呈稳定上升趋势。
+
+### 根因：N 个 Row Event × 每行定位成本
+
+**核心是 ROW 模式把一条 UPDATE 拆解成 N 个 Row Event**。一条批量 SQL 影响 N 行，ROW 模式就生成 N 个独立的行事件，从库必须逐条回放。这个 N 的数量是固定的、结构性的，与有没有主键无关。
+
+```
+主库: UPDATE t SET col = x          ← 一条 SQL，一次执行
+       ↓ (ROW 模式 binlog)
+binlog: Row Event 1 (BI=旧值1, AI=新值1)
+        Row Event 2 (BI=旧值2, AI=新值2)
+        ...
+        Row Event N (BI=旧值N, AI=新值N)    ← N 行 = N 个事件
+```
+
+**无主键是放大器**，把每个事件的处理成本从 O(log N) 放大到 O(N)：
+
+| | 有主键 | 无主键 |
+|---|---|---|
+| 事件数量 | N 个（固定） | N 个（固定） |
+| 每行定位 | `ha_index_read_map` O(log N) | `ha_rnd_init` + `ha_rnd_next` O(N) |
+| 总成本 | O(N log N) | O(N²) |
+| N=10000 示例 | ~17 万次操作 | ~1 亿次操作 |
+
+**N 个事件是放大基数，无主键是放大倍数。** 如果只有"N 个事件"没有"无主键"，每个事件 O(log N) 也很快；如果只有"无主键"没有"大量事件"，一条 UPDATE 只影响 1 行，1 次全表扫描也能忍。两者叠加才爆炸。
+
+主库执行 UPDATE 时，即使全表扫描也是**一次 SQL 执行**——optimizer 的扫描迭代器一次性扫完所有行，匹配的行直接修改，行定位由迭代器自然完成。不存在"逐条回放 N 个事件"的问题。从库不执行 SQL，而是回放 N 个独立的 Row Event，每个事件都要独立完成"定位 + 修改"，没有主库的迭代器上下文可以复用。
+
+STATEMENT 模式 binlog 下从库直接重放 SQL，和主库一样慢但不会更慢。ROW 模式逐行回放 + 无主键逐行全表扫描定位，才产生 N² 放大效应。
+
+### 无主键表对复制的三重影响
+
+**1. 行定位慢（本案例直接原因）**
+
+从库回放 Row Event 时通过 before-image 定位行。定位方式由 `slave_rows_search_algorithms` 控制（8.0.26 默认 `INDEX_SCAN,HASH_SCAN`）：
+
+- 有主键：主键索引直接定位（`INDEX_SCAN`），O(log N)
+- 无主键有 HASH_SCAN：通过主键哈希缓存行位置，仍需主键/唯一索引
+- 无主键无索引：全表扫描（`TABLE_SCAN`），O(N) 每行
+
+**2. binlog_row_image 无法 MINIMAL**
+
+MINIMAL 模式的 before-image 只记录主键列，无主键就无法唯一标识行。无主键表只能 FULL 或 NOBLOB，binlog 体积更大。这印证了 `mark_columns_per_binlog_row_image` 中"无主键则 read_set 全部置位"的代码逻辑。
+
+**3. WRITESET 依赖跟踪降级**
+
+writeset 基于主键哈希计算，无主键表没有 writeset（`writeset->size() == 0`），WRITESET 模式**回退到 COMMIT_ORDER**（rpl_trx_tracking.cc:232-247 的降级条件），从库并行度下降。
+
+### 解决方案
+
+给表添加主键或唯一索引（可用自增列），然后重建受影响的从库实例：
+
+```sql
+-- 检查无主键表
+SELECT table_schema, table_name, TABLE_ROWS
+  FROM information_schema.tables
+ WHERE (table_schema, table_name) NOT IN
+       (SELECT DISTINCT table_schema, table_name
+          FROM information_schema.columns
+         WHERE COLUMN_KEY = 'PRI')
+   AND table_schema NOT IN ('sys','mysql','information_schema','performance_schema')
+   AND table_type = 'BASE TABLE';
+
+-- 添加主键
+ALTER TABLE tmp1 ADD COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;
+```
+
+### 核心结论
+
+无主键表在复制的全链路上都是性能杀手：binlog 体积大（无法 MINIMAL）、从库行定位慢（全表扫描 N 次）、MTS 并行度低（WRITESET 回退）。主键不仅是查询优化手段，更是复制体系的基础设施。
 
 ---
 
