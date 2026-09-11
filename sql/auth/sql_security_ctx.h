@@ -343,6 +343,7 @@ class Security_context {
 
   /**
     m_priv_user - The user privilege we are using. May be "" for anonymous user.
+    note: m_user / m_host -》 登录用户（客户端握手包提供的原始用户名/主机） ； m_priv_user / m_priv_host -》 权限判定用户（privilege user/host，实际拿来做权限检查的账户）. 也就是mysql.user表中查询到的priv user, **用于proxy/anonymous user, 这时候两者不同**
   */
   char m_priv_user[USERNAME_LENGTH];
   size_t m_priv_user_length;

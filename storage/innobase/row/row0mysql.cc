@@ -1264,7 +1264,7 @@ run_again:
 
   trx_start_if_not_started_xa(trx, false, UT_LOCATION_HERE);
 
-  // note
+  // note: 应该是事务锁吧？
   err =
       lock_table(0, prebuilt->table,
                  static_cast<enum lock_mode>(prebuilt->select_lock_type), thr);

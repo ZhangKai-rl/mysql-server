@@ -776,6 +776,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
               continue;
             }
           }
+          // 行满足 WHERE 但刚才是半一致性读（没锁）→ was_semi_consistent_read() 为 true → continue 重新读同一行，这次带锁. 怎么直接continue了？
           if (table->file->was_semi_consistent_read())
             continue; /* repeat the read of the same row if it still exists */
 

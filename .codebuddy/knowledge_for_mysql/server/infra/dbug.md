@@ -48,7 +48,10 @@
 
 ## DBUG 宏体系
 
-`DBUG_TRACE` / `DBUG_PRINT` / `DBUG_RETURN` / `DBUG_ENTER` 等宏的展开与语义。
+`DBUG_TRACE` / `DBUG_PRINT` / `DBUG_RETURN` / `DBUG_ENTER` / `DBUG_DUMP` 等宏的展开与语义。
+
+- `DBUG_DUMP(keyword, ptr, len)`（`my_dbug.h:195`）→ `_db_dump_(__LINE__, keyword, ptr, len)`：debug 模式下把 `ptr` 起始的 `len` 字节按十六进制 dump 到 trace 输出；release 版是空宏 `do{}while(0)`（`my_dbug.h:273`），零开销。
+- 用法示例：`ha_innobase::rnd_pos`（`ha_innodb.cc:10870`）里 `DBUG_DUMP("key", pos, ref_length)` 用于 dump 主键值（ref）调试。
 
 ---
 
@@ -100,6 +103,16 @@
 - `UNIV_DEBUG` / `ut_d` / `ut_a`：InnoDB 自己的调试断言编译开关，非 DBUG
 - `innodb_monitor` / `INNODB_METRICS` 表：InnoDB 运行状态输出
 - 注意区分：DBUG trace（函数调用追踪） vs InnoDB 断言（`ut_a`） vs InnoDB 状态输出（`SHOW ENGINE INNODB STATUS`）
+
+### 内存破坏哨兵（canary 思想）
+
+MySQL 源码字面没有 `canary` 标识符，但用 magic 值实现"内存破坏检测哨兵"（canary 思想）：
+
+- `THD_SENTRY_MAGIC 0xfeedd1ff` / `THD_SENTRY_GONE 0xdeadbeef`（`sql/sql_class.h:338`）：`THD::dbug_sentry`（注释 "watch out for memory corruption"，`sql_class.h:1499`）在 debug 版构造函数置 MAGIC（`sql_class.cc:759`）、析构置 GONE（`sql_class.cc:1449`）；`THD_CHECK_SENTRY` 断言校验，检测 THD 结构体被越界写坏。
+- InnoDB 内存块 `magic_n`（`mem0mem.h:407`）：`MEM_BLOCK_MAGIC_N 0x445566778899AABB` / `MEM_FREED_BLOCK_MAGIC_N 0xBBAA998877665544`；`mem_block_validate`（`mem0mem.ic:110`）校验失败抛 fatal "Memory block is invalid"；释放时改写（`memory.cc:430`）以抓 double-free / use-after-free。
+- 动态数组块 `DYN_BLOCK_MAGIC_N 375767`（`dyn0types.h:41`）。
+- 区分：`BINLOG_MAGIC`（`\xfe\x62\x69\x6e`）、`tc_log_magic`（`tc_log.cc:311`）是"格式标识魔数"，用于识别文件类型，非"被篡改即告警"的检测哨兵，语义不同于 canary。
+- 栈保护（stack canary）由编译器 `-fstack-protector` 注入，主代码不显式写。
 
 ---
 

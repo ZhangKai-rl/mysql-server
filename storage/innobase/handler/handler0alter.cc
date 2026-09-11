@@ -6225,7 +6225,13 @@ bool ha_innobase::inplace_alter_table_impl(TABLE *altered_table,
 
     if (err == DB_SUCCESS && ctx->online && ctx->need_rebuild()) {
       DEBUG_SYNC_C("row_log_table_apply1_before");
-      // ques: 这里为啥应用一次row_log?
+      // ques: 这里为啥应用一次row_log? 实际 row log apply twice in execute and commit.
+      /*
+        为什么要分两次？ 因为执行阶段（全表扫描重建）可能持续很久，期间 DML 一直在往 row log 里塞。如果攒到 commit 阶段才一次性 apply，commit 阶段会阻塞极长时间（apply 时要加锁阻止新 DML）。所以在执行阶段末尾先 apply 一轮，把大头消化掉，commit 阶段只需 apply 少量增量，把最终的阻塞窗口压缩到毫秒级。
+
+        第一次 apply 时，新 DML 仍可继续并发写；
+        第二次 apply 时，必须阻止新 DML（否则 rename 前后状态不一致）——这就是 online DDL 那个"短暂阻塞点"。
+      */
       err = row_log_table_apply(ctx->thr, m_prebuilt->table, altered_table,
                                 ctx->m_stage);
     }

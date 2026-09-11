@@ -2127,7 +2127,7 @@ ACL_USER *decoy_user(const LEX_CSTRING &username, const LEX_CSTRING &hostname,
   return user;
 }
 
-/** 这个函数很重要！！！！！
+/** 这个函数很重要！！！！！ 在mysql.user 表中找vio pkt 中记录的user
    Finds acl entry in user database for authentication purposes.
 
    Finds a user and copies it into mpvio. Reports an authentication

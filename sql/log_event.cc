@@ -3486,6 +3486,7 @@ bool Query_log_event::write(Basic_ostream *ostream) {
     start += 8;
   }
 
+  // note: 需要换用户在 slave 上回放
   if (thd && thd->need_binlog_invoker()) {
     LEX_CSTRING invoker_user{nullptr, 0};
     LEX_CSTRING invoker_host{nullptr, 0};

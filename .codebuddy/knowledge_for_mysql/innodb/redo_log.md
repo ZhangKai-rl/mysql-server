@@ -10,6 +10,11 @@
 - [文件层（物理结构）](#文件层物理结构)
 - [log block 层（512B）](#log-block-层512b)
 - [redo record 层](#redo-record-层)
+  - [写入原语：mlog_open / close / catenate](#写入原语mlog_open--mlog_close--mlog_catenate)
+  - [★ mlog_open_and_write_index](#mlog_open_and_write_index记录级-redo-的核心)
+  - [主要 record 类型的完整布局](#主要-record-类型的完整布局)
+  - [解析侧：如何把 redo 变回页面](#解析侧如何把-redo-变回页面)
+  - [mtr record group（原子应用单位）](#mtr-record-group原子应用单位)
 - [内存 buffer 布局（log_t）](#内存-buffer-布局log_t)
 - [mtr（mini-transaction）](#mtrmini-transaction)
   - [mtr 的原子性如何实现](#mtr-的原子性如何实现写时连续读时丢尾组)
@@ -189,11 +194,269 @@ redo 数据区（block 的 496B 数据域）就是**一条条变长 redo log rec
 | 动态元信息 | `MLOG_TABLE_DYNAMIC_META`(62) | 子类型+值（auto-inc、corrupted index 等） |
 | 控制/填充 | `MLOG_MULTI_REC_END`(31) / `DUMMY_RECORD`(32) / `TEST`(66) | 无或填充 |
 
+### 写入原语：`mlog_open` / `mlog_close` / `mlog_catenate`
+
+redo 记录不是"算好长度再写"，而是**先预留、再回填**——因为写的时候往往还不知道最终长度（比如 insert 要写"与 cursor 记录的差异尾段"，长度得比对完才知道）。
+
+载体是 `mtr_buf_t`，即 `dyn_buf_t<DYN_ARRAY_DATA_SIZE>`（`dyn0buf.h:418`，块大小 **512**，`dyn0types.h:45`），内部是 **block 双向链表 + 内嵌首块**（`m_first_block`，避免小 redo 的堆分配）。
+
+| 函数 | 位置 | 语义 |
+|------|------|------|
+| `mlog_open(mtr, size, ptr)` | `mtr0log.ic:41` | `dyn_buf_t::open(size)` **只返回尾块 `end()` 指针，不增加 `m_used`** —— 一块未记账的**预留区**；一次最多 512B |
+| `mlog_close(mtr, ptr)` | `mtr0log.ic:58` | `m_used = ptr - begin()` —— 用实际末尾指针**回收**未用完的预留区 |
+| `mlog_catenate_string(mtr, str, len)` | `mtr0log.cc:60` | `mtr->get_log()->push(str, len)`，**立即**记账，内部按 512B 自动切片跨块 |
+| `mlog_catenate_ulint[_compressed]` | `mtr0log.ic:69/111` | 追加 1/2/4B **不压缩**整数，或 `mach_write_compressed` 1~5B |
+
+**为什么需要两套机制**：预留区必须**物理连续**（调用方直接 `memcpy`），不能超过 512B；而变长 payload（如记录尾段）可能接近一页。所以 `push()` 内部循环切片：
+
+```cpp
+// include/dyn0buf.h:237-252
+  void push(const byte *ptr, uint32_t len) {
+    while (len > 0) {
+      uint32_t n_copied;
+      if (len >= MAX_DATA_SIZE) { n_copied = MAX_DATA_SIZE; }
+      else { n_copied = len; }
+      ::memmove(push<byte *>(n_copied), ptr, n_copied);
+      ptr += n_copied; len -= n_copied;
+    }
+  }
+```
+
+**经典范式**（`page0cur.cc:1042`）：先预留 `MLOG_BUF_MARGIN` 让**小**情况零拷贝，放不下再退化成 catenate：
+
+```cpp
+  if (log_ptr + rec_size <= log_end) {
+    memcpy(log_ptr, ins_ptr, rec_size);
+    mlog_close(mtr, log_ptr + rec_size);
+  } else {
+    mlog_close(mtr, log_ptr);
+    mlog_catenate_string(mtr, ins_ptr, rec_size);
+  }
+```
+
+`MLOG_BUF_MARGIN = 256`（`mtr0log.h:272`）—— 512 − 256 = 256B 足以容纳绝大多数差异尾段。`dyn0types.h:43` 的约束 `DYN_ARRAY_DATA_SIZE > MLOG_BUF_MARGIN + 30` 正是为此。
+
+### `mlog_write_initial_log_record_fast` / `_low`
+
+| | `_low`（`mtr0log.ic:169`） | `_fast`（`mtr0log.ic:191`） |
+|---|---|---|
+| 入参 | 显式 `space_id` / `page_no` | 页内指针 `ptr`（自动推 space/page） |
+| space/page 来源 | — | `page = ut_align_down(ptr, UNIV_PAGE_SIZE)`；`space = mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID)`；`offset = mach_read_from_4(page + FIL_PAGE_OFFSET)` |
+| 额外 | — | `ut_d(mtr->memo_modify_page(ptr))` 断言页已 X/SX latch；**doublewrite buffer 直接跳过**（`TRX_SYS_SPACE` 且 offset ∈ [FSP_EXTENT_SIZE, 3*FSP_EXTENT_SIZE) 时原样返回，不写任何字节） |
+| 用途 | 元数据类 redo（无 page frame） | 物理页修改（`mlog_open_and_write_index` 等） |
+
+布局都是 `type(1B) + space_id(1~5B) + page_no(1~5B)`，共 **3~11 字节**；`REDO_LOG_INITIAL_INFO_SIZE = 11`（`mtr0log.h:65`）是它的上界。
+
+**`mach_write_compressed` 编码**（`mach0data.ic:156`）：
+
+| 条件 | 字节 | 前缀 | 有效位 |
+|---|---|---|---|
+| `n < 0x80` | 1 | `0` | 7 |
+| `n < 0x4000` | 2 | `10` | 14 |
+| `n < 0x200000` | 3 | `110` | 21 |
+| `n < 0x10000000` | 4 | `1110` | 28 |
+| `n >= 0xFFFFFC00` | 2 | `111110`（扩展） | 10 |
+| `n >= 0xFFFE0000` | 3 | `1111110`（扩展） | 17 |
+| `n >= 0xFF000000` | 4 | `11111110`（扩展） | 24 |
+| 其他 | 5 | `11110000` + 4B 原值 | 32 |
+
+（先判小值再判极大值——接近 2^32 的大数用扩展短编码更省）
+
+### ★ `mlog_open_and_write_index()`：记录级 redo 的核心
+
+**定义**：`mtr/mtr0log.cc:795`；声明与文档 `mtr0log.h:247`。
+
+```cpp
+bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
+                               const dict_index_t *index, mlog_id_t type,
+                               size_t size, byte *&log_ptr);
+```
+
+- `rec`：页内指针（可以是记录，也可以是 page frame 内任意位置）。用途 4 个：① 下对齐取 page 拿 space/page_no；② 断言该页已被 fix；③ `page_is_leaf()` 决定 `n_uniq` 取 leaf 还是 non-leaf 版本；④ 断言 `page_rec_is_comp(rec) == dict_table_is_comp(index->table)`
+- `size`：调用方在 index 元信息**之后**还需要的 payload 字节数（预留值）
+- `log_ptr`：**出参**，成功时指向预留区起始
+- 返回 `false` 表示未 open（redo 被禁用，或 `size == 0`）
+
+**完整字节布局**（`INDEX_LOG_VERSION_CURRENT = 1`）：
+
+| # | 字段 | 字节 | 条件 |
+|---|------|------|------|
+| 1 | `type` | 1 | 总是 |
+| 2 | `space_id`（compressed） | 1~5 | 总是 |
+| 3 | `page_no`（compressed） | 1~5 | 总是 |
+| 4 | `index_log_version`（=1） | 1 | 总是 |
+| 5 | `flag`：`INSTANT 0x04` \| `VERSIONED 0x02` \| `COMPACT 0x01` | 1 | 总是 |
+| 6 | `n`（字段数） | 2 | `is_versioned \|\| is_comp` |
+| 7 | `n_instant_cols` | 2 | 仅 `is_instant` |
+| 8 | `n_uniq` | 2 | 仅 `is_comp` |
+| 9 | 每个字段 `len` | `2n` | 仅 `is_comp` |
+| 10 | `n_versioned_fields` | 2 | 仅 `is_versioned` |
+| 11 | 每个 versioned 字段 `logical_pos(2)+phy_pos(2)+[v_added 1]+[v_dropped 1]` | 4~6 each | 仅 `is_versioned` |
+| — | **调用方 payload** | `size` | 由调用方写 |
+
+字段 `len` 的编码（`mtr0log.cc:694`）：`fixed_len`；变长大列写 `0x7fff`；`DATA_NOT_NULL` 置最高位 `0x8000`。
+
+**内联了什么 / 没内联什么**（重要澄清）：
+
+- ✅ 内联：`n`、`n_uniq`、`n_instant_cols`、每字段长度 + NOT NULL 位、instant add/drop 的 `logical_pos`/`phy_pos`/`v_added`/`v_dropped`、`is_comp`/`is_instant`/`is_versioned` 三个标志、`index_log_version`
+- ❌ **没有** `index->id`、**没有** `table->id`、**没有**完整 `prtype`（只取 NOT NULL 一个 bit）、**没有** `mbminmaxlen`、**没有**索引名/表名（恢复时用常量 `"LOG_DUMMY"`）
+
+**为什么要内联**：崩溃恢复在**数据字典（DD）加载之前**就要 apply redo。重放 `MLOG_REC_INSERT` 需要知道记录有几个字段、每个多长、是否 COMPACT，才能切分记录、算 offsets、定位系统列。这些信息要么不在 page 里（COMPACT 没有固定 offsets 数组），要么依赖 DD，只能内联进 redo。
+
+**历史背景（8.0.30 分水岭）**：
+
+- 8.0.29 及以前：用**两套 type** 区分行格式 —— `MLOG_REC_INSERT_8027=9`（REDUNDANT）vs `MLOG_COMP_REC_INSERT_8027=38`（COMPACT），delete/update 同理
+- 8.0.30 起：新增**统一 type** `MLOG_REC_INSERT=67` / `CLUST_DELETE_MARK=68` / `REC_DELETE=69` / `REC_UPDATE_IN_PLACE=70`（`mtr0types.h:261-270`），行格式改由内联的 flag 字节承载
+- 老 type 保留为 `*_8027`，仅用于从 ≤8.0.27 升级后的向后兼容恢复
+
+**函数体三段关键逻辑**：
+
+```cpp
+// mtr0log.cc:819 — ① 空间估算（含 versioned 字段的顺序变更检测）
+  size_needed = 0;
+  log_index_get_size_needed(index, size, n, is_comp, is_versioned, is_instant,
+                            fields_with_changed_order, size_needed);
+  size_t alloc = size_needed;
+  if (alloc > mtr_buf_t::MAX_DATA_SIZE) { alloc = mtr_buf_t::MAX_DATA_SIZE; }  // 512
+  if (!mlog_open(mtr, alloc, log_ptr)) { ... return false; }
+```
+
+```cpp
+// mtr0log.cc:859 — ② 写 initial + version + flag + counts
+  log_ptr = mlog_write_initial_log_record_fast(rec, type, log_ptr, mtr);
+  log_index_log_version(INDEX_LOG_VERSION_CURRENT, log_ptr);
+  uint8_t flag = 0;
+  if (is_instant) SET_INSTANT(flag);
+  if (is_versioned) SET_VERSIONED(flag);
+  if (is_comp) SET_COMPACT(flag);
+  log_index_flag(flag, log_ptr);
+  log_index_column_counts(index, n, rec, is_comp, is_versioned, is_instant, log_ptr);
+```
+
+```cpp
+// mtr0log.cc:921 — ③ 收尾：保证调用方能 memcpy 至少 size 字节的连续区
+  if (size == 0) {
+    mlog_close(mtr, log_ptr);
+    log_ptr = nullptr;
+  } else if (log_ptr + size > log_end) {
+    mlog_close(mtr, log_ptr);
+    bool success = mlog_open(mtr, size, log_ptr);   // 重开一块
+    ut_a(success);
+  }
+```
+
+注意 lambda `f`（`:881-888`）：index 元信息本身也可能超过一个 block，每写一批前检查，不够就 `close_and_reopen_log`（`mtr0log.cc:656`）—— 所以**一条 redo 记录的 index 元信息可以跨 mtr_buf block**。
+
+**调用点**：
+
+| write_log 函数 | 位置 | type | `size` |
+|---|---|---|---|
+| `page_cur_insert_rec_write_log` | `page0cur.cc:978` | `MLOG_REC_INSERT` | `2+5+1+5+5+MLOG_BUF_MARGIN` |
+| `page_cur_delete_rec_write_log` | `page0cur.cc:2253` | `MLOG_REC_DELETE` | 2 |
+| `btr_cur_update_in_place_log` | `btr0cur.cc:3314` | `MLOG_REC_UPDATE_IN_PLACE` | `1+7+14+2+MLOG_BUF_MARGIN` |
+| `btr_cur_del_mark_set_clust_rec_log` | `btr0cur.cc:4355` | `MLOG_REC_CLUST_DELETE_MARK` | `1+1+7+14+2` |
+
+### 主要 record 类型的完整布局
+
+**`MLOG_REC_INSERT`**（`page0cur.cc:968-1049`）—— 最复杂的一种：
+
+```
+[type][space][page_no] [index 元信息] ┊ [cursor_rec offset:2]
+                                      ┊ [end_seg_len: compressed]  ← 奇偶即标志位
+                                      ┊ 若为奇数: [info_bits:1][origin_offset: compressed][mismatch_index: compressed]
+                                      ┊ [差异尾段: rec_size - mismatch_index 字节原始记录]
+```
+
+- `end_seg_len = 2*(rec_size-i) + 1`（奇数 = 后面带 extra info）或 `2*(rec_size-i)`（偶数 = 不带）
+- **只写"与 cursor 记录不同的尾段"**，靠 `mismatch_index` 标明从第几个字段开始不同
+- `origin_offset` = extra_size（记录头的变长部分长度）
+
+**`MLOG_REC_DELETE`**（`page0cur.cc:2249`）：只有 2 字节 `page_offset(rec)` —— 删除的信息全在 page 里，redo 只需说"删这个偏移的记录"。
+
+**`MLOG_REC_UPDATE_IN_PLACE`**（`btr0cur.cc:3314`）：
+
+```
+[flags:1] [系统列: TRX_ID位置 compressed + roll_ptr 7B + trx_id u64-compressed] [page_offset:2] [update vector 变长]
+```
+
+注意**二级索引也要写一份"哑"系统列**（全 0），因为解析侧不区分（`btr0cur.cc:3332` 注释）。
+
+**`MLOG_REC_CLUST_DELETE_MARK`**（`btr0cur.cc:4351`）：`0(1B) + 1(1B) + 系统列 + page_offset(2B)`。
+
+**物理日志（非记录级）**：
+
+| 函数 | 布局 | 位置 |
+|------|------|------|
+| `mlog_write_ulint` | `[type][space][page_no][offset:2][val:1~5 compressed]` → 6~18B | `mtr0log.cc:256` |
+| `mlog_write_string` | `[type][space][page_no][offset:2][len:2]` + **数据体（catenate，不占预留区）** | `mtr0log.cc:327/342` |
+| `mlog_log_string` | 同上但不改内存（只记日志） | `mtr0log.cc:342` |
+
+### 解析侧：如何把 redo 变回页面
+
+> ⚠️ 位置澄清：`mlog_parse_index()` / `mlog_parse_index_8027()` 定义在 **`mtr/mtr0log.cc`**，不是 `log0recv.cc`（那里只调用）。
+
+`mlog_parse_index`（`mtr0log.cc:1215`）→ `mlog_parse_index_v1`（`:1242`）做四件事：
+
+1. 读 flag 拆出 `is_comp` / `is_instant` / `is_versioned`（`:1244-1253`）
+2. **凭空造一个 dummy 表 + dummy 索引**：`dict_mem_table_create(RECOVERY_INDEX_TABLE_NAME="LOG_DUMMY", ...)`（`:1266`）、`dict_mem_index_create(...)`（`:1277`）
+3. 逐字段还原列：`parse_index_fields`（`:1018`）按 2B len 重建每个列，`len & 0x7fff` 是长度、`len & 0x8000` 是 NOT NULL（`:1034-1041`）
+4. versioned 字段还原 + 物理位置回填（`:1298-1346`）
+
+然后 `recv_parse_or_apply_log_rec_body`（`log0recv.cc:1582`）按 type 分派：
+
+| type | case 行 | 解析函数 |
+|---|---|---|
+| `MLOG_REC_INSERT` | `:1927` | `page_cur_parse_insert_rec` `:1934` |
+| `MLOG_REC_CLUST_DELETE_MARK` | `:1952` | `btr_cur_parse_del_mark_set_clust_rec` `:1959` |
+| `MLOG_REC_UPDATE_IN_PLACE` | `:2007` | `btr_cur_parse_update_in_place` `:2014` |
+| `MLOG_REC_DELETE` | `:2226` | `page_cur_parse_delete_rec` `:2233` |
+| `MLOG_PAGE_REORGANIZE` | `:2099` | `btr_parse_page_reorganize` `:2106` |
+
+每个 case 后都有 `ut_a(!page || page_is_comp(page) == dict_table_is_comp(index->table));` —— 校验内联的 COMPACT 标志与页面实际行格式一致。
+
 ### mtr record group（原子应用单位）
 
-- 单 record 的 mtr：type 字节最高位置 1（`MLOG_SINGLE_REC_FLAG=128`，mtr0types.h:67；设置于 `prepare_write`，mtr0mtr.cc:799）
-- 多 record 的 mtr：末尾追加 `MLOG_MULTI_REC_END=31` 单字节记录（mtr0mtr.cc:806）
-- 恢复时以 record group 为**原子单位**应用；`first_rec_group` + SINGLE_REC_FLAG 是解析锚点
+一个 mtr 写出的所有 record 构成一个 **record group**，它是恢复时的**原子应用单位**。为了让解析方能找出组的边界，用了两个控制标记：
+
+| 常量 | 值 | 位置 |
+|---|---|---|
+| `MLOG_SINGLE_REC_FLAG` | 128 | `mtr0types.h:67` |
+| `MLOG_MULTI_REC_END` | 31 | `mtr0types.h:150` |
+| `MLOG_BIGGEST_TYPE` | 76 | `mtr0types.h:273` |
+
+> 最大合法 type 是 76，**bit7（0x80）永远空闲**，所以可以安全地把它 OR 到 type 字节上做标志位。
+
+**写入侧** — `mtr_t::Command::prepare_write()`（`mtr0mtr.cc:760`）：
+
+```cpp
+  if (n_recs <= 1) {
+    ut_ad(n_recs == 1);
+    /* Flag the single log record as the only record in this mini-transaction. */
+    *m_impl->m_log.front()->begin() |= MLOG_SINGLE_REC_FLAG;      // :799
+  } else {
+    /* Because this mini-transaction comprises multiple log records,
+    append MLOG_MULTI_REC_END at the end. */
+    mlog_catenate_ulint(&m_impl->m_log, MLOG_MULTI_REC_END, MLOG_1BYTE);  // :806
+    ++len;                                                                // :807
+  }
+```
+
+为什么 `m_log.front()->begin()` 就是第一条记录的 type 字节？
+
+- `front()` = `m_first_block`（内嵌首块，`dyn0buf.h:326`）
+- 第一条 redo 记录的第一个字节正是 `mlog_write_initial_log_record_low` 写的 `mach_write_to_1(log_ptr, type)`（`mtr0log.ic:176`）
+- 即使 `mlog_open_and_write_index` 后来因跨块而 `close_and_reopen_log`，**首字节始终留在 `m_first_block` 偏移 0 处**
+
+**解析侧的完整性判定**（这是"原子性"真正落地的地方）：
+
+1. `recv_parse_log_rec`（`log0recv.cc:2821`）：`MLOG_MULTI_REC_END` **不允许**带 SINGLE_REC_FLAG，带了就是 corrupt（`:2862-2865`）；剥离标志位在 `mlog_parse_initial_log_record`（`mtr0log.cc:143`，`*type = *ptr & ~MLOG_SINGLE_REC_FLAG`）
+2. 扫描分派（`:3241-3258`）：`single_rec = !!(*ptr & MLOG_SINGLE_REC_FLAG)` → 走 `recv_single_rec`（`:2965`）还是 `recv_multi_rec`（`:3069`）
+3. `recv_multi_rec`（`:3076-3129`）三处判定：
+   - `:3093` 组中间再遇 SINGLE_REC_FLAG → corrupt
+   - `:3117` 必须读到 `type == MLOG_MULTI_REC_END` 才算组完整，否则继续读
+   - `:3131-3139` 若 `new_recovered_lsn > scanned_lsn` 要求把下一个 block 也扫进来
+
+**一句话**：一条 record 的 type 字节 bit7 = "本 mtr 只有我这一条"。置位则单条即完整组；未置位则必须一直读到 `MLOG_MULTI_REC_END`，中途断掉就判为 corrupt log 或等待更多数据 —— 这保证了**永远不会应用到半个 mtr**。
 
 ---
 
@@ -354,6 +617,34 @@ flowchart TD
 - 用户线程到此为止只做了"预留区间 + memcpy + 挂脏页"，**不碰磁盘 IO**
 - 块头回填（`log_data_block_header_serialize`，log0files_io.h:627-634）在 log_writer 写盘前**就地在 log buffer 里完成**，含 crc32 入 trailer
 - 纯 `MTR_LOG_NONE` 的 mtr（无日志且非 NO_REDO）在 `mtr_t::commit` 直接走 release 路径，不进 execute（mtr0mtr.cc:672-679）
+
+**代码级展开** — `Command::execute()`（`mtr0mtr.cc:842`）：
+
+```cpp
+void mtr_t::Command::execute() {
+  ulint len = prepare_write();                          // :846 补 SINGLE_REC_FLAG / MULTI_REC_END
+  if (len > 0) {
+    mtr_write_log_t write_log;
+    write_log.m_left_to_write = len;
+    auto handle = log_buffer_reserve(*log_sys, len);    // :853 预留 [start_lsn, end_lsn]
+    write_log.m_handle = handle;
+    write_log.m_lsn = handle.start_lsn;
+    m_impl->m_log.for_each_block(write_log);            // :858 逐 block 拷贝进 log.buf
+    log_wait_for_space_in_log_recent_closed(*log_sys, handle.start_lsn);   // :863
+    add_dirty_blocks_to_flush_list(handle.start_lsn, handle.end_lsn);      // :867
+    log_buffer_close(*log_sys, handle);                                    // :869
+    m_impl->m_mtr->m_commit_lsn = handle.end_lsn;                          // :871
+  } else {
+    add_dirty_blocks_to_flush_list(0, 0);
+  }
+  release_all();          // 逆序释放 m_memo 里的 latch
+  release_resources();
+}
+```
+
+拷贝由仿函数 `mtr_write_log_t::operator()`（`mtr0mtr.cc:505-553`）完成，逐 block 调 `log_buffer_write`（`:518`）并在最后一块设置 `log_buffer_set_first_record_group`（`:545`）—— 这个 "first record group" 标记是**恢复扫描的起点锚点**，8.0 每个 log block 头部都记它，替代了 5.7 的单一 `LOG_CHECKPOINT_1ST_REC_GROUP`。
+
+> 注意 `mtr_write_log` 在 8.0 已改名成 `mtr_write_log_t`（是个函数对象，不再是自由函数）。
 
 ---
 
@@ -651,7 +942,24 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 |------|------|
 | `mtr0types.h:42` | `mtr_log_t` 四种 log mode |
 | `mtr0types.h:63` | `mlog_id_t` redo record 类型枚举（76 种） |
-| `mtr0log.ic:169` | `mlog_write_initial_log_record_low`：record 头格式（type+压缩 space/page） |
+| `mtr0types.h:67` / `:150` | `MLOG_SINGLE_REC_FLAG`(128) / `MLOG_MULTI_REC_END`(31) |
+| `mtr0types.h:261-270` | 8.0.30+ 统一记录级 type：`MLOG_REC_INSERT`(67) / `CLUST_DELETE_MARK`(68) / `REC_DELETE`(69) / `REC_UPDATE_IN_PLACE`(70) |
+| `mtr0log.ic:41` / `:58` | `mlog_open`（预留区，不记账）/ `mlog_close`（按实际末尾回收） |
+| `mtr0log.ic:169` / `:191` | `mlog_write_initial_log_record_low` / `_fast`（后者含 doublewrite 过滤） |
+| **`mtr0log.cc:795`** | **`mlog_open_and_write_index`（记录级 redo 核心）** |
+| `mtr0log.cc:521` / `:591-646` / `:694` / `:710` | `log_index_get_size_needed` / log version+flag+counts / 字段 len 编码 / `log_index_fields` |
+| `mtr0log.cc:656` / `:881-888` | `close_and_reopen_log`（index 元信息跨 block） |
+| `mtr0log.cc:1215` / `:1242` / `:1018` | `mlog_parse_index` / `mlog_parse_index_v1` / `parse_index_fields` |
+| `mtr0log.cc:414` | `mlog_parse_index_8027`（≤8.0.27 兼容格式） |
+| `mtr0log.cc:256` / `:327` / `:342` | `mlog_write_ulint` / `mlog_write_string` / `mlog_log_string` |
+| `mtr0log.cc:60` | `mlog_catenate_string` |
+| `dyn0buf.h:184/201/237` / `dyn0types.h:45` | `dyn_buf_t::open/close/push`；`DYN_ARRAY_DATA_SIZE = 512` |
+| `mtr0log.h:65` / `:272` | `REDO_LOG_INITIAL_INFO_SIZE = 11` / `MLOG_BUF_MARGIN = 256` |
+| `page0cur.cc:978` / `:2253` | `page_cur_insert_rec_write_log` / `page_cur_delete_rec_write_log` |
+| `btr0cur.cc:3314` / `:4355` | `btr_cur_update_in_place_log` / `btr_cur_del_mark_set_clust_rec_log` |
+| `log0recv.cc:1582` / `:1927/1952/2007/2226` | `recv_parse_or_apply_log_rec_body` 及记录级 case |
+| `log0recv.cc:2821/2965/3069` | `recv_parse_log_rec` / `recv_single_rec` / `recv_multi_rec` |
+| `mach0data.ic:156` | `mach_write_compressed`（1~5B 编码规则） |
 | `mtr0mtr.cc:439` | `s_mode_update` log mode 状态机 |
 | `mtr0mtr.cc:760` | `prepare_write`：SINGLE_REC_FLAG / MULTI_REC_END |
 | `mtr0mtr.cc:842` | `Command::execute`：mtr commit 写 redo 主流程 |

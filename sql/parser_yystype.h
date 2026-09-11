@@ -337,6 +337,7 @@ struct PT_install_component_set_element {
 
 enum class Set_operator { UNION, EXCEPT, INTERSECT };
 
+// NOTE: 语法栈里每个符号都带一个语义值（semantic value），比如：token INT 的语义值是个 int（数字 42）不同类型的值，都存在同一个栈里。Bison 用一个 union 来存栈元素，这个 union 就是 YYSTYPE. 见sql_yacc.yy
 union YYSTYPE {
   Lexer_yystype lexer;  // terminal values from the lexical scanner
   /*

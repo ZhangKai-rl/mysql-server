@@ -3871,12 +3871,14 @@ class LEX_GRANT_AS {
           LEX::reset() redundant.
 */
 
+// 见图： https://help.aliyun.com/zh/polardb/polardb-for-mysql/architecture-of-mysql-server-in-mysql-8?spm=a2c4g.11186623.help-menu-2249963.d_0_7_3.72ad2c34uujZOd&scm=20140722.H_426491._.OR_help-T_cn~zh-V_1
+// note: 清晰lex, qb, qe, slave, next 这些概念
 struct LEX : public Query_tables_list {
   friend bool lex_start(THD *thd);
 
   Query_expression *unit;  ///< Outer-most query expression
   /// @todo: query_block can be replaced with unit->first-select()
-  Query_block *query_block;            ///< First query block
+  Query_block *query_block;            ///< First query block. 可能是属于expression的？
   Query_block *all_query_blocks_list;  ///< List of all query blocks
  private:
   /* current Query_block in parsing */
@@ -4052,6 +4054,7 @@ struct LEX : public Query_tables_list {
   LEX_MASTER_INFO mi;  // used by CHANGE MASTER
   LEX_SLAVE_CONNECTION slave_connection;
   Server_options server_options;
+  // max query per hour
   USER_RESOURCES mqh;
   LEX_RESET_SLAVE reset_slave_info;
   ulong type;

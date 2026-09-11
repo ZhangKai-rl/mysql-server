@@ -115,11 +115,113 @@ prebuilt->row_read_type == ROW_READ_TRY_SEMI_CONSISTENT
 
 源码 `row0sel.cc:4334-4341` 注释：正确性证明依赖"不加 gap lock"，因为 gap lock 锁定范围，若范围末尾行被删除、purge，半一致性读行为复杂难证。因此严格限定在 `skip_gap_locks()` 为 true 的 RC/RU 下，与 `allow_semi_consistent() == skip_gap_locks()` 自洽。`!unique_search` 的排除是因为唯一索引精确查找命中需精确语义，不应走"先旧版本再重读"。
 
+gap lock 背景：next-key lock（record + gap）只在 RR 及以上（SERIALIZABLE）使用，解决幻读；RC/RU 不加 gap lock（`skip_gap_locks()` 为 true），故 RC 容忍幻读，也因此才能半一致性读。
+
+### 为什么必须聚集索引
+
+MVCC 版本链（undo 链）只挂在聚集索引记录上（`DB_ROLL_PTR` 指向 undo）；二级索引记录无版本链，可见性要回表判断。`row_vers_build_for_semi_consistent_read` 断言 `ut_ad(index->is_clustered())`（`row0vers.cc:1377`），触发条件 `index == clust_index`（`row0sel.cc:5268`）——"读旧版本"只能在聚集索引记录上做。
+
+### SELECT_SKIP_LOCKED vs DB_SKIP_LOCKED
+
+- `SELECT_SKIP_LOCKED`：`enum select_mode` 值（`prebuilt->select_mode`），对应 `FOR UPDATE SKIP LOCKED` 语义。
+- `DB_SKIP_LOCKED`：`dberr_t` 返回值，`sel_set_rec_lock`（`row0sel.cc:1138`）→ `lock_clust_rec_read_check_and_lock` 在 sel_mode==SKIP_LOCKED 且记录被锁时返回。
+- `row0sel.cc:5290-5291` 区分：`prebuilt->select_mode == SELECT_SKIP_LOCKED` → `goto next_rec`（用户显式 SKIP LOCKED，真跳过）；否则是半一致性读临时传的 SELECT_SKIP_LOCKED（只借"不等待"语义，`prebuilt->select_mode` 本身未变），走构建旧版本。
+
+### 重读同一行的机制（游标不推进）
+
+半一致性读路径（`row0sel.cc:5288-5314`）不走 `next_rec` 标签（PHASE 5 移动游标在 `next_rec` 内），游标停在原记录，`pcur->store_position`（`row0sel.cc:5785`）存好位置。第二次 `row_search_mvcc`（direction != 0）经 `sel_restore_position_for_mysql`（`row0sel.cc:4884`）恢复位置；`row0sel.cc:4897-4906`：游标停同一行且 `row_read_type == DID` 时不 `goto next_rec`，继续处理同一行。
+
+第一次没锁、第二次加锁靠 `row_read_type` 翻转：TRY → `use_semi_consistent=true` → SELECT_SKIP_LOCKED → DB_SKIP_LOCKED → 没锁返回 DID；DID → `use_semi_consistent=false` → 普通模式悲观等待 → 返回置回 TRY（`row0sel.cc:6075-6080`）。
+
+### prebuilt 生命周期
+
+`row_prebuilt_t`（`row0mysql.h:553`，注释 "save CPU time"）缓存访问一张表所需全部上下文（index/trx/search_tuple/m_stop_tuple/mysql_template/pcur/ins_graph/upd_graph/select_lock_type/select_mode/row_read_type）。创建 `row_create_prebuilt`（`row0mysql.cc:805`）于 `ha_innobase::open`（`ha_innodb.cc:7397`）；销毁 `row_prebuilt_free`（`row0mysql.cc:957`）于 `ha_innobase::close`（`ha_innodb.cc:7691`）；`magic_n`（ROW_PREBUILT_ALLOCATED/FREED）防 use-after-free。
+
+### 缓冲 row id 的场景
+
+`UpdateRowsIterator::Read`（`sql_update.cc:2864`）分两阶段：扫描（`DoImmediateUpdatesAndBufferRowIds`，`sql_update.cc:2418`）+ 延迟更新（`DoDelayedUpdates`，`sql_update.cc:2584`，按 row id `ha_rnd_pos` 回表）。缓冲 row id 场景：① UPDATE 改了被扫描的键（`used_key_is_modified`，`sql_update.cc:647`，边扫边改会重读/漏行）；② ORDER BY（需先排序）；③ 多表 UPDATE（非 `m_immediate_table` 用 `StoreRowId` 写临时表 `m_tmp_tables`，`sql_update.cc:2531-2569`）；④ AFTER 触发器关 batch 反例（`sql_update.cc:849-856`）。半一致性读行在 `DoImmediateUpdatesAndBufferRowIds` 开头 `was_semi_consistent_read()` 直接 `return false`（`sql_update.cc:2420`），让嵌套循环迭代器重读同一行。
+
 ---
 
 ## read view 与可见性判断
 
-> 待补。涉及 ReadView 类（`read0types.h`）、`changes_visible` / `prepare`（`read0read.cc`）、低水位 `m_low_limit_no` 与 purge 的关系、`trx_undo_prev_version_build` 的完整回溯路径、二级索引 MVCC（`row_search_mvcc` 非锁定读分支 `row0sel.cc:5346` 起）。
+### 两种读：一致性读 vs 当前读
+
+`row_search_mvcc` 开头（`row0sel.cc:4855-4864`）按 `select_lock_type` 分流：
+
+- `LOCK_NONE`（普通 SELECT）：一致性读，`trx_assign_read_view`（`row0sel.cc:4860`）分配 read view，用快照判断可见性。
+- `LOCK_X/LOCK_S`（UPDATE/DELETE/`SELECT FOR UPDATE`）：当前读（locking read），走 else 分支加表意向锁（`lock_table`），**不开 read view**，读最新已提交版本。
+
+所以 UPDATE 是当前读，不依赖快照 read view。
+
+### ReadView 的字段（快照内容）
+
+`ReadView::prepare`（read0read.cc:449）快照 `trx_sys` 当前状态，得到四个字段：
+
+| 字段 | 含义 |
+|------|------|
+| `m_creator_trx_id` | 创建者事务自己 |
+| `m_up_limit_id` | 上界 = 创建时**最小**活跃事务 id（`id < 它` → 已提交老事务） |
+| `m_low_limit_id` | 下界 = 创建时**下一个**要分配的 trx id（`id >= 它` → 未来事务） |
+| `m_ids` | 创建时正在活跃（未提交）的事务 id 有序数组 |
+
+### 可见性判断规则（changes_visible）
+
+`ReadView::changes_visible`（read0types.h:171-191）四条规则：
+
+1. `id == m_creator_trx_id` → 自己改的，可见。
+2. `id < m_up_limit_id` → 快照前已提交 → 可见。
+3. `id >= m_low_limit_id` → 快照后才开始 → 不可见。
+4. 中间区间 → `binary_search` 查 `m_ids`：活跃→不可见，已提交→可见。
+
+本质是快照隔离（Snapshot Isolation）：版本可见 ⟺ 其事务在快照创建时刻已提交。
+
+### read view 的分配与复用（trx_assign_read_view + Fast Path）
+
+`trx_assign_read_view`（trx0trx.cc:2355）：已有活跃 view 则复用，否则 `MVCC::view_open` 新建。`view_open`（read0read.cc:531）有 Fast Path 复用：read view 对象池化（`m_free` 链表），用**指针 LSB 位当 closed 标记**（`p & ~1` 还原指针），避免反复 new/delete。
+
+### 深层机制：有序数组、双序列、竞态
+
+**ids_t 有序数组 + 二分**：`m_ids` 是 ReadView 专用的有序数组 `ids_t`（read0types.h:59，裸指针 `m_ptr`+`m_size`+`m_reserved`），只为支撑 `changes_visible` 的 `std::binary_search`（O(log n)）。`ids_t::insert`（read0read.cc:284）：`back() < value` 时 `push_back`（trx_id 递增分配的常见 fast path），否则 `upper_bound + memmove` 二分插入（罕见，如 `copy_complete` 插创建者 id）。
+
+**快照数据源 rw_trx_ids 维护**：`trx_sys->rw_trx_ids`（trx0sys.h:558）是全局有序的"活跃 RW 事务 id"数组。开始：`trx_sys_allocate_trx_id` + `push_back`（trx0trx.cc:1323）；提交：`trx_erase_lists` 用 `lower_bound + erase` 删除并 `view_close`（trx0trx.cc:1871-1885）。`prepare` 在持 `trx_sys->mutex` 时 `copy_trx_ids(rw_trx_ids)` 冻结快照。
+
+**竞态 1（rw_trx_ids 删除顺序）**：`trx0trx.cc:1966-1970` 注释——必须"先擦 rw_trx_ids/rw_trx_list、再移出 serialisation list"。否则中间窗口新 read view 会把该事务判"活跃不可见"，但其 undo 已因 `trx->no` 失效被 purge → missing history。
+
+**竞态 2（Fast Path bug#117553）**：AC-NL-RO 事务无锁复用 view（`m_closed=false` 后不持 mutex 检查 `m_low_limit_id`），与 purge 的 `clone_oldest_view` 竞态，把过时的 `m_low_limit_id/no` 拷进 `purge_sys->view` → `changes_visible` 对已 purge 事务误判"不可见" → 读已 purge 的 undo page → CRASH（read0read.cc:546-591 注释含完整推导）。
+
+**trx_id vs trx_no 双序列**：`trx->id` 事务开始分配（写 `DB_TRX_ID`），只用于 MVCC 可见性判断；`trx->no` 提交时在 serialisation list 分配（提交序，运行期恒 `TRX_ID_MAX`），只用于 purge 顺序 + `m_low_limit_no`。read view 用 id 判可见性（changes_visible），用 no 定 purge 边界（`m_low_limit_no = trx_get_serialisation_min_trx_no()`，read0read.cc:454，即 `trx_sys->serialisation_min_trx_no`）。
+
+**view 软/硬关闭 + m_views 链表**：`view_close`（read0read.cc:774）两条路——软关闭（own_mutex=false，AC-NL-RO）只 `m_closed=true` + 指针 LSB 置 1，留在 m_views 不回收（供 Fast Path 复用）；硬关闭（own_mutex=true，RW）`close()+REMOVE(m_views)+ADD(m_free)` 回收。m_views 新 view 在头（`UT_LIST_ADD_FIRST`，read0read.cc:624），尾是最老；`get_oldest_view`（read0read.cc:657）从尾扫跳过 closed 找最老活跃 view。
+
+**purge 交互**：`clone_oldest_view`（read0read.cc:726）`copy_prepare(*oldest_view)` 拷贝最老 view + `copy_complete` 插回创建者 id，再 `reduce_low_limit(gtid_oldest_trxno)`（:747）用 GTID 最老 trx_no 压低边界，阻止 purge 清理未刷进 `mysql.gtid_executed` 的 undo。
+
+### RR vs RC：read view 生命周期
+
+- RR（`> READ_COMMITTED`）：read view 第一次一致性读创建，事务结束才 `view_close`，整个事务复用 → 可重复读。
+- RC（`<= READ_COMMITTED`）：每条语句结束 `view_close`（ha_innodb.cc:19500，注释 "each consistent read set its own snapshot"），下条语句重建 → 每次读最新已提交。
+
+判定规则相同，差异全在"何时关闭重建"这一行 `view_close`。
+
+### read view 快照 vs 最新已提交版本
+
+- 一致性读：`ReadView::changes_visible()`（`read0read.cc`）判断，只返回"read view 创建时刻已提交"的版本（事务快照）。
+- semi-consistent read：`row_vers_build_for_semi_consistent_read` 用 `trx_rw_is_active(version_trx_id)`（`row0vers.cc:1396`）判断"版本所属事务是否仍活跃"，只要**已提交**（不活跃）就返回，不管它是否在 read view 创建之后才提交。即读"最新已提交版本"，比快照读更新。
+
+这符合 UPDATE 当前读的语义：更新必须基于最新已提交值，而非旧快照。
+
+### read view 与 purge
+
+read view 的低水位 `m_low_limit_no` 决定 purge 边界：purge 只能清理"所有活跃 read view 都看不到"的旧版本。`ReadView::prepare`（`read0read.cc`）计算 `m_low_limit_no`。GTID 持久化可压低边界（`read0read.cc` `reduce_low_limit`）。
+
+### 快照读执行流程与版本回溯
+
+`row_search_mvcc` 一致性读分支：先 `trx_assign_read_view` 分配快照，每扫到一条聚集索引记录用 `lock_clust_rec_cons_read_sees`（lock0lock.cc:231）判断——取 rec 的 `trx_id`（`row_get_rec_trx_id`）→ `view->changes_visible`。
+
+- 可见 → 直接返回当前 rec。
+- 不可见 → `row_sel_build_prev_vers_for_mysql`（row0sel.cc:3071）→ `trx_undo_prev_version_build`（row0vers.cc）沿 `DB_ROLL_PTR` 指向的 undo 链回溯，找到第一个可见版本。
+
+二级索引走 `lock_sec_rec_cons_read_sees`（lock0lock.cc:268），因二级索引页信息不足，判定"不确定"时回表到聚集索引再判断（row0sel.cc:3306-3314）。临时表/只读模式直接可见（lock0lock.cc:246-249）。
 
 ---
 

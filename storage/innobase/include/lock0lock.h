@@ -987,6 +987,7 @@ constexpr uint32_t LOCK_ORDINARY = 0;
   the record; for instance, an x-lock on the gap does not give permission to
   modify the record on which the bit is set; locks of this type are created
   when records are removed from the index chain of records */
+// note: gap lock. 挂在间隙后面的记录上！！！
 constexpr uint32_t LOCK_GAP = 512;
 /** this bit means that the lock is only on the index record and does NOT
    block inserts to the gap before the index record; this is used in the case

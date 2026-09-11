@@ -4759,6 +4759,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
           tmp_user->user.str = sctx->user().str;
           tmp_user->user.length = strlen(sctx->user().str);
         }
+        // user = definer + tmp_user.
         if (!(user = get_current_user(thd, tmp_user))) goto error;
 
         /* copy password expire attributes to individual lex user */
@@ -4783,6 +4784,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
             !user->alter_status.update_failed_login_attempts &&
             !user->alter_status.update_password_lock_time &&
             (thd->lex->ssl_type == SSL_TYPE_NOT_SPECIFIED))
+          // 只改密码，不改认证插件，过期等等
           update_password_only = true;
 
         is_self = !strcmp(sctx->user().length ? sctx->user().str : "",

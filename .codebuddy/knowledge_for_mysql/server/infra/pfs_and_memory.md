@@ -232,6 +232,45 @@ PFS 在用户态通过三层防护实现等效效果：
 └────────────────────────────────────────────────────┘
 ```
 
+### 1.6.1 主链路：一次加锁的端到端 instrumentation 流程
+
+上面的分层图是**静态结构**，主链路是它**动态走一遍**——从业务代码调 `mysql_mutex_lock` 到 event 落进 ring buffer 的完整脉络：
+
+```
+业务代码（开发者零 PFS 感知）
+  mysql_mutex_lock(&dict_operation_lock)
+    │ ① 第一层宏展开：注入源码位置（__FILE__ / __LINE__）
+    ▼
+  mysql_mutex_lock_with_src(&m, "btr0sea.cc", 320)
+    │ ② 第二层宏展开：进入 inline 函数
+    ▼
+  inline_mysql_mutex_lock(&m, file, line)
+    │ ③ 运行时逐层短路：m_psi != nullptr? m_enabled?
+    ▼
+  PSI_MUTEX_CALL(start_mutex_wait)          ← 编织点 A
+    │  = psi_mutex_service->start_mutex_wait（vtable 间接 / PFS_DIRECT_CALL 直调）
+    ▼
+  pfs_start_mutex_wait_v1(&state, mutex, LOCK, file, line)
+    │ ④ 记录 timer_start 到 locker state
+    ▼
+  my_mutex_lock(&m_mutex)                   ← 真正的加锁（业务本体）
+    │
+    ▼
+  PSI_MUTEX_CALL(end_mutex_wait)            ← 编织点 B
+    │  = pfs_end_mutex_wait_v1(locker, rc)
+    ▼
+  ⑤ 计算耗时 → 写入 events_waits_current（ring buffer）
+     → 按 thread / event_name 聚合到 summary 表
+```
+
+**这一条链路的三个关键分叉点**：
+
+- **③ 短路判断**：`m_psi == nullptr`（未注册）或 `m_enabled == false`（类别关闭）时直接跳过 ④⑤，开销约 2 条 `cmp` + 分支预测命中
+- **① ② 宏展开 vs ③ 运行时**：宏在**编译期**决定"埋点代码是否存在"，运行时只判断"是否激活"——这就是"编译期编织 + 运行时采集"的分工
+- **⑤ 落点**：start 记开始时间，end 算差值，同一个 event 从 `current` 滚入 `history` 再到 `summary` 聚合
+
+> 对照 1.4.2 的宏展开：那里讲的是**每一层宏怎么展开**（静态），这里讲的是**展开后的代码运行时怎么流转**（动态）。两者一静一动，合成完整认知。
+
 ### 1.7 关键概念辨析：Event、Trace、Metrics、Profile
 
 这些词经常被混用。它们在可观测性领域有精确的定义层次：
@@ -369,6 +408,45 @@ InnoDB 不是用一个通用分配器管理所有内存，而是根据生命周�
 │  └──────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────┘
 ```
+
+### 2.1.1 主链路：一次分配落到哪个分配器
+
+上面的全景图是**静态分层**，主链路是**一次 `mem_heap_alloc` 沿哪条路径落到最底层**：
+
+```
+mem_heap_alloc(heap, n)                       ← bump 分配入口
+  │
+  ├─ 当前 block 剩余空间够？
+  │   ├─ 够 → 直接 bump（O(1) 推 free 指针）
+  │   │       buf = block + free + MEM_NO_MANS_LAND
+  │   │       mem_block_set_free(free + MEM_SPACE_NEEDED(n))
+  │   │
+  │   └─ 不够 → mem_heap_add_block(heap, n)
+  │             │  新块大小 = 2×上一块，封顶标准值
+  │             ▼
+  │         mem_heap_create_block(heap, size, type)
+  │             │
+  │             ├─ type==DYNAMIC 或 size < 半页(8KB)
+  │             │     → ut::malloc_withkey(KEY, len)
+  │             │         → jemalloc / glibc malloc → PFS 统计
+  │             │
+  │             └─ 大块（BUFFER 类型）:
+  │                 ├─ type & BTR_SEARCH
+  │                 │     → free_block_ptr 原子取（AHI 死锁规避，失败返 NULL）
+  │                 └─ 否则
+  │                       → buf_block_alloc
+  │                           → Buffer Pool free list（一整个 16KB 页）
+  ▼
+返回 buf
+```
+
+**这条链路的三个关键分叉**：
+
+- **bump vs add_block**：绝大多数分配走 bump 分支（O(1)，推 free 指针）；只有当前 block 装不下才 `add_block`（低频）
+- **小块 vs 大块**（`create_block` 内）：`< 半页(8KB)` 走 `malloc`，因为不值得为几 KB 临时数据浪费一整个 16KB BP 页
+- **BTR_SEARCH 特殊路径**：持有 AHI X-latch 时不能从 BP 分配（可能触发 LRU 驱逐 → 又要 AHI latch → 死锁），所以改成从预留的 `free_block_ptr` 原子取，取不到返回 NULL 而非崩溃
+
+> 这条链路把 2.2~2.5 四个分配器串成一条线：`mem_heap_alloc` 是统一入口，`create_block` 是分流点，最终落到 `jemalloc/glibc`（malloc 路径）或 `Buffer Pool`（页面路径）。
 
 ### 2.2 mem_heap —— InnoDB 的 Bump Allocator（指针碰撞分配器）
 
@@ -618,7 +696,48 @@ struct Scoped_heap {
 
 MEM_ROOT 是 MySQL Server 层（非 InnoDB）的 arena 分配器。思想与 mem_heap 同源（bump allocate + 批量释放），但设计上有显著差异以适应 Server 层的不同需求。
 
-#### 2.3.2 与 mem_heap 的详细对比
+#### 2.3.2 主链路：一次 Server 层分配落到哪
+
+与 mem_heap 的主链路（2.1.1）**并行**，但底层只有 `my_malloc` 一条路，**没有 Buffer Pool 分支**——这是 Server 层与引擎层分配器的根本区别：
+
+```
+MEM_ROOT::Alloc(length)                        my_alloc.h:146
+  │  ALIGN_SIZE 对齐
+  ├─ 快路径：当前 block 剩余够（free_end - free_start >= length）?
+  │   ├─ 够 → bump（O(1)）                     my_alloc.h:160-164
+  │   │       ret = m_current_free_start
+  │   │       m_current_free_start += length
+  │   │
+  │   └─ 不够 → AllocSlow(length)              my_alloc.h:167
+  │
+  ▼
+AllocSlow(length)                               my_alloc.cc:108
+  ├─ length >= m_block_size 或 SINGLE_CHUNKS?
+  │   ├─ 是 → AllocBlock(length, length)        my_alloc.cc:116-123
+  │   │        大块单独分配，插到倒数第二位置（不干扰后续小块）
+  │   │
+  │   └─ 否 → ForceNewBlock(length)             my_alloc.cc:144
+  │             └─ AllocBlock(ALIGN_SIZE(m_block_size), length)
+  │                  → 新块成为 current block
+  │             → bump 分配                       my_alloc.cc:147-149
+  ▼
+AllocBlock(wanted_length, minimum_length)       my_alloc.cc:58
+  ├─ 容量检查：m_max_capacity 超限 → EE_CAPACITY_EXCEEDED / nullptr
+  ├─ bytes_to_alloc = length + ALIGN_SIZE(sizeof(Block))
+  ├─ new_block = my_malloc(m_psi_key, bytes_to_alloc, MYF(...))   my_alloc.cc:90
+  │    → 底层 malloc → PFS 统计（唯一落点，不碰 Buffer Pool）
+  ├─ m_block_size += m_block_size/2             my_alloc.cc:103  ← 指数增长
+  └─ 返回 new_block
+```
+
+**与 mem_heap 主链路的两个关键差异**：
+
+- **底层落点单一**：mem_heap 大块会分流到 `buf_block_alloc`（Buffer Pool），MEM_ROOT 永远只走 `my_malloc`——Server 层不持有 BP，也没有"拿一整个 16KB 页换临时数据"的问题
+- **慢路径两类分叉**：mem_heap 慢路径只有"add_block（2× 增长）"一条；MEM_ROOT 慢路径多一条"**大块单独分配**"（`length >= m_block_size` 时单独开块、插倒数第二），避免偶发的大请求（如 2MB）把后续所有小分配都拖进大块浪费空间
+
+> 完整对比见 2.3.3 的表格；这里只强调主链路上的分流差异。
+
+#### 2.3.3 与 mem_heap 的详细对比
 
 | 维度 | mem_heap | MEM_ROOT |
 |------|---------|----------|
@@ -637,7 +756,7 @@ MEM_ROOT 是 MySQL Server 层（非 InnoDB）的 arena 分配器。思想与 mem
 | **PFS 埋点** | 通过 `ut::malloc_withkey` → `PSI_memory_key` | 通过 `my_malloc` + `PSI_memory_key` |
 | **代码位置** | `storage/innobase/mem/` + `include/mem0mem.*` | `mysys/my_alloc.cc` + `include/my_alloc.h` |
 
-#### 2.3.3 MEM_ROOT 的指数增长与独立大块分配
+#### 2.3.4 MEM_ROOT 的指数增长与独立大块分配
 
 ```cpp
 // my_alloc.cc:101-103
@@ -653,6 +772,96 @@ if (length >= m_block_size || MEM_ROOT_SINGLE_CHUNKS) {
 ```
 
 这个设计保证：偶尔来一个巨大的分配（如 2MB）不会导致后续所有小分配都从 2MB 块中分配（那会浪费大量空间），而是隔离到独立 block。
+
+#### 2.3.5 MEM_ROOT 的衍生容器生态（Server 层独有，mem_heap 没有）
+
+**这是 MEM_ROOT 与 mem_heap 最深层的差异**：MEM_ROOT 之上长出了一整套容器生态，而 mem_heap 只有原始分配函数族 + `Scoped_heap` RAII。原因在于两层代码风格——Server 层是 C++ 类层次重灾区（解析树、优化器、executor），天然需要 STL 风格泛型容器；InnoDB 核心是历史 C 风格，直接 `mem_heap_alloc` 分配字节 + 手动 offset 管理。
+
+生态分四个层级：
+
+```
+① 方法级      MEM_ROOT::ArrayAlloc<T>(num, args...)    my_alloc.h:182
+② allocator级 Mem_root_allocator<T>                    sql/mem_root_allocator.h
+③ 容器级      Mem_root_array<T> / _YY<T>               sql/mem_root_array.h
+              mem_root_deque<T>                        include/mem_root_deque.h
+④ 适配 STL    std::vector/deque/list/set<T, Mem_root_allocator<T>>
+```
+
+**① ArrayAlloc —— 分配并构造 num 个 T**
+
+```cpp
+// my_alloc.h:182-189
+T *ArrayAlloc(size_t num, Args... args) {
+  static_assert(alignof(T) <= 8, "MEM_ROOT only returns 8-aligned memory.");
+  T *ret = static_cast<T *>(Alloc(num * sizeof(T)));   // 一次性 Alloc
+  // ... 然后逐个 placement new 构造
+}
+```
+
+`ArrayAlloc` 是 MEM_ROOT **方法级**的便捷入口：一次 `Alloc` 拿到整块内存，再 placement new 构造每个元素。`mem_root_deque` 内部就用它分配 Block 数组（`m_root->ArrayAlloc<Block>(...)`）。
+
+**② Mem_root_allocator —— 适配 STL 的桥**
+
+```cpp
+// sql/mem_root_allocator.h:101-110
+pointer allocate(size_type n, ...) {
+  pointer p = static_cast<pointer>(m_memroot->Alloc(n * sizeof(T)));  // 走 MEM_ROOT
+  if (p == nullptr) throw std::bad_alloc();
+  return p;
+}
+void deallocate(pointer, size_type) {}   // ★ 空操作：MEM_ROOT 不支持单块释放
+```
+
+`deallocate` 是空操作——这是适配器模式里的"退化适配"：STL 容器期望能逐个释放，但 MEM_ROOT 只能整体释放，所以干脆什么都不做，等 MEM_ROOT 生命周期结束统一回收。
+
+`rebind`（`mem_root_allocator.h:155-158`）是关键机制：容器内部要分配的不是 `T`，而是节点类型（如 `std::list` 要分配 `_List_node`），`rebind` 提供"从 `Allocator<T>` 推导 `Allocator<InternalNode>`"的类型配方，并把底层 `m_memroot` 传递过去。
+
+**③ 两个容器类 + 一个 deque（对比见下表）**
+
+| | Mem_root_array | Mem_root_array_YY | mem_root_deque |
+|---|---|---|---|
+| 定义 | `mem_root_array.h:426` | `mem_root_array.h:61` | `mem_root_deque.h:110` |
+| 内存布局 | 连续（`m_array` 裸指针） | 连续 | 分块（1KB/块）+ 物理索引 |
+| 构造/析构 | 有 | **无**（Bison `%union` 要求 POD） | 有 |
+| 用途 | 通用顺序容器 | 解析树语法栈 | 需两端插入/删除 |
+
+**Mem_root_array 的内存布局**（好调试的原因）：
+
+```cpp
+// mem_root_array.h:409-413
+protected:
+  MEM_ROOT *m_root;
+  Element_type *m_array;   // ★ 连续内存裸指针
+  size_t m_size;
+  size_t m_capacity;
+```
+
+`m_array` 指向连续内存，gdb 一条命令就能全打印：`p *arr.m_array@arr.m_size`。
+
+**mem_root_deque 的分块 + 物理索引**（难调试的原因）：
+
+```
+m_blocks     Block 数组（每个 Block 存 block_elements 个元素，约 1KB，2 的幂）
+m_begin_idx  物理起始索引
+m_end_idx    物理结束索引（one-past-end）
+
+元素定位（mem_root_deque.h:616）:
+  get(physical_idx) = m_blocks[physical_idx / block_elements]
+                        .elements[physical_idx % block_elements]
+```
+
+元素分散在多个 1KB 块里，靠 `m_begin_idx + 逻辑索引` 换算成物理索引，再二次间接寻址定位。gdb 的 libstdc++ pretty-printer 不认识这个自造类，所以只显示一堆内部字段，看不到元素值。
+
+> **调试 mem_root_deque 的三个技巧**：
+> 1. `p deq[i]` —— `operator[]` 是 const（`mem_root_deque.h:169`），gdb 能直接调
+> 2. `p deq.size()` / `deq.front()` / `deq.back()`
+> 3. 手动解引用：`p deq.m_blocks[X].elements[Y]`，其中物理索引 `= m_begin_idx + i`，`X = phys / block_elements`，`Y = phys % block_elements`
+
+**为什么解析树偏爱 `_YY` 和 `mem_root_deque`**：
+
+- `Mem_root_array_YY<PT_table_reference *>`（`from_clause`、`join_table_list`）：Bison 语法栈是 `union`，成员必须是 POD（无构造/析构），所以用无 ctor 的 `_YY` 版
+- `mem_root_deque<List_item *>`（`many_values`）：VALUES 列表要 `push_back` 追加，也可能 `push_front`，deque 比 array 灵活
+- 全部走 MEM_ROOT：**解析树生命周期 = 一次语句**，随 `THD::mem_root` 语句结束一次性释放，无需逐个 delete
 
 ### 2.4 buf_buddy —— Binary Buddy Allocator（二叉伙伴分配器）
 

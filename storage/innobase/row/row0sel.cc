@@ -4331,6 +4331,7 @@ static row_to_range_relation_t row_compare_row_to_range(
     return (row_to_range_relation);
   }
 
+  // ques: 为什么 no gap lock 是semi-consistent read 的前提？
   /* While I believe that we handle semi-consistent reads correctly, the proof
   is quite complicated and lingers on the fact that semi-consistent reads are
   used only if we don't use gap locks. And fortunately, we've already checked
@@ -4417,7 +4418,7 @@ It also has optimization such as pre-caching the rows, using AHI, etc.
 QUES: search 的 cursor 的范围是多少？
 
 @param[out]     buf             buffer for the fetched row in MySQL format
-每次调用只读取一行，放到buf 中
+xxxx: 每次调用只读取一行，放到buf 中, 格式为：
 @param[in]      mode            search mode PAGE_CUR_L
 @param[in,out]  prebuilt        prebuilt struct for the table handler;
                                 this contains the info to search_tuple,
@@ -4430,6 +4431,8 @@ QUES: search 的 cursor 的范围是多少？
                                 pcur with stored position! In opening of a
                                 cursor 'direction' should be 0.
                                 这是一个入参，在row_search_mvcc的过程中不会改变
+                                第一次读该行进入时为 0，第二次（如semi-consistent read 第二次加锁读同行)变为 1
+                                也就是 行级
 @return DB_SUCCESS or error code */
 dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
                         row_prebuilt_t *prebuilt, ulint match_mode,
@@ -4640,6 +4643,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     columns because we demand that all the columns in primary key
     are non-null. */
 
+    // note: unique_search 的判定逻辑。三个条件： match_mode == ROW_SEL_EXACT（等值点查）、dict_index_is_unique（走唯一索引/主键）、给出了完整唯一键（search_tuple 字段数 == 唯一索引列数）
     unique_search = true;
 
     /* Even if the condition is unique, MySQL seems to try to
@@ -5261,11 +5265,13 @@ rec_loop:
     }
     /* in case of semi-consistent read, we use SELECT_SKIP_LOCKED, so we don't
     waste time on creating a WAITING lock, as we won't wait on it anyway */
+    // 使用 semi-consistent read 的四个条件
     const bool use_semi_consistent =
         prebuilt->row_read_type == ROW_READ_TRY_SEMI_CONSISTENT &&
         !unique_search && index == clust_index && !trx_is_high_priority(trx);
     err = sel_set_rec_lock(
         pcur, rec, index, offsets,
+                                       // NOTE
         use_semi_consistent ? SELECT_SKIP_LOCKED : prebuilt->select_mode,
         prebuilt->select_lock_type, lock_type, thr, &mtr);
 
@@ -5797,6 +5803,7 @@ idx_cond_failed:
 
   goto normal_return;
 
+// note: 如何推进cursor 的？
 next_rec:
 
   if (end_loop >= 99 && need_vrow && vrow == nullptr && prev_rec != nullptr) {
@@ -5822,7 +5829,7 @@ next_rec:
   vrow = nullptr;
 
   /*-------------------------------------------------------------*/
-  /* PHASE 5: Move the cursor to the next index record */
+  /* note: PHASE 5: Move the cursor to the next index record */
 
   /* NOTE: For moves_up==false, the mini-transaction will be
   committed and restarted every time when switching b-tree

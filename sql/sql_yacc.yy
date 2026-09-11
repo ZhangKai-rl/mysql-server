@@ -516,6 +516,12 @@ void warn_on_deprecated_user_defined_collation(
 
 // https://zhuanlan.zhihu.com/p/716898493
 // 这里是MYSQLparse的入口. sql_parser -> MYSQLparser函数的参数
+/**
+  %parse-param { class THD *YYTHD }                  // yyparse 第一个参数是 THD*
+  %parse-param { class Parse_tree_root **parse_tree } // 第二个参数是解析树出参
+  %lex-param   { class THD *YYTHD }                  // yylex 也拿到 THD*
+  %define api.pure                                    // reentrant 解析器（线程安全）. 将传统 bison 变为可重入
+*/
 %parse-param { class THD *YYTHD }
 %parse-param { class Parse_tree_root **parse_tree }
 

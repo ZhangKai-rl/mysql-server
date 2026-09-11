@@ -1926,6 +1926,7 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit) {
 
     for (auto &ha_info : ha_list) {
       int err;
+      // note: 这里是external_lock 里 ha_regisiter_trx 对该事务注册的handlerton
       auto ht = ha_info.ht();
       if ((err = ht->commit(ht, thd, all))) {
         char errbuf[MYSQL_ERRMSG_SIZE];

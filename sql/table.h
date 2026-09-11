@@ -1402,7 +1402,7 @@ typedef Bitmap<MAX_FIELDS> Field_map;
 struct TABLE {
   TABLE_SHARE *s{nullptr};
   // xxxx: TABLE是实际用于 handler *file 的！！！！
-  handler *file{nullptr};  // 存储引擎的句柄
+  handler *file{nullptr};
   TABLE *next{nullptr}, *prev{nullptr};
 
  private:
@@ -2581,6 +2581,7 @@ struct LEX_MFA {
   /*
     flag used during authentication and to decide if server should
     be in sandbox mode or not
+    for FIDO  生物验证
   */
   bool requires_registration;
   /* flag set during ALTER USER .. nth FACTOR UNREGISTER */

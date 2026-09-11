@@ -39,8 +39,10 @@
    The interface is chosen to be similar to std::vector.
 
    @remark
-   Mem_root_array_YY is constructor-less for use in the parser stack of unions.
+   note: Mem_root_array_YY is constructor-less for use in the parser stack of unions.
    For other needs please use Mem_root_array.
+   xxxx: Mem_root_array_YY 用于parser_yystype.h 中 union YYSTYPE, 作为bison sql_yacc.yy
+   的类型，因此必须 trival/pod，_YY 这些都是 trival
 
    @remark
    Unlike DYNAMIC_ARRAY, elements are properly copied

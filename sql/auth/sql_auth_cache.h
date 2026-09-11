@@ -243,6 +243,7 @@ class Acl_credential {
   uint8 m_salt_len;
 };
 
+// mysql.user 表中的用户
 class ACL_USER : public ACL_ACCESS {
  public:
   USER_RESOURCES user_resource;

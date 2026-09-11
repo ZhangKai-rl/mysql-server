@@ -549,6 +549,7 @@ constexpr uint32_t ROW_PREBUILT_FREED = 26423527;
 /** A struct for (sometimes lazily) prebuilt structures in an Innobase table
 handle used within MySQL; these are used to save CPU time. */
 
+// note
 struct row_prebuilt_t {
   ulint magic_n;               /*!< this magic number is set to
                                ROW_PREBUILT_ALLOCATED when created,

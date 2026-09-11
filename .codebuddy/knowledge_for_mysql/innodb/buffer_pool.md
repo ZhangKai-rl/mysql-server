@@ -5,6 +5,7 @@
 ## 目录
 
 - [概述](#概述)
+- [slot-based 结构：frame 与控制块](#slot-based-结构frame-与控制块)
 - [理论基础](#理论基础)
 - [buf_page_t 状态机与 buf_page_in_file](#buf_page_t-状态机与-buf_page_in_file)
 - [脏页刷新（Flush）](#脏页刷新flush)
@@ -30,6 +31,32 @@ InnoDB 的缓冲池，缓存表空间数据页（16KB 为主），控制块为 `
 | 5.6 | 多 buffer pool instance |
 | 5.7 | 在线 resize（chunk） |
 | 8.0 | flush 无锁化改造（8.0.19 起 flush_list_mutex 替代 buf_pool mutex 扫 flush_list）；page cleaner 协调者/worker 模型 |
+
+---
+
+## slot-based 结构：frame 与控制块
+
+InnoDB buffer pool 是经典的 slot-based（frame-based）buffer manager，术语源自 Gray & Reuter《Transaction Processing: Concepts and Techniques》（buf0buf.cc:136 注释明确引用）。
+
+核心思想：预分配一大块内存，切成 N 个固定大小槽位（frame，每个 = `UNIV_PAGE_SIZE`），每个槽位配一个控制块记录该槽位当前装哪一页、脏否、被谁 pin。
+
+三要素与 InnoDB 对应：
+
+| 通用概念 | InnoDB 实现 |
+|---------|------------|
+| 槽位 frame | `buf_block_t::frame`（`byte*`，buf0buf.h:1710） |
+| 控制块 | `buf_block_t`（内含 `buf_page_t page` + `BPageLock lock` + `frame`） |
+| 页表 page table | `buf_pool_t::page_hash`（按 `(space_id, page_no)` 索引，buf0buf.h:2354） |
+| 空闲链表 | `free_list` |
+| 替换策略 | LRU list（old/new 两段、midpoint insertion） |
+
+内存布局（`buf_chunk_init` buf0buf.cc:993）：一次分配一整块 chunk，头部放 `buf_block_t` 控制块数组（`chunk->blocks`），后面紧跟 frame 数组；循环 `buf_block_init(buf_pool, block, frame)`（:748，`block->frame = frame`）后 `block++`、`frame += UNIV_PAGE_SIZE`，两者一一对应连续排列。
+
+`buf_block_t` 第一个成员必须是 `buf_page_t page`（buf0buf.h:1700），让 `page_hash` 能统一指向 `buf_page_t`（裸压缩页）或 `buf_block_t`（有 frame 的页）。
+
+为什么叫 slot-based：槽位是固定页大小、按需动态装载任意页（页号与槽位非固定绑定，靠 page_hash 解耦），对比"固定映射式"（页号直接映射内存位置，无页表）和"对象/变长式"（malloc 级粒度）。CMU 15-445 BusTub 是最简教学实现（`pages[]` + `page_table_` + `replacer_` + `free_list_`）。
+
+InnoDB 在经典骨架上扩展：chunk 分区（在线 resize）、多实例（`innodb_buffer_pool_instances`，每实例独立 chunk/LRU/page_hash）、压缩页突破固定槽位（`ZIP_PAGE/ZIP_DIRTY` 无 frame，压缩数据用 buddy allocator 动态切，`zip_hash`/`zip_free`）、控制块与 frame 分离但同块紧邻（不污染页数据）。
 
 ---
 

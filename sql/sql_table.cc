@@ -17743,6 +17743,7 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
       goto err_new_table_cleanup;
     });
 
+    // copy ddl
     if (copy_data_between_tables(thd, thd->m_stage_progress_psi, table,
                                  new_table, alter_info->create_list, &copied,
                                  &deleted, alter_info->keys_onoff, &alter_ctx))
@@ -18480,6 +18481,7 @@ static int copy_data_between_tables(
     return -1;
   }
 
+  // note: 这就是copy ddl 上锁的位置？
   if (to->file->ha_external_lock(thd, F_WRLCK)) {
     destroy_array(copy, to->s->fields);
     return -1;
@@ -18616,6 +18618,7 @@ static int copy_data_between_tables(
 
   to->file->ha_extra(HA_EXTRA_BEGIN_ALTER_COPY);
 
+  // ques; 这里在干嘛: COPY 是 server 层逐行 INSERT ... SELECT
   while (!(error = iterator->Read())) {
     if (thd->killed) {
       thd->send_kill_message();

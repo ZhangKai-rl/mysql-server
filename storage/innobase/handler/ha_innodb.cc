@@ -10859,6 +10859,7 @@ int ha_innobase::rnd_next(uchar *buf) /*!< in/out: returns the row in this
 /** Fetches a row from the table based on a row reference.
  @return 0, HA_ERR_KEY_NOT_FOUND, or error code */
 
+// ques: ref 怎么理解？
 int ha_innobase::rnd_pos(
     uchar *buf, /*!< in/out: buffer for the row */
     uchar *pos) /*!< in: primary key value of the row in the
@@ -18349,6 +18350,7 @@ int ha_innobase::check(THD *thd,                /*!< in: user thread handle */
 /** Tells something additional to the handler about how to do things.
  @return 0 or error number */
 
+// TODO
 int ha_innobase::extra(enum ha_extra_function operation)
 /*!< in: HA_EXTRA_FLUSH or some other flag */
 {
@@ -18629,6 +18631,7 @@ trx_t::isolation_level_t innobase_trx_map_isolation_level(
  @brief 这是 InnoDB 感知 statement/LOCK TABLES 边界、做一些会话/事务态准备的关键回调点（例如记录 m_mysql_has_locked、绑定 m_user_thd 等）。
  external_lock() 总体定位：它是 InnoDB 感知“SQL 层表锁边界/语句边界”的 hook.
  扩散sql layer lock_type -> innodb prebuilt->select_lock_type
+  注册事务、开始 sql  语句, 记录回滚savepoint等
  @return 0 */
 
 // TODO
@@ -18702,6 +18705,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
   m_prebuilt->sql_stat_start = true;
   m_prebuilt->hint_need_to_fetch_extra_cols = 0;
 
+  // xxxx
   reset_template();
 
   /** FTWRL
@@ -18762,10 +18766,11 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
 
     *trx->detailed_error = 0;
 
+    // note
     innobase_register_trx(ht, thd, trx);
 
     /*
-    xxxx TODO
+    xxxx TODO: 核心，确定 lock 类型？
     For reads we will use LOCK_NONE, LOCK_S or LOCK_X according to this chart:
                          +-----------------------------------------+
                          | is_dd_table or skip_locking             |
@@ -18843,7 +18848,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
       if (sql_command == SQLCOM_LOCK_TABLES && THDVAR(thd, table_locks) &&
           thd_test_options(thd, OPTION_NOT_AUTOCOMMIT) &&
           thd_in_lock_tables(thd)) {
-        // note: 锁定读external_lock语句开始时就上锁了
+        // note: 锁定读external_lock语句开始时就上锁了, 上的什么锁？具体锁的什么？释放时机？
         dberr_t error = row_lock_table(m_prebuilt);
 
         if (error != DB_SUCCESS) {

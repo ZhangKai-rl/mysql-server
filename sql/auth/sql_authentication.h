@@ -57,6 +57,7 @@ class Thd_charset_adapter {
 /**
   The internal version of what plugins know as MYSQL_PLUGIN_VIO,
   basically the context of the authentication session
+  MP: mysql plugin, EXT: extension
 */
 struct MPVIO_EXT : public MYSQL_PLUGIN_VIO {
   MYSQL_SERVER_AUTH_INFO auth_info;// 存储 ./mysql --user=xxx --password=xxx
