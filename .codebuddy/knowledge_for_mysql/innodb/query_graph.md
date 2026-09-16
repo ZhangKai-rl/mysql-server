@@ -1,24 +1,27 @@
 # InnoDB Query Graph 执行模型深度解析
 
 > 基于 MySQL 8.0.39 源码，涵盖 fork/thr/node 三层架构、查询图构建与生命周期、row_prebuilt_t 与查询图关系、que_run_threads 调度器、锁等待挂起与精确唤醒机制、srv_sys->tasks 全局队列与 purge 调度。
+>
+> **边界**：本篇讲 query graph 执行模型的**通用机制**（构建 / 调度 / 挂起 / 唤醒）；回滚图（roll_node 外层 + undo graph 内层的两层结构）与事务回滚的剖析见 [`trx.md`](trx.md)「回滚机制」。
 
 ## 目录
 
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [查询图的构建](#查询图的构建)
-- [核心概念：fork / thr / node 三层架构](#核心概念fork--thr--node-三层架构)
-- [节点类型与 C 风格多态](#节点类型与-c-风格多态)
-- [row_prebuilt_t 与查询图的关系](#row_prebuilt_t-与查询图的关系)
-- [SELECT 不走查询图](#select-不走查询图)
-- [执行调度器：que_run_threads 与 que_thr_step](#执行调度器que_run_threads-与-que_thr_step)
-- [thr 状态机](#thr-状态机)
-- [锁等待挂起机制](#锁等待挂起机制)
-- [精确唤醒：从 2PL 放锁到 os_event_set](#精确唤醒从-2pl-放锁到-os_event_set)
-- [srv_sys->tasks 全局队列与 purge 调度](#srv_systasks-全局队列与-purge-调度)
-- [两种执行模型对比：1:1 阻塞 vs task queue 分发](#两种执行模型对比11-阻塞-vs-task-queue-分发)
+- [核心实现](#核心实现)
+  - [查询图的构建](#查询图的构建)
+  - [核心概念：fork / thr / node 三层架构](#核心概念fork--thr--node-三层架构)
+  - [节点类型与 C 风格多态](#节点类型与-c-风格多态)
+  - [row_prebuilt_t 与查询图的关系](#row_prebuilt_t-与查询图的关系)
+  - [SELECT 不走查询图](#select-不走查询图)
+  - [执行调度器：que_run_threads 与 que_thr_step](#执行调度器que_run_threads-与-que_thr_step)
+  - [thr 状态机](#thr-状态机)
+  - [锁等待挂起机制](#锁等待挂起机制)
+  - [精确唤醒：从 2PL 放锁到 os_event_set](#精确唤醒从-2pl-放锁到-os_event_set)
+  - [srv_sys->tasks 全局队列与 purge 调度](#srv_systasks-全局队列与-purge-调度)
+  - [两种执行模型对比：1:1 阻塞 vs task queue 分发](#两种执行模型对比11-阻塞-vs-task-queue-分发)
 - [Misc](#misc)
-- [关键源码位置速查](#关键源码位置速查)
+- [参考](#参考)
 
 ---
 
@@ -99,9 +102,13 @@ InnoDB 最初由 Heikki Tuuri 在 1995 年独立开发，查询图执行模型�
 
 ---
 
-## 查询图的构建
+## 核心实现
 
-### 入口：pars_complete_graph_for_exec
+> 本章讲 query graph 的**构建、调度、挂起与唤醒**，共 11 个环节：查询图构建、fork/thr/node 三层架构、节点多态、prebuilt 关系、SELECT 特例、执行调度器、thr 状态机、锁等待挂起、精确唤醒、purge 队列调度、两种执行模型。回滚图（roll_node 外层 + undo graph 内层）的剖析见 [`trx.md`](trx.md)「回滚机制」。
+
+### 查询图的构建
+
+#### 入口：pars_complete_graph_for_exec
 
 所有查询图的构建都通过 `pars_complete_graph_for_exec()`（`pars0pars.cc:1734`）完成：
 
@@ -128,7 +135,7 @@ que_thr_t *pars_complete_graph_for_exec(que_node_t *node, trx_t *trx,
 
 这个函数做三件事：创建 fork（语句容器）→ 创建 thr（执行线程）→ 把 node 挂到 thr 下。返回 thr 供后续 `que_run_threads(thr)` 执行。
 
-### 四种操作的查询图构建
+#### 四种操作的查询图构建
 
 InnoDB 为每种 SQL 操作预编译了对应的查询图：
 
@@ -196,9 +203,9 @@ DELETE 复用 UPDATE 的 upd_graph——InnoDB 中 DELETE 是 UPDATE 的特殊�
 
 ---
 
-## 核心概念：fork / thr / node 三层架构
+### 核心概念：fork / thr / node 三层架构
 
-### que_fork_t — 语句容器
+#### que_fork_t — 语句容器
 
 一条 SQL 语句对应一个 fork（`que_fork_t` = `que_t`），定义在 `include/que0que.h:295`：
 
@@ -215,7 +222,7 @@ struct que_fork_t {
 
 fork 包含这条语句属于哪个事务、有几个 thr 在跑。大多数情况下只有 1 个 thr，但 purge 等场景可以有多个。
 
-### que_thr_t — 虚拟执行线程
+#### que_thr_t — 虚拟执行线程
 
 定义在 `include/que0que.h:225`：
 
@@ -234,7 +241,7 @@ struct que_thr_t {
 
 thr 是**控制流**的载体——记录"下一步执行哪个 node"（run_node）、"谁在执行"（通过 thr_get_trx 获取事务）、"当前状态"。thr 不是 OS 线程，是逻辑状态机，必须依附于一个 OS 线程才能执行。
 
-### node — 操作状态节点
+#### node — 操作状态节点
 
 每种操作对应一种 node，记录"做什么、做到哪了"。例如 `upd_node_t`（`include/row0upd.h`）：
 
@@ -249,7 +256,7 @@ struct upd_node_t {
 
 node 跨多次调用保持状态。例如 UPDATE 多行时，每次调用处理一行，node 中的 pcur 记录当前游标位置。
 
-### 三者关系
+#### 三者关系
 
 ```
 que_fork_t "语句"
@@ -265,9 +272,9 @@ thr 在不同 node 之间流转执行。一个 thr 可以执行多个不同的 n
 
 ---
 
-## 节点类型与 C 风格多态
+### 节点类型与 C 风格多态
 
-### que_common_t — 多态基类
+#### que_common_t — 多态基类
 
 所有节点类型都以 `que_common_t` 作为第一个字段，实现 C 风格多态：
 
@@ -280,7 +287,7 @@ struct que_common_t {
 
 通过 `que_node_get_type(node)` 读取 type 字段判断节点类型，然后 `static_cast` 到具体子类型。
 
-### 节点类型清单
+#### 节点类型清单
 
 `que_thr_step()`（`que0que.cc:923`）中的 switch 分发列出了所有节点类型：
 
@@ -289,7 +296,7 @@ struct que_common_t {
 | UPDATE | `QUE_NODE_UPDATE` | `row_upd_step` | 更新行 |
 | INSERT | `QUE_NODE_INSERT` | `row_ins_step` | 插入行 |
 | SELECT | `QUE_NODE_SELECT` | `row_sel_step` | 查询行 |
-| UNDO | `QUE_NODE_UNDO` | `row_undo_step` | 回滚行 |
+| UNDO | `QUE_NODE_UNDO` | `row_undo_step` | 回滚行（回滚图的两层结构见 [`trx.md`](trx.md)「回滚与查询图」） |
 | PURGE | `QUE_NODE_PURGE` | `row_purge_step` | 清理 undo |
 | ASSIGNMENT | `QUE_NODE_ASSIGNMENT` | `assign_step` | 赋值 |
 | IF | `QUE_NODE_IF` | `if_step` | 条件分支 |
@@ -300,15 +307,145 @@ struct que_common_t {
 | COMMIT | `QUE_NODE_COMMIT` | `trx_commit_step` | 事务提交 |
 | FUNC | `QUE_NODE_FUNC` | `proc_eval_step` | 函数求值 |
 
-### 设计模式
+#### 设计模式
 
 这是经典的 **Interpreter Pattern**（解释器模式），具体实现为基于状态机的协程式执行：node 是数据（做什么），thr 是控制流（谁在做、下一步做什么），分离后 thr 可在不同 node 间流转，node 状态在锁等待挂起/恢复之间保持。
 
+#### 回滚图：模型的一个特殊应用
+
+节点清单里的 `UNDO`（`QUE_NODE_UNDO`）不是孤立存在的——它属于**回滚图**，这是 query graph 执行模型的一个特殊应用：**回滚不是普通函数调用，而是构造并解释执行两层 graph**：
+
+```
+外层 fork（QUE_FORK_MYSQL_INTERFACE）
+└── roll_node_t（QUE_NODE_ROLLBACK）     ← 回滚"命令"节点，trx_rollback_step 驱动
+    └── undo_thr ──> 内层 fork（QUE_FORK_ROLLBACK）
+        └── undo_node（QUE_NODE_UNDO）    ← 真正逐行撤销，row_undo_step 驱动
+```
+
+两层结构、三种 fork type（`QUE_FORK_MYSQL_INTERFACE` / `QUE_FORK_ROLLBACK` / `QUE_FORK_RECOVERY`）的分工、与 DML query graph 的异同（动态构建 vs 预编译缓存），详见 [`trx.md`](trx.md)「回滚机制 → 回滚与查询图」。
+
+这里只需记住一个与 thr 状态机的呼应：**`QUE_FORK_ROLLBACK` 类型的 fork 在 `que_thr_stop` 里走 `SUSPENDED` 分支**（见下文 thr 状态机分支 [4]）——内层 undo graph 的 thr 挂起，正是等外层 roll_node 调度它继续。
+
+#### 控制语句与 brother 链遍历
+
+`que_common_t` 中的 `brother` 字段构成**兄弟链**，控制语句（IF/WHILE/FOR/PROC）靠它顺序执行子语句。
+
+#### PROC：过程容器
+
+`proc_step()`（`eval0proc.ic:40`）：
+
+```cpp
+static inline que_thr_t *proc_step(que_thr_t *thr) {
+  node = static_cast<proc_node_t *>(thr->run_node);
+
+  if (thr->prev_node == que_node_get_parent(node)) {
+    /* 从父节点下来 = 第一次进入过程：从第一条语句开始 */
+    thr->run_node = node->stat_list;
+  } else {
+    /* 从子语句返回：next 应为 NULL（已处理完所有语句） */
+    ut_ad(que_node_get_next(thr->prev_node) == nullptr);
+    thr->run_node = nullptr;
+  }
+
+  /* run_node 为 NULL 说明所有语句执行完 → 回到父节点 */
+  if (thr->run_node == nullptr) {
+    thr->run_node = que_node_get_parent(node);
+  }
+
+  return (thr);
+}
+```
+
+**`prev_node == parent` 判断语义**：这是查询图执行的核心模式。如果"上一个执行的节点"就是"当前节点的父节点"，说明控制流是**第一次从上层进入**这个节点；否则说明是**从子语句返回**。
+
+#### WHILE：循环
+
+`while_step()`（`eval0proc.cc:107`）：
+
+```cpp
+que_thr_t *while_step(que_thr_t *thr) {
+  node = static_cast<while_node_t *>(thr->run_node);
+
+  ut_ad((thr->prev_node == que_node_get_parent(node)) ||
+        (que_node_get_next(thr->prev_node) == nullptr));
+
+  eval_exp(node->cond);                       // 求值循环条件
+
+  if (eval_node_get_bool_val(node->cond)) {
+    thr->run_node = node->stat_list;          // 条件为真 → 进入循环体
+  } else {
+    thr->run_node = que_node_get_parent(node); // 条件为假 → 退出到父节点
+  }
+
+  return (thr);
+}
+```
+
+WHILE 循环的实现：每次回到 while_node 时重新求值条件，为真则 `run_node = stat_list` 重新进入循环体，为假则 `run_node = parent` 跳出循环。**循环体的最后一条语句执行完后，`que_thr_step` 的控制语句分支会把 `run_node` 设回 while_node**（因为最后一条语句 `next == nullptr`，会走到 `else if (type == QUE_NODE_WHILE)` 分支再次求值条件）。
+
+#### IF：条件分支
+
+`if_step()`（`eval0proc.cc:40`）：
+
+```cpp
+que_thr_t *if_step(que_thr_t *thr) {
+  node = static_cast<if_node_t *>(thr->run_node);
+
+  if (thr->prev_node == que_node_get_parent(node)) {
+    eval_exp(node->cond);                     // 第一次进入：求值条件
+
+    if (eval_node_get_bool_val(node->cond)) {
+      thr->run_node = node->stat_list;        // 条件为真 → then 分支
+    } else if (node->else_part) {
+      thr->run_node = node->else_part;        // 有 else → else 分支
+    } else if (node->elsif_list) {
+      elsif_node = node->elsif_list;
+      for (;;) {
+        eval_exp(elsif_node->cond);
+        if (eval_node_get_bool_val(elsif_node->cond)) {
+          thr->run_node = elsif_node->stat_list;  // elsif 条件为真
+          // ...
+        }
+      }
+    }
+  }
+  return (thr);
+}
+```
+
+IF 同样用 `prev_node == parent` 判断是否第一次进入——只有第一次进入才求值条件，从分支返回时不再重复求值。
+
+#### 控制语句的三段式结构
+
+所有控制语句都遵循这个模式：
+
+```
+1. 进入判断：prev_node == parent ? 第一次进入 : 从子语句返回
+2. 分支选择：根据条件/状态设置 run_node（进入子语句 / 回到父节点）
+3. 兄弟推进：子语句执行完且还有兄弟 → run_node = next(brother)
+```
+
+`que_thr_step` 开头的控制语句分支就是第 3 步的实现：
+
+```cpp
+if (type & QUE_NODE_CONTROL_STAT) {
+    if ((thr->prev_node != que_node_get_parent(node)) &&
+        que_node_get_next(thr->prev_node)) {
+      /* 从子语句返回且有下一个兄弟 → 执行兄弟 */
+      thr->run_node = que_node_get_next(thr->prev_node);
+    } else {
+      /* 否则进入控制语句自己的 step 函数（if_step/while_step/...） */
+    }
+}
+```
+
+**注意**：控制语句的 step 函数（`if_step`/`while_step`/`for_step`/`proc_step`）**返回 void**，在函数内部直接修改 `thr->run_node`；而 DML 的 step 函数（`row_upd_step`/`row_ins_step`/`row_sel_step`）**返回 `que_thr_t*`**，可以返回不同的 thr（虽然实际返回原 thr 或 nullptr）。
+
 ---
 
-## row_prebuilt_t 与查询图的关系
+### row_prebuilt_t 与查询图的关系
 
-### row_prebuilt_t 中的 graph 字段
+#### row_prebuilt_t 中的 graph 字段
 
 `row_prebuilt_t` 是 MySQL handler 层与 InnoDB 之间的预编译结构，包含 4 个查询图字段（`include/row0mysql.h:670-683`）：
 
@@ -327,7 +464,7 @@ struct row_prebuilt_t {
 };
 ```
 
-### 各 graph 的使用场景
+#### 各 graph 的使用场景
 
 | graph 字段 | 使用场景 | 是否真执行 |
 |-----------|---------|-----------|
@@ -335,7 +472,7 @@ struct row_prebuilt_t {
 | `ins_graph` | `row_insert_for_mysql_using_ins_graph()` | 是 |
 | `upd_graph` | `row_update_for_mysql()` / `row_delete_for_mysql()` | 是 |
 
-### 缓存复用与失效
+#### 缓存复用与失效
 
 INSERT graph 有缓存复用机制（`row0mysql.cc:1062-1079`）：
 
@@ -357,9 +494,9 @@ if (prebuilt->ins_node != nullptr) {
 
 ---
 
-## SELECT 不走查询图
+### SELECT 不走查询图
 
-### SELECT 的实际执行路径
+#### SELECT 的实际执行路径
 
 SELECT **不走查询图**。`row_search_mvcc()` 和 `row_search_no_mvcc()` 是独立的搜索函数，直接操作 B+树和持久化游标：
 
@@ -371,7 +508,7 @@ MySQL SQL 层 → ha_innobase::general_fetch()     // ha_innodb.cc:10524
 
 `sel_graph` 只是给锁系统借 thr 用的 dummy（如 `row_lock_table()`），不是执行 SELECT 的载体。
 
-### 为什么 SELECT 不走查询图
+#### 为什么 SELECT 不走查询图
 
 查询图执行模型是为**锁等待挂起/恢复**设计的。SELECT 在 InnoDB 中通常不需要锁等待（MVCC 读不加锁），只有在 `SELECT ... FOR UPDATE` / `SELECT ... LOCK IN SHARE MODE` 时才加锁。即使加锁，`row_search_mvcc()` 内部直接调用 `sel_set_rec_lock()` 处理锁等待，不需要 query graph 的挂起/恢复机制。
 
@@ -379,9 +516,9 @@ INSERT / UPDATE / DELETE 必须走查询图，因为它们可能遇到锁冲突�
 
 ---
 
-## 执行调度器：que_run_threads 与 que_thr_step
+### 执行调度器：que_run_threads 与 que_thr_step
 
-### 入口：que_run_threads
+#### 入口：que_run_threads
 
 `que_run_threads()`（`que0que.cc:1082`）是执行入口，包含一个 `goto loop` 循环：
 
@@ -403,27 +540,167 @@ loop:
 }
 ```
 
-### 内层：que_run_threads_low → que_thr_step
+#### 内层：que_run_threads_low 完整循环与 next_thr 机制
 
-`que_run_threads_low()` 循环调用 `que_thr_step()`（`que0que.cc:923`），每次执行一个 node：
+`que_run_threads_low()`（`que0que.cc:1024`）是实际的执行循环，包含关键的 **next_thr 切换机制**：
 
 ```cpp
-static inline que_thr_t *que_thr_step(que_thr_t *thr) {
-  node = thr->run_node;                    // 取当前节点
-  type = que_node_get_type(node);          // 判断类型
+static void que_run_threads_low(que_thr_t *thr) {
+  trx = thr_get_trx(thr);
 
-  if (type == QUE_NODE_UPDATE) {
-    thr = row_upd_step(thr);               // 执行 UPDATE
-  } else if (type == QUE_NODE_INSERT) {
-    thr = row_ins_step(thr);               // 执行 INSERT
-  } else if (type == QUE_NODE_SELECT) {
-    thr = row_sel_step(thr);               // 执行 SELECT
-  }
-  // ...
+  do {
+    log_free_check();                        // [1] 检查 redo 空间是否充足
+
+    next_thr = que_thr_step(thr);            // [2] 执行一步，可能返回不同 thr
+
+    trx_mutex_enter(trx);
+
+    if (next_thr != thr) {                   // [3] thr 变了
+      ut_a(next_thr == nullptr);             //     实际上只会是 nullptr
+
+      /* 减引用计数；若锁等待已结束，可能返回新的可运行 thr */
+      que_thr_dec_refer_count(thr, &next_thr);
+
+      if (next_thr != nullptr) {
+        thr = next_thr;                      //     切换到新 thr
+      }
+    }
+
+    trx_mutex_exit(trx);
+
+  } while (next_thr != nullptr);             // [4] nullptr 即退出循环
 }
 ```
 
-### step 函数的固定签名
+三个关键点：
+
+- **[1] `log_free_check()`**：每执行一步前检查 redo log 是否有足够空间，避免执行到一半因 redo 满而失败。
+- **[2] `next_thr = que_thr_step(thr)`**：`que_thr_step` 返回值可能是**不同的 thr**（注释说"if, e.g., a subprocedure call is made"），但 `ut_a(next_thr == nullptr)`（第 1061 行）断言表明：实际上 `que_thr_step` 只会返回 nullptr（表示 thr 挂起/结束）或原 thr。
+- **[3] `que_thr_dec_refer_count()`**：这是 thr 切换的唯一入口。它调用 `que_thr_stop(thr)` 尝试停止当前 thr，如果 `que_thr_stop` 返回 false（说明挂起/等待的原因已消失——锁已释放），就把 `trx->error_state = DB_SUCCESS` 并 `*next_thr = thr`，让循环继续执行这个 thr（**不切换**）。
+
+正是因为 `que_thr_step` 实际只返回 nullptr 或原 thr，且 `que_thr_dec_refer_count` 只在"等待已结束"时返回原 thr，**永远不会真正切换到另一个 thr**。这是"为什么不 thr = thr->next 切换"的代码级答案——虽然框架设计了切换能力，但 MySQL 路径下每个 fork 只有 1 个活跃的 thr，没有可切换的目标。
+
+#### que_thr_dec_refer_count 完整逻辑
+
+`que_thr_dec_refer_count()`（`que0que.cc:712`）是唯一能减引用计数的地方（另一个是 `que_thr_stop_for_mysql`），且**只能从 `que_run_threads` 内部调用**：
+
+```cpp
+static void que_thr_dec_refer_count(que_thr_t *thr, que_thr_t **next_thr) {
+  trx = thr_get_trx(thr);
+  ut_a(thr->is_active);
+  ut_ad(trx_mutex_own(trx));
+
+  if (thr->state == QUE_THR_RUNNING) {
+    // 尝试停止 thr；返回 false 说明停止原因已消失
+    if (!que_thr_stop(thr)) {
+      ut_a(next_thr != nullptr && *next_thr == nullptr);
+
+      /* The reason for the thr suspension or wait was
+      already canceled before we came here: continue
+      running the thread. */
+
+      trx->error_state = DB_SUCCESS;   // 必须在这里重置，否则没人重置
+      *next_thr = thr;                 // 继续运行原 thr
+
+      return;                          // ← 注意：这里直接 return，不减引用
+    }
+  }
+
+  fork = static_cast<que_fork_t *>(thr->common.parent);
+
+  --trx->lock.n_active_thrs;   // 事务活跃 thr 数减 1
+  --fork->n_active_thrs;       // fork 活跃 thr 数减 1
+  thr->is_active = false;
+}
+```
+
+**注意**：如果 `que_thr_stop` 返回 false（等待已结束），函数直接 `return` **不减引用计数**，因为 thr 还要继续运行。
+
+#### que_thr_step 的完整分发逻辑
+
+`que_thr_step()`（`que0que.cc:925`）按节点类型分发，并维护 `prev_node`：
+
+```cpp
+static inline que_thr_t *que_thr_step(que_thr_t *thr) {
+  trx = thr_get_trx(thr);
+  ut_ad(thr->state == QUE_THR_RUNNING);
+  ut_a(trx->error_state == DB_SUCCESS);
+
+  thr->resource++;                 // 资源计数（用于并发控制）
+
+  node = thr->run_node;
+  type = que_node_get_type(node);
+  old_thr = thr;
+
+  if (type & QUE_NODE_CONTROL_STAT) {          // [控制语句]
+    if ((thr->prev_node != que_node_get_parent(node)) &&
+        que_node_get_next(thr->prev_node)) {
+      // 从子语句返回且有下一个兄弟语句 → 执行下一个兄弟
+      thr->run_node = que_node_get_next(thr->prev_node);
+    } else if (type == QUE_NODE_IF) {
+      if_step(thr);
+    } else if (type == QUE_NODE_FOR) {
+      for_step(thr);
+    } else if (type == QUE_NODE_PROC) {
+      if (thr->prev_node == que_node_get_parent(node)) {
+        trx->last_sql_stat_start.least_undo_no = trx->undo_no;
+      }
+      proc_step(thr);
+    } else if (type == QUE_NODE_WHILE) {
+      while_step(thr);
+    } else {
+      ut_error;
+    }
+  } else if (type == QUE_NODE_ASSIGNMENT) {
+    assign_step(thr);
+  } else if (type == QUE_NODE_SELECT) {
+    thr = row_sel_step(thr);
+  } else if (type == QUE_NODE_INSERT) {
+    thr = row_ins_step(thr);
+  } else if (type == QUE_NODE_UPDATE) {
+    thr = row_upd_step(thr);
+  } else if (type == QUE_NODE_FETCH) {
+    thr = fetch_step(thr);
+  } else if (type == QUE_NODE_OPEN) {
+    thr = open_step(thr);
+  } else if (type == QUE_NODE_FUNC) {
+    proc_eval_step(thr);
+  } else if (type == QUE_NODE_THR) {
+    thr = que_thr_node_step(thr);
+  } else if (type == QUE_NODE_COMMIT) {
+    thr = trx_commit_step(thr);
+  } else if (type == QUE_NODE_UNDO) {
+    thr = row_undo_step(thr);
+  } else if (type == QUE_NODE_PURGE) {
+    thr = row_purge_step(thr);
+  } else if (type == QUE_NODE_RETURN) {
+    thr = return_step(thr);
+  } else if (type == QUE_NODE_EXIT) {
+    thr = exit_step(thr);
+  } else if (type == QUE_NODE_ROLLBACK) {
+    thr = trx_rollback_step(thr);
+  } else {
+    ut_error;
+  }
+
+  // 更新 prev_node：EXIT 特殊处理为包含它的循环节点
+  if (type == QUE_NODE_EXIT) {
+    old_thr->prev_node = que_node_get_containing_loop_node(node);
+  } else {
+    old_thr->prev_node = node;
+  }
+
+  if (thr) {
+    ut_a(thr_get_trx(thr)->error_state == DB_SUCCESS);
+  }
+
+  return (thr);
+}
+```
+
+**关键**：`prev_node` 的更新很重要。控制语句（IF/WHILE/PROC）通过比较 `prev_node == parent` 来判断"控制是从父节点下来的（第一次进入）"还是"从子语句返回的（继续执行兄弟）"。
+
+#### step 函数的固定签名
 
 每种节点的 step 函数只接收 `que_thr_t *thr`，内部从 `thr->run_node` 取出具体 node：
 
@@ -438,7 +715,11 @@ que_thr_t *row_upd_step(que_thr_t *thr) {
 
 底层函数（如 `row_upd_clust_step`）接收 `node` 和 `thr` 两个参数：node 提供"做什么"（表、游标、更新向量），thr 提供"谁在做"（事务、控制流）。
 
-### 调用链示例
+step 函数的返回值语义：
+- 返回**原 thr**：继续执行
+- 返回 **nullptr**：thr 挂起（锁等待）或完成，`que_run_threads_low` 退出循环
+
+#### 调用链示例
 
 以 `UPDATE t1 SET x=1 WHERE id=5` 为例：
 
@@ -458,9 +739,9 @@ MySQL SQL 层 → ha_innobase::update_row()
 
 ---
 
-## thr 状态机
+### thr 状态机
 
-### 四种状态
+#### 四种状态
 
 ```cpp
 enum que_thr_state_t {
@@ -471,7 +752,7 @@ enum que_thr_state_t {
 };
 ```
 
-### 状态转换
+#### 状态转换
 
 ```
                     que_fork_start_command()
@@ -501,9 +782,9 @@ enum que_thr_state_t {
 
 ---
 
-## 锁等待挂起机制
+### 锁等待挂起机制
 
-### 状态设置的完整链路
+#### 状态设置的完整链路
 
 当行操作遇到锁冲突时，状态设置经过以下步骤：
 
@@ -530,18 +811,74 @@ enum que_thr_state_t {
 
 **关键**：`QUE_THR_LOCK_WAIT` 状态在 `que_thr_stop()` 中设置（`que0que.cc:682`），不是在 `que_run_threads` 的 switch 中设置，也不是在 `que_thr_stop_for_mysql` 中设置。
 
-### que_thr_stop vs que_thr_stop_for_mysql
+#### que_thr_stop 完整分支
+
+`que_thr_stop()`（`que0que.cc:650`）按优先级判断 thr 应该进入哪个状态，返回 `true` 表示已停止：
+
+```cpp
+bool que_thr_stop(que_thr_t *thr) {
+  que_t *graph = thr->graph;
+  trx_t *trx = thr_get_trx(thr);
+
+  ut_ad(trx_mutex_own(trx));
+
+  if (graph->state == QUE_FORK_COMMAND_WAIT) {
+    /* [1] fork 在等待命令 → thr 挂起 */
+    thr->state = QUE_THR_SUSPENDED;
+
+  } else if (trx->lock.que_state == TRX_QUE_LOCK_WAIT) {
+    /* [2] 事务进入锁等待 → thr 锁等待（最常用的分支） */
+    trx->lock.wait_thr = thr;
+    thr->state = QUE_THR_LOCK_WAIT;
+
+  } else if (trx->error_state != DB_SUCCESS &&
+             trx->error_state != DB_LOCK_WAIT) {
+    /* [3] 有其他错误（非锁等待）→ thr 完成 */
+    thr->state = QUE_THR_COMPLETED;
+
+  } else if (graph->fork_type == QUE_FORK_ROLLBACK) {
+    /* [4] rollback 类型的 fork → thr 挂起 */
+    thr->state = QUE_THR_SUSPENDED;
+
+  } else {
+    /* [5] fork 仍活跃 → 不停止，返回 false */
+    ut_ad(graph->state == QUE_FORK_ACTIVE);
+    return false;      // ← 这个返回值很关键
+  }
+
+  return true;
+}
+```
+
+五个分支的完整语义：
+
+| 分支 | 条件 | 新状态 | 说明 |
+|------|------|--------|------|
+| [1] | `graph->state == QUE_FORK_COMMAND_WAIT` | `SUSPENDED` | fork 等待命令（如游标 fetch 间隙），thr 挂起等待下次唤醒 |
+| [2] | `trx->lock.que_state == TRX_QUE_LOCK_WAIT` | `LOCK_WAIT` | **最常用的锁等待分支**，同时设置 `trx->lock.wait_thr = thr` 供后续唤醒定位 |
+| [3] | 有其他错误且非 `DB_LOCK_WAIT` | `COMPLETED` | 真错误（如死锁 victim、超时），thr 结束 |
+| [4] | `graph->fork_type == QUE_FORK_ROLLBACK` | `SUSPENDED` | rollback 图，thr 挂起等回滚调度（回滚图两层结构详见 [`trx.md`](trx.md)「回滚与查询图」） |
+| [5] | fork 仍 `ACTIVE` 且无错误 | — | **返回 false，不停止** |
+
+**分支 [5] 的返回值语义**：`que_thr_stop` 返回 `false` 表示"没有理由停止这个 thr，它应该继续运行"。`que_thr_dec_refer_count` 正是靠这个返回值判断"挂起/等待的原因已消失，thr 应继续执行"（见前文）。
+
+**分支 [2] 是锁等待的核心**：注意这里设置的是 `trx->lock.wait_thr = thr`（事务记录等待的 thr），而 `trx->lock.que_state = TRX_QUE_LOCK_WAIT` 是在 `lock_table()`/`lock_rec_lock()` 检测到冲突时设置的。两者缺一不可——`que_thr_stop` 只是读取 `que_state` 来决定 thr 状态。
+
+#### que_thr_stop vs que_thr_stop_for_mysql
 
 | | `que_thr_stop()` | `que_thr_stop_for_mysql()` |
 |---|---|---|
 | 位置 | `que0que.cc:650` | `que0que.cc:770` |
 | 调用者 | `que_thr_dec_refer_count()`（内部调度路径） | MySQL 接口路径（如 `row_lock_table()`） |
-| 是否设置 LOCK_WAIT | **是** | **否** |
+| 是否设置 LOCK_WAIT | **是**（分支 [2]） | **否** |
+| 返回值 | `bool`（false = 不应停止） | `void` |
 | 场景 | 内部 query graph 执行循环 | MySQL handler 层调用 InnoDB 后的收尾 |
 
 `que_thr_stop_for_mysql()` 不设置 `LOCK_WAIT`。它处理 MySQL 接口路径的收尾——如果 thr 还在 RUNNING 且有错误就标记 COMPLETED，如果已经因为锁等待被 `que_thr_stop()` 设置了 `LOCK_WAIT` 就直接 return（保持原状态不变）。
 
-### lock_wait_suspend_thread 的实际挂起
+**关键差异**：`que_thr_stop` 是**内部调度器**用的（在 `que_run_threads_low` 循环内被调用，通过返回值影响控制流）；`que_thr_stop_for_mysql` 是 **MySQL handler 层**用的（在 row0mysql.cc 的各 `row_xxx_for_mysql` 函数末尾调用，只做清理，不影响控制流）。降低引用计数的只有这两个函数。
+
+#### lock_wait_suspend_thread 的实际挂起
 
 `lock_wait_suspend_thread()`（`lock0wait.cc:200`）执行真正的 OS 线程阻塞：
 
@@ -574,13 +911,13 @@ void lock_wait_suspend_thread(que_thr_t *thr) {
 
 `os_event_wait(slot->event)` 底层是 `pthread_cond_wait` 或 `futex`，OS 线程在此被调度出去。
 
-### 挂起的是哪个线程
+#### 挂起的是哪个线程
 
 **是 user thd 的 OS 线程在等。** 不是后台线程，也不是独立的 query graph 线程。
 
 InnoDB 的 query graph 执行是 **1:1 模型**——一个 user connection 对应一个 OS 线程，这个线程同时就是执行 query graph 的线程。`que_thr_t` 只是逻辑状态机，底层跑在 user thd 的 OS 线程上。锁等待时 user thd 阻塞在 `os_event_wait` 上，不会去执行其他 query node。
 
-### 竞态检查的必要性
+#### 竞态检查的必要性
 
 从 `que_thr_stop()` 设置 `QUE_THR_LOCK_WAIT` 到 `lock_wait_suspend_thread()` 被调用之间，持有锁的事务可能已经释放锁并调用了 `lock_wait_release_thread_if_suspended()`，把 thr 状态改回了 `QUE_THR_RUNNING`。
 
@@ -588,9 +925,9 @@ InnoDB 的 query graph 执行是 **1:1 模型**——一个 user connection 对�
 
 ---
 
-## 精确唤醒：从 2PL 放锁到 os_event_set
+### 精确唤醒：从 2PL 放锁到 os_event_set
 
-### 完整调用链
+#### 完整调用链
 
 事务提交时 2PL shrinking phase 释放所有锁，唤醒等待者：
 
@@ -622,7 +959,7 @@ trx_commit_in_memory()                              // trx0trx.cc
                           lock_table_dequeue(lock)
 ```
 
-### 授权等待者
+#### 授权等待者
 
 `lock_rec_grant()`（`lock0lock.cc:2392`）遍历锁队列中等待的 lock，对每个调用 `lock_grant_or_update_wait_for_edge_if_waiting()`（`lock0lock.cc:2375`）：
 
@@ -637,7 +974,7 @@ static void lock_grant_or_update_wait_for_edge_if_waiting(
 
 如果等待者的 `blocking_trx` 就是正在释放锁的事务，则授权（或更新 wait-for-graph 边）。
 
-### 精确唤醒
+#### 精确唤醒
 
 授权后调用 `lock_reset_wait_and_release_thread_if_suspended()`（`lock0wait.cc:423`）：
 
@@ -680,7 +1017,7 @@ static void lock_wait_release_thread_if_suspended(que_thr_t *thr) {
 }
 ```
 
-### 防二次唤醒设计
+#### 防二次唤醒设计
 
 `lock0wait.cc:358-423` 注释明确了四条规则保证每个 trx 最多被唤醒一次：
 
@@ -693,9 +1030,9 @@ static void lock_wait_release_thread_if_suspended(que_thr_t *thr) {
 
 ---
 
-## srv_sys->tasks 全局队列与 purge 调度
+### srv_sys->tasks 全局队列与 purge 调度
 
-### 队列定义
+#### 队列定义
 
 `srv_sys_t`（`srv0srv.cc:758`）中定义了一个全局 task queue：
 
@@ -708,7 +1045,7 @@ struct srv_sys_t {
 };
 ```
 
-### 入队：srv_que_task_enqueue_low
+#### 入队：srv_que_task_enqueue_low
 
 `srv_que_task_enqueue_low()`（`srv0srv.cc:3205`）是唯一的入队函数：
 
@@ -723,7 +1060,7 @@ void srv_que_task_enqueue_low(que_thr_t *thr) {
 
 唯一调用者在 `trx0purge.cc:2515`——purge coordinator 提交 purge thr。
 
-### 出队：srv_task_execute
+#### 出队：srv_task_execute
 
 `srv_task_execute()`（`srv0srv.cc:2813`）从队列取 thr 执行：
 
@@ -744,7 +1081,7 @@ static bool srv_task_execute(void) {
 }
 ```
 
-### purge worker 线程循环
+#### purge worker 线程循环
 
 `srv_worker_thread()`（`srv0srv.cc:2846`）：
 
@@ -763,11 +1100,181 @@ void srv_worker_thread() {
 }
 ```
 
+#### purge coordinator 完整流程
+
+#### 1. 构建 purge 查询图（启动时）
+
+`trx_purge_graph_build()`（`trx0purge.cc:197`）在 InnoDB 启动时构建 purge 查询图，**每个 purge 线程一个 thr**：
+
+```cpp
+static que_t *trx_purge_graph_build(trx_t *trx, ulint n_purge_threads) {
+  heap = mem_heap_create(512, UT_LOCATION_HERE);
+
+  // 创建 purge 类型的 fork 根节点
+  fork = que_fork_create(nullptr, nullptr, QUE_FORK_PURGE, heap);
+  fork->trx = trx;
+
+  for (i = 0; i < n_purge_threads; ++i) {
+    thr = que_thr_create(fork, heap, nullptr);
+    thr->child = row_purge_node_create(thr, heap);   // 每个 thr 挂一个 purge node
+  }
+
+  return (fork);
+}
+```
+
+构建结果：
+```
+que_fork_t (QUE_FORK_PURGE)
+├── thr[0] → purge_node_t (清理 undo rec)
+├── thr[1] → purge_node_t
+├── thr[2] → purge_node_t
+└── ...（共 n_purge_threads 个）
+```
+
+**这是查询图中唯一真正的"多 thr 并行"场景**——一个 fork 下有多个 thr，每个 thr 有自己的 purge node。
+
+#### 2. 初始化 purge sys
+
+`trx_purge_sys_initialize()`（`trx0purge.cc:255`）调用 `trx_purge_graph_build` 创建 `purge_sys->query`。注意注释说明 purge 事务是"假事务"：
+
+```cpp
+/* A purge transaction is not a real transaction, we use a transaction
+here only because the query threads code requires it. It is otherwise
+quite unnecessary. We should get rid of it eventually. */
+purge_sys->trx->id = 0;
+purge_sys->query = trx_purge_graph_build(purge_sys->trx, n_purge_threads);
+```
+
+purge 本身不需要事务，但**查询图框架要求每个 graph 必须有 trx**，所以创建了一个 `id = 0` 的假事务。
+
+#### 3. 一个 purge batch：trx_purge
+
+`trx_purge()`（`trx0purge.cc:2471`）执行一次 purge batch：
+
+```cpp
+ulint trx_purge(ulint n_purge_threads, ulint batch_size, bool truncate) {
+  /* [1] 克隆最老 read view 作为 purge 边界 */
+  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
+
+  /* [2] 读取待 purge 的 undo rec，分配到各 purge node */
+  n_pages_handled = trx_purge_attach_undo_recs(n_purge_threads, batch_size);
+
+  if (n_purge_threads > 1) {
+    /* [3a] 多 worker：把前 n-1 个 thr 入全局队列（异步执行） */
+    for (i = 0; i < n_purge_threads - 1; ++i) {
+      thr = que_fork_scheduler_round_robin(purge_sys->query, thr);
+      srv_que_task_enqueue_low(thr);       // 入 task queue，srv worker 执行
+    }
+
+    /* [3b] coordinator 自己执行最后一个 thr（同步） */
+    thr = que_fork_scheduler_round_robin(purge_sys->query, thr);
+    purge_sys->n_submitted += n_purge_threads - 1;
+
+    goto run_synchronously;
+  } else {
+    /* [3c] 单线程：coordinator 直接执行 */
+    thr = que_fork_scheduler_round_robin(purge_sys->query, nullptr);
+  }
+
+run_synchronously:
+  ++purge_sys->n_submitted;
+  que_run_threads(thr);                    // coordinator 执行自己的 thr
+  purge_sys->n_completed.fetch_add(1);
+
+  if (n_purge_threads > 1) {
+    trx_purge_wait_for_workers_to_complete();   // 等待所有 worker 完成
+  }
+}
+```
+
+**核心设计**：`n_purge_threads` 个 thr 中，前 `n-1` 个入全局队列由 srv worker 异步执行，**coordinator 自己同步执行最后 1 个**（避免 coordinator 空转等待）。
+
+#### 4. undo rec 分配：trx_purge_attach_undo_recs
+
+`trx_purge_attach_undo_recs()`（`trx0purge.cc:2304`）把 undo rec 分配到各 purge node：
+
+```cpp
+static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
+                                        ulint batch_size) {
+  /* [1] 取前 n_purge_threads 个 thr，重置其 purge node */
+  for (auto thr : purge_sys->query->thrs) {
+    if (n_purge_threads <= i) break;
+    node = static_cast<purge_node_t *>(thr->child);
+    ut_a(que_node_get_type(node) == QUE_NODE_PURGE);
+    node->recs = nullptr;
+    node->done = false;
+    run_thrs[i++] = thr;
+  }
+
+  /* [2] 读取 batch_size 条 undo rec，按 table_id 分组 */
+  Purge_groups_t purge_groups(n_purge_threads, purge_sys->heap);
+  purge_groups.init();
+
+  while (n_pages_handled < batch_size) {
+    rec.undo_rec = trx_purge_fetch_next_rec(&rec.modifier_trx_id,
+                                            &rec.roll_ptr, &n_pages_handled,
+                                            heap);
+    if (rec.undo_rec == nullptr) break;
+    purge_groups.add(rec);        // 按 table_id 分组
+  }
+
+  /* [3] 负载不均时重新分配（仅 history 过长时触发） */
+  purge_groups.distribute_if_needed();
+
+  /* [4] 把分组结果赋给各 thr 的 purge node */
+  purge_groups.assign(run_thrs);
+}
+```
+
+`Purge_groups_t::distribute()`（`trx0purge.cc:2204`）做负载均衡：计算每组最多 `max_n = (total_rec + n_threads - 1) / n_threads` 条，超出部分移到下一组，最多两趟处理完。
+
+**注意**：`distribute_if_needed()` 只在 `srv_max_purge_lag > 0 && rseg_history_len > srv_max_purge_lag` 时触发——即 history list 过长时才做负载均衡，正常情况保持按 table_id 分组的自然分布。
+
+#### 5. round-robin 调度器
+
+`que_fork_scheduler_round_robin()`（`que0que.cc:315`）按顺序选下一个 thr：
+
+```cpp
+que_thr_t *que_fork_scheduler_round_robin(que_fork_t *fork, que_thr_t *thr) {
+  trx_mutex_enter(fork->trx);
+
+  /* 若无当前 thr，取第一个；否则取下一个兄弟 thr */
+  if (thr == nullptr) {
+    thr = UT_LIST_GET_FIRST(fork->thrs);
+  } else {
+    thr = UT_LIST_GET_NEXT(thrs, thr);
+  }
+
+  if (thr) {
+    fork->state = QUE_FORK_ACTIVE;
+    fork->last_sel_node = nullptr;
+
+    switch (thr->state) {
+      case QUE_THR_COMMAND_WAIT:
+      case QUE_THR_COMPLETED:
+        ut_a(!thr->is_active);
+        que_thr_init_command(thr);       // 初始化 thr 准备执行
+        break;
+      case QUE_THR_SUSPENDED:
+      case QUE_THR_LOCK_WAIT:
+      default:
+        ut_error;                        // 不支持这些状态
+    }
+  }
+
+  trx_mutex_exit(fork->trx);
+  return (thr);
+}
+```
+
+调度器只接受 `COMMAND_WAIT` / `COMPLETED` 状态的 thr，`SUSPENDED` / `LOCK_WAIT` 会 `ut_error`。这保证了每个 thr 在被调度前处于可初始化状态。
+
 ---
 
-## 两种执行模型对比：1:1 阻塞 vs task queue 分发
+### 两种执行模型对比：1:1 阻塞 vs task queue 分发
 
-### 模型 1：User DML/DDL — 1:1 阻塞模型
+#### 模型 1：User DML/DDL — 1:1 阻塞模型
 
 ```
 User Connection (OS Thread)
@@ -780,7 +1287,7 @@ User Connection (OS Thread)
 
 普通 DML/DDL 的 thr 从创建到完成都在 user thd 上执行，不进 task queue，不切换到 srv worker。
 
-### 模型 2：Purge — task queue 调度模型
+#### 模型 2：Purge — task queue 调度模型
 
 ```
 purge coordinator (srv_purge thread)
@@ -795,7 +1302,7 @@ purge worker (srv_worker thread)
     → que_run_threads(thr)              ← srv worker 执行
 ```
 
-### 对比
+#### 对比
 
 | | User DML/DDL | Purge |
 |---|---|---|
@@ -849,38 +1356,19 @@ if (slot == nullptr) {
 
 ---
 
-## 关键源码位置速查
+## 参考
 
-| 位置 | 说明 |
-|------|------|
-| `pars0pars.cc:1734` | `pars_complete_graph_for_exec()` — 查询图构建入口 |
-| `row0mysql.cc:1060` | `row_get_prebuilt_insert_row()` — INSERT graph 缓存复用 |
-| `row0mysql.cc:1747` | `row_prebuild_sel_graph()` — SELECT dummy graph 构建 |
-| `row0mysql.cc:1768` | `row_create_update_node_for_mysql()` — UPDATE graph 构建 |
-| `row0mysql.cc:1239` | `row_lock_table()` — 需要 dummy sel_graph |
-| `ha_innodb.cc:10524` | `general_fetch()` — SELECT 实际执行路径（不走查询图） |
-| `que0que.cc:1082` | `que_run_threads()` — 执行入口，goto loop 循环 |
-| `que0que.cc:923` | `que_thr_step()` — 调度器，按 node 类型分发 |
-| `que0que.cc:650` | `que_thr_stop()` — 设置 `QUE_THR_LOCK_WAIT` |
-| `que0que.cc:770` | `que_thr_stop_for_mysql()` — MySQL 接口路径 stop，不设 LOCK_WAIT |
-| `que0que.cc:266` | `que_thr_end_lock_wait()` — thr 状态从 LOCK_WAIT 改回 RUNNING |
-| `que0que.h:225` | `que_thr_t` 结构定义 |
-| `que0que.h:295` | `que_fork_t` 结构定义 |
-| `row0upd.cc:3300` | `row_upd_step()` — UPDATE step 函数 |
-| `row0upd.cc:3044` | `row_upd_clust_step(node, thr)` — 接收 node + thr 两个参数 |
-| `lock0wait.cc:200` | `lock_wait_suspend_thread()` — 竞态检查 + os_event_wait |
-| `lock0wait.cc:299` | `os_event_wait(slot->event)` — 真正的 OS 线程阻塞 |
-| `lock0wait.cc:322` | `lock_wait_table_release_slot()` — 唤醒后善后 |
-| `lock0wait.cc:358` | `lock_wait_release_thread_if_suspended()` — os_event_set 精确唤醒 |
-| `lock0wait.cc:423` | `lock_reset_wait_and_release_thread_if_suspended()` — 唤醒入口 |
-| `lock0wait.cc:51` | `lock_wait_table_print()` — slot 耗尽时诊断打印 |
-| `lock0lock.cc:6173` | `lock_trx_release_locks()` — 2PL 放锁入口 |
-| `lock0lock.cc:4304` | `try_release_all_locks()` — 遍历 trx_locks 释放 |
-| `lock0lock.cc:2436` | `lock_rec_dequeue_from_page()` — 释放行锁并授权等待者 |
-| `lock0lock.cc:2375` | `lock_grant_or_update_wait_for_edge_if_waiting()` — 检查等待者是否可授权 |
-| `srv0srv.cc:758` | `srv_sys_t` — 含 tasks 全局队列定义 |
-| `srv0srv.cc:2813` | `srv_task_execute()` — 从队列取 thr，断言 QUE_NODE_PURGE |
-| `srv0srv.cc:2846` | `srv_worker_thread()` — purge worker 循环 |
-| `srv0srv.cc:3205` | `srv_que_task_enqueue_low()` — thr 入队 |
-| `srv0srv.h:963` | `srv_thread_type` 枚举（SRV_WORKER / SRV_PURGE / SRV_MASTER） |
-| `trx0trx.cc:2045` | `trx_release_impl_and_expl_locks()` — 2PL shrinking phase |
+**论文**
+
+- Lehman, P. L., Yao, S. B. *Efficient Locking for Concurrent Operations on B-Trees*. ACM TODS, 1981. — B-link tree 与乐观锁耦合，锁等待挂起/恢复与其"遇到锁冲突则等待"思路一致
+- Gray, J. N., Lorie, R. A., Putzolu, G. R., Traiger, I. L. *Granularity of Locks and Degrees of Consistency in Shared Data Banks*. IBM, 1975. — 2PL，精确唤醒发生在 shrinking phase 放锁时
+- Graefe, G. *Volcano — An Extensible and Parallel Query Evaluation System*. IEEE TKDE, 1994. — 火山模型（iterator model），与 query graph 的逐行拉取相似
+
+**官方文档**
+
+- *MySQL 8.0 Reference Manual → InnoDB Locking and Transaction Model*
+
+**相关文档**
+
+- 回滚图（roll_node 外层 + undo graph 内层）与事务回滚剖析见 [`trx.md`](trx.md)「回滚机制」
+- 事务状态机、提交与回滚的完整生命周期见 [`trx.md`](trx.md)

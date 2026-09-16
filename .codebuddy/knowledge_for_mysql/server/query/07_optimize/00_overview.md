@@ -16,25 +16,135 @@
 
 ## 设计思想与理论基础
 
-### 优化器的理论谱系：System R → Cascades → hypergraph
+### CBO 与 RBO：MySQL 属于哪一类？
 
-关系型查询优化器五十年的演进，有两条主线，MySQL 恰好两条都沾：
+优化器按"**怎么选计划**"分两大阵营——这是理解优化器行为的第一层分类：
 
-**1. System R 派：动态规划 + 代价模型（1979）**
+| | **RBO（Rule-Based，基于规则）** | **CBO（Cost-Based，基于代价）** |
+|---|---|---|
+| 决策依据 | 预定义的**规则/启发式**（"有索引就用索引"、"先做选择后做连接"） | **代价估算**（IO + CPU），选代价最小的 |
+| 需要统计信息 | 不需要 | **需要**（行数、NDV、`rec_per_key`、直方图） |
+| 优点 | 简单、可预测、优化本身开销小 | 能适应数据分布与数据量 |
+| 缺点 | **不看数据**——数据倾斜时可能选出极差计划 | 依赖统计准确性；代价模型本身可能失真；优化有开销 |
+| 代表 | Oracle 早期的 RULE 模式、早期 MySQL | System R 之后的所有现代优化器 |
 
-Selinger et al. 的《Access Path Selection in a Relational DBMS》奠定了现代优化器的基石：
+**MySQL 的定位：以 CBO 为主，但保留了大量规则/启发式成分。** 这一点必须讲清楚，因为很多"优化器不听话"的现象正来自两类的混用：
 
-- **左深树 + 自底向上动态规划**：只考虑"连接顺序"，按表数递增枚举，复用子问题最优解
+**CBO 的部分**（看数据、算代价）：
+
+- 代价模型（`Cost_model_table`：`page_read_cost` / `row_evaluate_cost` / `key_compare_cost`，见 `01_cost_model.md`）
+- 访问方法选择：`ref` vs `range` vs 全表扫的比价（`best_access_path`）
+- join order 的代价比较（`prefix_cost`）
+- range 优化器对多种访问类型（range / skip scan / index merge）的比价
+
+**规则与启发式的部分**（不看数据）：
+
+- **逻辑改写几乎都是纯规则的**——子查询转 semi-join、IN→EXISTS、等值传播、常量传播、条件下推、外连接简化，都是"满足条件就改写"，不比较代价
+- **join order 的剪枝是启发式的**——`prune_level` 的启发式剪枝使搜索**非穷举**，源码注释明说 "may miss the optimal QEPs"
+- **无统计时的兜底常量**：`COND_FILTER_EQUALITY = 0.1`、`INEQUALITY = 0.3333`、`BETWEEN = 0.1111` —— 纯拍的
+- **大量 `optimizer_switch` 开关**：本质是把规则/代价决策的**最终裁决权**暴露给 DBA 手动覆盖（这本身就是对"模型不够准"的承认）
+
+**为什么现代优化器都是"规则 + 代价"的混合**：
+
+> **规则负责生成等价的候选计划，代价负责从候选中挑最好的。**
+
+纯 CBO 要枚举所有候选（指数级，太贵）；纯 RBO 不看数据（容易选差）。所以 Cascades 之后的主流架构都是"规则生成 + 代价选择"。MySQL 虽然**没有**实现 Cascades 的规则引擎，但整体遵循这个分工：
+
+| 阶段 | 性质 | 做什么 |
+|---|---|---|
+| **逻辑优化** | 规则驱动 | 生成语义等价的候选（改写） |
+| **物理优化** | 代价驱动 | 从候选中挑代价最低的实现 |
+
+**历史脉络**：MySQL 早期 RBO 色彩更重（5.x 的 join order 就是贪心 + 固定规则，逻辑改写也更少）；8.0 持续 CBO 化——引入直方图、改进 condition filtering、用 estimator 计算选择率，都是为了让"代价"这部分更准、让"拍脑袋常量"用得更少。
+
+---
+
+### 优化器的理论谱系：System R → DPccp / DPhyp →（思想上的）Cascades
+
+关系型查询优化器五十年的演进，join 枚举这条线是**三步走**，MySQL 恰好走到了第三步：
+
+```
+System R (1979)        DPccp (2006)            DPhyp (2008)
+左深树 + 子集 DP   →   连通子图对，bushy 可达  →  + 超图，非内连接也合法
+O(2^n)                 O(3^n)                   O(3^n) + 合法性编码进图
+```
+
+---
+
+**1. System R 派：动态规划 + 代价模型（Selinger et al., SIGMOD 1979）**
+
+《Access Path Selection in a Relational DBMS》奠定了现代优化器的范式，四个贡献：
+
 - **代价模型**：用统计信息（基数、选择性）估算每个候选计划的 IO + CPU 代价
 - **选择性估算**：假设各条件独立，`结果行数 = 输入行数 × 各过滤系数乘积`
+- **自底向上动态规划**：按"已连接的表集合"递增（1 表 → 2 表 → … → n 表），每个子集**保留最优子计划**（memo），避免重复计算子问题
+- **左深树假设**：每次只往已有前缀**尾部**加一张表，所以状态数是子集数 **O(2^n)**，而不是排列数 O(n!)
+- **interesting orders（感兴趣的排序）**：最容易被忽略、影响却最深远的一条——**DP 状态不只是"表集合"，还要带上"输出是否按某组列有序"**。因为有序输出能省掉一次排序、或启用 merge join，所以同一个表集合要保留**多个不同 interesting order** 的最优计划
 
-MySQL 的**旧优化器（greedy）就是 System R 的简化版**——代价模型直接沿用（`01_cost_model.md`），但把穷举 DP 换成带剪枝的贪心搜索（`physical/06_join_order.md`），牺牲最优性换速度。
+**MySQL 与 System R 的关系要分两层说**（这点常被含糊带过）：
 
-**2. Cascades 派：规则 + 代价（1995）**
+| 层面 | 关系 |
+|---|---|
+| **思想上** | **继承**：代价模型、左深树、选择率估算这套范式直接沿用（见 `01_cost_model.md`） |
+| **算法上** | **不是**：旧优化器**没有**实现 System R 的 DP——它不按子集建 memo 表，而是用"单路径 + 全局代价上界 + 可调深度"的 **DFS + 分支限界**（`join->positions[]` 是单条路径，不是 DP 表） |
 
-Graefe 的《The Cascades Framework for Query Optimization》提出更现代的架构：逻辑算子（logical algebra）与物理算子（physical algebra）分离，用**规则**做等价变换、用**代价**做选择。
+⇒ 准确说法是"**思想源自 System R，但用贪心 + 剪枝取代了穷举 DP**"——牺牲最优性换规划时间。详见 `physical/06_join_order.md`。
 
-MySQL 8.0 的 **hypergraph 优化器**（`physical/09_hypergraph.md`）在思想上更接近这一派——虽然它没完整实现 Cascades 的规则引擎，但吸收了"逻辑枚举与代价驱动分离"、以及 DPhyp / CD-C 这些更先进的 join 枚举算法。
+---
+
+**2. DPccp：从"只能左深"到"任意形状"（Moerkotte, 2006）**
+
+System R 的左深假设把空间压到 O(2^n)，代价是 **bushy 计划完全不可达**——像 `(A⋈B)⋈(C⋈D)` 这种"两个分支各自先用选择性谓词缩小、再 join"的形状，在分析型查询里常常明显更优，却根本生成不出来。
+
+Moerkotte 在《On the Correct and Complete Enumeration of the Core Search Space》里系统分析了"核心搜索空间"，给出 **DPccp**：
+
+- 它枚举的不是"子集"，而是 **csg-cmp-pair（连通子图 + 连通补图对）**：
+  - **csg**（connected subgraph）：一组通过连接谓词连通的表
+  - **cmp**（complement）：csg 的补图中、与 csg 连通的那部分
+  - 把 csg 的结果与 cmp 的结果 join，就得到一个候选
+- **只枚举连通的组合** ⇒ 天然避免笛卡尔积（cross product），无需事后剔除
+- **csg 与 cmp 都允许任意形状** ⇒ **bushy 可达**
+- **复杂度**：csg-cmp-pair 的数量是 **O(3^n)**——比枚举所有子集对的 O(4^n) 好一个量级，但比左深 DP 的 O(2^n) 大一档。**这大一档就是"支持 bushy"要付的规划代价**
+
+---
+
+**3. DPhyp：DPccp + 超图（Moerkotte & Neumann, SIGMOD 2008）= MySQL 的 hypergraph**
+
+《Dynamic Programming Strikes Back》在 DPccp 上再进一步：把查询表示成**超图**——关系是节点、连接谓词是边，而**外连接 / 反连接 / 半连接的重排序限制被编码成超边**。
+
+意义在于：**"哪些连接顺序合法"这件事被一次性编译进图结构**，DPccp 的连通性枚举就自动只产生合法计划，不需要在搜索循环里反复检查"这个顺序会不会破坏外连接语义"。
+
+MySQL 8.0 的 hypergraph 优化器就是 DPhyp 的实现（见 `physical/09_hypergraph.md`）。
+
+> ⚠️ **常见误引**：这篇论文的出处是 **SIGMOD 2008**，不是 CIDR 2021。（CIDR 2021 是 Neumann 团队的另一批工作。）
+
+---
+
+**4. Cascades 派：规则 + 代价（Graefe, 1995）——思想上的另一条线**
+
+《The Cascades Framework for Query Optimization》提出逻辑算子与物理算子分离：用**规则**做等价变换、用**代价**做选择。
+
+MySQL 8.0 的 hypergraph 在**思想上**更接近这一派（逻辑枚举与代价驱动分离），但要说清楚：**它并没有实现 Cascades 的规则引擎**——MySQL 没有 Volcano/Cascades 那种可扩展的规则 + 物理属性框架，它的枚举核心仍是 DPhyp，改写逻辑则散落在 prepare/optimize 各阶段的具体函数里。
+
+此外 hypergraph 还用到 **CD-C 冲突规则**（Moerkotte et al.）来表达外连接的重排序限制，少数无法折叠进超边的情况会在 `CostingReceiver` 里手工检查。
+
+---
+
+### 三代算法在 MySQL 源码中的落点
+
+join 枚举经历三代算法。全景如下——**各代的详细源码落点见对应篇**（细节不在此重复）：
+
+| 代 | 算法 | join 形状 | MySQL 落地 | 详见 |
+|---|---|---|---|---|
+| 一 | System R（Selinger 1979） | 左深树 | 旧优化器**思想上继承、算法上未采用**（DFS + 分支限界，无 DP 表） | [`physical/06_join_order.md`](physical/06_join_order.md) |
+| 二 | DPccp（Moerkotte 2006） | bushy | **未实现**（全库搜索 `DPccp` 零命中） | — |
+| 三 | DPhyp（Moerkotte & Neumann 2008） | bushy + **超图** | hypergraph 优化器直接实现（**非**经 DPccp） | [`physical/09_hypergraph.md`](physical/09_hypergraph.md) |
+
+三点值得记住：
+
+1. **MySQL 跳过了 DPccp**，直接实现 DPhyp——函数命名与分解完全按 DPhyp 的 csg / cmp / csg-cmp-pair，而不是 DPccp 那套无重复枚举的 partition 编号。
+2. **旧优化器不是 System R 的 DP**：`join->positions` 分配大小是 `table_count`（**线性**）而非 2^N，没有按子集建 memo 表，是 DFS + 分支限界（`join->best_read` 作全局上界）。System R 真正留下的只有代价模型、选择率估算、左深树三个思想遗产。
+3. **两条路径靠 `AccessPath` 汇合**：分叉在 `JOIN::optimize()` 的 `if (thd->lex->using_hypergraph_optimizer())`，合流在 `JOIN::m_root_access_path`——但**产出方式不同**：旧优化器是末端 `create_access_paths()` **事后翻译** QEP_TAB 数组，hypergraph 则**原生**以 AccessPath 作为 DP 状态。
 
 ### 为什么 MySQL 有两条优化路径
 
@@ -231,4 +341,14 @@ SELECT t1.a FROM t1 WHERE t1.a IN (SELECT t2.b FROM t2 WHERE t2.c > 5);
 
 **内核月报**
 - **2024/04《MySQL 查询优化分析 - 基础概念》** —— 本目录"四阶段框架"的直接来源
+
+**其他**
+- 知乎 - 从优化器综述论文学习System-R框架和Cascade框架： https://zhuanlan.zhihu.com/p/611439035
+- 查询优化器：从 System R 到 Cascades: https://quant67.com/post/algorithms/60-query-optimizer/query-optimizer.html
+- 知乎 - An Overview of Query Optimization in Relational Systems：https://zhuanlan.zhihu.com/p/463696413
+- https://zhuanlan.zhihu.com/p/1943396105124574367
+- https://zhuanlan.zhihu.com/p/632565261
+- https://www.mirrorship.cn/zh-CN/blog/d/273649
+- https://download.csdn.net/blog/column/2727851/132138500
+- https://developer.aliyun.com/article/789923
 

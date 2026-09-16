@@ -5,12 +5,13 @@
 ## 目录
 
 - [一、总览](#一总览)
-- [二、const table 检测](#二const-table-检测)
-- [三、Key_use 数组：ref 访问的基础](#三key_use-数组ref-访问的基础)
-- [四、find_best_ref：ref 访问的代价与 fanout](#四find_best_refref-访问的代价与-fanout)
-- [五、best_access_path：ref / range / scan 的最终比较](#五best_access_pathref--range--scan-的最终比较)
-- [六、二次 range 重估](#六二次-range-重估)
-- [七、最终落地与 EXPLAIN type 映射](#七最终落地与-explain-type-映射)
+- [二、设计思想与理论基础](#二设计思想与理论基础)
+- [三、const table 检测](#三const-table-检测)
+- [四、Key_use 数组：ref 访问的基础](#四key_use-数组ref-访问的基础)
+- [五、find_best_ref：ref 访问的代价与 fanout](#五find_best_refref-访问的代价与-fanout)
+- [六、best_access_path：ref / range / scan 的最终比较](#六best_access_pathref--range--scan-的最终比较)
+- [七、二次 range 重估](#七二次-range-重估)
+- [八、最终落地与 EXPLAIN type 映射](#八最终落地与-explain-type-映射)
 
 ---
 
@@ -32,7 +33,191 @@ Optimize_table_order::choose_table_order()  // :5394  ★ join order + 访问方
 
 ---
 
-## 二、const table 检测
+## 二、设计思想与理论基础
+
+### 反常识：EXPLAIN 的 11 个 type 不是优化器的内部分类
+
+8.0.39 的 `enum join_type` 确实有 11 个（`system` / `const` / `eq_ref` / `ref` / `ALL` / `range` / `index` / `fulltext` / `ref_or_null` / `index_merge`）。但优化器内部真正使用的分类只有 **4 级**：
+
+```cpp
+// Index type, note that code below relies on this element definition order
+enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, FULLTEXT };
+```
+
+而且选择规则里等级是**硬序**——高等级无条件胜出：
+
+```cpp
+if (best_found_keytype >= NOT_UNIQUE && cur_keytype >= NOT_UNIQUE)
+  new_candidate = cur_ref_cost < best_ref_cost;      // 同级才比代价
+else if (best_found_keytype == cur_keytype)
+  new_candidate = cur_ref_cost < best_ref_cost;
+else if (best_found_keytype > cur_keytype)
+  new_candidate = true;                              // 高等级无条件胜出
+```
+
+**结论**：EXPLAIN 的 11 类是给**用户看的"执行器形态"标签**；优化器内部的"分类"是 {聚集主键 / 唯一 / 非唯一 / 全文} 4 类 + 代价比较。这解释了为什么这套 type 看起来不正交——**它不是正交分解，而是"枚举最佳执行器形态"**。
+
+### 真正的正交维度只有两个
+
+| 维度 | 取值 | 对应 type |
+|---|---|---|
+| **① 定位基数**（一次探测产出几行） | 0/1 行 | `const` / `system` / `eq_ref` |
+| | n 行 | `ref` / `ref_or_null` |
+| **② 索引取值形态** | 等值 | `const`/`eq_ref`/`ref`/`ref_or_null`/`fulltext` |
+| | 多点 / 区间 | `range`、`index_merge` |
+| | 全量 | `ALL`、`index` |
+| | 无索引可用 | `ALL` |
+
+- "是否走索引"**不是**独立维度（与 ①② 高度相关）
+- **输出是否有序 / 是否需要回表**才是 `index` 与 `ALL` 分家的真正理由（见下）
+- `fulltext` / `index_merge` / `ref_or_null` 是**历史补丁**，不属于分类学
+
+### 为什么 `index`（全索引扫描）要单列？
+
+`index` 不是"比 ALL 差一点点的扫描"，而是"**换了一个更瘦的物理对象扫描**" + "顺带白送有序性"。三处证据：
+
+**① ALL→index 的升级是非代价的硬性启发式**（这是 `type=index` 最常见的来源）：
+
+```cpp
+/**
+ An utility function - apply heuristics and optimize access methods to tables.
+ Currently this function can change REF to RANGE and ALL to INDEX scan if
+ latter is considered to be better (not cost-based) than the former.
+*/
+void JOIN::adjust_access_methods() {
+```
+
+注意函数头注释里的 **"not cost-based"**——设计者把 `index` 当成"确定优于 ALL"，而不是"待比的候选"。
+
+**② 代价公式上"索引条目比整行瘦"**：`index_scan_cost` 按 `key_length + ref_length` 算每页条目数，`table_scan_cost` 按整个 `data_file_length` 算。
+
+**③ InnoDB 的 ALL 本来就是在扫聚集索引**：
+
+```cpp
+/*
+  Used to avoid scanning full tables on an index. If this flag is set then
+  the handler always has a primary key (hidden if not defined) and this
+  index is used for scanning rather than a full table scan in all
+  situations. No separate data/index file.
+*/
+#define HA_TABLE_SCAN_ON_INDEX (1 << 2)
+```
+
+即：**ALL 扫的是聚集索引（含所有列），换一个更窄的覆盖二级索引一定更省 IO**。这正是"覆盖索引时不回表"在代价模型里的落点。
+
+### const / system 为什么必须在 join order 之前提出来
+
+**收益**（`extract_const_tables()` 注释明说）：
+
+```
+Tables that are extracted have their rows read before actual execution
+starts ... Thus, they do not take part in join order optimization process,
+which can significantly reduce the optimization time.
+```
+
+第二重收益容易忽略：**优化期就能剪掉整个查询**——`zero_result_cause = "Impossible WHERE noticed after reading const tables"`。读 const 表这个动作本身就承担了一部分谓词求解，能比任何代价估算更早判空。
+
+**代价**（这部分常被忽略）：
+
+1. **优化期真实 IO**——`join_read_const_table()` 在 optimize 阶段就真去读行。优化本身有磁盘/缓冲池副作用
+2. **值被冻结在优化期**——常量传播把 `t1.a` 替换成读出来的字面量，此后执行期不再重新求值
+3. **适用面被三条限制卡死**（注释原文）：依赖其他表 / 无精确统计 / 全文检索
+4. 引擎可拒绝 const 化：`HA_BLOCK_CONST_TABLE`
+5. **外连接的唯一内表只能"确认 0 行"才算 const**——NULL 补行语义下"1 行"并不唯一确定
+
+### eq_ref 为什么必须单列：fanout ≡ 1 是能被"白嫖"的强性质
+
+- **代价估算上**：EQ_REF 的 cost 退化成 `prev_record_reads × page_read_cost(1.0)`，**完全不看 `rec_per_key`**——因为不需要估计"返回多少行"
+- **NULL 破坏唯一性**：唯一索引允许同一 key 值出现多个 NULL，因此 `HA_NULL_PART_KEY && !null_rejecting_key` ⇒ 退化为 REF。**唯一性带来的"fanout ≤ 1"必须以"谓词拒绝 NULL"为前提**
+- **函数依赖判定**：eq_ref 意味着"这张表被前驱表唯一决定"，所以它的 rowid **不必进** DuplicateWeedout 的临时表（`sj_table_is_included()` 直接 `return false`）。这是只有 fanout=1 才能做的推导
+
+### 覆盖索引的价值：唯一代码落点
+
+`find_cost_for_ref()` 的三分支是"回表 vs 不回表"的分水岭：
+
+```cpp
+if (table->covering_keys.is_set(keyno)) {
+  // We can use only index tree
+  return index_scan_cost(keyno, 1, num_rows).total_cost();
+}
+if (keyno == table->s->primary_key && table->file->primary_key_is_clustered()) {
+  return read_cost(keyno, 1, num_rows).total_cost();   // 索引即数据
+}
+return min(table->file->page_read_cost(keyno, num_rows), worst_seeks);  // 回表
+```
+
+### index_merge：动机与"为什么常常更慢"
+
+**ROR（Rowid-Ordered Retrieval）** 要求扫出来的 rowid **有序**。对 InnoDB 二级索引，**只有"前缀全部等值"时 rowid 才按主键有序**；一旦是范围扫描，输出按 (索引列, 主键) 有序而 rowid 无序。
+
+⇒ **index_merge intersection 在 InnoDB 上几乎只能用于多个等值条件**——这是它适用面窄、常常让人"感觉没用上"的根因。
+
+代价模型三段解释了"为什么反而更慢"：① 要扫 N 个索引（N 份索引 IO）② 回表是**随机 sweep read**（攒 rowid 再 `ha_rnd_pos`，而非单索引 range 的局部有序回表）③ `Unique` 的排序去重成本。
+
+**它的定位从来不是"与 range 平起平坐的候选"**，源码注释说死了：
+
+```
+* index_merge will never be used if range scan is possible (even if
+  range scan is more expensive)
+```
+
+### index dive vs 统计估算的取舍
+
+| | dive | 统计 |
+|---|---|---|
+| 做法 | 每个 range 调 `records_in_range()`（InnoDB 真下潜 B-tree 采样若干页） | 用 `records_per_key(n-1)` = records / n_diff |
+| 精度 | 高 | 假设数据均匀分布 |
+| 开销 | **O(range 数) 次引擎调用** | O(1) |
+
+`eq_range_index_dive_limit` 默认 **200**，超过就切统计。两条细节：
+
+- **对 NULL 一律不用统计**（"x IS NULL" 的行数 "likely to be very different"）
+- 唯一索引等值直接 `rows = 1`，**连统计都不用**
+
+第三条取舍：range 优化有**内存硬预算** `range_optimizer_max_mem_size`（默认 8 MiB），超了就静默退回 table scan。与"dive vs 统计"是同一类取舍——**用可控的资源上限换优化本身的确定性开销**。
+
+### 与 System R 的对照：一个反直觉的结论
+
+System R 是"**先独立为每张表选出最优 access path，再在此之上做 join order 搜索**"。
+
+MySQL 旧优化器相反：**把 access path 的选择嵌进 join order 搜索的每一次扩展里**——`find_best_ref()` 的入参就带着 join 上下文（`prefix_rowcount`），返回的代价前缀乘的也是它。
+
+**后果**：MySQL 的"最优访问方法"是**相对于某个 join 前缀**的局部最优，不是全局最优。所以 join order 定完之后必须"二次 range 重估"（见第六章）——前驱表确定后，原来非 sargable 的谓词变 sargable 了。
+
+**反直觉的是**：hypergraph 优化器反而**更接近 System R**——它在 `FoundSingleNode()` 里为每个节点独立 propose 全部候选（table scan / index scan / ref / 参数化 ref / range / fulltext / index merge），再由 DPhyp 在子图上做连接。
+
+### `unique_subquery` / `index_subquery` 为什么还在？
+
+**它们根本不是 `join_type` 枚举成员。** 8.0.39 的枚举只有 11 个，不含这两个。它们是 `opt_explain.cc` 里的**显示别名**，注释自己就写了原因：
+
+```cpp
+/*
+  For backward-compatibility, we have special presentation of "index
+  lookup used for in(subquery)": we do not show "ref/etc", but
+  "index_subquery/unique_subquery".
+*/
+if (join->query_expression()->item->engine_type() ==
+    Item_subselect::INDEXSUBQUERY_ENGINE)
+  str = (j_t == JT_EQ_REF) ? "unique_subquery" : "index_subquery";
+```
+
+即：**EXPLAIN 输出是用户可见的兼容性契约**。真正的访问方法只有 `eq_ref` / `ref`；这两个名字只在"某个 ref/eq_ref 恰好被用作 `IN (子查询)` 的索引查找"时换个显示名。现代 MySQL 里它们几乎见不到，是因为这类查询现在大多走 semi-join 了。
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `eq_range_index_dive_limit` | **200** | 等值 range 数超过它就改用统计（0=永远 dive） |
+| `range_optimizer_max_mem_size` | **8388608**（8 MiB） | range 优化内存硬预算，超了放弃 range |
+| `max_seeks_for_key` | **ULONG_MAX**（默认不生效） | clamp ref 的估算行数 |
+| `optimizer_search_depth` | **MAX_TABLES + 1**（默认穷举） | 0=自动选合理值 |
+| `optimizer_prune_level` | **1** | 0=不剪枝穷举；1=按行数启发式剪枝 |
+
+⚠️ **`optimizer_switch` 里不存在 `range_scan` 开关**。range 只能整体通过 `range_optimizer_max_mem_size`（设小到触发放弃）或 `FORCE INDEX` / `IGNORE INDEX` 间接影响。
+
+---
+
+## 三、const table 检测
 
 ### 2.1 extract_const_tables（`sql_optimizer.cc:5607`）
 
@@ -137,7 +322,7 @@ if (join->where_cond && update_const_equal_items(thd, join->where_cond, tab))
 
 ---
 
-## 三、Key_use 数组：ref 访问的基础
+## 四、Key_use 数组：ref 访问的基础
 
 ### 3.1 update_ref_and_keys（`sql_optimizer.cc:8279`）
 
@@ -184,7 +369,7 @@ if (const_item) {
 
 ---
 
-## 四、find_best_ref：ref 访问的代价与 fanout
+## 五、find_best_ref：ref 访问的代价与 fanout
 
 `sql/sql_planner.cc:207`。
 
@@ -287,7 +472,7 @@ else if (best_found_keytype > cur_keytype)
 
 ---
 
-## 五、best_access_path：ref / range / scan 的最终比较
+## 六、best_access_path：ref / range / scan 的最终比较
 
 `sql/sql_planner.cc:981`。
 
@@ -355,7 +540,7 @@ pos->read_cost = best_read_cost;
 
 ---
 
-## 六、二次 range 重估
+## 七、二次 range 重估
 
 join order 定完后（`make_join_query_block`），第 i 张表的**前驱表集合已确定**，所以：
 - 原来"非 sargable"的 `t2.a > t1.a` 现在**变成 sargable**（t1 在前缀里了）
@@ -404,7 +589,7 @@ tab->set_range_scan(range_scan);
 
 ---
 
-## 七、最终落地与 EXPLAIN type 映射
+## 八、最终落地与 EXPLAIN type 映射
 
 ### 7.1 JT_* → AccessPath::Type（`QEP_TAB::access_path()`，`sql_executor.cc:3701`）
 

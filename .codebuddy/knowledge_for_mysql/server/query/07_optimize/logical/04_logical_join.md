@@ -4,14 +4,241 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [零、阶段定位与调用链](#零阶段定位与调用链)
 - [一、join nest 数据结构与不变式](#一join-nest-数据结构与不变式)
 - [二、两个前置归一化](#二两个前置归一化)
 - [三、simplify_joins Pass 1：外连接转内连接](#三simplify_joins-pass-1外连接转内连接)
 - [四、simplify_joins Pass 2：嵌套 join 扁平化](#四simplify_joins-pass-2嵌套-join-扁平化)
 - [五、derived / view / CTE merge](#五derived--view--cte-merge)
-- [六、semi-join nest 收缩](#六semi-join-nest-收缩pull_out_semijoin_tables)
-- [七、已知限制与"本版本不具备的能力"](#七已知限制与本版本不具备的能力)
+- [六、LATERAL：让派生表看见同层兄弟表](#六lateral让派生表看见同层兄弟表)
+- [七、semi-join nest 收缩](#七semi-join-nest-收缩pull_out_semijoin_tables)
+- [八、已知限制与"本版本不具备的能力"](#八已知限制与本版本不具备的能力)
+
+---
+
+## 设计思想与理论基础
+
+> 后面七节回答"怎么做"；本章回答"**为什么不得不这么做**"。核心两件事：**外连接为什么难优化**、**两个 Pass 为什么必须是这个顺序**。
+
+### 1. 外连接为什么比内连接难优化
+
+**内连接的自由度**：⋈ 可交换、可结合。MySQL 把这份自由度**编码进了数据结构**——hypergraph 的 `FlattenInnerJoins()` 把无连接条件的 INNER JOIN 折成 n 元 `MULTI_INNER_JOIN`，注释说动机是"more flexible pushdown ... **no matter how the join tree was written by the user**"；`MakeJoinGraphFromRelationalExpression()` 的注释一句话概括：**"inner joins are more freely reorderable than outer joins"**。
+
+**外连接：结合律只有一个方向成立**。`OperatorsAreAssociative()` 的头注释：
+
+```cpp
+// Returns true if (t1 <a> t2) <b> t3 === t1 <a> (t2 <b> t3).
+//
+// Note that this is not symmetric; e.g.
+//
+//   (t1 JOIN t2) LEFT JOIN t3 === t1 JOIN (t2 LEFT JOIN t3)
+//
+// but
+//
+//   (t1 LEFT JOIN t2) JOIN t3 != t1 LEFT JOIN (t2 JOIN t3)
+```
+
+即：把 ⟕ **往外提**（成为根）合法；把 ⟕ **往里塞**（塞进右子树）非法。
+
+**具体反例**（用行说明，比符号直观）。设 `A = {a:1}`、`B = ∅`、`C = {x:2}`，条件 `ON c.x = 1`：
+
+| 形式 | 计算 | 结果 |
+|---|---|---|
+| `(A LEFT JOIN B ON TRUE) JOIN C ON c.x=1` | `A⟕B = {(1,NULL)}`，再 `⋈ σ(C) = ⋈ ∅` | **0 行** |
+| `A LEFT JOIN (B JOIN C ON c.x=1) ON TRUE` | `B⋈σ(C) = ∅`，`A⟕∅ = {(1,NULL,NULL)}` | **1 行** |
+
+连行数都不一样——**差别完全来自 NULL 补行**。
+
+**注意 `(LEFT_JOIN, LEFT_JOIN)` 这对不是无条件成立**：
+
+```cpp
+if ((a.type == LEFT_JOIN || a.type == FULL_OUTER_JOIN) && b.type == LEFT_JOIN) {
+  // True if and only if the second join predicate rejects NULLs on all tables in e2.
+  return IsNullRejecting(b, b.left->tables_in_subtree);
+}
+```
+
+外连接之间要"可结合"，前提是**第二个谓词拒 NULL**——这正是"外连接转内连接"在代数层面的等价表述。⇒ **null-rejecting 不是拍脑袋的优化技巧，它就是让外连接重新获得代数自由度的充要条件。**
+
+**nest 就是"重排序约束的载体"**。老优化器 `check_interleaving_with_nj()` 的头注释给出两条限制：
+
+```
+LIMITATIONS ON JOIN ORDER
+  1. "Outer tables first" - any "outer" table must be before any
+     corresponding "inner" table.
+  2. "No interleaving" - tables inside a nested join must form a
+     continuous sequence in join order
+```
+
+并给出反例：`t0 join t1 left join (t2 join t3) on cond1` 中，join order `t1 t2 t0 t3` 非法——t0 的 WHERE 谓词会在 nest 算完前施加，**可能错误地丢掉本该被 NULL 补出来的行**。
+
+⇒ **这就是"嵌套 join 扁平化为什么必要"的答案**：nest 不是装饰，它是一条"这些表必须连成一段、且外表必须先走"的约束。nest 越少越浅，可枚举的 join order 越多。
+
+### 2. NULL 补行：复杂度的根源，与 null-rejecting 的定理
+
+**定义**：
+
+```
+A ⟕_p B  =  (A ⋈_p B)  ∪  N(B)
+N(B)     =  { a ∘ (NULL, …, NULL) | a ∈ A 且 ¬∃b∈B: p(a,b) }
+```
+
+`N(B)`（NULL-complemented rows）两个关键特征：① **整行全 NULL**——B 的每一列都是 NULL；② 与内连接部分**不相交**——它代表"没匹配上"。
+
+外连接全部的复杂度都来自 `N(B)`：破坏结合律、让谓词下推变非法、让去重/聚合/semi-join 都要额外处理"这一行是不是补出来的"、要求执行器维护 match flag。
+
+**定义（null-rejecting）**：谓词 `P` 对表集 `T` 拒 NULL ⟺ 当 `T` 中所有表的所有列均为 NULL 时，`P` 必为 FALSE 或 UNKNOWN。
+
+hypergraph 侧的注释是这个定义的逐字表述：
+
+```cpp
+// Returns whether the join condition for "expr" is null-rejecting (also known
+// as strong or strict) on the given relations; that is, if it is guaranteed to
+// return FALSE or NULL if _all_ tables in "tables" consist only of NULL values.
+// (This means that adding tables in "tables" which are not part of any of the
+// predicates is legal, and has no effect on the result.)
+```
+
+"also known as **strong or strict**" 说明这套术语是学术界通用的，MySQL 只是沿用。
+
+**定理（外连接退化定理）**：设后置过滤器 `W`（WHERE 语境，`UNKNOWN ≡ FALSE`）。若 `W` 对 `T ⊆ B` 拒 NULL，则 `σ_W(A ⟕_p B) = σ_W(A ⋈_p B)`。
+
+**证明**：
+
+```
+σ_W(A ⟕_p B) = σ_W((A ⋈_p B) ∪ N(B))          [定义]
+             = σ_W(A ⋈_p B) ∪ σ_W(N(B))       [选择对并可分配]
+```
+
+而 `N(B)` 中任一元组在 `T` 上全 NULL（特征①），由定义 `W` 对其必为 FALSE 或 UNKNOWN；WHERE 语境下 `UNKNOWN ≡ FALSE`，故 `σ_W(N(B)) = ∅` ⟹ 两者相等。∎
+
+**两条推论，正好对应代码里的两个动作**：
+
+1. `table->outer_join = false`——⟕ 退化为 ⋈
+2. `*cond = and_conds(*cond, join_cond)` + `set_join_cond(nullptr)`——ON 从"外连接的匹配条件"变成普通后置过滤条件，搬到 WHERE
+
+第 2 步**不是可选的装饰**：补行已消失，ON 再留在 nest 上就没有语义作用了；而且它是**让 nest 变成"无 ON 的纯括号"从而能被 Pass 2 溶解的唯一办法**。
+
+**为什么"只要 nest 里有一张表被拒 NULL"就够了**：因为 `N(B)` 是整行全 NULL，`W` 只要拒绝 B 中**任意一张**表，所有补行就一起被过滤。所以判据是**有交集即可**：
+
+| 位置 | 判据 |
+|---|---|
+| 经典优化器 | `if (!table->outer_join \|\| (used_tables & not_null_tables))` |
+| hypergraph | `Overlaps(tables, cond->not_null_tables())`（是 `Overlaps` 不是 `IsSubset`） |
+
+⇒ **一个重要精度结论**：MySQL 把"拒 NULL"压缩成**表级位图**，而 NULL 补行的粒度恰好也是"整表全 NULL"——两者对齐，所以"取并 + 有交集"在语义层面**零损失**。
+
+**逆否：为什么 `IS NULL` 不能转**。`WHERE t2.b IS NULL` 对 t2 **不**拒 NULL ⇒ `not_null_tables = ∅` ⇒ 不转。这正是 `LEFT JOIN ... WHERE t2.pk IS NULL`（反连接惯用法）能保住语义的原因——它不会被"优化"成 INNER JOIN。**"不能转"和"能转"同样重要。**
+
+### 3. 转成内连接后解锁了什么
+
+| 解锁项 | 源码证据要点 |
+|---|---|
+| **join order 自由度** | 解除"外表优先 + 不交错"两条限制 |
+| **谓词下推** | hypergraph 注释：下推会 *"remove rows that should otherwise be output (as NULL-complemented ones)"* |
+| **派生表条件下推** | `can_push_condition_to_derived()` 明确排除 `is_inner_table_of_outer_join()` |
+| **分区裁剪 / 提前判空** | zero-result 判定带 `!is_inner_table_of_outer_join()` |
+| **MIN/MAX 优化** | `opt_sum.cc` 明确跳过外连接表 |
+| **函数依赖 / ONLY_FULL_GROUP_BY** | *"weak-to-strong, which is unusable, becomes strong-to-strong"* |
+| **join buffering** | 外连接 nest 首张内表不能用 buffer 则整 nest 禁用 |
+| **semi-join** | nest 消失后不再被外连接 nest 包裹 |
+| **nest 溶解本身** | Pass 2（见下） |
+
+⇒ **这就是"外连接转内连接"收益最大的原因**：一次转换，9 条通道同时打开。而 `simplify_joins()` 头注释的措辞是 **might**——它只承诺"可选计划集变大"，不承诺代价变小。
+
+### 4. 为什么分两个 Pass，顺序能否颠倒
+
+两个 Pass 在同一个函数体内：Pass 1 是主循环（外连转内连 + ON 上提 + `dep_tables` 记账 + 位图上推），Pass 2 是紧随其后的第二个循环（扁平化 + 嵌套 SJ nest 溶解）。
+
+**顺序不可颠倒，四条独立的硬理由**：
+
+**(a) Pass 2 的准入条件由 Pass 1 创造。** Pass 2 判定 `nested_join != nullptr && table->join_cond() == nullptr`。外连接 nest **天生带 ON**，只有 Pass 1 成功后才 `set_join_cond(nullptr)`。⇒ **Pass 2 就是 Pass 1 的收割阶段。**
+
+**(b) 颠倒则收益归零。** 先跑 Pass 2，所有外连接 nest 都还带着 ON，一个都溶不掉——整个"外连接简化"退化成"去括号"。
+
+**(c) Pass 2 要消费 Pass 1 算出的 `dep_tables`。** `tbl->dep_tables |= table->dep_tables;` 把依赖位图下传给孩子，而 `dep_tables` 只在 Pass 1 的 WHERE 那趟才算。
+
+**(d) 颠倒后需要外层不动点循环。** Pass 2 在递归归程上每个 `join_list` 只跑一次；放在 Pass 1 前面，Pass 1 之后新产生的可溶 nest 就没人再溶了。
+
+**Pass 1 内部"递归① 必须先于递归②"是正确性边界**（不是效率考虑），注释逐字写着：
+
+```
+Thus, considering this example:
+(A LEFT JOIN B ON JC) WHERE W ,
+we'll "confront W with A LEFT JOIN B": this will, recursively,
+- confront W with B,
+- confront W with A.
+...
+We will not confront JC with B or A, it wouldn't make sense, as JC isn't a
+post-filter for their join operation.
+```
+
+⇒ **只有"后置过滤器"才有权判定一个外连接能否转内连接。** nest 自己的 ON 是它内部各成员的后置过滤器，对它自己、对它兄弟、对它外层都不是。
+
+**为什么自底向上**（`simplify_joins()` 的 IMPLEMENTATION 注释 *"On the recursive ascent all attributes are calculated..."*）：
+
+1. **数据流强制**：父 nest 的判定输入是 `used_tables`（nest 内叶子表 map 的**并**）和 `not_null_tables`（各成员拒 NULL 位图的**并**），**只能由孩子算出来**
+2. **级联方向**：`cond` 自顶向下传，而"cond 变强"自底向上发生。靠"列表逆序 + `fix_fields` 重算"实现**单趟收敛**，不做不动点迭代
+
+**规则驱动还是代价驱动？纯规则，且是刻意的。** 判定式是布尔的，全程没有 cost 结构。
+
+**为什么敢这样**：转换是**语义等价**的（上面的定理），而"更多 join order"意味着搜索空间**只包含式扩大**（原计划仍在新空间里）。所以承诺的是**可选集变大**，不是代价变小。
+
+**代价是转换不可逆**：`propagate_nullability()` 的副作用撤不回来。`subquery_to_derived` 的注释自曝：
+
+```
+// We could use LEFT JOIN unconditionally and let simplify_joins()
+// convert it to INNER JOIN, but the conversion is not perfect, as
+// not all effects of propagate_nullability() are undone.
+```
+
+⇒ 8.0 宁可让 `subquery_to_derived` **直接生成 INNER JOIN**，也不走"先 LEFT JOIN 再撤销"这条路。
+
+### 5. 与 derived merge 的关系：咬合的齿轮
+
+两者都在 prepare 期完成，方向相反，且**互为前提、互为目的**：
+
+1. **merge 制造 nest，simplify 溶解 nest**。`merge_underlying_tables()` 把 derived 的 `Table_ref` 原地升级成 `NESTED_JOIN`，这个 nest **注定要被 Pass 2 溶掉**
+2. **merge 把判断题转交给 simplify 用通用逻辑回答**。`merge_where()` 总是把 derived 的 WHERE 并进本 nest 的 ON，**不管有没有外连接**：无外连接 → Pass 1 上提到 WHERE → Pass 2 溶解；有外连接且不拒 NULL → ON 不上提 → WHERE 正确留在 ON 位置。**整个 `merge_where` 里没有任何一处 `if (outer_join)` 分支**——正确性完全由上面的定理保证
+3. **因果环**：merge 必须先于 simplify（否则拉平后无法做外连转内连）；simplify 又必须后于 merge 才能吃到二阶收益
+
+⇒ **一句话**：**merge 是把"看不见的黑盒"打开成 join 树；simplify 是把 join 树上的"不可动之分"抹掉。** 两者合起来，外层的 join order 才能把内层表真正交错进来。
+
+### 6. 理论溯源，与 MySQL 的差距
+
+- **Rao & Ross,《Outerjoin Simplification and Reordering for Query Optimization》, SIGMOD 1998**——外连接简化（null-rejecting ⇒ 退化）与外连接重排序的理论源头
+- **MySQL 源码里没有这些论文的引用痕迹**（`sql/` 下搜 `Rao`/`Galindo` 0 匹配）。8.0.39 里唯一显式引用的 join 序理论是 **[Moe13]**（Moerkotte et al.），且只出现在 hypergraph 侧
+
+**有意思的信号**：MySQL 把 1998 年那套"简化"结论当成常识直接用（连术语都沿用学术界的 *"also known as strong or strict"*），却把 citation 花在了更晚的 join 序枚举理论上——前者的"常识化"程度极高。
+
+**MySQL 相对理论的差距**（源码自曝）：
+
+| 保守点 | 证据 |
+|---|---|
+| ★ **只实现"简化"半边，基本没实现"重排序"半边** | `FlattenInnerJoins()` 注释逐字承认：*"Note that this (currently) does not do any rewrites to flatten even more. E.g., for the tree (a JOIN (b LEFT JOIN c)), it would be beneficial to use associativity to rewrite into (a JOIN b) LEFT JOIN c ..."*——**明说"有益但没做"**。这正是 Rao & Ross 标题里 "and Reordering" 那半边 |
+| 不会"制造"后置过滤器 | 只用**已经是**后置过滤器的 cond 判定 |
+| 只处理 LEFT JOIN | RIGHT JOIN 在解析期就被归一化 |
+| 没有 FULL OUTER JOIN | 只有枚举值，注释说 *"we will be needing it when we actually implement full outer join"* |
+| HAVING 从不参与判定 | 全库只有一个非递归调用点，传 `&m_where_cond` |
+
+⇒ **重排序半边在 8.0 里是以"不重排 + 把非法重排堵住"的形式存在的**：hypergraph 用 conflict rule（`{t2}→{t3}`）堵，老优化器用"外表优先 + 不交错"堵。两条路都是**保守但安全**的——源码明确写着"宁可禁掉合法计划，也绝不允许非法计划"。
+
+### 7. 参数：连接简化**没有**开关
+
+`optimizer_switch_names[]` 里**没有 `outer_join_simplification`**，也没有任何 `outer_join*` / `simplification` 项。`simplify_joins()` 的调用点外层**没有任何 `optimizer_switch` 判断**——它是**无条件执行**的（符合上文：语义等价变换，不是"可选优化策略"）。
+
+相关但间接的开关：
+
+| 开关 | 默认 | 关系 |
+|---|---|---|
+| `derived_merge` | **ON** | 关掉 ⇒ merge 不发生 ⇒ 二阶效应丢失 |
+| `derived_condition_pushdown` | ON | 受 `!is_inner_table_of_outer_join()` 限制 |
+| `hypergraph_optimizer` | **OFF** | 换 join order 搜索器，但**不换掉** `simplify_joins` |
+
+唯一能跳过 `simplify_joins()` 的不是开关，而是两个结构性条件：`skip_local_transforms`（INSERT 的部分路径）、建视图时的 `is_view_context_analysis()`。
+
+⇒ 顺带一个可观察现象：**同一个视图定义，在"创建时"和"被查询时"走的简化路径不同**——创建时不简化、不检查 ONLY_FULL_GROUP_BY，实际使用时才报错。
 
 ---
 
@@ -537,7 +764,142 @@ fix_tables_after_pullout(this, derived_query_block, derived_table,
 
 ---
 
-## 六、semi-join nest 收缩（pull_out_semijoin_tables）
+## 六、LATERAL：让派生表看见同层兄弟表
+
+`LATERAL` 是 SQL:1999 保留字（源码 token 注释就标着 `/* SQL-1999-R */`），作用是**让 FROM 里的派生表能引用同一 FROM 子句中排在它左边的表**。
+
+### 6.1 本质：改的是"外层名字解析上下文"
+
+派生表的"外层"是谁，由 `lateral` 这一个标志决定（`parse_tree_nodes.cc`，`PT_derived_table::contextualize`）：
+
+```cpp
+/*
+  Determine the immediate outer context for the derived table:
+  - if lateral: context of query which owns the FROM i.e. outer_query_block
+  - if not lateral: context of query outer to query which owns the FROM.
+*/
+if (!m_lateral) {
+  pc->thd->lex->push_context(outer_query_block->context.outer_context);
+}
+```
+
+**非 LATERAL 时跳过一层**（派生的"外层"是拥有 FROM 的查询的再外层），于是同一 FROM 的兄弟表**不可见**；**LATERAL 时不跳**，兄弟表进入可见范围。
+
+对应的硬检查在名字解析时（`item.cc`）：
+
+```cpp
+// A non-lateral derived table cannot see tables of its owning query
+if (place == CTX_DERIVED && select->end_lateral_table == nullptr) continue;
+```
+
+`continue` 表示跳过本层继续往外层找，全部找不到就报 `ER_BAD_FIELD_ERROR`（Unknown column）——这就是没有 LATERAL 时的症状。
+
+`end_lateral_table` 则负责**只让左边的表可见**：
+
+```cpp
+if (first_table && first_table->query_block &&
+    first_table->query_block->end_lateral_table)
+  last_table = first_table->query_block->end_lateral_table;
+```
+
+所以 `FROM lateral (select t1.a) dt LEFT JOIN t1` 会报错——`t1` 在右边。
+
+### 6.2 易混淆：相关派生表 ≠ LATERAL
+
+MySQL **允许**派生表引用"更外层查询"的表（相关派生表，EXPLAIN 显示 `DEPENDENT DERIVED`）；**不允许**的是引用同一 FROM 的兄弟表。LATERAL 补的正是后者。
+
+判定标准在 `sql_resolver.cc`（semi-join 上拉时派生表如何"变成" LATERAL）：
+
+> *"some outer ref is now a neighbour in FROM: we have made 'tr' LATERAL"*
+
+即 **有外层引用 + 引用目标在同一 FROM ⇒ 就是 LATERAL**。反过来说，LATERAL 就是"写进 FROM 的相关子查询"。
+
+### 6.3 m_lateral_deps：标记在 Query_expression 上
+
+⚠️ 一个反直觉的点：lateral 标记**不在 `Table_ref`**（`sql/table.h` 搜 `lateral` 零命中，也没有 `Table_ref::is_lateral()`），而在 `Query_expression`：
+
+```cpp
+/**
+  If 'this' is body of lateral derived table:
+  map of tables in the same FROM clause as this derived table, and to which
+  the derived table's body makes references.
+  In pre-resolution stages, this is OUTER_REF_TABLE_BIT, just to indicate
+  that this has LATERAL; after resolution ... this is the proper map.
+*/
+table_map m_lateral_deps;
+```
+
+三态语义：未写 LATERAL → `0`；解析前写了 → `OUTER_REF_TABLE_BIT`（只是打标记）；解析后 → 真实表集合（去掉伪表位）。
+
+若写了 LATERAL 但体内实际没引用任何同层表，会退回 `0`（源码注释：*"it will be handled as if LATERAL hadn't been specified"*）。
+
+### 6.4 依赖如何变成 join 顺序约束（呼应 3.5）
+
+`m_lateral_deps` 最终并进 `dep_tables`——与 3.5 节的外连接、`STRAIGHT_JOIN` 走**同一条记账链**：
+
+```cpp
+dep_tables |= derived->m_lateral_deps;
+```
+
+再由 `tab->dependent = tl->dep_tables` 传给计划器，闸门是 `best_extension_by_limited_search` 里的：
+
+```cpp
+!(remaining_tables & s->dependent)
+```
+
+只要该表还依赖任何未进计划的表，就不能放到当前位置。
+
+⚠️ **这里没有专门的错误消息**——"依赖表必须排在前"完全靠计划搜索**静默剪枝**保证。`share/messages_to_clients.txt` 里没有任何 `ER_LATERAL_*` 错误码。
+
+补充：derived 被 merge 后，lateral 属性下放到内部表、自身清零——*"The 'laterality' of this nest is not interesting anymore; it was transferred to underlying tables."*
+
+### 6.5 执行语义：不是字面的"每行重算"
+
+精确说法是：**对其依赖表中"在计划里排最后"的那张表，每换一行重新物化一次**。
+
+```cpp
+// We identified the last dependency of table_ref in the plan, and it's
+// the table whose reading must trigger rematerialization of table_ref.
+```
+
+只挂最后一张是为了减少无谓刷新（`sql_executor.h`：*"for efficiency (less useless calls to QEP_TAB::refresh_lateral())"*）。测试里数过：t1 两行、t2 通过 join 产生多行，但 `handler_write` 仍是 2——**依赖行没变就不重算**。
+
+运行时靠 `CacheInvalidatorIterator` 的 `generation` 计数触发（`Init()` / `Read()` / `SetNullRowFlag()` 都 ++），`MaterializeIterator` 比较代次决定是否重算。
+
+### 6.6 代价与限制
+
+| 限制 | 说明 |
+|---|---|
+| **禁用 join buffer** | 缓冲打乱行的到达顺序会导致反复重算。源码原话 *"it's very inefficient. So we forbid join buffering"* |
+| **不能作为 hash join 右侧** | hypergraph 把 lateral 依赖转成 `AccessPath::parameter_tables`，非零就不能上 hash join 右支 |
+| **代价模型** | `lateral_derived_cost` = 单次物化代价 × 重算次数 ÷ 读取次数（optimizer trace 有 `lateral_materialization` 节点） |
+| **只能引用左边的表** | `end_lateral_table` 机制 |
+| **必须带别名** | 语法层就报 `ER_DERIVED_MUST_HAVE_ALIAS` |
+| **不能引用 SELECT 列表别名** | `is_item_list_lookup = false` |
+| **LATERAL 是保留字** | `create table lateral(a int)` 报 parse error |
+
+**聚合的处理是"最省事的实现"，不是标准**：lateral 派生表里的聚合不会解析到直接外层（因为读 FROM 表发生在聚合之前），测试注释直言 *"This was the simplest behaviour to implement"*，并指出 SQL Server 和 PG 会拒绝这种查询。
+
+### 6.7 与共享物化的冲突（唯一与 CTE 的交集）
+
+这是 LATERAL 与 CTE 唯一的交界，也是 [`runtime/03_cte.md`](../../runtime/03_cte.md) 里那个 TODO 的由来。
+
+共享物化的语义是"多个引用共用一份内容、读可以交错"；lateral 的语义是"每行要有自己的内容"——**本质冲突**。代码用 `m_rematerialize` 把关：
+
+```cpp
+const bool use_shared_cte_materialization =
+    !table()->materialized && m_cte != nullptr && !m_rematerialize && ...
+```
+
+只要 `m_rematerialize == true`，共享物化就被短路。而判断"依赖行变了没有"的 `generation` 只能说明"看到新行"、不能说明"LATERAL 真正用到的列值变了"，于是有了那个保守的 TODO：
+
+> *"TODO: It would be better, although probably much harder, to check the actual column values instead of just whether we've seen any new rows."*
+
+源码里"lateral CTE"是**正式承认的概念**（`sql_resolver.cc`）：*"it means we now have a 'lateral CTE'"*。
+
+---
+
+## 七、semi-join nest 收缩（pull_out_semijoin_tables）
 
 `sql_optimizer.cc:6756-6867`。这是 MySQL 里**唯一**用"唯一键 ⇒ 至多一行 ⇒ 语义不变"论证来改动 join 结构的算法，与 MariaDB table elimination 的正确性论证同源。
 
@@ -573,7 +935,7 @@ do {                                                  // ★ 不动点循环
 
 ---
 
-## 七、已知限制与"本版本不具备的能力"
+## 八、已知限制与"本版本不具备的能力"
 
 | 限制 | 说明 |
 |---|---|

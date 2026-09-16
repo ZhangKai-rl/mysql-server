@@ -198,6 +198,8 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 | [08_access_path.md](08_access_path.md) | ④ | AccessPath 44 种类型、新旧优化器两条创建路径、与 Iterator 1:1 |
 | **[09_executor_iterator.md](09_executor_iterator.md)** | ⑤ | **RowIterator 火山模型（算法级）**：火山契约、`unlock_row` 三种例外、NLJ 的 NULL 补全状态机、HashJoin 三形态与 chunk 估算、BKA 的 MRR cookie、**index merge 三个迭代器**（多路归并取交集/堆归并去重/两阶段 Unique）、排序/物化在 `Init()`、显式栈翻译、`ExecuteIteratorQuery` |
 | [10_dml.md](10_dml.md) | ⑤ DML 分支 | **DML 与 SELECT 的差异篇**（SELECT 是主链 02~09，不重复）：`Sql_cmd_dml` 类体系（SELECT 也继承它）、INSERT 的 `write_record` 链（不走迭代器）、UPDATE/DELETE 单表快路径 vs 多表迭代器、Halloween 问题与两阶段读、与 SELECT 在 read_set/write_set/ICP/覆盖索引的差异 |
+| [12_prepared_statement.md](12_prepared_statement.md) | ⑤' PS 路径（与主链并行） | **预编译语句**：`COM_STMT_*` 五命令与二进制协议（报文逐字段）、`Prepared_statement` 生命周期、**社区版无 plan cache 的证据链**（PS 只缓存语法树、每次 execute 重做 optimize）、`Item_param` 三套类型与 `const_for_execution`（为什么 prepare 期不能折叠 `?`）、reprepare 自动修复、执行链路到 InnoDB |
+| [13_item_expression.md](13_item_expression.md) | 横切（表达式层） | **Item 表达式体系**：为何 Item 既是 AST 又是执行节点（零转换 vs 状态分散的权衡）、**`type()`/`result_type()`/`data_type()` 三套类型**的分工、类型聚合与 unsigned 陷阱、**三阶段生命周期**（构造/`itemize`/`fix_fields`）、`walk`/`transform`/`compile` 改写机制、**`Item_sum` 聚合状态机**（simple vs distinct、`endup` 泵回、`COUNT(DISTINCT)` 的 O(1) 特例）、`Item_cache` 惰性求值、`Item_equal` 等价类、**为何无表达式 JIT** |
 
 ### 横切内容（不占主链步骤）
 
@@ -259,7 +261,7 @@ PT_select_stmt::make_cmd()             ← Parse Tree 根节点
 | **Selinger et al.《Access Path Selection in a Relational DBMS》(SIGMOD 1979，System R)** | 代价模型、选择性估算、左深树 DP —— MySQL 旧优化器的代价公式来源 |
 | **Graefe《Volcano—An Extensible and Parallel Query Evaluation System》(1990)** | **火山模型（Volcano iterator model）** —— MySQL 8.0 的 `RowIterator` 就是它的实现：`Init()` / `Read()` 契约 |
 | **Graefe《The Cascades Framework for Query Optimization》(1995)** | 现代优化器框架（规则 + 代价），MySQL 未采用，但是 hypergraph 重构的参照系 |
-| **Moerkotte & Neumann《Dynamic Programming Strikes Back》(CIDR 2021)** | **DPhyp 算法** —— hypergraph 优化器 `EnumerateAllConnectedPartitions` 直接实现此论文，支持 bushy tree |
+| **Moerkotte & Neumann《Dynamic Programming Strikes Back》(SIGMOD 2008)** | **DPhyp 算法** —— hypergraph 优化器 `EnumerateAllConnectedPartitions` 直接实现此论文，支持 bushy tree |
 | **Galindo-Legaria《Parameterized Queries and Nesting Equivalences》(2001)** | 子查询去关联化、semi-join 转换的理论基础 |
 
 **设计思想主线**：MySQL 8.0 近年的重构（8.0.22 AccessPath、8.0.31 Query_term、迭代器化）本质上是**一次"去 JOIN 化"**——把过去揉在 `JOIN` 结构里的逻辑查询树、物理计划、执行状态拆开，让优化器可替换、执行器只认 AccessPath/Iterator。

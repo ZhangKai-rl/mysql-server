@@ -4,12 +4,76 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、语义与 level 约定](#一语义与-level-约定)
 - [二、多层聚合：Item_rollup_sum_switcher](#二多层聚合item_rollup_sum_switcher)
 - [三、分组列封装：Item_rollup_group_item](#三分组列封装item_rollup_group_item)
 - [四、流式聚集：AggregateIterator 状态机](#四流式聚集aggregateiterator-状态机)
 - [五、rollup 对优化器的影响](#五rollup-对优化器的影响)
 - [六、深潜补充：GROUPING()、resolver 后处理与一条纠错](#六深潜补充grouping-resolver-后处理与一条纠错)
+
+---
+
+## 设计思想与理论基础
+
+### ROLLUP 解决什么问题
+
+多维分析里的"小计/合计"需求：按 `(year, country, product)` 分组时，还想要 `(year,country)` 小计、`(year)` 小计、全局总计。
+
+不用 ROLLUP 的写法：4 个 `GROUP BY` 再用 `UNION ALL` 拼起来 —— **4 次扫描 + 4 次排序**。
+用 ROLLUP：**一次扫描**产出所有层次。
+
+### 语义本质：分组集的层次结构
+
+ROLLUP 是 **GROUPING SETS 的一个特例**（前缀链）：
+
+```
+ROLLUP(a, b, c)  ≡  GROUPING SETS { (a,b,c), (a,b), (a), () }
+```
+
+三者表达能力由强到弱：
+
+| 语法 | 产生的分组集 | 数量 | MySQL 8.0.39 |
+|---|---|---|---|
+| **GROUPING SETS** | 任意指定 | 任意 | ❌ 不支持 |
+| **CUBE** | 所有子集组合 | 2ⁿ | ❌ 不支持 |
+| **ROLLUP** | 前缀链 | n+1 | ✅ 支持 |
+
+**ROLLUP 只产生 n+1 个分组集（一条链），CUBE 产生 2ⁿ 个** —— 这正是 ROLLUP 能被高效实现的关键：分组集构成一条**链**，可以靠一次排序 + 流式聚集顺序产出（本文第四章）。CUBE 的组合不构成链，需要更重的机制。
+
+### 核心难点：NULL 的歧义
+
+ROLLUP 用"把被 rollup 掉的分组列置 NULL"来表示汇总行。但**真实数据里本来也可能有 NULL**，于是产生歧义：
+
+```
+a=1, b=NULL    ← 这是"a=1 且 b 真实为 NULL"的明细行，还是"a=1 的小计行"？
+```
+
+SQL 标准为此引入 **`GROUPING()` 函数**：返回该列是否**因 rollup 而**被置 NULL（1 = rollup 产生的 NULL，0 = 真实值）。实现见本文第六章。
+
+> 这是 ROLLUP 设计里最容易被忽略、但语义上最关键的一点：**汇总标记不能只靠 NULL 承载**。没有 `GROUPING()`，含 NULL 的数据就无法正确区分明细行与小计行。
+
+### 实现思路：一次扫描 + 多层聚合器
+
+要在一次扫描中同时产出 n+1 个层次的聚合值，就必须**为每个层次各维护一套聚合器**：
+
+| 组件 | 职责 | 本文 |
+|---|---|---|
+| `Item_rollup_sum_switcher` | 包住聚合函数，内部持有 n+1 个聚合器 | 第二章 |
+| `Item_rollup_group_item` | 包住分组列，按 level 决定是否输出 NULL | 第三章 |
+| `AggregateIterator` | 流式状态机，在分组边界切换 level | 第四章 |
+
+**代价是显式的**：聚合器数量 × (n+1)，内存与计算都按层次数放大。
+
+### 他库对比
+
+Oracle / PostgreSQL / SQL Server 都支持完整的 `GROUPING SETS` / `CUBE` / `ROLLUP`。MySQL 只实现了 `ROLLUP`——从 `olap_type` 枚举只有 `ROLLUP_TYPE` 一个值（本文 1.2 节）就能看出。这既是实现简化的选择，也是能力上的已知缺口。
+
+### 代价要点
+
+1. **聚合器 × (n+1)**：内存与计算按层次数放大
+2. **排序要求**：多层汇总依赖输入已按分组列排序（filesort 或索引）
+3. **优化器受限**：rollup 会禁用部分优化（本文第五章）
 
 ---
 
@@ -382,6 +446,6 @@ SetRollupLevel(INT_MAX);             // :195 用不可能的值强制"变化"，
 - *MySQL 8.0 Reference Manual → The GROUPING() Function*
 
 **相关文档**
-- 普通 GROUP BY 的临时表聚集见 [`01_filesort_and_temptable.md`](01_filesort_and_temptable.md)
+- 普通 GROUP BY 的临时表聚集见 [`01_filesort.md`](01_filesort.md)
 - 窗口函数（同为聚合家族）见 [`04_window_function.md`](04_window_function.md)
 - 计划改进阶段的临时表决策见 [`../07_optimize/10_plan_refinement.md`](../07_optimize/10_plan_refinement.md)

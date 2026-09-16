@@ -1397,6 +1397,6 @@ server 层通过 `binlog_query`/GTID 保证 DDL 在 binlog 中有记录。崩溃
 
 **相关文档**
 - 上游：server 层 DDL 入口与算法选择 `mysql_alter_table`（sql/sql_table.cc）；server↔引擎接口见 [`../server/handler.md`](../server/handler.md)
-- 下游：B-tree 释放的 extent 粒度与 FSP_FREE 见本文件「B-tree 的物理释放」；表空间碎片度量见 [`tablespace.md`](tablespace.md)
+- 下游：B-tree 释放的 extent 粒度与 FSP_FREE 见本文件「B-tree 的物理释放」；表空间碎片度量见 [`physical/tablespace.md`](physical/tablespace.md)
 - undo：DDL 为何不记数据 undo 见本文件；undo 本身见 [`undo_log.md`](undo_log.md)
 

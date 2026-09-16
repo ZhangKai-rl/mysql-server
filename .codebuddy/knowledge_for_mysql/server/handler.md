@@ -453,6 +453,266 @@ if (index->table->skip_alter_undo) {
 
 ---
 
+## row_prebuilt_t：server ↔ InnoDB 的桥接对象
+
+> 完整定义见 `include/row0mysql.h:553`。它是 `ha_innobase::m_prebuilt` 的类型，**不属于 handler 类继承体系**，却是 handler 每次操作真正依赖的"工作现场"。
+
+### 为什么需要它
+
+每次 DML 都要做一批"昂贵但可复用"的准备工作：把 MySQL 行格式 ↔ InnoDB 行格式的**转换模板**建出来、分配持久游标、构造查询图（query graph）、缓存 range 边界。若每行都重做一遍，开销无法接受。
+
+`row_prebuilt_t` 就是这些**跨行复用的状态集合**：建一次（`build_template`），之后所有行共用。这也是它名字里 "prebuilt" 的含义。
+
+### 字段分组
+
+| 组 | 字段 | 说明 |
+|---|---|---|
+| **句柄** | `table` / `index` / `trx` | `dict_table_t` / 当前索引 / 当前事务 |
+| **★ 行格式转换** | `mysql_template`（`mysql_row_templ_t*`）、`template_type`、`n_template`、`null_bitmap_len` | 由 `ha_innobase::build_template` 创建；`template_type` 取 `ROW_MYSQL_WHOLE_ROW` / `REC_FIELDS` / `DUMMY_TEMPLATE` / `NO_TEMPLATE` |
+| **读路径控制** | `read_just_key`、`need_to_access_clustered`、`hint_need_to_fetch_extra_cols`、`index_usable` | ★ `read_just_key` = **覆盖索引**（`HA_EXTRA_KEYREAD`，不必回表）；`need_to_access_clustered` = 二级索引取不到全部列、必须回表 |
+| **游标与 range** | `pcur` / `clust_pcur`、`search_tuple` / `m_stop_tuple` / `m_stop_tuple_found` | `btr_pcur_t` 持久游标；`[search_tuple, m_stop_tuple]` 就是一次 range 的两个边界 |
+| **执行节点** | `ins_node` / `upd_node`、`ins_graph` / `upd_graph` / `sel_graph` | InnoDB 的执行节点与查询图（`que_fork_t`） |
+| **自增** | `autoinc_last_value` / `_increment` / `_offset` / `autoinc_error`、`no_autoinc_locking` | 见 [`../feat/auto_increment.md`](../feat/auto_increment.md) |
+| **锁** | `select_lock_type`、`sql_stat_start` | `select_lock_type` 由 `external_lock` 设置（见上文）；`sql_stat_start` 在 `row_search_mvcc` 中被置 false |
+| **DML 语义开关** | `on_duplicate_key_update`、`replace` | 对应 `HA_EXTRA_INSERT_WITH_UPDATE` / `HA_EXTRA_WRITE_CAN_REPLACE` |
+| **缓冲区** | `ins_upd_rec_buff`、`default_rec`、`mv_data`、`heap` / `cursor_heap` | MySQL→InnoDB 的转换缓冲、默认值行、多值列数据 |
+
+### 两个值得单说的字段
+
+**① `clust_index_was_generated`**——用户没定义主键、InnoDB 自动生成 row_id 聚簇索引时置 true。它与 `byte row_id[DATA_ROW_ID_LEN]`（最后取到的行的 row_id）配套。★ 这正是 [`../innodb/physical/record.md`](../innodb/physical/record.md) 中「隐藏系统列与 DB_ROW_ID」在 handler 侧的对应物：那篇讲 row_id 怎么生成与持久化，这里讲它怎么被缓存与回传。
+
+**② `m_is_reading_range` 用了 RAII guard**：
+
+```cpp
+class row_is_reading_range_guard_t : private ut::bool_scope_guard_t {
+ public:
+  explicit row_is_reading_range_guard_t(row_prebuilt_t &prebuilt)
+      : ut::bool_scope_guard_t(prebuilt.m_is_reading_range) {}
+};
+row_is_reading_range_guard_t get_is_reading_range_guard() {
+  ut_ad(!m_is_reading_range);        // 断言作用域不嵌套
+  return row_is_reading_range_guard_t(*this);
+}
+```
+
+即"是否处于 `read_range_first/next` 中"这个状态由作用域自动管理，且显式断言不嵌套——比手工 bool 置位/复位更不容易漏。
+
+### mysql_row_templ_t：转换模板的每一项（`row0mysql.h:491`）
+
+`row_prebuilt_t::mysql_template` 是 `mysql_row_templ_t` 数组，**每列一项**，由 `ha_innobase::build_template` 填充。它存在的意义是：把"查字典才能知道的布局信息"预先算成数字，转换时直接 `memcpy`。
+
+```cpp
+struct mysql_row_templ_t {
+  ulint col_no;                   // 列号
+  ulint rec_field_no;             // 当前索引记录中的字段号
+  ulint clust_rec_field_no;       // ★ 聚簇索引记录中的字段号（回表时用）
+  ulint icp_rec_field_no;         // ★ ICP / end-range 用的字段号（只为可能下推的列定义）
+  ulint mysql_col_offset;         // MySQL 行格式中的偏移
+  ulint mysql_col_len;            // MySQL 行格式中的长度
+  ulint mysql_mvidx_len;          // 多值数组索引长度
+  ulint mysql_null_byte_offset;   // MySQL NULL 位图字节偏移
+  ulint mysql_null_bit_mask;      // NULL 位掩码（0 = 该列不可能为 NULL）
+  ulint type;                     // InnoDB mtype（DATA_CHAR...）
+  ulint mysql_type;               // MySQL 类型码（恒 < 256）
+  ulint mysql_length_bytes;       // true VARCHAR 用 1 还是 2 字节存长度
+  ulint charset, mbminlen, mbmaxlen;
+  ulint is_unsigned, is_virtual, is_multi_val;
+};
+```
+
+★ **这个结构的本质是"三重坐标映射"**——同列在三种表示里的位置都预先记下：
+
+| 坐标 | 字段 | 用在哪 |
+|---|---|---|
+| **MySQL 行格式** | `mysql_col_offset` / `mysql_col_len` / `mysql_null_byte_offset` / `mysql_null_bit_mask` | 读写 `TABLE->record[0]` |
+| **当前索引记录** | `rec_field_no` | 从当前扫描的索引记录取列 |
+| **聚簇索引记录** | `clust_rec_field_no` | 回表后从聚簇记录取列 |
+
+转换一行时不需要任何字典查找，纯数字索引 + `memcpy`——**这就是 "prebuilt 省 CPU" 的全部秘密**。
+
+两个易忽略的细节：
+
+- `icp_rec_field_no` **只为"可能参与 ICP 下推或 end-range 判断"的列定义**，其余列不填——避免为用不到的列付代价；
+- `mysql_length_bytes` 记录 MySQL 行格式里 true VARCHAR 的长度前缀是 1 还是 2 字节；**注意注释强调：key value（键值）格式恒用 2 字节**，与行内表示不同。
+
+#### template_type：四种模板各用于什么
+
+```cpp
+constexpr uint32_t ROW_MYSQL_NO_TEMPLATE = 2;
+/* dummy template used in row_scan_and_check_index */
+constexpr uint32_t ROW_MYSQL_DUMMY_TEMPLATE = 3;
+```
+
+| 类型 | 含义 | 谁在用 |
+|---|---|---|
+| `ROW_MYSQL_WHOLE_ROW` | 模板含**全部列** | `build_template(true)`：写路径（`write_row` / `update_row`）、并行扫描、ALTER 重建、采样 |
+| `ROW_MYSQL_REC_FIELDS` | 模板只含**本次需要的列** | `build_template(false)`：读路径（`index_read` / `rnd_next` / `general_fetch`） |
+| `ROW_MYSQL_DUMMY_TEMPLATE` | **空模板**（`n_template = 0`），只校验不取行 | `CHECK TABLE`、`row_scan_and_check_index`（`row0sel.cc:5731` 注释 "CHECK TABLE: fetch the row"） |
+| `ROW_MYSQL_NO_TEMPLATE` | 不需要模板 | `ha_innodb.cc:3188`（HANDLER 等场景） |
+
+★ **`build_template(true/false)` 这个参数，就是 `read_set` 优化在 InnoDB 侧的落地**：读路径只把 `read_set` 里的列建进 `mysql_template` 数组（`n_template` 更小），取行时直接跳过无关列。这是 `SELECT a FROM t` 比 `SELECT *` 快的深层原因之一——不只是少了 IO，**每行还少做了 N-1 次格式转换**。
+
+#### 构建、复用与失效
+
+- `build_template(bool whole_row)`（`ha_innodb.cc:8377`）填充 `mysql_template` 数组并设 `n_template`；`reset_template()`（`ha_innodb.h:521`）清空；
+- ★ `can_reuse_mysql_template()`（`row0mysql.cc:4817`）的复用条件是 `template_type != ROW_MYSQL_DUMMY_TEMPLATE && !in_fts_query`；
+- ★ debug 构建下还有一段"**重建前后逐字节比对**"的断言（`:10227-10242`）：先把旧 `mysql_template` 整份拷下、强制重建、再 `memcmp` 比较并断言 `n_template` 不变——用来验证"复用模板"与"重建模板"结果一致，是防止模板失效类 bug 的防线。
+
+#### build_template 逐行解析（`ha_innodb.cc:8377`）
+
+**① 开头三个"强制升级成整行"的条件**
+
+```cpp
+if (m_prebuilt->select_lock_type == LOCK_X) {
+  /* We always retrieve the whole clustered index record if we
+  use exclusive row level locks, for example, if the read is
+  done in an UPDATE statement. */
+  whole_row = true;                                   // ★ 条件一
+} else if (!whole_row) {
+  if (m_prebuilt->hint_need_to_fetch_extra_cols == ROW_RETRIEVE_ALL_COLS) {
+    if (m_prebuilt->read_just_key) {
+      fetch_all_in_key = true;                        // ★ 条件二（覆盖索引分支）
+    } else {
+      whole_row = true;
+    }
+  } else if (m_prebuilt->hint_need_to_fetch_extra_cols == ROW_RETRIEVE_PRIMARY_KEY) {
+    fetch_primary_key_cols = true;                    // ★ 条件三
+  }
+}
+```
+
+★ **条件一最值得记住**：只要拿的是**排他行锁**（`LOCK_X`，如 `UPDATE` 里的读、`SELECT ... FOR UPDATE`），就**无条件升级为取整行**。这是"锁定读比普通读慢"的深层原因之一——不是锁本身慢，而是**锁定读无法享受"只取需要的列"这一优化**。
+
+**② 选定模板基于哪个索引 + 分配空间**
+
+```cpp
+clust_index = m_prebuilt->table->first_index();
+index = whole_row ? clust_index : m_prebuilt->index;   // 整行 → 基于聚簇；否则基于当前索引
+m_prebuilt->need_to_access_clustered = (index == clust_index);
+
+n_fields = (ulint)table->s->fields;
+if (!m_prebuilt->mysql_template)
+  m_prebuilt->mysql_template = ut::malloc_withkey(..., n_fields * sizeof(mysql_row_templ_t));
+#if defined(UNIV_DEBUG) && !defined(UNIV_DEBUG_VALGRIND)
+  memset(m_prebuilt->mysql_template, 0, ...);          // 为逐字节比对
+#endif
+m_prebuilt->template_type = whole_row ? ROW_MYSQL_WHOLE_ROW : ROW_MYSQL_REC_FIELDS;
+m_prebuilt->null_bitmap_len = table->s->null_bytes;
+```
+
+模板数组按**全列数**分配（`table->s->fields`），但实际只填前 `n_template` 项——所以 `n_template` 才是真正的"要转换多少列"。`need_to_access_clustered` 在这里赋初值，**后面逐列检查时还会被更新**（发现二级索引取不到的列就置 true）。
+
+**③ ICP 列优先建模板**（`:8460`）
+
+```cpp
+if (active_index != MAX_KEY && active_index == pushed_idx_cond_keyno) {
+  ...
+  templ = build_template_field(...);
+  m_prebuilt->idx_cond_n_cols++;
+  ut_ad(m_prebuilt->idx_cond_n_cols == m_prebuilt->n_template);   // ★ ICP 列必须排在最前
+  set_templ_icp(templ, index, m_prebuilt->index, column_position);
+}
+```
+
+有下推条件时，**ICP 用到的列必须排在模板最前面**（`idx_cond_n_cols == n_template` 断言），因为 `row_search_idx_cond_check` 只扫前 `idx_cond_n_cols` 项——省去遍历全模板。
+
+**★★ ④ `build_template_needs_field`：这一列到底要不要？**
+
+这是整个函数的心脏（`ha_innodb.cc:8165`），四级判断：
+
+```cpp
+const Field *field = table->field[i];
+
+if (!index_contains) {                                   // ① 索引不含此列
+  if (read_just_key) {
+    /* If this is a 'key read', we do not need
+    columns that are not in the key */
+    return (nullptr);                                     // 覆盖索引 → 跳过
+  }
+} else if (fetch_all_in_key) {                            // ② 索引含此列 且 要求全取
+  return (field);
+}
+
+if (bitmap_is_set(table->read_set, static_cast<uint>(i)) ||    // ③ ★ read_set / write_set
+    bitmap_is_set(table->write_set, static_cast<uint>(i))) {
+  /* This field is needed in the query */
+  return (field);
+}
+
+if (fetch_primary_key_cols &&                             // ④ 需要主键列
+    dict_table_col_in_clustered_key(index->table, i - num_v)) {
+  return (field);
+}
+
+return (nullptr);                                         // ⑤ 不需要，跳过
+```
+
+返回值 `nullptr` 的列**不进模板**，`n_template` 不增长——取行时就完全跳过它。
+
+#### read_set / write_set 是什么（为什么 `SELECT a` 比 `SELECT *` 快）
+
+**它是什么**：`TABLE` 上的两个位图 `MY_BITMAP read_set` / `write_set`，**每列一个 bit**，标记"**本次语句**需要读 / 要写哪些列"。
+
+**谁设置它**：优化器在 prepare/resolve 阶段。语句里出现过的列（SELECT 列表、WHERE、JOIN 条件、ORDER BY、GROUP BY、写语句要更新的列…）会被 `mark_column_used()` 打进位图。所以：
+
+| 语句 | `read_set` 内容 |
+|---|---|
+| `SELECT a FROM t WHERE b > 1` | 只有 `a`、`b` 两列 |
+| `SELECT * FROM t` | 全部列 |
+| `UPDATE t SET a = 1 WHERE b = 2` | `read_set` 含 `b`，`write_set` 含 `a` |
+
+**谁用它**：三层都会看它——
+
+1. **server 层**：判断某列是否"被本次查询用到"（决定是否要为该列做转换/校验）；
+2. **InnoDB `build_template(false)`** ——上面第 ③ 步，决定模板里有哪些列；
+3. **`row_search_mvcc` 取行时**只转换模板里的列。
+
+★ 所以 `SELECT a FROM t` 比 `SELECT *` 快的**完整因果链**是：
+
+```
+查询只用到 a
+  → read_set 只有 a 这一位
+  → build_template(false) 只建 1 个 mysql_row_templ_t（n_template = 1）
+  → 取每行时只做 1 次字段转换 + 1 次 memcpy
+  → 其余列连"从 rec 里解析 offset"这一步都省了
+```
+
+不只是"少读 IO"——**每行的 CPU 转换开销也按列数线性下降**。这在宽表（几十列）上差异极大。
+
+**两个易踩的坑**：
+
+- `write_set` 也参与判断：所以 `UPDATE` 即使只改一列，模板里也要有被改的列（否则写不回去）；
+- **锁定读会绕过这个优化**——见上，`LOCK_X` 直接 `whole_row = true`，`read_set` 此时不起作用。
+
+### ★ clust_templ_for_sec
+
+这个标志属于 `row_search_mvcc` / `row_sel_store_mysql_rec` 的**执行细节**，已移至 [`../innodb/row_search.md`](../innodb/row_search.md) 的「★ row_sel_store_mysql_rec」一节——那里有 `row_sel_store_mysql_rec` 的完整上下文，放一起更好懂。
+
+此处只留一句提要：**扫描二级索引、但模板按主键建**（`index != clust_index && need_to_access_clustered`）。因为二级索引记录里隐含主键列，模板中的 PK 列可以**直接从二级索引记录抠出来**，剩下的才回表——这是"覆盖索引 / 回表"二分之外的第三种形态。
+
+### fetch cache：顺序扫描时的批量缓存
+
+```cpp
+constexpr uint32_t MYSQL_FETCH_CACHE_SIZE = 8;
+/* After fetching this many rows, we start caching them in fetch_cache */
+constexpr uint32_t MYSQL_FETCH_CACHE_THRESHOLD = 4;
+```
+
+★ **取满 4 行后才开始缓存、一次缓存 8 行**（`row_sel_dequeue_cached_row_for_mysql`）。为什么要有阈值：**顺序扫描**才值得缓存；随机点查缓存命中率低，缓存反而浪费内存与拷贝开销。所以它是"用前几行判断这是不是顺序扫描"的自适应策略。
+
+### 魔数与生命周期
+
+```cpp
+constexpr uint32_t ROW_PREBUILT_ALLOCATED = 78540783;
+constexpr uint32_t ROW_PREBUILT_FREED = 26423527;
+```
+
+`row_search_mvcc` 入口的 `ut_a(prebuilt->magic_n == ROW_PREBUILT_ALLOCATED)`（`:4501`）就是 use-after-free 的第一道防线——释放时置 `FREED`，后续误用立即断言失败。
+
+### 与 handler 的关系
+
+`row_prebuilt_t` 由 `ha_innobase::open` 时创建、`close` 时释放，**每个 `ha_innobase` 实例一份**（不像 `TABLE_SHARE` 那样跨连接共享）。所以它是"**会话私有、表私有**"的：同一张表在两个连接里各有各的 prebuilt、各有各的持久游标状态。
+
 ## Misc
 
 ### handler vs handlerton 易混淆
@@ -607,7 +867,7 @@ rowid 链路涉及三种"键/列"格式，容易混：
 |---|---|---|---|
 | **record 列存储格式** | 引擎读行填 `record[0]` | SQL 层计算/比较 | VARCHAR 有长度前缀、BLOB 是"长度+外置指针"、CHAR 定长无前缀 |
 | **引擎键格式** | `key_copy`（`sql/key.cc:136`） | `index_read`/`position` 的 ref | 可空 keypart 前 1 字节 NULL 标记、变长 2 字节长度头、定长空格填充 |
-| **addon 格式** | `Field::pack` | filesort 排序记录 | 紧凑序列化，见 [runtime/01](query/runtime/01_filesort_and_temptable.md) 1.3 |
+| **addon 格式** | `Field::pack` | filesort 排序记录 | 紧凑序列化，见 [runtime/01](query/runtime/01_filesort.md) 1.3 |
 
 `position()` 的 `ref` 是**引擎键格式**——既不是 record 格式，也不是 InnoDB 内部格式。
 
@@ -723,7 +983,7 @@ EXPLAIN 输出里的 `ref` 列（访问类型 `const`/`ref`/`eq_ref`）是**另�
 
 ### 谁用它
 
-- **filesort 的 indirect 模式**：排序结果只存 `ref`，读结果时 `ha_rnd_pos()` 回表（见 [query/runtime/01_filesort_and_temptable.md](query/runtime/01_filesort_and_temptable.md) 1.3）
+- **filesort 的 indirect 模式**：排序结果只存 `ref`，读结果时 `ha_rnd_pos()` 回表（见 [query/runtime/01_filesort.md](query/runtime/01_filesort.md) 1.3）
 - **DML 两阶段读**：`position()` 记行 ID → `rnd_pos()` 回表改（见 [query/10_dml.md](query/10_dml.md)）
 - **index merge 的 ROR**：`IndexRangeScanIterator` 按 rowid 输出，靠 `position()` 填 `file->ref`
 - **WeedoutIterator**：semijoin 去重的键就是外层表的 row ID

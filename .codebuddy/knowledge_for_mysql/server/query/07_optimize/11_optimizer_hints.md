@@ -8,6 +8,7 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、架构总览：双语法器 + 四层对象树](#一架构总览双语法器--四层对象树)
 - [二、hint 的语法与解析](#二hint-的语法与解析)
 - [三、Opt_hints 四层对象树](#三opt_hints-四层对象树)
@@ -16,6 +17,64 @@
 - [六、INDEX 如何限制候选索引](#六index-如何限制候选索引)
 - [七、SET_VAR / MAX_EXECUTION_TIME / RESOURCE_GROUP](#七set_var--max_execution_time--resource_group)
 - [八、8.0.39 已废弃或未生效的 hint](#八8039-已废弃或未生效的-hint)
+
+---
+
+## 设计思想与理论基础
+
+### hint 解决什么问题
+
+优化器基于代价与统计信息决策，但三类情况下会选错：
+
+1. **统计信息过时**（直方图缺失、数据倾斜）
+2. **代价模型失真**（01 篇）
+3. **优化器本身能力有限**（搜索空间被剪枝、用了启发式）
+
+hint 就是让用户**手动覆盖优化器决策**的逃生舱。
+
+### 为什么用独立的小语法器（双语法器）
+
+8.0.39 的 hint 语法**不在主语法器 `sql_yacc.yy` 里**，而在独立的小 Bison 语法器 `sql/sql_hints.yy`。主词法器识别到 hintable 关键字（SELECT/INSERT/UPDATE/DELETE/REPLACE）后紧跟 `/*+` 时才唤醒它。
+
+**为什么这么设计**：
+
+1. **注释语法不适合塞进主语法器**——hit 写在注释里，主语法器本该当注释跳过；只有特定位置才激活旁路解析
+2. **错误容忍**——hint 写错**不应该让整条 SQL 失败**（SQL 标准精神：hint 是"建议"）。独立语法器可以局部报错 + 产生 warning，不污染主语法器的错误恢复
+3. **避免语法冲突**——hint 语法独立演进，不会与主语法产生 LALR 冲突
+
+> 这是理解 MySQL hint 的关键：**它不是主语法的一部分，而是挂在注释上的旁路解析**。
+
+### 四层对象树：为什么是 global → query block → table → key
+
+hint 需要作用在不同粒度的对象上，所以自然形成四层：
+
+| 层 | 作用对象 | hint 例子 |
+|---|---|---|
+| global | 整个语句 | `MAX_EXECUTION_TIME`、`SET_VAR`、`RESOURCE_GROUP` |
+| query block | 子查询块 | `JOIN_ORDER`、`SEMIJOIN`、`SUBQUERY` |
+| table | 某张表 | `NO_MERGE`、`BNL`、`MERGE` |
+| key | 某个索引 | `INDEX`、`NO_INDEX`、`JOIN_INDEX` |
+
+查找时由外向内、由粗到细（`hint_key_state` 先查 key 级，再 fallback 到 table 级）。
+
+> 这种"分层对象树 + 按粒度查找"是 hint 系统的**通用设计**——Oracle 的 hint 体系、PostgreSQL 的 `pg_hint_plan` 插件都是同构的。
+
+### 理论定位：hint 是"规则"对"代价"的覆盖
+
+呼应 00 篇的 CBO/RBO 划分：
+
+- 优化器正常路径是 **CBO**（代价驱动）
+- hint 是**用户手写的规则**，直接覆盖代价决策
+
+所以 hint 本质上是一个 **RBO 旁路**——允许人在优化器不够聪明时手工下指令。
+
+这也解释了为什么 hint 用多了是"坏味道"：它把决策权从优化器还给了人，而**人的判断会随数据变化而过期**（数据时变了，硬编码的 hint 还在）。
+
+### 代价与限制
+
+- **hint 不保证生效**——优化器可能因语义限制无法满足。这是"建议"语义的必然结果，也是它被设计成 warning 而非 error 的原因
+- 8.0.39 有一批已废弃或未生效的 hint（本篇第八章）
+- 与 prepared statement 的交互：hint 在 **prepare 时**解析，之后不再变（本篇第七章）
 
 ---
 

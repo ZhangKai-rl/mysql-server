@@ -1,6 +1,8 @@
 # MySQL Binlog 机制深度解析
 
-> 基于 MySQL 8.0.39 源码，涵盖 Ordered Commit 三阶段流水线、BGC Ticket 系统、内部 2PC（含 Prepare/Commit 三层职责分解）、binlog_order_commits 参数、commit 阶段与 trx->no、Anonymous_Gtid、Event 格式与 mysqlbinlog 解读、Row Image 记录过程。
+> 基于 MySQL 8.0.39 源码，涵盖 Ordered Commit 三阶段流水线、BGC Ticket 系统、内部 2PC、binlog_order_commits 参数、commit 阶段与 trx->no、Anonymous_Gtid、Event 格式与 mysqlbinlog 解读、Row Image 记录过程。
+>
+> **边界**：本篇讲 binlog 侧机制（BGC 流水线、2PC 协调、事件格式）；2PC 的引擎侧执行（trx prepare 逐行剖析、undo 状态、外部 XA）与事务生命周期见 [`../../innodb/trx.md`](../../innodb/trx.md)。
 
 ## 目录
 
@@ -8,13 +10,12 @@
   - [提交流程全景图](#提交流程全景图)
 - [BGC Ticket 系统](#bgc-ticket-系统)
 - [内部 2PC（两阶段提交）](#内部-2pc两阶段提交)
-  - [三层职责分解：Prepare 与 Commit 各做什么](#三层职责分解prepare-与-commit-各做什么)
 - [binlog_order_commits 参数](#binlog_order_commits-参数)
 - [Commit 阶段与 trx_no](#commit-阶段与-trx_no)
 - [Anonymous_Gtid](#anonymous_gtid)
 - [Event 格式与 mysqlbinlog 解读](#event-格式与-mysqlbinlog-解读)
 - [Row Image 记录过程](#row-image-记录过程)
-- [关键源码位置速查](#关键源码位置速查)
+- [参考](#参考)
 
 ---
 
@@ -196,135 +197,18 @@ MGR 完全开源（GPLv2），代码位于 `plugin/group_replication/`。上层 
     → commit: ha_commit_low → InnoDB 引擎层真正 commit
 ```
 
-### 三层职责分解：Prepare 与 Commit 各做什么
+### binlog 侧的核心环节：finalize cache 与结束事件
 
-2PC 的两个阶段在 server / binlog / innodb 三层各有明确分工。下文按阶段展开。
+> 2PC 的引擎侧剖析（prepare 五层逐行、undo 状态、`HA_IGNORE_DURABILITY` 的协同、触发条件 `rw_ha_count > 1`、外部 XA 的 detach / by_xid）见 [`../../innodb/trx.md`](../../innodb/trx.md)「事务与 binlog：2PC」。本篇只讲 binlog 自己的环节。
 
-#### Prepare 阶段
-
-**Server 层**（handler.cc）只做协调准备，不做持久化：
+`MYSQL_BIN_LOG::commit` 在进 `ordered_commit` 之前，先 finalize binlog cache：
 
 | 动作 | 位置 | 说明 |
 |------|------|------|
-| 持久化 owned GTID | `commit_owned_gtids` (handler.cc:1625) | 仅 binlog 关闭 / 从库关 log_replica_updates 时刷 gtid_executed 表 |
-| 获取 MDL COMMIT 锁 | handler.cc:1751 | `MDL_INTENTION_EXCLUSIVE`，阻止与 FTWRL 并发 |
-| 判定是否 2PC | handler.cc:1772 | `rw_ha_count > 1 && !no_2pc` 才调 prepare |
-| 驱动 prepare | handler.cc:1773 | `tc_log->prepare(thd, all)` |
-
-**Binlog 层**（binlog.cc）不写 binlog 文件，只设标志 + 驱动引擎：
-
-| 动作 | 位置 | 说明 |
-|------|------|------|
-| 设 HA_IGNORE_DURABILITY | binlog.cc:8042 | 告诉 InnoDB redo prepare 别 fsync，延迟到 flush stage 批量来 |
-| 驱动引擎 prepare | `ha_prepare_low` (binlog.cc:8045) | 遍历 hton 调 `ht->prepare` |
-| XA PREPARE 特殊处理 | binlog.cc:8050 | `is_xa_prepare` 时额外调 `commit(skip_commit=true)`，只写 `XA_prepare_log_event` 不做引擎 commit |
-
-**InnoDB 层**（ha_innodb.cc / trx0trx.cc）是 prepare 阶段真正做持久化的一层：
-
-```
-innobase_xa_prepare (ha_innodb.cc:20016)
-└─ trx_prepare_for_mysql (trx0trx.cc:3169)
-   └─ trx_prepare (trx0trx.cc:3039)
-      ├─ trx_prepare_low (trx0trx.cc:2976)
-      │   ├─ trx_undo_set_state_at_prepare (trx0trx.cc:3003/3010)
-      │   │   undo log segment: TRX_UNDO_ACTIVE → TRX_UNDO_PREPARED
-      │   ├─ mtr_commit (trx0trx.cc:3018)  ← 将 undo 页修改写入 redo log buffer，返回 lsn
-      │   └─ return lsn
-      ├─ trx->state = TRX_STATE_PREPARED (trx0trx.cc:3065)
-      ├─ trx_sys->n_prepared_trx++ (trx0trx.cc:3066)
-      └─ trx_flush_logs(trx, lsn) (trx0trx.cc:3086)
-          ← 因 HA_IGNORE_DURABILITY，不强制 fsync；redo 只进 log buffer
-```
-
-| 动作 | 说明 |
-|------|------|
-| undo 标记 PREPARED | `trx_undo_set_state_at_prepare` 将 undo segment 状态改为 `TRX_UNDO_PREPARED`，崩溃恢复时 InnoDB 扫 undo 能识别这些事务 |
-| 写 redo（不 fsync） | MTR 将 undo 页修改记入 redo log buffer，拿到 lsn；因 `HA_IGNORE_DURABILITY` 不做 `log_write_up_to` |
-| trx 状态切换 | `TRX_STATE_ACTIVE → TRX_STATE_PREPARED`，`n_prepared_trx++` |
-| 释放 GAP 锁 | RC 及以下隔离级别，prepare 时释放 GAP 锁（trx0trx.cc:3077-3083） |
-
-Prepare 的本质：在 undo log 中打上 PREPARED 标记 + 写 redo（暂不 fsync），让事务进入"可恢复"状态——崩溃后引擎能重建 prepare 状态，交由 binlog 恢复裁决 commit 还是 rollback。
-
-#### Commit 阶段
-
-**Server 层**（handler.cc）驱动 commit + 清理：
-
-| 动作 | 位置 | 说明 |
-|------|------|------|
-| 驱动 commit | handler.cc:1788 | `tc_log->commit(thd, all)` |
-| 失败则 rollback | handler.cc:1789 | commit 出错走 `ha_rollback_trans` |
-| 释放 MDL COMMIT 锁 | handler.cc:1815 | commit 完成后释放 |
-| 清理事务上下文 | `trn_ctx->cleanup()` (handler.cc:1819) | 重置事务 scope |
-| GTID 收尾 | handler.cc:1831-1833 | `gtid_state->update_on_commit/rollback` |
-
-**Binlog 层**（binlog.cc）是 commit 阶段的重头戏，分两步：
-
-第一步——finalize binlog cache（binlog.cc:8081-8258）：
-
-| 动作 | 位置 | 说明 |
-|------|------|------|
-| 记录 MTS last_committed | `store_commit_parent` (binlog.cc:8164) | 取当前 `max_committed_timestamp` 作为 commit parent |
+| 记录 MTS last_committed | `store_commit_parent` | 取当前 `max_committed_timestamp` 作为 commit parent |
 | 追加结束事件 | binlog.cc:8243 | 普通 2PC → `Xid_log_event`；XA → `XA_prepare_log_event`；1PC → `Query_log_event("COMMIT")` |
-| finalize cache | `cache_mngr->trx_cache.finalize` (binlog.cc:8244) | 将结束事件写入 trx cache，cache 冻结不再追加 |
+| finalize cache | `cache_mngr->trx_cache.finalize` | 将结束事件写入 trx cache，cache 冻结不再追加 |
 | before_commit hook | binlog.cc:8278 | 插件钩子（如半同步复制） |
-
-第二步——ordered_commit 三阶段（binlog.cc:8313 → 8853）：
-
-| 阶段 | 持锁 | 动作 | 位置 |
-|------|------|------|------|
-| Flush | `LOCK_log` | ① `ha_flush_logs(true)` 批量 fsync redo（把 prepare 阶段攒的 redo 落盘）<br>② `process_flush_stage_queue` 串行写 binlog cache 到文件<br>③ 分配 `sequence_number`（MTS 逻辑时钟） | binlog.cc:8444, 8456 |
-| Sync | `LOCK_sync` | `sync_binlog_file` → `fsync(binlog)` **★提交点** | binlog.cc:8659 |
-| Commit | `LOCK_commit` | `process_commit_stage_queue` → `ha_commit_low` 驱动引擎 commit | binlog.cc:8513 |
-
-提交点 = sync stage 的 binlog fsync 成功那一刻。此前崩溃 → rollback；此后崩溃 → commit。
-
-**InnoDB 层**在 commit 阶段两个时机介入：
-
-时机一——Flush stage 的 redo fsync（由 binlog 层调用）：
-
-```
-ha_flush_logs(true) (binlog.cc:8444)
-└─ flush_handlerton (handler.cc:2435)       ← 遍历引擎
-   └─ innobase_flush_logs (ha_innodb.cc:5655)
-      └─ log_buffer_flush_to_disk (ha_innodb.cc:5688)
-         ← 把 log buffer 中所有 redo（含 prepare 的 undo PREPARED 标记）落盘
-```
-
-这一步把 prepare 阶段被 `HA_IGNORE_DURABILITY` 延迟的 redo 批量 fsync，是 redo group commit 的核心——整组事务的 redo prepare 一次 fsync，而非每事务一次。
-
-时机二——Commit stage 的引擎 commit（纯内存收尾）：
-
-```
-ha_commit_low (handler.cc:1887)
-└─ ht->commit → innobase_commit (ha_innodb.cc:5762)
-   ├─ thd_binlog_pos (ha_innodb.cc:5851)     ← 记录 binlog 位置（供 mysqlbackup）
-   ├─ trx->flush_log_later = true (ha_innodb.cc:5857)  ← redo commit 记录也不立即 fsync
-   └─ innobase_commit_low (ha_innodb.cc:5695)
-      └─ trx_commit_for_mysql → trx_commit_low → trx_commit_in_memory
-         ├─ undo: TRX_UNDO_PREPARED → TRX_UNDO_COMMITTED，移入 history list 供 purge
-         ├─ 分配 trx->no（serialisation number），入 serialisation_list + purge queue
-         ├─ 持久化 GTID 到 undo header
-         ├─ 释放全部行锁，从 rw_trx_list / rw_trx_ids 移除
-         └─ 更新 MVCC 可见性（改动对新 read view 可见）
-```
-
-Commit 阶段 InnoDB 做的是纯内存态收尾——改 undo 状态、分配序列号、释放锁、更新可见性。没有需要保序的磁盘 I/O（持久化在 prepare redo + binlog fsync 已完成），这就是 `binlog_order_commits=OFF` 时 commit 阶段可并行的原因。
-
-#### 三层职责速查矩阵
-
-| 层 | Prepare 阶段 | Commit 阶段 |
-|----|-------------|-------------|
-| Server | 判定 2PC、获取 MDL 锁、协调 GTID | 驱动 commit、释放 MDL 锁、清理上下文 |
-| Binlog | 设 HA_IGNORE_DURABILITY、驱动引擎 prepare | finalize cache（追加 Xid event）→ ordered_commit 三阶段（flush 写盘 / sync fsync / commit 驱动引擎） |
-| InnoDB | undo 标记 PREPARED + 写 redo（不 fsync）+ trx 状态切换 | flush stage 批量 fsync redo + commit stage 内存收尾（undo COMMITTED / 分配 trx->no / 释放锁 / MVCC） |
-
-### 关键门槛：rw_ha_count > 1
-
-`rw_ha_count` 统计读写参与者个数。当 binlog 开启且事务修改了 InnoDB 数据时，参与者是 {InnoDB, binlog} 两个，`rw_ha_count = 2 > 1`，触发完整 2PC。当 binlog 关闭、只有 InnoDB 一个参与者时，`rw_ha_count = 1`，跳过 prepare 走 1PC 快速路径。
-
-### HA_IGNORE_DURABILITY 的精妙之处
-
-`MYSQL_BIN_LOG::prepare`（binlog.cc:8027）设置 `thd->durability_property = HA_IGNORE_DURABILITY`，让 prepare 阶段写的 redo prepare 记录**故意不立即 fsync**。原因是要把整个 group 的所有事务的 redo prepare 记录攒起来，在 flush stage 的 `ha_flush_logs` 中一次性批量 fsync。这是 redo group commit 和 binlog group commit 的协同点。
 
 ### 提交点与崩溃恢复
 
@@ -347,9 +231,8 @@ Commit 阶段 InnoDB 做的是纯内存态收尾——改 undo 状态、分配�
 
 MySQL 的"2PC"有两副面孔，共用同一套 prepare/commit 引擎接口：
 
-**内部 2PC**（本文主角）：对用户透明，普通 `COMMIT` 一条语句内核自动完成。目的是 binlog/redo 一致性。
-
-**外部 XA**：用户显式 `XA START` / `XA PREPARE` / `XA COMMIT`，跨多个 MySQL 实例。复用 `ht->prepare`，但额外写 `XA_prepare_log_event`（binlog.cc:8213），prepare 状态对客户端可见。
+- **内部 2PC**：对用户透明，普通 `COMMIT` 内核自动完成，目的是 binlog/redo 一致性。
+- **外部 XA**：用户显式 `XA START` / `XA PREPARE` / `XA COMMIT`，跨多个 MySQL 实例，额外写 `XA_prepare_log_event`。引擎侧细节（detach、by_xid 接口、XA 返回码、崩溃恢复状态机）见 [`../../innodb/trx.md`](../../innodb/trx.md)「外部 XA：与内部 2PC 的差异」。
 
 ---
 
@@ -391,31 +274,13 @@ Leader 把整个 group 拉进 commit stage，按事务写入 binlog 的同一顺
 
 ## Commit 阶段与 trx_no
 
-### Commit 阶段做了什么
-
-commit 阶段（`process_commit_stage_queue` → `finish_transaction_in_engines` → InnoDB `trx_commit_low` → `trx_commit_in_memory`）做的不是持久化，而是一系列内存态收尾操作：
-
-1. **分配 `trx->no`（序列化号）**：`trx_add_to_serialisation_list`（trx0trx.cc:1501）在 `trx_sys` serialisation mutex 保护下调用 `trx_sys_allocate_trx_no`，分配单调递增的序列号，加入 serialisation_list 和 purge queue
-2. **undo 标记 committed**，移入 history list（供 MVCC 回溯和 purge）
-3. **持久化 GTID 到 undo header**（trx0trx.cc:1972，必须在标记 committed 之后、移出 serialisation list 之前）
-4. **释放该事务持有的所有行锁**，从 `rw_trx_list` / `rw_trx_ids` 移除，更新 MVCC 让改动对新开的 read view 可见
-5. **更新 MTS 依赖跟踪 `max_committed`**（binlog.cc:8539）+ leader 有序批量更新 `gtid_executed`（`update_commit_group`，8562）
-
-### 为什么可以并发
-
-持久化（redo prepare + binlog fsync）在 prepare/sync 阶段已经完成。commit 阶段剩下的全是内存数据结构的收尾，每个事务操作的是自己独立的数据结构，没有需要保序的磁盘 I/O，天然可并行。
-
 ### commit order 的核心载体：trx->no
 
 `binlog_order_commits` 控制的"引擎 commit 顺序"，本质就是内存态的提交顺序，核心体现是 `trx->no`（serialisation number）的分配顺序。
 
-| | `trx->id` | `trx->no` |
-|---|---|---|
-| 分配时机 | 事务**开始**时（`trx_start_low`） | 事务**提交**时（`trx_sys_allocate_trx_no`） |
-| 运行期值 | 立即有值，写进行记录的 `DB_TRX_ID` | 提交前恒为 `TRX_ID_MAX`（trx0trx.cc:1405） |
-| 作用 | 标识行由哪个事务修改 | 决定**提交序**：purge 顺序 + MVCC read view 可见性 |
+> `trx->no` 的分配细节（`trx_add_to_serialisation_list` / `trx_serialisation_number_get` 的 purge queue 优化）、`trx->id` vs `trx->no` 的对比、commit 阶段的内存收尾（undo COMMITTED / 放锁 / MVCC / GTID 落盘）见 [`../../innodb/trx.md`](../../innodb/trx.md)「事务提交」。commit 阶段可并发的理由见下文「为什么只有 commit 阶段有开关」。
 
-`trx->no` 在 `finish_transaction_in_engines` 里、`trx_sys` serialisation mutex 保护下按调用先后单调递增分配。谁先被调用 commit，谁的 `trx->no` 就更小。
+`trx->no` 在 `finish_transaction_in_engines` 里、serialisation mutex 保护下按调用先后单调递增分配。谁先被调用 commit，谁的 `trx->no` 就更小。
 
 `binlog_order_commits` ON → `trx->no` 分配顺序 == binlog 写入顺序；OFF → 顺序不保证。Clone、一致性备份、`START TRANSACTION WITH CONSISTENT SNAPSHOT` 依赖"引擎提交序 == binlog 序"来取一致快照。
 
@@ -613,46 +478,16 @@ Body:
 
 ---
 
-## 关键源码位置速查
+## 参考
 
-| 函数/变量 | 文件:行号 | 作用 |
-|-----------|----------|------|
-| `MYSQL_BIN_LOG::ordered_commit` | binlog.cc:8853 | BGC 三阶段流水线入口 |
-| `process_flush_stage_queue` | binlog.cc:8456 | flush stage 串行 flush binlog cache |
-| `sync_binlog_file` | binlog.cc:8659 | sync stage fsync binlog |
-| `process_commit_stage_queue` | binlog.cc:8513 | commit stage 引擎提交 |
-| `finish_commit` | binlog.cc:8702 | order_commits=OFF 时各线程自行 commit |
-| `ha_commit_trans` | handler.cc:1615 | 2PC 入口 |
-| `MYSQL_BIN_LOG::prepare` | binlog.cc:8027 | 2PC 第一阶段，设 HA_IGNORE_DURABILITY |
-| `ha_prepare_low` | handler.cc:2293 | 遍历引擎调 prepare |
-| `innobase_xa_prepare` | ha_innodb.cc:20016 | InnoDB prepare 入口 |
-| `trx_prepare_for_mysql` | trx0trx.cc:3169 | InnoDB prepare 主体 |
-| `trx_prepare_low` | trx0trx.cc:2976 | undo 标记 PREPARED + 写 redo（不 fsync） |
-| `trx_undo_set_state_at_prepare` | trx0trx.cc:3003 | undo segment 状态 → TRX_UNDO_PREPARED |
-| `ha_flush_logs` | handler.cc:2446 | flush stage 批量 fsync redo（遍历引擎） |
-| `innobase_flush_logs` | ha_innodb.cc:5655 | InnoDB redo 落盘 → log_buffer_flush_to_disk |
-| `ha_commit_low` | handler.cc:1887 | commit stage 遍历引擎调 commit |
-| `innobase_commit` | ha_innodb.cc:5762 | InnoDB commit 入口 |
-| `innobase_commit_low` | ha_innodb.cc:5695 | → trx_commit_for_mysql 内存态收尾 |
-| `binlog::Binlog_recovery::recover` | binlog.cc:7916 | 崩溃恢复入口 |
-| `recover_one_internal_trx` | xa/recovery.cc:242 | 内部 XID 仲裁 |
-| `Bgc_ticket_manager` | bgc_ticket_manager.h/cc | ticket 系统主体 |
-| `assign_ticket` | rpl_context.cc:239 | 幂等分配 ticket |
-| `wait_for_ticket_turn` | rpl_commit_stage_manager.cc:214 | 只放行 ticket==front |
-| `trx_add_to_serialisation_list` | trx0trx.cc:1501 | 分配 trx->no |
-| `trx_serialisation_number_get` | trx0trx.cc:1543 | 设置序列化号 |
-| `Gtid_log_event` 构造函数 | log_event.cc:12983 | 区分 GTID/Anonymous_Gtid |
-| `opt_binlog_order_commits` | binlog.cc:173 | 全局变量定义 |
-| `Sys_binlog_order_commits` | sys_vars.cc:1741 | 参数注册 |
-| `ha_write_row` / `ha_update_row` / `ha_delete_row` | handler.cc:8002/8033/8058 | DML 触发 row image 记录 |
-| `binlog_log_row` | handler.cc:7860 | row image 核心调度 |
-| `mark_columns_per_binlog_row_image` | table.cc:5682 | 按 binlog_row_image 设置列 bitmap |
-| `binlog_prepare_row_images` | binlog.cc:11249 | 打包前调整 read_set |
-| `pack_row` | rpl_record.cc:232 | 行数据转 binlog 传输格式 |
-| `pack_field` | rpl_record.cc:74 | 打包单个列 |
-| `enum_row_image_type` | rpl_record.h:40 | WRITE_AI/UPDATE_BI/UPDATE_AI/DELETE_BI |
-| `binlog_write_row` | binlog.cc:11104 | INSERT 行镜像写入 |
-| `binlog_update_row` | binlog.cc:11129 | UPDATE 行镜像写入（BI+AI） |
-| `binlog_delete_row` | binlog.cc:11201 | DELETE 行镜像写入 |
-| `Rows_log_event::do_add_row_data` | log_event.cc:8136 | 追加行数据到事件 buffer |
-| `Rows_log_event::write_data_body` | log_event.cc:10490 | 事件写入 binlog 文件 |
+**官方文档**
+
+- *MySQL 8.0 Reference Manual → Binary Log*
+- *MySQL 8.0 Reference Manual → XA Transactions*
+
+**相关文档**
+
+- 2PC 引擎侧执行（prepare 五层逐行、undo 状态、外部 XA、崩溃恢复三幕）见 [`../../innodb/trx.md`](../../innodb/trx.md)
+- GTID 的三条持久化路径见 [`gtid.md`](gtid.md)
+- MTS 并行复制与 last_committed / sequence_number 见 [`replication.md`](replication.md)
+

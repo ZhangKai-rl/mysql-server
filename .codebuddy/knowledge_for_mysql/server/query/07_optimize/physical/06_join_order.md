@@ -4,6 +4,7 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、算法选择与 search_depth](#一算法选择与-search_depth)
 - [二、总入口：choose_table_order](#二总入口choose_table_order)
 - [三、greedy_search：外层贪心框架](#三greedy_search外层贪心框架)
@@ -14,6 +15,138 @@
 - [八、半连接与物化表的嵌入](#八半连接与物化表的嵌入)
 - [九、与 hypergraph 的分流](#九与-hypergraph-的分流)
 - [十、相关参数](#十相关参数)
+
+---
+
+## 设计思想与理论基础
+
+### 设计思想与权衡
+
+#### 1. 为什么是"限深 DFS + 剪枝"，而不是 System R / DPccp
+
+首先要纠正一个常见说法：**它不是"纯贪心"，而是一个可以把穷举度从 1 调到 N 的连续旋钮**（`search_depth` 就是那个旋钮）。源码注释给了复杂度：`O(N * N^search_depth / search_depth)`，当 `search_depth >= N` 时为 **`O(N!)`**。
+
+而且 **N 不是表数，而是"非 eq_ref 表 + eq_ref 组"数**——这个定义本身就是为控制爆炸做的。
+
+**为什么不是 DP**（源码没有一行明说，但结构上有硬证据）：
+
+- 老优化器**没有按子集索引的 DP memo 数组**——只有 `join->positions[]`（单条路径）、`best_positions`（一个最优完整计划）、`best_read`（一个全局上界）。`table_map` 只用于"剩余表集合"和依赖判断
+- ⇒ 它是 **DFS + 分支限界（branch & bound）**，不是 DP
+- **收益**：内存 O(N) 而非 O(2^n)；规划时间可用 `search_depth` 硬性封顶
+- **代价**：没有最优子结构复用，同一子集在不同路径被重复计算；且**默认就放弃了最优性**
+
+**放弃最优性的官方表述**：`optimizer_prune_level` 的定义文本——"0 - do not apply any heuristic, thus perform **exhaustive** search; 1 - prune plans based on number of retrieved rows"；以及剪枝注释——"This heuristic **may miss the optimal QEPs**"。
+
+#### 2. 61 表上限的来历与设计关系
+
+`table_map = uint64_t`，`MAX_TABLES = 64 - 3 = 61`（3 位被 `INNER_TABLE_BIT` / `OUTER_REF_TABLE_BIT` / `RAND_TABLE_BIT` 占用）。三层关系：
+
+1. **位图是老优化器一切效率的前提**（O(1) 集合运算），也是 61 上限的来源
+2. **61 这个数直接决定了"必须贪心"**：61! 是天文数字，仅靠限深不够，必须有剪枝
+3. **位图是稀缺资源**：连"要不要把子查询拍平成 semi-join"都要按启发式优先级抢名额（每个 nest 还要**预留一个物化槽位**）
+
+#### 3. 左深树假设的代价
+
+源码证据（`sql_executor.cc`）："The join tree in MySQL is generally a **left-deep tree**"；遇到非左深时——"which we **cannot handle at this point**"，处理办法是**关掉功能**（BKA / hash join 直接关）而不是支持它。
+
+- **收益**：计划表示退化成长度 N 的数组 → 执行器"从左到右卷起来" → 搜索只需枚举排列 → 空间 O(N)，且能复用"前缀代价单调"做分支限界
+- **代价**：**bushy 计划完全不可达**（如 `(A⋈B)⋈(C⋈D)` 这种两个分支各有选择性谓词的形状）；右深/深树也不可达
+
+**hypergraph 的演进动机**（DPhyp）：① bushy 可达（枚举连通子图对）；② 把"哪些顺序合法"从搜索过程**移出去、编码进图结构**（外连接/反连接的重排序限制用**超边**表达）。
+
+> **新老设计的分水岭**：老优化器把左深当成**全局不可动摇的结构假设**；hypergraph 把左深当成**一类特定计划（索引查找）上可证明无损的空间缩减技巧**（借自 Postgres："such plans never gain anything from being bushy"）。
+
+#### 4. 三种剪枝为什么都要（互补关系）
+
+| | 触发条件 | 安全性 | 砍掉什么 |
+|---|---|---|---|
+| **cost 剪枝** | `prefix_cost >= best_read`，**不受 prune_level 管**，需 `found_plan_with_allowed_sj` | **安全**（依赖前缀代价单调） | 已比全局最优差的分支 |
+| **启发式剪枝** | `prune_level==1` 且兄弟候选在 rows + cost 双维被支配 | **不安全**（注释承认） | 同层被支配的兄弟前缀 |
+| **eq_ref 扩展** | `prune_level==1 && key!=null && rows_fetched<=1.0` | 近似安全（1:1 连接代价与顺序无关） | 等价排列（**直接降 N**） |
+
+**为什么缺一不可**：
+
+- **cost 剪枝砍不动"等价物"**：eq_ref 排列的代价完全相同，永远只满足 `==` 不满足 `>=`，一根都剪不掉 ⇒ 必须由 eq_ref 扩展处理
+- **cost 剪枝在找到第一个完整计划前几乎不工作**（`best_read` 初值 `DBL_MAX`），且只沿 cost 一维 ⇒ 启发式补"rows + cost 双维支配"
+- 启发式不安全 ⇒ 由 `prune_level` 显式开关，留 `prune_level=0` 当"后悔药"
+- eq_ref 扩展只适用唯一键 1:1 的**连续链**，对普通表无能为力
+
+> **注意**：`prune_level=0`（"exhaustive"）时 cost 剪枝**依然生效**——所以 MySQL 的"穷举"实际是"穷举 + 分支限界"。
+
+**源码自认的启发式性**：启发式剪枝里有 `/* TODO: What is the reasoning behind this condition? */`；`almost_equal` 的 10% 容差是因为"存储引擎统计是浮点近似值，严格 `==` 会全部失配"（另留 `@todo`：更好的做法是看索引是否 unique，而不是比数字）。
+
+#### 5. `found_plan_with_allowed_sj` 为什么必须（正确性约束，不是优化）
+
+`join->best_read` 是全局代价上界。若当前 best plan 用了一个**被 `optimizer_switch` 禁用的策略**（如关掉 DuplicateWeedout 时的 DW），那 `best_read` 就是"**不可用计划的代价**"。拿它当上界会：把所有本来合法、但代价略高的分支全部剪掉，**最后可能连一个可用计划都找不到**。
+
+所以条件写成 `prefix_cost >= best_read && found_plan_with_allowed_sj`——**只有手上已有"策略全部可用"的计划时，`best_read` 才是可信上界**。且 `greedy_search` 每轮重置 `best_read = DBL_MAX; found_plan_with_allowed_sj = false`，不跨轮继承。
+
+#### 6. 为什么 `best_rowcount` / `best_cost` 必须是局部变量
+
+它们在 `best_extension_by_limited_search()` 函数体开头声明（初值 `DBL_MAX`），因为该函数**递归**——每进一层新建一对。真实语义是"**当前前缀的这一个扩展层里，已试过的兄弟候选中最好的那个**"。
+
+**如果改成全局会怎样**：一旦某个深度较浅、代价很小的前缀被记录下来，后续所有更深的（本来就更大代价的）前缀都会立刻"被支配"而全部剪掉——**搜索会在第一个候选之后立即终止**。这不是激进剪枝，是**直接失效**。
+
+对比：`best_read` 全局（完整计划的代价可比）；`best_rowcount/best_cost` 必须每层独立（**不同前缀、不同深度的部分计划根本不可比**）。且局部变量随栈帧丢弃、无需回滚——而共享数组 `best_ref[]` 就必须显式 `memcpy` 保存/恢复。
+
+#### 7. 为什么 `std::swap` 无条件执行
+
+注释原文：
+
+> **Don't move swap inside conditional code**: All items should be uncond. swapped to maintain '#rows-ordered' best_ref[]. **This is critical for early pruning of bad plans.**
+
+三个要点：
+
+1. 这是一条明确的**防回归警告**（防止后人把 swap 挪进 `if` 里）
+2. 维持 `best_ref[]` 按**访问行数升序** ⇒ 先试小表/选择性强的表 ⇒ 先得到低代价前缀 ⇒ `best_read` 很早被拉紧 ⇒ cost 剪枝才能"early"地大杀四方
+3. 顺序乱了则第一个试到的可能是巨大扇出的前缀，`best_read` 长期虚高，**剪枝形同虚设**
+
+有序性的来源是 `Join_tab_compare_default`——**先保证拓扑/键依赖合法，再按 `found_records` 升序，最后用指针地址 tie-break 保证排序确定性**。
+
+> 补充：`greedy_search` 提交时用 `memmove`（稳定旋转），`best_extension` 探索时用 `std::swap`。
+
+#### 8. "找不到可用表"时没有回退——靠前置条件保证
+
+循环体的 `if` 可能对所有表都不成立，此时函数什么也不做地返回、`best_read` 仍为 `DBL_MAX`。而 `greedy_search` 的处理是**断言**（`assert(join->best_read < DBL_MAX)`），不是回退。
+
+正确性外包给两件事：
+
+1. `Join_tab_compare_default` 的**拓扑排序**（`dependent` 优先）
+2. `JOIN::propagate_dependencies()` 用 **Warshall 算法 O(N³)** 构造依赖传递闭包
+
+⇒ 用一次性 O(N³) 预处理，换取搜索过程中"**永不碰壁**"。这就是主循环能写得这么乐观的原因。
+
+### 理论溯源
+
+join 枚举的三代算法（完整谱系见 [`../00_overview.md`](../00_overview.md) 的「优化器的理论谱系」）：
+
+| 算法 | 搜索空间 | 能否 bushy | MySQL |
+|---|---|---|---|
+| **System R（Selinger 1979）** | 左深树 + 按子集 DP，O(2^n)，用 **interesting orders** 扩展状态 | ❌ | **思想上继承**（代价模型/左深树/选择率），**算法上未采用**——没有 memo 表，是 DFS + 分支限界 |
+| **DPccp（Moerkotte 2006）** | 枚举 **csg-cmp-pair**，O(3^n) | ✅ | 未直接实现 |
+| **DPhyp（Moerkotte & Neumann, SIGMOD 2008）** | DPccp + **超图**（超边编码非内连接的重排序限制） | ✅ | hypergraph 的 `EnumerateAllConnectedPartitions` 直接实现此论文 |
+- **CD-C 冲突规则（Moerkotte et al.）**：把"哪些顺序合法"编码进图结构
+
+#### System R 的遗产在旧优化器里的落点
+
+旧优化器"思想上继承 System R、算法上未采用"（上表第一行）。具体对应关系：
+
+| 理论要素 | 源码落点 | 关键证据 |
+|---|---|---|
+| **代价模型** | `Cost_model_table`：`page_read_cost` / `row_evaluate_cost` / `key_compare_cost` | `page_read_cost` 按 `table_in_memory_estimate()` 把页数拆成"在内存"和"在磁盘"两部分加权——IO+CPU 公式的具体实现 |
+| **选择率独立连乘** | `Item_cond_and::get_filtering_effect` | 注释直接写明 *"Conjunction of independent events: P(A and B ...) = P(A) * P(B) * ..."*；OR 同理用容斥 |
+| **左深树** | `best_extension_by_limited_search` | 状态 = `join->positions[idx]`（长度 idx 的前缀）+ 剩余表集合；转移只有"前缀末尾追加一张表"，递归只走 `idx + 1` |
+| **interesting orders** | **弱化实现**：`keys_in_use_for_order_by` → `test_skip_sort` → `test_if_skip_sort_order` → `test_if_cheaper_ordering` | ⚠️ 顺序**不进入搜索状态**——它是表序定下来之后的一个**后处理 pass**：检查第一张非 const 表能否用索引免排序，再用 `sort_by_table` 把有序性反馈进代价/剪枝。这与 System R 把 interesting order 作为 **DP 状态维度**是不同的 |
+| **"不是 DP"** | `join->positions` | 分配大小 = `table_count`（**线性**），不是 2^N；注释说 *"we also maintain a stack of join optimization states"*。唯一的"记忆"是 `join->best_read` 这个全局上界 |
+
+> **最重要的一条**：MySQL 旧优化器**没有按子集建 DP 表**（`positions` 是线性的），它是 **DFS + 分支限界**。所以"System R 的 DP"在 MySQL 里只留下了代价模型、选择率估算、左深树这三个思想遗产，算法骨架并不相同。
+
+### 他库对比与演进动机
+
+- **两条路径并存**：由 `optimizer_switch=hypergraph_optimizer` 分流，**默认 off**。打开会告警：*"The hypergraph optimizer is **highly experimental**… Do not enable it unless you are a MySQL developer"*，且该开关名在 `optimizer_switch` 列表里被注释为 **"Deliberately not documented"**
+- **官方定位**（`join_optimizer.h` 文件头）："intended to **eventually take over completely**"，但当前 "nearly feature complete, but… **a very simplistic cost model**"
+- ⇒ 老优化器不是"遗留垃圾"，而是当前**唯一**支持 Hints、EXPLAIN TRADITIONAL/JSON、UPDATE、临时表聚合、MIN/MAX 优化的路径
+- **行为兼容性**：prepared statement / 存储程序用的是"**准备时**"的优化器，之后每次执行不再检查开关（同一条 PS 不会因开关变化突然换优化器）
 
 ---
 
@@ -591,3 +724,5 @@ if (make_join_plan()) { ... }   // 旧 greedy 路径
 - 访问方法代价见 [`07_access_method.md`](07_access_method.md)
 - semi-join 策略嵌入见 [`../logical/03_semijoin.md`](../logical/03_semijoin.md)
 - hypergraph 优化器见 [`09_hypergraph.md`](09_hypergraph.md)
+- 知乎：https://zhuanlan.zhihu.com/p/644832644
+- https://zhuanlan.zhihu.com/p/632872022

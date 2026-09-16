@@ -4,6 +4,7 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、range 优化在优化器中的位置](#一range-优化在优化器中的位置)
 - [二、get_mm_tree：从 WHERE 构造 SEL_TREE](#二get_mm_tree从-where-构造-sel_tree)
 - [三、SEL_ARG 的三重结构与区间操作](#三sel_arg-的三重结构与区间操作)
@@ -11,6 +12,184 @@
 - [五、代价与行数估算（index dive vs 统计）](#五代价与行数估算index-dive-vs-统计)
 - [六、长 IN list 字面量的处理](#六长-in-list-字面量的处理)
 - [七、从 SEL_TREE 到执行](#七从-sel_tree-到执行)
+
+---
+
+## 设计思想与理论基础
+
+### 设计思想与权衡
+
+#### 1. 为什么是 SEL_ARG「区间森林」——三重结构各管什么
+
+`tree.h` 里有长达 200 行的设计文档，核心一句是：
+
+> It represents a condition in a special form (we don't have a name for it ATM). **The SEL_ARG::next/prev is "OR", and next_key_part is "AND".**
+
+| 结构 | 字段 | 解决什么 |
+|---|---|---|
+| **红黑树** | `left/right/parent/color` | 按区间下界 **O(log n) 定位** + 有序插入 |
+| **双向链表** | `next/prev` | 同 key part 内的**有序遍历与线性归并** |
+| **next_key_part** | 指向 `SEL_ROOT` | 多列前缀的**递归 AND** |
+
+**为什么三者不可替代**：
+
+- `key_or` 用红黑树 `find_range()` 定位插入点
+- 但**区间合并**（判断重叠/相邻）只能在 `next/prev` 链上做——因为合并要看**前驱/后继区间的上界**，这是链表语义、不是搜索树语义
+- 多列 AND 递归：`next_key_part` 必须指向 `SEL_ROOT`（一棵完整子树），而不是单个 `SEL_ARG`
+
+**为什么不直接用扁平区间列表或位图**（源码 `SPACE COMPLEXITY NOTES` 直接回答了）：
+
+- **扁平列表** = 展开后的 DNF，多列 IN 会**笛卡尔爆炸**：`(kp1 IN n1) AND (kp2 IN n2) AND (kp3 IN n3)` ⇒ `n1*n2*n3` 条区间
+- **位图**需要离散可枚举域，而 range 面对的是 `VARCHAR/DECIMAL/DATETIME` 等**有序连续域**上的开闭区间（`min_flag/max_flag` 携带 `NEAR_MIN/NEAR_MAX/NO_MIN_RANGE/NO_MAX_RANGE`），根本建不了位图
+- **SEL_ARG 图**通过 `next_key_part` **共享子树**，让"后继 keypart 的同一段条件"只存一份
+
+但源码也诚实承认**共享不是万能的**：存在 WHERE 长度 `O(3*#max_keyparts)`、而 SEL_ARG 图大小 `O(2^(#max_keyparts/2))` 的查询——**这就是后面 8MB 内存闸的直接动因**。
+
+**一个常被忽略的关键设计：引用计数 + lazy copy**。`SEL_ROOT::use_count` 做 copy-on-write；`key_or` 里若两棵树都被共享（`use_count > 0`）就 clone，**且选元素更少的一方**（最便宜）。
+
+#### 2. range 分析为什么在多个阶段反复做
+
+先修正：**`create_access_paths` 不重跑**（它直接复用 `tab->range_scan()`）。真正重跑 `test_quick_select()` 的有 5 处：`estimate_rowcount`、`test_if_skip_sort_order`（2 处）、`can_switch_from_ref_to_range`、`make_join_query_block`（2 处），以及执行期的 `DynamicRangeIterator::Init`（**每行外层表重算一次**）。
+
+**为什么必须分多次**——四类"之前不知道的信息"：
+
+- **(a) 前驱表的常量值（MAYBE_KEY）**：`SEL_ROOT::Type::MAYBE_KEY` 的注释——"There is a range predicate that refers to another table. The range access method cannot be used on this index **unless that other table is earlier in the join sequence**"。所以 `test_quick_select` 才有 `prev_tables` / `read_tables` 两个参数
+- **(b) 排序方向**：注释明说前次调用没考虑 ASC/DESC，"so in case of DESC ordering we still need to recheck"
+- **(c) LIMIT**：`test_quick_select` 开头就有 `if (limit < records)`，所以 `make_join_query_block` 的 `LOW_LIMIT` 重跑条件才有意义
+- **(d) 表依赖 / 条件上移**（`NOT_FIRST_TABLE`）
+
+**代价与收益**：每次重跑都要重建整棵森林 + **重新做 index dive**。源码承认这个开销（`check_stack_overrun` 按 `3 * STACK_MIN_SIZE + sizeof(RANGE_OPT_PARAM)`），而"**只对 OOM 报一次警告**"的设计正是因为会重跑多次。
+
+**本质**：join order、常量传播、排序需求、LIMIT 四者**互相依赖**。MySQL 选的是"**贪心 + 事后补救**"而不是联合求解——证据是 `make_join_query_block` 里那段自嘲注释：*"Access method changed. This is after deciding join order… so the info updated below will **not have any effect** on the execution plan."*
+
+#### 3. 为什么需要这么多种 range 访问类型
+
+`test_quick_select` 里的**竞争顺序本身就是设计说明**（每种都在跟"覆盖索引全扫"基线比价）：
+
+```
+1. 覆盖索引全扫（基线，只挑最短覆盖索引）
+2. get_best_group_min_max  → GROUP_INDEX_SKIP_SCAN
+3. get_best_skip_scan      → INDEX_SKIP_SCAN
+4. get_key_scans_params    → INDEX_RANGE_SCAN
+5. get_best_ror_intersect  → ROR-intersection
+6. get_best_disjunct_quick → index merge
+```
+
+**skip scan 的动机：复合索引前导列缺失**。形式化条件是 `SELECT A, B, C FROM T WHERE EQ(A) AND RNG(C)`，索引 `I = <A, B, C>`，其中 **B 非空且无条件**（就是缺失那一列）。执行是"for each eq_prefix → for each distinct B → 子区间扫 C"。
+
+**为什么不能直接用 index merge**（三个硬理由）：
+
+1. index merge 要求每个分支是**完整可用的 range**，而 B 列**根本没有条件**，无法构成任何 range
+2. **index merge 不支持覆盖索引**（`index_merge.h` 明确列为限制），而 skip scan **强制要求覆盖索引**
+3. index merge 无法**枚举 B 的 distinct 值**
+
+**为什么不全扫**：skip scan 用 `index_next_different()` **跳组**（"skip"的由来），代价是 `O(distinct(A,B))` 次 B 树定位，而非 `O(rows)` 次记录读取。
+
+> 额外设计点：skip scan 的候选索引走**单独的 `skip_scan_keys`**，不走 `const_keys`——因为前导列缺失，该索引不可能用于 ref 访问。
+
+**MIN/MAX 优化**（注意它**不在** `range_optimizer/` 目录，在 `sql/opt_sum.cc`）：这是最激进的一种——**整个 JOIN 都可能被消掉**，直接返回常量行。它与 range 是不同层次：range 优化"怎么读行"，MIN/MAX 优化"**根本不用读行**"（`HA_READ_KEY_OR_NEXT` 一次搞定）。且它要**在优化期就执行**（把聚合函数替换成常量）。
+
+**loose scan / GROUP_MIN_MAX**：把 GROUP BY + 聚合**整个下沉到访问层**（连 `AggregateIterator` 都省了）。它与 skip scan 的本质区别：loose scan 要求 **gap 列必须是常量**（"the predicates provide constants to fill the gap in the index"），而 skip scan 是**枚举** gap 列的 distinct 值。
+
+**index merge 为什么分 ROR-intersection / ROR-union / sort-union**：
+
+- **ROR**（rowid ordered）要求分支输出 rowid 有序，才能做**多路归并求交集**，否则必须落 `Unique`/临时表。能否 ROR 由 `is_key_scan_ror()` 判定：等值前缀之后的剩余 keypart 必须与聚簇 PK 前缀一致
+- **CPK 的特殊处理**（很精妙）：聚簇 PK 含所有字段，用它做 intersection 的常规扫描没意义——所以**不用它取行，而是用它的条件去过滤其他 key 扫描得到的 rowid**
+- **union vs sort-union**：ROR-union 每个分支还要 ROR；不能用 ROR 就退化到 `IndexMergeIterator` + `Unique` 去重
+
+#### 4. index dive 为什么对 range 特别重要
+
+**答案一句话**：`records_per_key` 只对**完整前缀等值**有意义。范围谓词（`a > 5 AND a < 100`、`LIKE 'x%'`、`BETWEEN`）**没有任何统计能回答**，只能真的下到 B 树里量一下两个边界之间有多少记录。
+
+源码也确认"**只有等值区间才配用统计**"（`eq_ranges_exceeds_limit` 的注释：必须是等值、且非 `x IS NULL`）。
+
+**InnoDB 侧怎么估**（`btr_estimate_n_rows_in_range`）：两次 B 树下降找分叉层 → 分叉在叶层则**精确**（`nth_rec` 相减）；分叉很高则**采样**，且**最多读 10 页**（`N_PAGES_READ_LIMIT`）。几个有意思的细节：
+
+- 并发下重试 4 次，失败返回固定值 10（`rows_in_range_arbitrary_ret_val`）
+- **怕优化器误判空集**：`if (n_rows == 0) n_rows = 1`——注释说优化器会基于"0 行"直接返回 Empty set，即使加锁读也该真的搜索
+- **上界钳制**：`n_rows > table_n_rows / 2 && !exact` ⇒ 砍到一半，避免离谱估计
+
+**无 dive 的三类兜底**：(a) FORCE INDEX 的 `skip_records_in_range`；(b) 引擎能力不足（NULL_RANGE 导致全扫被拒、`HA_ONLY_WHOLE_INDEX`）；(c) `records_in_range` 返回 `HA_POS_ERROR`（整个 MRR 方案作废）。
+
+#### 5. 长 IN list 的设计
+
+- **DNF 展开**：每次 `tree_or` 都要 `find_range` + RB insert + 可能的 clone，总体 **O(N log N)**
+- **NOT IN 的代价是源码明确承认的 O(N²)**：注释说 *"the range analyzer will use O(N²) memory (**which is probably a bug**)"*，并引用 BUG#15872 / BUG#21282 ⇒ **NOT IN 超过 1000 条直接放弃构造 SEL_TREE**（`NOT_IN_IGNORE_THRESHOLD`）。设计权衡很清楚：与其 O(N²) 冒 OOM 风险，不如放弃（源码甚至认为"大 NOT IN 列表本来也不太可能产出好的 range 访问"）
+- **排序 + 二分（`in_vector`）**有两层目的：①**执行期**无 range 时 O(log N) 求值；②**优化期**构造区间。**NULL 不入数组**（"避免二分误匹配"）
+- **为什么不显式去重**：①重复值产生同一个单点区间，`key_or` 的合并逻辑会自然并掉；②排序已使重复值相邻，"跳过相邻相等"就等价去重，不必为每种类型（`in_string/in_longlong/in_double/...`）各实现一次；③去重会破坏 `value_to_item(pos)` 的下标语义
+- **8MB 内存闸（`range_optimizer_max_mem_size`）**：`SEL_ARG/SEL_TREE` 全分配在 `param->temp_mem_root`，超限抛 `EE_CAPACITY_EXCEEDED` → 被 `Range_optimizer_error_handler` **降级成 warning** → 之后所有 `param->has_errors()` 检查短路返回 `nullptr` → **退化为全表扫**。且"只报一次警告"（因为多阶段重跑）。
+  > 注意：**group-min-max 仍可能被选中**——注释说 "it can be constructed **no matter if there is a range tree**"
+
+#### 6. 8.0 的 range_optimizer 重构
+
+`sql/opt_range.cc` **已不存在**，拆成 15 个 `range_optimizer/*.cc`。每个访问类型都有 **`_plan`（规划，返回 `AccessPath`）+ 非 `_plan`（执行期 Iterator）**双文件。
+
+**最可核实的动机**：与 AccessPath / Iterator 化强耦合——旧架构 range 优化器返回 `QUICK_SELECT_I*`（**既是执行器又是计划**），新架构劈成两半。
+
+**最重要的架构收益**：粒度化 API 让 **hypergraph 能绕过 `test_quick_select`**，直接调用 `get_mm_tree` + `check_quick_select` + `get_ranges_from_tree` 三个原语；而且它**逐谓词调用 `get_mm_tree` 再自己 `tree_and`**，从而精确追踪"哪个谓词被哪个 range 覆盖/吸收"（`tree_applied_predicates` vs `tree_subsumed_predicates`）——**这在拆分前不可能做到**，因为旧代码里 `get_mm_tree` 只在 `test_quick_select` 内部被整体调用一次。
+
+> 遗留痕迹说明重构是渐进的：`ROR_SCAN_INFO` 的 TODO、"this is my (sgunders') understanding as of September 2021: …although it seems the code for this was never written"。
+
+### 失效场景与已知短板
+
+#### 多列范围的限制（源码最坦白的自我批评）
+
+**range 只能对最后一个 keypart 用不等式**。源码注释直接编码了这条规则：
+
+```
+/* "(kp1 > c1) AND (kp2 OP c2) AND ..." -> (kp1 > c1) */
+```
+
+工程表达是 `num_exact_key_parts`（被压低），并有"last-ditch effort"：`a >= 3 AND b IN (4,9,10)` ⇒ 从 `(3,4)` 开始扫（而不是 `(3,-inf)`），**但之后必须 recheck**。
+
+#### NULL 处理
+
+- `x IS NULL` 在 range 里是**单点区间**（`is_singlepoint` 明确算作单点）
+- 但 **`x IS NULL` 不能用索引统计**——三处独立注释说法一致："the number of rows with this value are likely to be very different"
+- 外连接 inner 表的 `IS NULL` **直接禁用 range**
+- `NULL_RANGE` 可能导致全表扫而被拒绝
+
+#### collation / 类型转换
+
+- 不可比（不同 collation、DATETIME vs TIME）时 `warn_index_not_applicable`
+- **LIKE 一律标记 `inexact`**：注释说 Unicode collation 有 contractions 等，"will frequently be a bit too broad"
+- **方言坑**：`"int_col > 'foo'"` 被解释为 `"int_col > 0"` 而非永假——注释原话："MySQL's SQL dialect has some **strange interpretations**"
+- **前缀索引导致去重失败**（很隐蔽）：`VARCHAR(3)` 列 + `INDEX(col(1))`，"f" 与 "foo" 在索引里不可区分 ⇒ NOT IN 的区间必须从 `<=` 而非 `<` 开始
+
+#### index merge 的四大限制（`index_merge.h` 原文）
+
+1. **能用 range 就永不用 index merge**（即使 range 更贵）
+2. 不支持覆盖索引（上一条的推论）
+3. 复杂嵌套 AND/OR 会漏掉一些方案，"the choice of read plan may depend on **the order of conjuncts/disjuncts**"
+4. 没有 `index_merge_ref`
+
+其他：**DESC 排序禁用** ROR-intersection 与 index merge union；**DELETE 禁用** ROR-intersection（"Simultaneous key scans and row deletes on several handler objects are not allowed"）；**XOR 直接放弃**；几何类型不能做 AND。
+
+### ICP 与 range 的边界
+
+边界由 `num_exact_key_parts` 精确定义：
+
+| 条件类别 | range 处理 | ICP / Filter |
+|---|---|---|
+| 索引前缀上的等值（构成 range 边界） | ✅ 完全吸收（subsumed） | 不需要 |
+| 最后一个 keypart 上的不等式 | ✅ 作为 range 边界 | 不需要 |
+| **非等值 keypart 之后的 keypart 条件** | ❌（`num_exact_key_parts` 被压低） | ✅ **必须 recheck** |
+| **前缀索引列上的条件** | 部分（边界是截断值） | ✅ |
+| **LIKE / 类型转换 / 非可比 collation** | 产生**过宽**的 range（`inexact`） | ✅ |
+| 不在该索引中的列 | ❌ | 视情况 |
+
+> **关键结论**：`SEL_TREE::inexact` 在旧优化器下**不影响正确性**（"The old join optimizer **always** does this"——无条件 recheck）。它真正发挥作用是在**超图优化器**里：避免重复计算 selectivity、避免多余的 Filter。
+
+### 理论溯源
+
+- 区间表示与红黑树 + 有序链表的组合是 range optimization 的经典做法
+- 引用计数 + copy-on-write 用于对抗"共享子树的组合爆炸"
+
+### 他库对比与演进动机
+
+- **重构收益之一是可测试性**：`unittest/gunit/fake_range_opt_param.h` 提供 `Fake_RANGE_OPT_PARAM`，`opt_range-t.cc` 直接 include `range_optimizer/internal.h`
+- **重构收益之二**是让 hypergraph 能复用 range 原语（前面已述）
+- 分区裁剪（`partition_pruning.cc`）也复用同一套 `RANGE_OPT_PARAM` + `SEL_ARG` 基础设施
 
 ---
 

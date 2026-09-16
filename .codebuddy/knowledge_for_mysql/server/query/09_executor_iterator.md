@@ -44,6 +44,154 @@ MySQL 选火山是**被行式存储约束的必然**：
 
 所以 8.0 的执行器是**彻底的火山模型**——这也是"社区 MySQL 没有向量执行"这个常见疑问的答案（`Handler` 层、`RowIterator` 层都是逐行）。
 
+### 并行执行：从 Volcano 的 Exchange 到 morsel-driven
+
+上面两节讲的是"**一次处理多少行**"（一行 / 一批 / 一段编译码）。并行是**另一个维度**："**多少线程同时处理**"。本节系统讲清楚它——因为 MySQL 在这件事上的立场，是理解它执行器定位的关键。
+
+#### 先分清并行的三种粒度
+
+| 粒度 | 含义 | 例子 |
+|---|---|---|
+| ① **inter-query**（查询间） | 多个查询同时跑 | 连接级 thread pool |
+| ② **intra-operator**（算子内） | **一个算子**拆成多份并行做 | 并行 scan、并行 hash join build |
+| ③ **inter-operator / pipeline**（算子间） | **不同算子**在不同线程同时跑 | scan 出下一批时 join 正处理上一批 |
+
+②③ 合称 **intra-query parallelism（查询内并行）**——这才是"并行查询"真正所指。**MySQL 有 ①，没有 ②③**（证据见最后）。
+
+#### Exchange：Volcano 的并行方案
+
+Graefe 那篇论文标题里就有 "Parallel"——它的并行化方案就是 **Exchange 算子**。
+
+**要解决的问题**：计划树是静态的，如何在树里表达"并行"？**答案**：在计划中插入 Exchange 作为**数据重分布的关节**。三种形态：
+
+| 形态 | 数据流向 | 作用 |
+|---|---|---|
+| **Gather**（汇聚） | N → 1 | 把多个 worker 的结果收成一个流（计划顶部必然有） |
+| **Repartition**（重分区） | N → N | 按 join key / group key 重新分发，保证同一 key 落到同一 worker |
+| **Broadcast**（广播） | 1 → N | 把小表复制给每个 worker（小表 join 大表） |
+
+一个并行 hash join 的形状：
+
+```
+              Gather                     ← 结果汇总
+                │
+      ┌─────────┼─────────┐
+    HashJoin  HashJoin  HashJoin         ← 3 个 worker 各做一份
+        │         │         │
+        └──── Repartition(by key) ────┘  ← 按 join key 重分发，保证能 join 上
+        ┌─────────┴─────────┐
+      Scan R              Scan S         ← 两个输入各自并行扫
+```
+
+**关键特征：并行度被"烤进"（baked into）了计划里。** Exchange 下面挂几个 worker，编译期就定死，执行时不能改。这正是后面 morsel-driven 要批评的地方。
+
+#### Pipeline 与 pipeline breaker
+
+| 概念 | 定义 |
+|---|---|
+| **pipeline** | 一段算子链，数据在其中**不落盘**，一行（或一个批）从链头流到链尾 |
+| **pipeline breaker** | **必须吸干全部输入才能吐出第一行**的算子，会打断流水线 |
+
+典型 breaker：
+
+| 算子 | 为什么是 breaker |
+|---|---|
+| Sort | 没看完全部输入，不知道谁排第一 |
+| Hash join 的 **build** 阶段 | 哈希表没建完不能 probe |
+| 哈希聚合 / 临时表聚合 | 同理 |
+| Exchange | 收不齐数据没法重分布 |
+
+流式的（非 breaker）：`FilterIterator`、`LimitOffsetIterator`、NLJ 的 probe 侧、`AppendIterator`。
+
+MySQL 里**有意识地消除不必要 breaker** 的证据是 `StreamingIterator`——"本要物化但其实不需要"时的去物化版本：
+
+```cpp
+// StreamingIterator is a minimal version of MaterializeIterator that does not
+// actually materialize; instead, every Read() just forwards the call to the
+// subquery iterator...
+// It is used for when the optimizer would normally set up a materialization,
+// but you don't actually need one
+```
+
+#### morsel-driven 在批评什么
+
+HyPer 的 Leis et al.（SIGMOD 2014，《Morsel-Driven Parallelism: A NUMA-Aware Query Evaluation Framework for the Many-Core Age》）针对的就是 Exchange 这套 **plan-driven parallelism**：
+
+1. **并行度静态**——编译期固定，无法适应运行时：别的查询占了核、某 worker 遇到数据倾斜
+2. **调度僵化**——线程与计划的绑定固定，一个线程卡住没人接替
+3. **NUMA 不友好**——Exchange 跨节点搬数据
+
+**它的解法**：把"计划里写死并行结构"改成"**运行时动态调度数据分片**"。
+
+- **morsel**：输入切成固定大小的水平分片（千行量级），调度单位是 morsel 而**不是整个算子**
+- **dispatcher + worker**：worker 数 ≈ 核数，dispatcher 运行时把 morsel 分给空闲 worker
+- **弹性并行度**（论文原话）：*"The degree of parallelism is not baked into the plan but can elastically change during query execution"*
+- **NUMA-aware**：morsel 的内存分配在处理它的线程的本地 NUMA 节点
+- **pipeline 内不落盘**：一个 morsel 在一个线程内流过整段 pipeline
+
+#### MySQL 站在哪：没有 Exchange，没有查询内并行
+
+| | MySQL 8.0.39 社区版 |
+|---|---|
+| Exchange 算子 | ❌ **不存在** |
+| intra-query 并行 | ❌ **没有** |
+| 实际有的 | 后台线程（purge/flush/IO）、MTS 并行回放、thread pool（inter-query）、InnoDB `Parallel_reader`（极窄，见下） |
+
+**Exchange 不存在的硬证据**：`AccessPath::Type` 枚举是 MySQL 计划算子的**全集**（TABLE_SCAN / INDEX_SCAN / REF / HASH_JOIN / NESTED_LOOP_JOIN / FILTER / SORT / AGGREGATE / MATERIALIZE / WINDOW / WEEDOUT / APPEND / STREAM / CACHE_INVALIDATOR ...），其中**没有任何 Exchange / Gather / Repartition / Distribute**。另外 `sql/iterators/` 全部 13 个头文件也无 exchange 类；全库搜 `intra-query` 零命中。
+
+> ⚠️ 唯一匹配 `*exchange*` 的是 `sql/sql_exchange.h`，但那是 `SELECT ... INTO OUTFILE` / `LOAD DATA`，与并行无关——别被名字骗了。
+
+**`innodb_parallel_read_threads` 的真实范围**（常被误传为"并行查询"）：只服务 **DDL 建索引 / CHECK TABLE / 无 WHERE 的 `SELECT COUNT(*)`**，不用于任何带谓词、JOIN、GROUP BY 的普通查询。分派逻辑在 `row_scan_index_for_mysql()` 里一目了然：
+
+```cpp
+if (!check_keys) {
+  return row_mysql_parallel_select_count_star(trx, indexes, n_threads, n_rows);
+}
+return parallel_check_table(trx, index, n_threads, n_rows);
+```
+
+且它 **bypass 了整个迭代器树**（由 `optimize_aggregated_query()` 在优化阶段决定），扫描完线程即解散——**执行器本身仍是单线程 volcano**。
+
+**最有意思的对照：MySQL 其实"懂" morsel，只是不在 SQL 层。**
+
+`Parallel_reader`（`storage/innobase/include/row0pread.h`）的设计注释几乎是 morsel-driven 的 B+tree 变体——**动态分裂 + 工作窃取 run queue**：
+
+```cpp
+// To solve the imbalance problem we dynamically split the sub-trees as and
+// when required... the first thread that finishes scanning the first set of 4
+// partitions will then dynamically split the 5th sub-tree... As the other
+// threads complete their sub-tree scans they will pick up more execution
+// contexts (Ctx) from the Parallel_reader run queue
+```
+
+但它在 `storage/innobase/`，与 SQL 执行器的迭代器树**完全隔离、无任何连接点**。
+
+> 准确表述：**MySQL 的并行是"存储引擎内部的数据并行"，不是"执行器层的算子并行"**；HyPer 恰恰相反（morsel-driven 是执行器层一等公民）。所以 `Parallel_reader` 可以作为"morsel 思想在存储层的独立实现"引用，但**不能**作为"MySQL 有 morsel-driven 查询执行"的证据。
+
+**HeatWave：把并行外包出去**（架构级佐证）
+
+源码树里没有 HeatWave 实现（闭源插件），但留了让二级引擎**整条查询旁路本地执行器**的钩子：
+
+```cpp
+/// A hook that secondary storage engines can use to override the executor
+/// completely.
+using Override_executor_func = bool (*)(JOIN *, Query_result *);
+```
+
+配合 `USE_EXTERNAL_EXECUTOR` 标志与 `secondary_engine_cost_threshold` 变量。这说明 Oracle 的战略是：**社区版执行器保持单线程 volcano，把并行/列式/向量化放在闭源 HeatWave 里**——这本身反证了社区版没有查询内并行。
+
+#### 对照表
+
+| 维度 | MySQL 8.0.39 社区版 | HyPer morsel-driven |
+|---|---|---|
+| 执行模型 | ✅ 经典 Volcano，`Init()` + `Read()` | Volcano 变体（融合） |
+| `next()` 粒度 | **1 行** | morsel（千行量级） |
+| Exchange 算子 | ❌ 不存在 | ✅ 核心机制 |
+| 查询内并行 | ❌ 没有 | ✅ |
+| 调度 | 静态树 + 调用栈 | dispatcher 动态 + 工作窃取 |
+| NUMA-aware | ❌ | ✅ |
+| pipeline | 事实上有流式（含 `StreamingIterator` 去物化），但**无 pipeline 概念/调度器** | ✅ 显式 pipeline 与 breaker 分析 |
+
 ### 8.0 从 `Executor` 重构到 `RowIterator` 的意义
 
 5.7 的执行逻辑散落在 `JOIN` 的各个 `exec_*` 方法里，与优化器、与 JOIN 结构强耦合。8.0 重构成独立的 `RowIterator` 体系（`sql/iterators/`），收益：
@@ -603,7 +751,7 @@ range->end_key.flag   = HA_READ_AFTER_KEY;      // 单 key 的闭开区间
 - **addon fields**：排序记录里直接带 SELECT 需要的列，**读结果不用回表**
 - **indirect**：只存 `handler::ref`（行位置），读结果时 `ha_rnd_pos()` **回表**（8.0.20 后仅 UPDATE/DELETE 两阶段读、FTS、大 BLOB 用）
 
-> 两种载体的本质（addon = 存列值 vs rowid = 存 `handler::ref`）与 8.0.20 演进见 [`runtime/01_filesort_and_temptable.md`](runtime/01_filesort_and_temptable.md) 1.3 节。
+> 两种载体的本质（addon = 存列值 vs rowid = 存 `handler::ref`）与 8.0.20 演进见 [`runtime/01_filesort.md`](runtime/01_filesort.md) 1.3 节。
 
 六种结果迭代器通过 `IteratorHolder` union（`sorting_iterator.h:139`）**共享同一块存储**，避免堆分配。
 

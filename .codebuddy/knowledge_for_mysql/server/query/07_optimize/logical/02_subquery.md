@@ -4,6 +4,7 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、Subquery_strategy 状态机与生命周期](#一subquery_strategy-状态机与生命周期)
 - [二、resolve_subquery 总入口](#二resolve_subquery-总入口)
 - [三、IN → IN2EXISTS](#三in--in2exists)
@@ -13,6 +14,155 @@
 - [七、标量子查询 → derived](#七标量子查询--derived)
 - [八、flatten_subqueries 与恒假删除](#八flatten_subqueries-与恒假删除)
 - [相关参数](#相关参数)
+
+---
+
+## 设计思想与理论基础
+
+### 子查询的分类：是三维，不是"语法形态"
+
+MySQL 对子查询的判定不是"语法形态"单维度，而是**（形态 × 位置 × 到子句根的连接方式）**三维：
+
+| 维度 | 源码载体 | 取值 |
+|---|---|---|
+| **形态** | `Item_subselect::subs_type` | SINGLEROW / EXISTS / IN / ALL / ANY |
+| **位置** | `Collect_scalar_subquery_info::Location` | L_SELECT / L_WHERE / L_HAVING / L_JOIN_COND |
+| **连接方式** | `enum_condition_context` + `embedding_join_nest` | ANDS（AND 顶层）/ ANDS_ORS / NEITHER；`(Table_ref*)1`=WHERE 的 AND 部分、nest 指针=ON 的 AND 部分、**NULL=其他位置（且"不是改写候选"）** |
+
+同一句 `IN (SELECT ...)`，在 WHERE 的 AND 顶层、在 OR 下、在 ON 里、在 SELECT list 里，走的路径完全不同——semi-join 要求 ANDS 且在 WHERE/ON；derived 容 OR；标量→derived 禁 JOIN_COND 位置的相关子查询。
+
+> 后面八节讲"每种改写怎么做"，本章讲"为什么按这个维度分、以及为什么需要这么多条路"。
+
+### 相关 vs 不相关：为什么是关键分野
+
+**"相关性"在 MySQL 里不是一个标记，而是一个参与所有 `used_tables()` 位运算的伪表位。**
+
+`table_map` 是 64 位位图，其中 3 位被"子查询属性"占用：
+
+```cpp
+constexpr const size_t MAX_TABLES_FOR_SIZE{sizeof(table_map) * 8};
+constexpr const size_t MAX_TABLES{MAX_TABLES_FOR_SIZE - 3};   // = 61
+constexpr const table_map INNER_TABLE_BIT{1ULL << (MAX_TABLES + 0)};
+constexpr const table_map OUTER_REF_TABLE_BIT{1ULL << (MAX_TABLES + 1)};
+constexpr const table_map RAND_TABLE_BIT{1ULL << (MAX_TABLES + 2)};
+```
+
+注释对 `OUTER_REF_TABLE_BIT` 的说明是：*"all subquery items between the column reference and the query block where the column is resolved, have this bit set"*——**相关性会沿 Item 树向上传播**。因此相关子查询天然"逐外层行变化"，无法"算一次缓存"。
+
+这个代价被**显式建模**进代价公式（`compare_costs_of_subquery_strategies()`）：
+
+```cpp
+const double subq_executions = calculate_subquery_executions(in_pred, trace);
+const double cost_exists = subq_executions * saved_best_read;
+const double cost_mat_table = sjm.materialization_cost.total_cost();
+const double cost_mat = cost_mat_table + subq_executions * sjm.lookup_cost.total_cost();
+```
+
+`subq_executions` 沿父 join 链累乘 fanout 得到。
+
+⇒ **这个公式就是"相关 vs 不相关"的量化表达**：EXISTS 成本线性于外层行数；物化把成本拆成"一次性建表 + 每次 O(1) 探测"。
+
+**去相关在 MySQL 里有两层含义**（很多资料混淆）：
+
+1. **semi-join 层**：`decorrelate_condition()` / `decorrelate_equality()`，把 `outer_expr OP inner_expr` 从子查询 WHERE 摘出来，变成 sj nest 的 `sj_outer_exprs`/`sj_inner_exprs`
+2. **标量→derived 层**：把相关谓词提升为 **derived 的 GROUP BY 键**——"按相关键分组，一次算完所有组，再按键回连"。这正是教科书式 decorrelation 在 MySQL 的落地形态
+
+### 为什么需要四条出路：在四维资源上取舍
+
+`IN (SELECT ...)` 有四条出路，本质是在**（表预算 / 内存 / CPU / 重排自由度）**四维上取舍：
+
+| 出路 | 消耗 | 换取 | 变差的场景 |
+|---|---|---|---|
+| **semi-join 拍平** | **表预算**（不可逆） | 重排自由度 + 五种去重策略 | 有 GROUP BY/HAVING/聚合/窗口/UNION、不在 AND 顶层、表数超 `MAX_TABLES` |
+| **物化** | 内存 / 临时表 | 子查询只算一次 | 相关、非确定性、多列可空、类型不兼容 |
+| **IN→EXISTS** | **CPU**（线性于外层 fanout） | 零额外资源，永远可行 | 相关 + 外层大表 ⇒ 灾难 |
+| **转 derived**（8.0） | 一次物化 | 可吃 hash join + 自由重排 | 默认 OFF；去不了相关就报错 |
+
+**semi-join 为什么是首选**——四条证据：
+
+1. `resolve_subquery()` 判定链里排第一，命中即 `choice_made = true`，其余短路
+2. 变换把子查询的表、条件**整体搬进外层 FROM/WHERE**，之后统一 join 排序、选 access path
+3. **不可逆**：`flatten_subqueries()` 头注释——"performed **once in query lifetime and is irreversible**"
+4. **去相关的价值**（`decorrelate_condition()` 头注释，本章最好的一段原文）：
+
+> "The purpose of decorrelation is to be able to use more execution strategies. **Without decorrelation, EXISTS is limited to FirstMatch and DupsWeedout strategies. Decorrelation enables LooseScan and Materialization.**"
+
+**它吃表预算**是最"工程"却关键的约束：
+
+```cpp
+// Add the tables in the subquery nest plus one in case of materialization:
+const uint tables_added =
+    subq_item->unit->first_query_block()->leaf_table_count + 1;
+if (table_count + tables_added <= MAX_TABLES && !...has_aj_nests)
+  subq_item->strategy = Subquery_strategy::SEMIJOIN;
+```
+
+`MAX_TABLES = 61`，超限的子查询被退回 `UNSPECIFIED` 再走 IN2EXISTS。**这是"为什么不能只用 semi-join"的最硬证据：它吃全局资源。**
+
+资源不够时还要**优先保住最贵的**（调度启发式）：相关子查询优先、表多者优先、靠前的优先。
+
+### 两阶段决策：为什么有的策略先"候选"
+
+`Subquery_strategy` 枚举注释：
+
+> "Sometimes the strategy is first only a candidate, then the real decision happens in a second phase. Other times the first decision is final."
+
+原因是**阶段能力不同**：resolver 阶段没有 `best_read`/fanout，算不出 `subq_executions`，做不了代价决策；optimizer 阶段才有。所以
+
+- 能在 resolver 定死的就定死（semi-join 结构性、derived 结构性、EXISTS 直接终态）
+- 定不死的登记 `CANDIDATE_FOR_IN2EXISTS_OR_MAT`，等 `decide_subquery_strategy()`
+
+"候选"同时也是**一个待处理的注册队列**（push 进 `sj_candidates`，在 `flatten_subqueries()` 里统一排序/拍平）。
+
+### 设计哲学：非确定性为什么不能物化
+
+这是本篇唯一一处可以直接谈"设计哲学"的源码证据。`decorrelate_condition()` 的头注释把"能否物化/去相关"从工程限制上升到了**用户直觉语义**：
+
+```
+1. Non-deterministic function as substitute for expression from outer query block:
+   A  SELECT * FROM t1 WHERE RAND() IN (SELECT t2.x FROM t2)
+   B  SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2 WHERE RAND() = t2.x);
+   The intuitive interpretation of the IN subquery is that the random function
+   is evaluated per row of the outer query block, whereas in the EXISTS subquery,
+   it should be evaluated per row of the inner query block...
+...
+Thus, the intuitive interpretation is to avoid materialization for subqueries
+with non-deterministic components in the inner query block, and hence
+such predicates will not be decorrelated.
+```
+
+⇒ **这不是实现难度问题，而是"用户对非确定函数求值次数的直觉"问题**：`RAND() IN (SELECT ...)` 用户期望 RAND 每行外层算一次；一旦物化（子查询只算一次），语义就变了。
+
+### NULL 语义：三值逻辑怎么保住
+
+`NOT IN` 遇 NULL 返回空集是经典陷阱。源码用多层机制保住三值：
+
+- **`abort_on_null`**——顶层 vs 非顶层的分水岭。顶层（WHERE）FALSE 与 UNKNOWN 等价，可以忽略；`NOT IN` 不行，**必须仍执行子查询**再判定
+- **`Item_is_not_null_test`**——用副作用 `owner->was_null |= 1` 在只有二值的 EXISTS 里"偷渡"三值信息；且**故意伪造 `RAND_TABLE_BIT`** 让优化器不敢把它从 HAVING 下推到 WHERE
+- **物化引擎的 NULL 二次探测**——未找到匹配时再用 `null_ref_key` 探一次 NULL
+
+anti-join 侧极保守：一旦 `null_problem` 且任一列可空 → 直接退回。**这就是 `NOT IN` 在有 NULL 列时永远拿不到 anti-join 的直接原因。**
+
+### 演进痕迹（代码化石）
+
+| 痕迹 | 说明 |
+|---|---|
+| `WL#1110` | 子查询物化引擎 `subselect_hash_sj_engine` 的"出生证" |
+| `BUG#36752` | 物化的类型/BLOB 限制，注释自称 **"This is a temporary fix"**，从 5.6 拖到 8.0.39 未移除 |
+| `Bug#14215895` | UNION 子查询 + `LIMIT 1` 不能让每个分支提前终止 |
+| `WL#6570` | prepare-once 重构，大量 `@todo`/`remove-after` 是未完成的活化石 |
+| `unique_subquery` / `index_subquery` | `subselect_uniquesubquery_engine` 类已不存在，**只剩 EXPLAIN 兼容字符串** |
+| `SubqueryExecMethod` | 这个枚举**在代码里根本不存在**，只活在一条 TODO 注释里 |
+| `WL#10431` | 窗口函数场景下强制物化（IN2EXISTS 需要把 `outer_expr = WF` 塞进 WHERE/HAVING，而 WF 不允许出现在那里） |
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `semijoin` | **ON** | semi-join 总开关 |
+| `materialization` | **ON** | 物化总开关（**同时管 semi-join 的 Materialize 策略与子查询物化**） |
+| `subquery_materialization_cost_based` | **ON** | ON=代价比较；OFF=无条件物化 |
+| `subquery_to_derived` | **OFF** | IN→derived / 标量→derived；secondary engine 下被强制打开 |
 
 ---
 
@@ -731,3 +881,7 @@ replace_subcondition(thd, tree, subq_item, truth_item, false);
 - semi-join 见 [`03_semijoin.md`](03_semijoin.md)
 - 运行期执行见 [`../../runtime/02_subquery_runtime.md`](../../runtime/02_subquery_runtime.md)
 - 派生表合并见 [`04_logical_join.md`](04_logical_join.md)
+- 表与 `TABLE`/`TABLE_SHARE` 对象见 [`../../../table.md`](../../../table.md)
+
+**社区文章**
+- [MySQL · 源码分析 · Derived table 代码分析（梁辰）](https://zhuanlan.zhihu.com/p/443656156) —— `resolve_derived` / merge 与物化的判定条件

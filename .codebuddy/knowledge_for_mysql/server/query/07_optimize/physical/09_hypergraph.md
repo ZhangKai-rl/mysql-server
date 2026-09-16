@@ -4,6 +4,7 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [零、定位：为什么需要它](#零定位为什么需要它)
 - [一、开关与入口](#一开关与入口)
 - [二、FindBestQueryPlan 全流程](#二findbestqueryplan-全流程)
@@ -14,6 +15,64 @@
 - [七、FinalizePlan](#七finalizeplan)
 - [八、深潜：候选锦标赛与 LogicalOrderings](#八深潜候选锦标赛与-logicalorderings)
 - [九、已知限制](#九已知限制)
+
+---
+
+## 设计思想与理论基础
+
+### 三代 join 枚举算法：为什么最后是超图
+
+| 代 | 算法 | 出处 | join 形状 | 关键限制 |
+|---|---|---|---|---|
+| 一 | System R 动态规划 | Selinger 1979 | **左深树** | 只搜左深树；interesting order 作为一个 DP 状态维度 |
+| 二 | **DPccp** | Moerkotte et al. 2008 | bushy（任意） | **只支持简单图**：一条边只能连 2 个节点 ⇒ 只能表达二元连接谓词，且**只能处理 inner join** |
+| 三 | **DPhyp** | Moerkotte & Neumann 2008 | bushy | 用**超图**同时突破上面两条 |
+
+**超图解决的两个具体问题**——这是理解本篇的前提：
+
+1. **复杂连接谓词**：`t1.a = t2.a AND t2.b = t3.b` 这类多表等值传递，在简单图里被拆成两条独立边，枚举时会产出"先 join t1、t3（二者无直接谓词）"的无效中间组合。**超边可以同时连接多个节点**，把这类谓词作为整体约束表达。
+2. **非内连接**：外连接 / 半连接 / 反连接有严格重排序限制。DPhyp 用 **CD-C 冲突规则**表达"哪些表不能被重排"，再用 `AbsorbConflictRulesIntoTES` 把大多数冲突**吸收进超边**，少数无法折叠的在 `CostingReceiver` 里手工检查。
+
+> 所以 hypergraph 不是噱头——**超图是它能同时支持 bushy + 复杂谓词 + 外连接三者的共同前提**。
+
+**术语**：`csg` = connected subgraph（连通子图），`cmp` = complement（补图）。DPhyp 的枚举单位是 **csg-cmp-pair**——每个连通子图与其补图配对，这正是 bushy 树也能被完整枚举到的原因（对比：左深树只需枚举前缀）。
+
+### DPhyp 论文 ↔ MySQL 实现对照
+
+理论落到代码上的对应关系（本篇第四、五章讲算法细节，这里给全景映射）：
+
+| 论文概念 | MySQL 函数 / 结构 | 备注 |
+|---|---|---|
+| `Solve()` | `EnumerateAllConnectedPartitions` | 注释原文 *"Called Solve() in the DPhyp paper"* |
+| `EmitCsg()` | `EnumerateComplementsTo` | |
+| `EnumerateCsgRec()` | `ExpandSubgraph` | |
+| `EnumerateCmpRec()` | `ExpandComplement` | |
+| `EmitCsgCmp()` | receiver 的 `FoundSubgraphPair` | |
+| `N(S, X)`（邻域） | `FindNeighborhood` | 注释说它**占 DPhyp 总耗时 20–70%** |
+| **`dpTable`** | `CostingReceiver::m_access_paths`（`NodeMap → AccessPathSet`） | 两层作用：①存该子集的最优 AccessPath（**可保留多条**，Pareto 前沿）②**充当连通性 oracle**——`HasSeen(S)` 就是查这个 map |
+| 超图 | `JoinHypergraph` / `Hyperedge { left, right }` | 两端是 `NodeMap` 位图，最大 61 表 |
+| 非内连接约束 | CD-C 冲突规则 + `AbsorbConflictRulesIntoTES` | 注释 *"almost verbatim the CD-C algorithm from Moerkotte et al [Moe13]"* |
+| 降级 | `SimplifyQueryGraph`（[Neu09]） | 超过 `optimizer_max_subgraph_pairs`（默认 100000）触发，二分搜索找"够简单"的图 |
+
+**关于 DPccp**：全库搜索 `DPccp` **零命中**。MySQL 是**直接实现 DPhyp**——函数命名与分解完全按 DPhyp 的 csg / cmp / csg-cmp-pair，而不是 DPccp 那套无重复枚举的 partition 编号。
+
+### MySQL 补了论文没写清的地方
+
+两处源码注释自述（很有意思，说明论文并不完备）：
+
+1. *"Some critical details are still missing, **which we've had to fill in ourselves**"*
+2. forbidden 集合的扩展以避免重复枚举：*"the DPhyp paper misses this. The 'Building Query Compilers' document, however, seems to have corrected it"*
+
+### 与旧优化器的分野与合流
+
+`AccessPath` 是两者的统一 IR，但**产出方式根本不同**：
+
+- **旧优化器**：`JOIN::optimize()` 末端用 `create_access_paths()` 把 QEP_TAB 数组**翻译**成 AccessPath 树——是**事后翻译**
+- **hypergraph**：**原生**以 AccessPath 作为 DP 状态直接产出
+
+分叉点在 `JOIN::optimize()` 的 `if (thd->lex->using_hypergraph_optimizer())`，合流点在 `JOIN::m_root_access_path`。
+
+**这个差异有实际后果**：旧优化器的 AccessPath 是翻译出来的，很多决策在翻译前已定型；hypergraph 从一开始就用 AccessPath 做 DP 状态，因此能自然表达"同一子集保留多条候选（Pareto 前沿）"——这也是 `m_access_paths` 用 `AccessPathSet`（集合）而非单个 `AccessPath` 的原因。
 
 ---
 
@@ -465,7 +524,12 @@ if (EnumerateAllConnectedPartitions(graph.graph, &receiver) && thd->is_error()) 
 
 ### 8.1 澄清：只有 DPhyp，没有 DPccp
 
-全目录搜索 `DPccp` **零命中**——MySQL 8.0 只实现了 DPhyp（`subgraph_enumeration.h:667`，注释引 Moerkotte & Neumann CIDR 2021）。两者都枚举 csg-cmp-pair，区别：DPccp（Moerkotte 2006）需**预处理连通子图集合**（代价 O(#ccp)），DPhyp 用"最小节点 + forbidden + 邻域增量增长"**直接生成**，无需预处理。真正的"切换"只有两处：无超边时单表快路径直调 `FoundSingleNode(0)`（`join_optimizer.cc:6533-6539`）；超限后 `SimplifyQueryGraph` 重建 receiver 重跑（`:6540-6575`）。
+全目录搜索 `DPccp` **零命中**——MySQL 8.0 只实现了 DPhyp。
+
+> ⚠️ **关于论文出处的订正**：源码注释**只写了论文名和作者**，没有标年份/会议——原文是 *"The algorithm is described in the paper 'Dynamic Programming Strikes Back' by Neumann and Moerkotte. There is a somewhat extended version of the paper (that also contains a few corrections) in Moerkotte's treatise **'Building Query Compilers'**. Some critical details are still missing, which we've had to fill in ourselves."*
+> 该论文的正式出处是 **SIGMOD 2008**（此前文档中标注的 "CIDR 2021" 有误，源码注释并未给出）。另外注意注释里的这句坦白：**"Some critical details are still missing, which we've had to fill in ourselves"**——MySQL 自己补了论文没写清的细节。
+
+**DPccp 与 DPhyp 的关系**（DPccp 的完整讲解见 `../00_overview.md` 的理论谱系）：两者都枚举 **csg-cmp-pair**，区别在于 DPccp（Moerkotte 2006）需要**预处理连通子图集合**（代价 O(#ccp)），而 DPhyp 用"最小节点 + forbidden + 邻域增量增长"**直接生成**，无需预处理；DPhyp 进一步用**超边**表达外连接/反连接的重排序限制。真正的"切换"只有两处：无超边时单表快路径直调 `FoundSingleNode(0)`（`join_optimizer.cc:6533-6539`）；超限后 `SimplifyQueryGraph` 重建 receiver 重跑（`:6540-6575`）。
 
 ### 8.2 AccessPathSet：DP 表兼支配结构
 
@@ -564,9 +628,13 @@ if (thd->lex->m_sql_cmd != nullptr &&
 ## 参考
 
 **论文**
-- **Moerkotte & Neumann《Dynamic Programming Strikes Back》(CIDR 2021)** —— **DPhyp**。`EnumerateAllConnectedPartitions` 直接实现此论文
+- **Moerkotte & Neumann《Dynamic Programming Strikes Back》(SIGMOD 2008)** —— **DPhyp**。`EnumerateAllConnectedPartitions` 直接实现此论文
 - **Moerkotte et al.《On the correct and complete enumeration of the core search space》([Moe13])** —— **CD-C 算法**。`FindHyperedgeAndJoinConflicts` 源码注释明说 "almost verbatim"
 - **Moerkotte《Building Query Compilers》(treatise)** —— 补正了 DPhyp 论文漏掉的 complement 枚举细节（`EnumerateComplementsTo` 的 `new_forbidden`）
 - **Neumann [Neu09]《Query Simplification: Graceful Degradation for Join-Order Optimization》** —— `graph_simplification.cc` 实现此论文
 - **Graefe《The Cascades Framework》(1995)** —— 设计参照系
+
+**其他文档**
+-  月报 - MySQL中的HyperGraph优化器: http://mysql.taobao.org/monthly/2022/06/04/
+- MySQL · 源码解析 · MySQL 8.0.23 Hypergraph Join Optimizer代码详解: http://mysql.taobao.org/monthly/2021/02/03/
 

@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 JSON 数据类型、二进制存储格式（JSONB）、DOM 内存表示、JSON Path、函数体系（含实现算法）、JSON_TABLE、索引方案（生成列/函数索引/多值索引）、比较排序、部分更新全链路、崩溃恢复、以及一条 UPDATE 的全链路串联。
 >
-> 相关独立文档：[`innodb/lob.md`](../../innodb/lob.md)（LOB 物理层）、[`server/gis.md`](gis.md)（GeoJSON 与 JSON 的边界）。
+> 相关独立文档：[`innodb/physical/lob.md`](../../innodb/physical/lob.md)（LOB 物理层）、[`server/gis.md`](gis.md)（GeoJSON 与 JSON 的边界）、[`../../feat/generated_columns.md`](../../feat/generated_columns.md)（生成列机制全链路：求值器、虚拟列索引、undo/purge、binlog，本篇 8.1~8.3 只讲 JSON 视角）。
 
 ## 目录
 
@@ -309,7 +309,7 @@ MySQL 是分层架构，JSON 的语义全部在上面一层：
 
 **那它到底是不是"物理文件"？**
 
-- JSONB 的内容**最终确实会被写进 `.ibd` 文件**（作为 BLOB 列的值，超限则进 off-page LOB 页，见 `innodb/lob.md`）
+- JSONB 的内容**最终确实会被写进 `.ibd` 文件**（作为 BLOB 列的值，超限则进 off-page LOB 页，见 `innodb/physical/lob.md`）
 - 但它是**逻辑/编码格式**，不是 InnoDB 定义的存储结构
 
 类比一下就清楚了：
@@ -321,7 +321,7 @@ MySQL 是分层架构，JSON 的语义全部在上面一层：
 
 Word 不关心数据落在哪个磁盘块，磁盘也不认识 Word 文档——**JSONB 和 InnoDB 页格式就是这种关系**。
 
-顺带对比：**FTS 恰恰相反**（见 [`innodb/fts.md`](../../innodb/fts.md)），它是 InnoDB 自己维护的倒排索引，由 11 张辅助表承载，InnoDB **完全知道**里面每个字节的含义。这就是"JSON 当 BLOB 存"和"FTS 自建索引"的本质差别。
+顺带对比：**FTS 恰恰相反**（见 [`feat/fts.md`](../../feat/fts.md)），它是 InnoDB 自己维护的倒排索引，由 11 张辅助表承载，InnoDB **完全知道**里面每个字节的含义。这就是"JSON 当 BLOB 存"和"FTS 自建索引"的本质差别。
 
 格式文法注释在 `sql-common/json_binary.h:59-141`：
 
@@ -1238,7 +1238,7 @@ case MYSQL_TYPE_JSON:  // JSON fields are stored as BLOBs
 - 所有 JSON 语义（解析、路径、类型、比较）都在 server 层完成；
 - 部分更新是唯一打通两层的机制：server 把 `Binary_diff` 塞进 `upd_t`，InnoDB 照着改 LOB 页。
 
-> **off-page 之后的物理实现（first page / data page / index entry / lob_version / purge 回收）属于 InnoDB LOB 子系统，已独立到 [`innodb/lob.md`](../../innodb/lob.md)。** 这里只保留与 JSON 直接相关的结论。
+> **off-page 之后的物理实现（first page / data page / index entry / lob_version / purge 回收）属于 InnoDB LOB 子系统，已独立到 [`innodb/physical/lob.md`](../../innodb/physical/lob.md)。** 这里只保留与 JSON 直接相关的结论。
 
 > **GeoJSON / 空间类型与 JSON 共享解析器但存储独立，已独立到 [`server/gis.md`](gis.md)。**
 
@@ -1275,7 +1275,7 @@ if (dfield_is_ext(new_val) || old_len != new_len ||
 1. **JSON 值变长，即使还在"内联"范围内，也必须 delete+insert**，不是 in-place。这对短 JSON 的高频更新影响很大。
 2. **`MLOG_REC_UPDATE_IN_PLACE` 记录的是字段新值全量，不是 diff** —— `row_upd_index_write_log`（`row0upd.cc:644`）逐字段写 `field_no / len / 新值`。所以 in-place 路径下 redo 量仍与 JSON 值大小成正比。
 
-> ⚠️ **纠错（本轮发现）**：8.0.30 之后**写入侧已不再用 `MLOG_COMP_REC_*_8027`**。那批常量（`mtr0types.h:171/182/185`）全库只在两处出现：定义处和恢复解析 `log0recv.cc:2021/4142`，**写入路径（`btr/`、`page/`、`lob/`）零引用**。现在的写入侧类型是 `MLOG_REC_INSERT/DELETE/UPDATE_IN_PLACE`（67/69/70），因为引入了 `mlog_open_and_write_index()` 把 index 元信息内联进 redo 记录，不再需要区分 COMPACT/REDUNDANT 两套类型。
+> ⚠️ **纠错**：8.0.30 之后**写入侧已不再用 `MLOG_COMP_REC_*_8027`**。那批常量（`mtr0types.h:171/182/185`）全库只在两处出现：定义处和恢复解析 `log0recv.cc:2021/4142`，**写入路径（`btr/`、`page/`、`lob/`）零引用**。现在的写入侧类型是 `MLOG_REC_INSERT/DELETE/UPDATE_IN_PLACE`（67/69/70），因为引入了 `mlog_open_and_write_index()` 把 index 元信息内联进 redo 记录，不再需要区分 COMPACT/REDUNDANT 两套类型。
 
 ### 12.2 LOB 侧的 redo：全是通用类型
 
@@ -1707,7 +1707,7 @@ MaterializedTableFunctionIterator::Init (composite_iterators.cc:1965)
 | **DOM** | Document Object Model，JSON 的内存树形表示（`Json_dom` 子类） |
 | **Binary diff** | 物理层增量：`{offset, length}`，发给引擎 |
 | **Logical diff / Json_diff** | 逻辑层增量：`{REPLACE/INSERT/REMOVE, path, value}`，写进 binlog |
-| **LOB** | Large Object，InnoDB 8.0 重构后的大对象存储（first page + data page + index entry）—— 完整内容见 [`innodb/lob.md`](../../innodb/lob.md) |
+| **LOB** | Large Object，InnoDB 8.0 重构后的大对象存储（first page + data page + index entry）—— 完整内容见 [`innodb/physical/lob.md`](../../innodb/physical/lob.md) |
 | **lob_version** | LOB 首页上的版本号，MVCC 用它区分同一 LOB 的不同版本 |
 | **multi-valued index** | 多值索引，一个 JSON 数组展开成 N 条二级索引记录 |
 | **auto-wrapping** | 对非数组值应用 `[0]` 时隐式包成单元素数组（MySQL 扩展） |
@@ -1848,4 +1848,4 @@ A：**默认会**。JSON 列是 BLOB，row 格式下 binlog 对 BLOB 只能全�
 | `storage/innobase/include/lob0pages.h:97` | LOB 页有效载荷 `payload() = 16327` |
 | `storage/innobase/lob/lob0impl.cc:929` / `:1048` | `lob::insert`（全量重写）/ 每 4 页提交一次 mtr |
 
-> LOB 更完整的速查见 [`innodb/lob.md`](../../innodb/lob.md)。
+> LOB 更完整的速查见 [`innodb/physical/lob.md`](../../innodb/physical/lob.md)。

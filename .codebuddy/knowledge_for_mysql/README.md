@@ -43,30 +43,36 @@
 
 | 文件 / 目录 | 内容 |
 |---|---|
+| [table.md](server/table.md) | **表**：四层表示（DD → `TABLE_SHARE` → `TABLE` → `Table_ref`）、三个缓存分工（TDC / `table_open_cache` 16 分片 / InnoDB dict）、表的八种通用操作（open / lock / CREATE / ALTER / RENAME / TRUNCATE / DROP / FLUSH）与各自入口函数、分区表 SHARE↔`dict_table_t` 一对多 |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
 | [mdl.md](server/mdl.md) | MDL 元数据锁：表结构保护、双兼容性矩阵排队语义、wait-for graph 死锁检测 |
 | [auth/](server/auth/) | 认证与授权：security_context.md（认证上下文）、mfa.md（多因素认证）、definer.md（definer 与 SQL SECURITY） |
 | [replication/](server/replication/) | 复制：binlog.md（格式/组提交/2PC）、gtid.md、replication.md（主从）、prpl.md（并行复制） |
 | [datatype/](server/datatype/) | 数据类型：json.md（JSON 二进制/部分更新/索引）、gis.md（空间/R-tree） |
-| [infra/](server/infra/) | 通用机制：list.md（侵入式链表）、dbug.md（DBUG 框架）、pfs_and_memory.md（PFS 与内存）、vio.md（VIO 通信抽象） |
+| [dd/](server/dd/) | **数据字典**（两套并存）：dd.md（8.0 权威 DD：DD 表体系、`dd::Table` 对象模型、DD↔文本往返、DD cache、SDI、`innodb_dynamic_metadata`）、innodb_dict.md（引擎侧 `dict_sys`：DICT_HDR 页、`SYS_*` 内部表、`dict_table_t`/`dict_index_t`、dict cache、从 DD 加载） |
+| [infra/](server/infra/) | 通用机制：list.md（侵入式链表）、dbug.md（DBUG 框架）、pfs.md（PFS 可观测性）、memory.md（内存分配器矩阵）、vio.md（VIO 通信抽象）、variables.md（变量体系） |
+| [plugin/](server/plugin/) | 可扩展框架：plugin.md（插件体系：ABI/类型/加载安装/引用计数延迟收割）、component.md（组件基础设施：minimal chassis/dynamic loader/mysql.component/manifest/内置组件清单）、service.md（服务：C ABI 契约/registry/default/acquire_related/老版 plugin service）、abi.md（**横切专题**：C++ ABI 五个不稳定点/符号可见性/异常防线/旧结构迁移/.pp 指纹门禁）；具体插件分析（如 clone_plugin.md）后续进此目录 |
 
 ### [innodb/](innodb/) —— 存储引擎
 
+> **物理结构**（表空间空间管理/页/行/LOB 四篇）集中在 [`innodb/physical/`](innodb/physical/) 子目录：`tablespace`（表空间/段/区/碎片度量）、`page_structure`（页 + 全页类型清单）、`record`（行）、`lob`（大对象）。
+
 | 文件 | 内容 |
 |------|------|
-| [buffer_pool.md](innodb/buffer_pool.md) | LRU、flush list、预读、page cleaner |
+| [buffer_pool.md](innodb/buffer_pool.md) | **Buffer Pool**：slot-based 骨架与 chunk 布局、`buf_page_t`/`buf_block_t` 状态机与 `buf_page_in_file`、io_fix 声明式 latch 协议校验（`Stateful_latching_rules`）、LRU 中点替换（old/new + `old_blocks_time` 时间窗抗扫描污染）、线性/随机预读、脏页刷盘三路径汇聚 `buf_flush_write_block_low`（WAL 先行 + checksum + doublewrite）、自适应刷脏（LSN age 因子 sqrt 非线性）、`Adaptive_flush`、压缩页三态（ZIP_PAGE/ZIP_DIRTY/FILE_PAGE）、page cleaner coordinator/worker、Buffer Pool Watch 哨兵、DBUG `ib_buf` 观测 |
 | [mvcc.md](innodb/mvcc.md) | read view、可见性判断、半一致性读 |
 | [row_search.md](innodb/row_search.md) | `row_search_mvcc`、游标推进（承接 handler.md） |
-| [page_structure.md](innodb/page_structure.md) | **B+ 树页物理结构**：FIL header/page header、infimum/supremum、heap + 单向链表 + page directory 稀疏索引、`page_cur_search` 页内二分 |
+| [btr.md](innodb/btr.md) | **索引 B-tree 结构与操作（btr 模块全套）**：游标体系与 `btr_cur_search_to_nth_level` 搜索（latch coupling + 8.0 SMO 锁预测裁剪）、乐观/悲观插入与页分裂（顺序插入感知 / 根页抬高）、删除与合并（merge_threshold / lift 降高）、更新三条路径、持久游标恢复协议、自适应哈希索引 AHI（8.0.30 分片）、`Btree_load` 排序批量构建 |
+| [tablespace.md](innodb/physical/tablespace.md) | **表空间物理结构与空间管理**：FSP header 112B / XDES 40B / inode 192B / fseg header 10B 逐字节布局、segment header → inode → fseg 解析链、`fseg_alloc_free_page_low` 七分支 / `fsp_alloc_free_page` / `fsp_free_page` / `fseg_mark_page_used` / lease 机制 / reserve factor、`FSP_FLAGS` 位域、系统表空间页布局、碎片度量（`DATA_FREE` / `FREE_EXTENTS`） |
+| [page_structure.md](innodb/physical/page_structure.md) | **页物理结构与全页类型清单**：FIL header/page header、infimum/supremum、heap + 单向链表 + page directory 稀疏索引、`page_cur_search` 页内二分、30 种页类型清单、**12 类常见页的逐字节 layout**（INDEX / FSP_HDR / XDES / INODE / IBUF_BITMAP / COMPRESSED / RSEG_ARRAY / TRX_SYS / BLOB-LOB / UNDO / SDI / ENCRYPTED） |
+| [record.md](innodb/physical/record.md) | **行记录格式与 offsets 数组**：record header 5/6 字节与 info bits、变长长度编码（1/2 字节 + 外置 0x40 位）、NULL 位图、`rec_get_offsets` 全链、offsets 前缀和 + 高 4 位标志协议、REDUNDANT 1/2 字节目录、instant V1/V2 行版本状态机、写方向 `rec_convert_dtuple_to_rec`、固定 offsets 缓存 |
+| [lob.md](innodb/physical/lob.md) | 大对象存储（JSON 部分更新的物理基础） |
 | [lock.md](innodb/lock.md) | 行锁、间隙锁、死锁检测 |
 | [redo_log.md](innodb/redo_log.md) | redo 格式、LSN、崩溃恢复 |
 | [undo_log.md](innodb/undo_log.md) | undo 表空间、purge |
 | [query_graph.md](innodb/query_graph.md) | InnoDB 内部执行模型（fork/thr/node） |
-| [lob.md](innodb/lob.md) | 大对象存储（JSON 部分更新的物理基础） |
 | [ddl.md](innodb/ddl.md) | online DDL |
-| [fts.md](innodb/fts.md) | 全文索引 |
 | [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`）+ 澄清社区无 SQL 层并行查询 |
-| [tablespace.md](innodb/tablespace.md) | 表空间碎片度量（`DATA_FREE` / `FREE_EXTENTS` 计算链路）、两层碎片辨析 |
 | [io.md](innodb/io.md) | I/O 路径：Buffered I/O vs O_DIRECT、`innodb_flush_method`、redo 刷盘、double buffering |
 | [trx.md](innodb/trx.md) | InnoDB 事务（`trx_t`） |
 
@@ -77,6 +83,9 @@
 | 文件 | 内容 |
 |---|---|
 | [partitioning.md](feat/partitioning.md) | **分区表**（全链路单篇）：`partition_info` 元数据模型、DD 持久化与"DD→文本→重解析"往返、分区裁剪（假索引复用 range 优化器）、`Partition_helper` 的 DML 路由、`ha_innopart` 的分区上下文切换与 per-partition `dict_table_t`、TRUNCATE/EXCHANGE/ADD-DROP PARTITION、分区统计与能力边界 |
+| [fts.md](feat/fts.md) | **全文检索**（全链路单篇）：`MATCH...AGAINST` 语法与 `Item_func_match` 生命周期、优化器 `FT_KEYPART`/`JT_FT` 与 hints 下推、`FullTextSearchIterator`、filesort 的 FTS 特例、11 张辅助表与 ilist/VLC 编码、`FTS_DOC_ID`、`fts_cache` 与 sync/后台 optimize、墓碑删除与 OPTIMIZE 重写、布尔 AST 三遍遍历、`tf × idf²` 打分、崩溃恢复、InnoDB 与 MyISAM 差异 |
+| [auto_increment.md](feat/auto_increment.md) | **自增列**（全链路单篇）：三档 AUTOINC 锁模式与 `innobase_lock_autoinc` 逐分支（★ 默认 2 = NO_LOCKING 且为只读变量；mode1 检测到他人持表锁时"先放 mutex 再降级"规避死锁）、handler 区间分配与 `nb_desired_values` 的可靠性边界、★ 计数器持久化（`dict_table_autoinc_log` 写 redo + DDTableBuffer，8.0 重启不回退）、★ 纠正"重启必 SELECT MAX"（仅 IMPORT 无 cfg/表空时兜底）、DDL 保留计数器、空洞三来源与达到列上限行为 |
+| [generated_columns.md](feat/generated_columns.md) | **生成列**（全链路单篇）：VIRTUAL/STORED 语义、`Value_generator` 元数据与打开表时 `PARSE_GCOL_EXPR` 重解析、`vfield` 单遍求值器（依赖位图 + 拓扑序假设）、读写两条求值链路与覆盖索引短路、虚拟列二级索引（索引页物化 vcol 值 + `innobase_get_computed_value` 回调 + purge 无 TABLE 开表求值）、undo 中的 vcol 旧值与 v_idx、binlog 不对称镜像与备库重算、instant ADD/DROP 虚拟列、隐藏生成列家族（功能索引/多值索引/GIPK） |
 
 ### [log/](log/) —— 服务器日志
 
@@ -120,6 +129,7 @@
         ├─ 数据类型（JSON/GIS/时间类型…）  → server/datatype/
         ├─ binlog 与复制                    → server/replication/
         ├─ 被全局复用的通用机制             → server/infra/
+        ├─ 插件/组件/服务（可扩展框架）     → server/plugin/
         └─ 服务器日志                       → log/
 ```
 
@@ -134,7 +144,7 @@
 - 是**另一条并行的主链**，而非现有链的分支
   （例：DML 与 SELECT 共用前段但执行完全不同，独立为 `09_dml.md`，没有塞进 `runtime/`）
 - 是**通用子系统**，被多个上层复用
-  （例：LOB 是 InnoDB 通用机制，从 `json.md` 拆出为 `innodb/lob.md`）
+  （例：LOB 是 InnoDB 通用机制，从 `json.md` 拆出为 `innodb/physical/lob.md`）
 
 **该并入现有篇** —— 满足任一条：
 

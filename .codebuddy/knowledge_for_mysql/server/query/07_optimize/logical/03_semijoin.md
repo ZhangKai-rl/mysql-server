@@ -5,12 +5,13 @@
 ## 目录
 
 - [一、Semi-join 要解决什么问题](#一semi-join-要解决什么问题)
-- [二、Notation：ot/ct/nt/it](#二notationotctntit)
-- [三、Rewrite Phase：子查询拍平成 semi-join](#三rewrite-phase子查询拍平成-semi-join)
-- [四、Optimize Phase：五种策略的代价选择](#四optimize-phase五种策略的代价选择)
-- [五、Execution Phase：每种策略怎么执行](#五execution-phase每种策略怎么执行)
-- [六、五种策略的 JOIN ORDER 矩阵](#六五种策略的-join-order-矩阵)
-- [七、optimizer_switch 与 Hint](#七optimizer_switch-与-hint)
+- [二、设计思想与理论基础](#二设计思想与理论基础)
+- [三、Notation：ot/ct/nt/it](#三notationotctntit)
+- [四、Rewrite Phase：子查询拍平成 semi-join](#四rewrite-phase子查询拍平成-semi-join)
+- [五、Optimize Phase：五种策略的代价选择](#五optimize-phase五种策略的代价选择)
+- [六、Execution Phase：每种策略怎么执行](#六execution-phase每种策略怎么执行)
+- [七、五种策略的 JOIN ORDER 矩阵](#七五种策略的-join-order-矩阵)
+- [八、optimizer_switch 与 Hint](#八optimizer_switch-与-hint)
 
 ---
 
@@ -31,7 +32,131 @@ Country 的一行 `code='CN'`，如果 City 里有多个城市 Population > 7e6�
 
 ---
 
-## 二、Notation：ot/ct/nt/it
+## 二、设计思想与理论基础
+
+### 为什么必须有五种策略？
+
+**关键认知：semi-join 不是一个"算子"，而是"join order 上的一段区间 + 一个去重义务"。**
+
+源码 `setup_semijoin_dups_elimination()` 的注释开篇就点明了这个模型：
+
+```
+The join order has "duplicate-generating ranges", and every range is
+served by one strategy or a combination of FirstMatch with some other strategy.
+
+"Duplicate-generating range" is defined as a range within the join order
+that contains all of the inner tables of a semi-join.
+```
+
+区间的位置由 join reordering 决定，而去重能力又反过来约束 join order——正是这个**双向耦合**导致了"必须有多种策略"。
+
+**最硬的源码证据**在 `advance_sj_state()` 里：
+
+```
+Use the strategy if
+ * it is cheaper then what we've had, or
+ * we haven't picked any other semi-join strategy yet
+In the second case, we pick this strategy unconditionally because
+comparing cost without semi-join duplicate removal with cost with
+duplicate removal is not an apples-to-apples comparison.
+```
+
+> **"未去重的代价"和"已去重的代价"根本不同量纲，无法直接比较。**
+
+所以优化器不能只挑"最便宜的算子"，而必须保证**每个前缀上至少有一个策略能让去重成立**——这就是五策略必须共存的形式化理由。整个 `advance_sj_state()` 的核心不变量是位图 `dups_producing_tables`：**"还没被任何策略消除重复的内表集合，结束时必须为 0"**。
+
+### 分类学：3 类去重思路 × 4 个正交维度
+
+**维度一（最本质）：去重发生在什么时刻**
+
+| 类别 | 成员 | 机制 | 重复行是否真被生成过 |
+|---|---|---|---|
+| **① 提前退出（prevention）** | FirstMatch、LooseScan | 控制流层面"一组只取第一个" | 否（内表侧被短路/跳过） |
+| **② 事后剔除（cure）** | DuplicateWeedout | 先按内连接跑出全部重复，再用 rowid 唯一键过滤 | **是** |
+| **③ 预先做成无重复的块（normalize）** | Materialize×2 | 先物化内表并去重，之后退化成普通 join | 否（内表侧已去重） |
+
+**维度二：依赖什么物理设施**
+
+| 设施 | 策略 |
+|---|---|
+| 只靠执行控制流（零内存、零临时表） | FirstMatch |
+| 必须依赖**索引** | LooseScan |
+| 依赖**临时表** | DuplicateWeedout、MaterializeScan/Lookup |
+| 物化表上还要能**建索引** | MaterializeLookup（Scan 不需要） |
+
+Materialize 的两个子型就是按"用不用索引"拆出来的——源码明说 MaterializeLookup 不能用于 BLOB/GEOMETRY 列（"since indexes are not supported for BLOB columns"），而 Scan 可以。
+
+**维度三：谁驱动（内表在前还是外表在前）**
+
+- **外表驱动**：FirstMatch、MaterializeLookup
+- **内表驱动**：LooseScan（要求"相关外表都还没进前缀"）
+- **双向皆可**：MaterializeScan、DuplicateWeedout
+
+**维度四（最精妙）：FirstMatch 与 LooseScan 的进入条件严格互补**
+
+- FirstMatch 要求：相关外表**全部**已进前缀 —— `!(remaining_tables & outer_corr_tables)`
+- LooseScan 要求：**还有**相关外表没进前缀 —— `remaining_tables_incl & sj_depends_on`
+
+给定同一个 join 前缀，FM 与 LS 恰好覆盖两种**互斥**情形。**少了任何一个，就有一整类 join order 无法去重。**
+
+### 各策略分别牺牲了什么
+
+| 策略 | 收益 | 牺牲 |
+|---|---|---|
+| **FirstMatch** | 零临时表零内存，只改跳转指针 | 内表必须连续成块；多张内表时**禁用 join buffer**；不能跨 embedding nest 跳转 |
+| **LooseScan** | 行数直接用 `rec_per_key` 塌缩（`rowcount /= rpc`），**不物化不建临时表** | 必须内表驱动（放弃所有"外表在前"的 join order）；强索引要求；IN 表达式 ≤ 64；**不能用于 antijoin** |
+| **MaterializeLookup** | 内表彻底去重，后续 fanout 用 `distinct_rowcount` | 非平凡相关子查询**完全不可用**（`sj_corr_tables != 0` 直接放弃）；内表必须连续成块；类型/长度/BLOB 三道关 |
+| **MaterializeScan** | 允许物化表当驱动表，外表顺序自由 | 同上，且要预付 `materialization_cost`（建表 + 写 `mat_rowcount` 行），**哪怕外表只输出 1 行也要付** |
+| **DuplicateWeedout** | 对 join order **零约束** → 能把 semi-join 当普通 join 重排 | 重复行真的被生成、真的写过临时表（一次写 + 一次唯一键探查）；临时表可能落盘 |
+
+### 理论溯源：为什么 MySQL 搞这么多种？
+
+semi-join 在关系代数里是 R ⋉ S = π_R(R ⋈ S)，分布式数据库用"半连接缩减"减少传输量。但 **MySQL 的实现目标不同**：它要避免的是**行膨胀**（内表重复匹配导致外表行被放大）。
+
+**与 PostgreSQL / Oracle 的关键差异，根源是历史包袱**：
+
+MySQL 老优化器只有 nested loop 家族，五种策略全部是"在 nested loop 框架内去重"：
+
+- **FirstMatch** = 循环短路
+- **LooseScan** = 利用索引顺序（B-Tree 是 MySQL 唯一原生索引结构）
+- **Weedout** = 临时表唯一键 —— **因为没有 hash 表算子，只能拿临时表当 hash set 用**
+- **Materialize** = 临时表 + `<auto_distinct_key>` 唯一键，同样是"用临时表模拟 hash 去重"
+
+对比：PostgreSQL 的 `Hash Semi Join` 用内存 hash 表，一侧 build 一侧 probe，**天然"每个 probe 行只输出一次"**——因为 hash join 是"整块"算子，**去重建在算子内部**，不需要为不同 join order 设计不同的去重机制。
+
+MySQL 直到 8.0 才有 hash join，而在 hash join 里 semi-join 天然被支持：
+
+```cpp
+case JoinType::SEMI:
+  // Semijoin should return the first matching row, and then go to the next
+  // row from the probe input.
+```
+
+**这正是"五种策略"这个复杂度的历史由来**——它是一个"没有 hash join 的年代"留下的解决方案集合。
+
+### 三级兜底
+
+1. **策略内兜底**：DuplicateWeedout 无条件采纳（"not an apples-to-apples"）
+2. **退化成内连接**：`pull_out_semijoin_tables()` 把被 eq_ref 唯一确定的内表抽出 nest；nest 被抽空则整个 semi-join 消失。hypergraph 源码直接写了这条等价律：*"If the inner side is known to be free of duplicates on the key ... semijoin is equivalent to inner join"*。注意副作用：**pullout 会把不相关子查询变成相关的，从而失去 Materialize / LooseScan 资格**
+3. **转成 EXISTS**：表数超 `MAX_TABLES`(61)、子查询含 antijoin nest、或有 UNION/HAVING/聚合/LIMIT 等 → 退回 `IN→EXISTS`
+
+### 参数
+
+`optimizer_switch` 里 semijoin 相关的五个开关（`semijoin` / `firstmatch` / `loosescan` / `materialization` / `duplicateweedout`）**全部默认 on**。两个易错点：
+
+- 控制 semi-join 物化的开关名是 **`materialization`**（不是 `semijoin_materialization`），它与"子查询物化"**共用同一个 flag**
+- **antijoin（NOT IN / NOT EXISTS）会被强制砍掉 LooseScan**：
+
+```cpp
+if (sj_nest->is_aj_nest()) {
+  // only these are possible with NOT EXISTS/IN:
+  sj_enabled_strategies &= FIRSTMATCH | MATERIALIZATION | DUPSWEEDOUT;
+}
+```
+
+---
+
+## 三、Notation：ot/ct/nt/it
 
 内核月报 2021/06 定义的记法，理解五种策略的前提：
 
@@ -46,7 +171,7 @@ Country 的一行 `code='CN'`，如果 City 里有多个城市 Population > 7e6�
 
 ---
 
-## 三、Rewrite Phase：子查询拍平成 semi-join
+## 四、Rewrite Phase：子查询拍平成 semi-join
 
 ### 3.1 resolve_subquery：收集候选（准入条件）
 
@@ -178,7 +303,7 @@ anti-join（AJ）建模成 **LEFT JOIN + 右表键 IS NULL**。
 
 ---
 
-## 四、Optimize Phase：五种策略的代价选择
+## 五、Optimize Phase：五种策略的代价选择
 
 ### 4.1 make_join_plan 的前置
 
@@ -256,7 +381,7 @@ return SJ_OPT_MATERIALIZE_LOOKUP;                      // 否则索引查找
 
 ---
 
-## 五、Execution Phase：每种策略怎么执行
+## 六、Execution Phase：每种策略怎么执行
 
 > 本篇从**优化器视角**讲"选定策略后如何落到 QEP/迭代器"。**运行期的执行机制**（物化引擎 `subselect_hash_sj_engine`、IN2EXISTS 的 `Item_in_optimizer`、子查询缓存）详见 [`../../runtime/02_subquery_runtime.md`](../../runtime/02_subquery_runtime.md)。
 
@@ -315,7 +440,7 @@ ot -> [it1 -> nt1 -> it3]
 
 ---
 
-## 六、五种策略的 JOIN ORDER 矩阵
+## 七、五种策略的 JOIN ORDER 矩阵
 
 内核月报 2024/06《Semijoin 丛林小道全览》总结（用 `ct1,ct2` 外表 + `it1,it2` 内表，`WHERE ct1.a IN (SELECT it1.a FROM it1,it2 WHERE it2.b=ct2.b)`）：
 
@@ -331,7 +456,7 @@ ot -> [it1 -> nt1 -> it3]
 
 ---
 
-## 七、optimizer_switch 与 Hint
+## 八、optimizer_switch 与 Hint
 
 `optimizer_switch` 里 semi-join 相关开关（内核月报 2020/07）：
 

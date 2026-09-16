@@ -5,6 +5,7 @@
 ## 目录
 
 - [先有个整体印象](#先有个整体印象)
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、关键版本事实：JOIN_CACHE 已删除](#一关键版本事实join_cache-已删除)
 - [二、BNL：优化器标记，执行器改写为 hash join](#二bnl优化器标记执行器改写为-hash-join)
 - [三、BKA：BKAIterator + MultiRangeRowIterator + DS-MRR](#三bkabkaiterator--multirangerowiterator--ds-mrr)
@@ -27,6 +28,47 @@ join buffer 的经典动机没变：**避免"外层每进一行，内层表就�
 | `HashJoinRowBuffer` | `hash_join_buffer.h:119` | hash join 的 build 端内存哈希表 |
 | `BKAIterator` 的 `MEM_ROOT + m_rows` | `bka_iterator.h:202` | BKA 的外层行缓冲 |
 | BKA 的 MRR rowid buffer | `bka_iterator.h:400` | 内层批量读的 rowid 排序缓冲区 |
+
+---
+
+## 设计思想与理论基础
+
+### 为什么需要 join buffer：NLJ 的 O(N×M) 困境
+
+朴素嵌套循环（NLJ）的问题是：外层每进一行，内层表就要**完整扫一遍**。外层 N 行、内层 M 行 ⇒ 内层被扫 N 次，总代价 O(N×M)。当内层没有可用索引时只能如此。
+
+join buffer 的思路是**批量化**：外层一次读入 buffer（一批），内层只扫一遍，与 buffer 里所有外层行比对，内层扫描次数从 N 降到 N/batch。
+
+> 本质：**用内存换 IO**。这是 join buffer 家族所有技术的共同思想——**区别只在"换掉的究竟是什么"**。
+
+### 三条路线，换掉的东西不同
+
+| 技术 | 换掉什么 | 机制 | 比较次数 |
+|---|---|---|---|
+| **BNL**（Block Nested Loop） | 内层的**重复扫描** | 外层批量入 buffer，内层扫一遍 × 与 buffer 全部行比对 | **仍是 O(N×M)** |
+| **BKA**（Batched Key Access） | **随机 IO** | 外层批量 → 收集 key → MRR 按 rowid 排序 → 批量索引查找 | O(N)（走索引） |
+| **hash join** | **比较次数本身** | build 端建哈希表，probe 端 O(1) 探测 | **O(N+M)** |
+
+**关键洞察**：BNL 只省了 IO，**没省比较**——仍要拿内层每一行去和 buffer 里所有行比对。hash join 则把比较次数从 O(N×M) 降到 O(N+M)。
+
+所以 **hash join 在各维度上都不劣于 BNL**，这就是它取代 BNL 的理论原因。BKA 不与之冲突：它只适用于**内层有索引**的场景，价值是把"按外层顺序的随机索引查找"变成"按 rowid 排序后的顺序查找"（DS-MRR）。
+
+### 演进：为什么 BNL 只剩一个标记
+
+BNL 是"没有 hash join 的年代"的折中。8.0 引入 hash join 后，优化器仍产出 `ALG_BNL` 标记，但**执行器一律改写为 hash join**——BNL 退化为一个**优化器侧的遗留标记**，真正的"分块循环"语义由 hash join 的 `IN_MEMORY_WITH_HASH_TABLE_REFILL` 模式承载。
+
+这也解释了为什么 `JOIN_CACHE` 会被删到只剩 33 行空壳枚举：**实现没了，标记还在**。
+
+### 代价与限制
+
+- **`join_buffer_size` 是双向约束**：太小 → 装不下 build 端，需多趟 refill（退化为"分块"）；太大 → 并发查询内存压力大（它是**每个 join 各自分配**，不是全局共享）
+- **spill**：hash join 装不下时溢出到磁盘 chunk 文件，代价陡增
+- **适用面**：hash join 只用于等值连接；BKA 要求内层有索引
+
+### 他库对比
+
+- PostgreSQL 从一开始就把 hash join 作为主力，并有 `work_mem` 控制 spill——与 MySQL 的 `join_buffer_size` 定位相似
+- MySQL 直到 **8.0.18** 才有 hash join，此前长期只有 NLJ + BNL + BKA，这是它历史上 OLAP 能力弱的重要原因之一
 
 ---
 

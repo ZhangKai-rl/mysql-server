@@ -5,6 +5,7 @@
 ## 目录
 
 - [先有个整体印象](#先有个整体印象)
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、Window 对象与 setup](#一window-对象与-setup)
 - [二、流式 vs 缓冲：两种迭代器](#二流式-vs-缓冲两种迭代器)
 - [三、frame 语义与 RANGE 三路比较器](#三frame-语义与-range-三路比较器)
@@ -29,6 +30,57 @@
   ├─ 流式：check_partition_boundary 触发 WF clear，边读边累加
   └─ 缓冲：buffer_windowing_record 写 frame buffer → process_buffered_windowing_record 判断可输出
 ```
+
+---
+
+## 设计思想与理论基础
+
+### 窗口函数解决什么问题
+
+聚合（`GROUP BY`）会**塌缩行数**：N 行输入 → G 组输出。窗口函数保留 N 行，同时让每行都能访问"它所在分区的聚合上下文"。
+
+形式上，窗口函数 = **分区（PARTITION BY）+ 排序（ORDER BY）+ 帧（frame）** 三元组，为每行算出一个值。
+
+### 根本约束：是否需要看"当前行之后的行"
+
+这是窗口函数执行器设计的**唯一分水岭**：
+
+| | frame 范围 | 能否流式 | 典型例子 |
+|---|---|---|---|
+| **流式** | 只到 CURRENT ROW（`UNBOUNDED PRECEDING .. CURRENT ROW`） | ✅ 边读边累加 | `ROW_NUMBER()`、`SUM() OVER (ROWS UNBOUNDED PRECEDING)` |
+| **缓冲** | 涉及 `FOLLOWING` / `RANGE` / 整个 partition | ❌ 必须缓冲一个 partition | `LEAD/LAG`、`NTILE`、`CUME_DIST` |
+
+原因很直白：**算当前行需要未来的行，就只能先攒着**。这条约束直接决定了用哪个迭代器（本文第二章）。
+
+### inversion：滑动窗口的增量优化
+
+朴素实现：每个 frame 重新计算 ⇒ O(n × frame_size)。
+优化：frame 是滑动的，相邻两个 frame 只差"离开的一行"与"进入的一行" ⇒ **增量维护**：
+
+```
+new_value = old_value ⊕ entering_row ⊖ leaving_row
+```
+
+对应 `Window` 的 `m_row_optimizable`（ROWS 可用）与 `m_range_optimizable`（RANGE 可用）两个标志。
+
+⚠️ **理论限制**：inversion 要求聚合有**逆运算**。加法有逆（减法），故 `SUM`/`COUNT`/`AVG` 可行；但 **`MAX`/`MIN` 没有逆运算**——移除一个元素后无法得知新的极值（除非改用单调栈等结构），字符串聚合同理。所以 inversion 不是万能的。
+
+### 为什么必须先排序
+
+窗口函数的语义建立在 `PARTITION BY + ORDER BY` 之上，执行前输入必须**按 partition + order 排好序**。这个排序（filesort）往往是窗口函数查询的主要代价——`Window::m_sorting_order` 就是二者合并后的物理排序键。
+
+推论：**`RANGE` 帧比 `ROWS` 帧贵**，因为它需要 peer 判定（相同排序键的行属于同一 peer），这由本文第三章的三路比较器承担。
+
+### 他库对比与演进
+
+- PostgreSQL / Oracle 同样采用"排序 + 流式/缓冲"两分法，差异主要在 RANGE 帧的 peer 判定与 inversion 的覆盖范围
+- MySQL 的窗口函数是 **8.0 才引入**的，此前只能用自连接或用户变量模拟。这解释了两点：①实现相对"教科书式"（两分法清晰）②优化空间（如并行窗口、更激进的 inversion）尚未展开
+
+### 代价要点
+
+1. **排序代价**（filesort，可能落盘）
+2. **缓冲代价**：缓冲模式下整个 partition 需驻留内存或 `frame buffer` 表
+3. **RANGE 帧额外代价**：peer 判定
 
 ---
 

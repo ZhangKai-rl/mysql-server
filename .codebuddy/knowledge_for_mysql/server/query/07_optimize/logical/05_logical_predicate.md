@@ -4,11 +4,284 @@
 
 ## 目录
 
+- [设计思想与理论基础](#设计思想与理论基础)
 - [零、流水线与常见误解](#零流水线与常见误解)
 - [一、等值传播（Item_equal 等价类）](#一等值传播item_equal-等价类)
 - [二、常量折叠](#二常量折叠)
 - [三、谓词下推](#三谓词下推)
 - [四、索引条件下推 ICP](#四索引条件下推-icp)
+
+---
+
+## 设计思想与理论基础
+
+> 本章只回答"为什么这么设计"，实现细节见后面各节。
+
+### A. 四类谓词优化的共性：三种原子操作
+
+MySQL 里 WHERE 条件是一棵 `Item` 树。等值传播、常量折叠、谓词下推、ICP 看似无关，实则都在做**三种原子操作**：
+
+| 原子操作 | 语义 | 对应优化 |
+|---|---|---|
+| **推导 derive** | 从已知谓词推出新谓词 | 等值传播、常量传播 |
+| **移动 move** | 语义不变，改变求值点 | 谓词下推、ICP |
+| **消解 resolve** | 优化期就求值，用 `Item_func_true/false` 替换/删除子树 | 常量折叠、平凡条件消除 |
+
+⇒ 统一定义：**谓词优化 = 在不改变结果集的前提下，改变"哪些谓词存在"、"每个谓词在哪求值"、"哪些能在优化期定死"，使每一行被丢弃得尽可能早、尽可能便宜。**
+
+**为什么"移动谓词"能带来收益？** 看 `POSITION` 的递推式：
+
+```cpp
+  void set_prefix_join_cost(uint idx, const Cost_model_server *cm) {
+    if (idx == 0) {
+      prefix_rowcount = rows_fetched;
+      prefix_cost = read_cost + cm->row_evaluate_cost(prefix_rowcount);
+    } else {
+      prefix_rowcount = (this - 1)->prefix_rowcount * rows_fetched;
+      prefix_cost = (this - 1)->prefix_cost + read_cost +
+                    cm->row_evaluate_cost(prefix_rowcount);
+    }
+    prefix_rowcount *= filter_effect;
+  }
+```
+
+即 `prefix_rowcount(i) = prefix_rowcount(i-1) × rows_fetched(i) × filter_effect(i)`。
+
+⇒ **谓词收益 = 选择率 × 它所在层的输入行数，且会被其后所有层连乘放大。** 越早生效的选择率，被后续层放大的次数越多，省得越多。
+
+**一个关键且常被忽略的点**：`filter_effect` 只统计"**没被访问方法吃掉**"的谓词（源码注释：*"the fraction of the rows_fetched rows that will pass the table conditions that were NOT used by the access method"*）。
+
+⇒ 由此推出：**下推的极致不是"挂到更早的表"，而是"变成访问方法"。** 一个谓词若变成 SARGable，它就从 `filter_effect` 挪进了 `rows_fetched`，直接减少**读**的行数而非读完后过滤的行数。这正是 B 节里 "sargable transitive closure" 比 "join transitive closure" 更值钱的原因。
+
+**四类优化的顺序**（`optimize_cond()` 头注释就是官方定义）：
+
+```
+equality_propagation → constant_propagation → trivial_condition_removal
+```
+
+- **(a) 必须在 (b) 之前**：(b) 的注释原文 *"By transitivity, this also applies to MEPs, so the MEP in a) will become 42=x=y=z"*——没有 (a) 产出的 MEP 就没有 b 的输入；且 (b) 只认二元 `EQ_FUNC`/`EQUAL_FUNC`，**不认 `MULT_EQUAL_FUNC`**，所以两者是互补而非竞争
+- **(c) 必须最后**：它是唯一**删除节点**的 pass，删除会破坏后续推导所需的语料。这是编译器优化的标准范式：**先做常量传播（增量），再做死代码消除（消减）**
+- **ICP 必须最后**：它的第一个参数是 `keyno`（选中索引号）——没有 join order 和 access type 就没有"索引列"这个概念；且它的输入 `QEP_TAB::condition()` 本身就是普通下推的产物
+
+一个不对称（源码直接可证）：`optimize_cond` 对 HAVING 的调用传 `join_list == nullptr`，所以 **HAVING 不做等值传播**（等值传播依赖 join 结构与 ON 的继承链），但常量折叠与平凡消除照做。
+
+### B. 为什么需要"等价类"这个数据结构
+
+**不用等价类、直接两两传播会怎样？两条路都走不通。**
+
+- **路线一（只保留原谓词，临时传播）**：判断"f3 属于哪个类"每次都要扫描全部谓词，等于反复重算闭包
+- **路线二（预先物化 n² 个谓词）**：`f1=f2 AND f2=f3 AND ...` 要完备必须物化 O(n²) 个 `fi=fj`，Item 树会膨胀，PS 重执行要回滚的改动量爆炸
+
+**等价类的解法：用 O(n) 存储表达 O(n²) 的语义。** `Item_equal` 一个类注释就是设计说明书：
+
+```cpp
+/*
+  An item of this class Item_equal(f1,f2,...fk) represents a
+  multiple equality f1=f2=...=fk.
+*/
+```
+
+成员是 `List<Item_field> fields`（O(n)）+ 可选 `Item *m_const_arg`。**它实质上就是 union-find，只是实现很"土"**：
+
+| union-find 原语 | MySQL 实现 |
+|---|---|
+| **find** | `find_item_equal()` 沿 `cond_equal->current_level` 线性扫，再沿 `upper_levels` 往上爬 |
+| **union** | `Item_equal::merge()` 只有 `fields.concat(&item->fields);` —— **O(1)** |
+| 路径压缩 / 按秩合并 | **没有** |
+
+**为什么"够用"**：等值谓词数量级是几十，`merge` 是 O(1)，路径压缩属于过度设计。
+
+**关键对照**——O(n²) 的展开真实存在，但它是**消费端**的临时数组，不是存储端的 Item 树：
+
+```cpp
+} else {
+  // 无常量：所有有序对 (field_i, field_j), i≠j —— O(n²)
+  for (Item_field &outer : item_equal->get_fields())
+    for (Item_field &inner : item_equal->get_fields())
+      if (!outer.field->eq(inner.field))
+        add_key_field(..., &outer, true, &inner_ptr, 1, ...);
+}
+```
+
+`add_key_fields` 生成的是 `Key_use` 数组（一次性推导，用完就丢）。⇒ **等价类的价值就在于把 O(n²) 从"持久表示"降级为"一次性推导"。**
+
+**还有等价类独有、两两传播根本做不到的能力：延迟决策。** O(n²) 展开必须在展开时决定"选哪个代表"，但"哪个最好"依赖 join 顺序——而 join 顺序在 `build_equal_items` 阶段还没定。`Item_equal` 把等价类整体留着，直到 `substitute_for_best_equal_field`（join order 定完后）才挑代表。**它是一份"尚未兑现的选择权"。**
+
+**两层传递闭包**（类注释给出业界术语）：
+
+1. **join transitive closure**——让任意两表之间被视为有等值连接条件，**枚举出原本不存在的访问路径**（扩大 join order 搜索空间）
+2. **sargable transitive closure**——`f1=...=fk AND P(fi) ⇒ P(fj)`，把非 SARGable 谓词变成 SARGable
+
+**为什么"推导新谓词"比"改写已有谓词"更有价值**：改写只是换个写法（谓词数不变），推导是 0→1（信息量净增）；改写有位置依赖（必须知道 join 顺序），推导没有；**推导出来的进了代价模型（变成 range/ref 压低 `rows_fetched`），改写出来的进不了**。
+
+**MySQL 的关键取舍**——业界常规做法是"预处理时把闭包谓词全加上"，MySQL 偏不：
+
+```cpp
+  Both features are usually supported by preprocessing original query and
+  adding additional predicates.
+  We do not just add predicates, we rather dynamically replace some
+  predicates that can not be used to access tables in the investigated
+  plan for those, obtained by substitution of some fields for equal fields,
+  that can be used.
+```
+
+**`m_const_arg` 的威力与陷阱**。一旦等价类里出现常量，`eliminate_item_equal` 做**星形展开**——每个 field 直接与常量配对：`Item_equal(5, t1.a, t2.b)` ⇒ `t1.a = 5 AND t2.b = 5`。三层威力：全列钉死成常量、矛盾检测免费（`compare_const` 里发现 `a=1 AND a=2` 就置 `cond_false` 并把 `used_tables_cache` 置 0，上层直接判 Impossible WHERE）、const 表读出后还能继续注入。
+
+四个陷阱：
+
+1. **有常量后，等价类不再是"纯等值连接条件"**——`contains_only_equi_join_condition() { return const_arg() == nullptr; }`。所以 `t1.a=t2.a AND t2.a=5` 这类查询，等值传播反而**关掉了 hash join 的大门**（展开后连接键消失）
+2. **外连接列的"常量"不是常量**——`update_const()` 里 `if (item->const_item() && !item->is_outer_field())`。外连接内表的列可能因"空表→补 NULL"呈现 const 状态，那个 NULL 不能传播
+3. **`val_int()` 只能对"已读到的字段"求值**——类注释：*"We have to take care of restricting the predicate ... to the projection of known fields"*。等价类里可能含还没读的表的字段
+4. **PS 重执行要能回滚**——`Item_equal` 对象本身每次执行重建，所以内部修改不需登记；但 `eliminate_item_equal` 生成的新 `Item_func_eq` 挂进 AND 列表，**必须** `thd->change_item_tree` 登记
+
+### C. 常量折叠：三档"常量"与为什么不折叠所有
+
+MySQL 把"常量"分三档，语义完全不同：
+
+| 档位 | 判定 | 谁能用 |
+|---|---|---|
+| `basic_const_item()` | 就是字面量，求值无副作用 | `resolve_const_item` 的最低档 |
+| `const_item()` | `used_tables() == 0` | 优化期可求值 |
+| `const_for_execution()` | `!(used_tables() & ~INNER_TABLE_BIT)` | 表锁好、PS 参数绑定后才可求值 |
+
+**为什么必须排除子查询/非确定性/参数？靠"伪表位"，不靠 flag。** `RAND()` 通过 `get_initial_pseudo_tables()` 返回 `RAND_TABLE_BIT`；`Item_param::used_tables()` 返回 `INNER_TABLE_BIT`——**一次位或运算就把"不确定性"传播到整棵树上**。
+
+第二道防线是 `is_non_const_over_literals` walker（位图挡不住副作用函数、SP 变量、cache item）：`Item_param` / `Item_ref` / `Item_cache` / `get_lock` 系列都 override 成 `true`。
+
+**为什么折叠放在 `fix_fields` 里而不是单独的 pass**：
+
+1. `fix_fields` 自底向上、只跑一次，且此时类型/校对集/**比较函数**都已确定——`val_int()` 需要 `set_cmp_func()` 已设好比较器，这只有在 `fix_fields` 之后才成立
+2. **零额外遍历**——`Item_cond::fix_fields` 本来就要遍历参数列表
+3. **能顺手把整棵子树摘掉**（`li.remove()`）
+4. **真正的性能实质不是"把 1+2 变成 3"**，而是 `Arg_comparator::set_cmp_func` → `cache_converted_constant`：`WHERE int_col = '3'` 只做一次字符串→整数转换，而不是每行一次
+
+**为什么不折叠所有能折叠的**——`Item_cond::fix_fields` 里那一长串守卫，每一条都是一次真实事故：
+
+| 守卫 | 为什么 |
+|---|---|
+| `ref != nullptr` | 调用方必须允许改树 |
+| `select->first_execution` | **PS/SP 重执行时树已被改过**，再折叠会二次删除 |
+| `ignore_unknown()` | **三值逻辑**：只有顶层布尔才能二值化（非顶层可返回 UNKNOWN） |
+| `!select->has_ft_funcs()` | `ftfunc_list` 持有指针，删掉会悬空 |
+| `can_remove_cond` | IN→EXISTS 改造出来的条件不能删 |
+| `!is_view_context_analysis()` | 视图上下文分析阶段没有真实数据 |
+| `!walk(is_non_const_over_literals)` | 排除 param / SP args / 副作用函数 |
+
+**关于 PS 参数的不对称**：`Item_param` 在 prepare 期被两道防线挡住（不可回滚的删除不能做），但 optimize 期 `fold_condition` 用 `const_for_execution()`——`WHERE col > ?` **可以折叠**（类型域折叠：`tinyint_col > 999` ⇒ 恒假）。⇒ **可回滚的折叠可以做，不可回滚的删除必须等参数确定或只在首次执行做。**
+
+还有一层"主动不折叠"：`can_evaluate_condition()` 要求 `!is_expensive()`——注释 *"Used during optimization to avoid computing expensive expressions during this phase"*。**昂贵的常量表达式故意留到执行期。**
+
+### D. 谓词下推：两道门与外连接的守卫
+
+`make_cond_for_table(cond, tables, used_table, ...)` 是**递归 + 两道门**：
+
+**第一道门（归属）**：这条件跟我要服务的表有关系吗？
+
+```cpp
+if (used_table &&                                     // 1
+    !(cond->used_tables() & used_table) &&            // 2
+    !(cond->is_expensive() && used_table == tables))  // 3
+  return nullptr;
+```
+
+**第二道门（可求值）**：这条件引用的表都读到了吗？
+
+```cpp
+if ((cond->used_tables() & ~tables) ||
+    (!used_table && exclude_expensive_cond && cond->is_expensive()))
+  return nullptr;
+```
+
+**切分规则**：AND 可拆（每个合取项独立递归）；**OR 全或无**（任一 disjunct 提不出来就整个放弃——只保留 A 会错误过滤掉 B 为真的行，这是 soundness 问题不是性能问题）。
+
+两道门合起来保证：**每个条件挂到"所有依赖字段都可用的第一张表"，且只挂一次**。整个下推只需 **O(条件数 × 树深)**。
+
+两个细节：第一张表额外加 `const_table_map | OUTER_REF_TABLE_BIT`（否则常量条件永远过不了第一道门）；最后一张表加 `RAND_TABLE_BIT`（否则 `RAND()` 这类条件会挂不到任何表而丢失）。
+
+**为什么下推要小心外连接**：内连接里 WHERE 与 ON 语义等价可随便挪；外连接里**不成立**——`t1 LEFT JOIN t2 ON P` 对不匹配的行会补一条全 NULL 的 t2 行，这条补出来的行**没有被 ON 之外的条件约束过**。
+
+MySQL 的答案不是"不下推"，而是**下推 + 用 `Item_func_trig_cond` 守卫**：
+
+- `IS_NOT_NULL_COMPL`——"我正在生成 NULL 补行，快把条件关掉"
+- `FOUND_MATCH`——"只有内层外连接找到匹配才打开"
+
+⇒ **外连接下推的正确性靠"条件可以被动态开关"，而不是靠"选对位置"。** `Item_func_trig_cond` 把"位置"语义化成了"守卫位"。
+
+**下推 vs 延迟求值的张力**——不是"推得越早越好"：昂贵的常量条件**故意不折叠不下推**（挂在第一张表上留到执行期）；HAVING 不能下推到 WHERE（`SUM(x)` 在聚合前根本不存在）。
+
+⇒ 原则：**默认下推，但对三类条件说不**——昂贵的、语义上尚不可求值的（聚合/窗口）、会改变 NULL 补行语义的（外连接/反连接）。
+
+### E. ICP：省的是回表 I/O，不是 CPU
+
+不做 ICP 时的数据流：引擎定位索引条目 → **回表读整行** → 交给 server → server 过滤 → 丢弃。
+
+**错位点**：过滤所需的信息（索引列的值）引擎早就有了，但它不知道要过滤什么；知道要过滤什么的 server，要等整行都读上来才能过滤。中间那次回表（二级索引 → 聚簇索引）对最终被丢弃的行是**纯浪费**。
+
+InnoDB 侧的收益点：
+
+```cpp
+switch (row_search_idx_cond_check(buf, prebuilt, rec, offsets)) {
+  case ICP_NO_MATCH:    goto next_rec;          // ★ 不匹配，跳过回表
+  case ICP_MATCH:       goto requires_clust_rec;
+}
+```
+
+**一个常被忽略的反向证据：覆盖索引时根本不做 ICP。**
+
+```cpp
+case JT_REF:
+  if (table->covering_keys.is_set(qep_tab->ref().key) && !table->no_keyread)
+    table->set_keyread(true);              // ★ 覆盖索引 → keyread，不做 ICP
+  else
+    qep_tab->push_index_cond(tab, qep_tab->ref().key, &trace_refine_table);
+```
+
+这不是遗漏，而是**ICP 的收益来源本身就是"避免回表"**——覆盖索引已经不回表了，ICP 没有可省的东西（反而多一次 `val_int()`）。**这一行反向证明了：ICP 省的是回表 I/O，不是 CPU。**
+
+**ICP 与普通下推是两级火箭**，层次不同：
+
+| | 普通下推 | ICP |
+|---|---|---|
+| 移动的边界 | server 层内部（算子树之间） | **跨 server ↔ engine 边界** |
+| 收益 | 减少后续算子**输入行数** | 减少**回表 I/O**（结果集行数不变） |
+| 代价模型看见吗 | 看见（`filter_effect`） | **看不见**（在 `make_join_readinfo` 之后才设，join order 早定了） |
+
+```
+WHERE（join 之上）
+  →[普通下推]→ tab->condition()（挂到最早能求值的表）
+  →[ICP]→ 引擎（在索引条目上求值，不满足就不回表）
+```
+
+**还有第三层 `engine_condition_pushdown`（ECP）**，与 ICP 完全不是一回事：它推的是**整个条件**（不限于索引列），接口 `handler::cond_push`；触发点只有**单表 UPDATE/DELETE**（SELECT 不走），主要实现方是 NDB。
+
+**ICP 的 8 项判定**里几条值得注意：非聚簇主键才做（*"The performance improvement of pushing an index condition on a clustered key is much lower"*——主键扫描"索引即数据"，ICP 无可省）；虚拟生成列上的索引不支持；`reversed_access` 直接 return（注释 "historical limitation, lift it!"）。
+
+### F. 理论溯源与参数
+
+**老优化器没有任何论文引用**，但教科书术语被直接写进了注释，本身就是溯源证据：
+
+| 优化 | 源码里的术语痕迹 | 理论源头 |
+|---|---|---|
+| 等值传播 | *"join transitive closure"* / *"search argument transitive closure"* | 查询重写传递闭包；SARGable 是 System R 时代的术语 |
+| 传递闭包算法 | `propagate_dependencies` 注释：*"**Warshall's algorithm** is used to build the transitive closure"* | Warshall 1962 |
+| 谓词下推 | *"attached to the first table in the join order where all necessary fields are available"* | System R（Selinger 1979）的 "push selects down" |
+| 常量折叠 | `basic_const_item()` / `is_non_const_over_literals` 的分层 | 编译器的常量传播 + 副作用分析 |
+
+**反差很有意思**：8.0 新写的 **hypergraph 优化器大量引用论文**（`[Neu04]`、`[Neu04b]`、`[Sim96]`、`[Moe13]`、DPhyp、Vance & Maier 1995）。⇒ **老优化器是"工程驱动、无文献"的，新优化器是"论文驱动"的**——这是 8.0 两套优化器并存留下的明显风格断层。
+
+**三个开关默认都是 on**：
+
+| 开关 | bit | 默认 | 作用 |
+|---|---|---|---|
+| `engine_condition_pushdown` | `1<<4` | **on** | ECP：整个条件下推给引擎，**只在单表 UPDATE/DELETE 生效**，主要给 NDB |
+| `index_condition_pushdown` | `1<<5` | **on** | ICP：`idx_cond_push`，hint 名 `NO_ICP(t1 idx)` |
+| `condition_fanout_filter` | `1<<17` | **on** | **不是谓词优化开关，是估算开关**——关掉后 `filter_effect` 不参与，退化为 `quick_condition_rows` |
+
+### G. 一条贯穿全章的元原则
+
+> **"推导"和"移动"是廉价的、收益乘性的；"物化"是昂贵的、收益一次性的。** 所以：能用结构（等价类、table_map 位图）延迟决策的，就不要提前物化；能证明某个变换安全的，才做；证明不了的，加守卫（`Item_func_trig_cond`、trig_cond 白名单、`is_non_const_over_literals`）而不是放弃。
+
+对应到代码：等值传播不物化 n² 个谓词；不预先加闭包谓词（动态替换）；常量折叠不单开 pass（挂在 `fix_fields` 上）；下推不复制条件（用位运算判定"最早求值点"）；外连接下推 + trig_cond 守卫；ICP 不进代价模型（它是纯执行期收益，做了就是白赚）。
 
 ---
 

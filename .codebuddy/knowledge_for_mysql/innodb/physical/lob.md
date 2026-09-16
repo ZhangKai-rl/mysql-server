@@ -1,6 +1,6 @@
 # InnoDB LOB 深度解析
 
-> 基于 MySQL 8.0.39 源码。LOB（Large Object）是 InnoDB 8.0 重写的大对象存储子系统，是 JSON 部分更新能落地的物理基础。本文独立于 [`server/datatype/json.md`](../server/datatype/json.md)，那边只保留"JSON 当 BLOB 存"的结论。
+> 基于 MySQL 8.0.39 源码。LOB（Large Object）是 InnoDB 8.0 重写的大对象存储子系统，是 JSON 部分更新能落地的物理基础。本文独立于 [`server/datatype/json.md`](../../server/datatype/json.md)，那边只保留"JSON 当 BLOB 存"的结论。
 
 ## 目录
 
@@ -587,27 +587,16 @@ row_undo_mod (row0umod.cc:1272)
 
 ---
 
-## 关键源码位置速查
+## 参考
 
-| 位置 | 说明 |
-|------|------|
-| `include/lob0first.h:43` | first page 布局；`incr_lob_version` 声明 |
-| `lob/lob0first.cc:60` / `:392` / `:403` | COW replace / 版本递增 / 标记不可部分更新 |
-| `include/lob0pages.h:35`、`lob/lob0pages.cc:35/59` | data page / replace_inline / replace |
-| `include/lob0index.h:81` | index_entry_t 布局；`can_rollback:169`、`can_be_purged:178`、`set_old_version:186` |
-| `lob/lob0index.cc:47/83/111/235` | make_old_version_current / purge / purge_version / free_data_page |
-| `lob/lob0update.cc:96` | **lob::update 主入口**（阈值判定 110，diff 循环 140） |
-| `lob/lob0update.cc:268/501/600` | replace(COW) / replace_inline / apply_undolog(小改动回滚) |
-| `lob/lob0purge.cc:414/65/505` | purge 总入口 / rollback / ok_to_free 判定 |
-| `lob/lob0impl.cc:1074` | **lob::read（版本化 MVCC 读核心）** |
-| `include/lob0undo.h:42/86/146` | undo_data_t / undo_seq_t / undo_vers_t |
-| `lob/lob0undo.cc:41` | undo_data_t::apply |
-| `include/lob0lob.h:198` | ref_t；`LOB_SMALL_CHANGE_THRESHOLD:210` |
-| `lob/lob0lob.cc:410/957/1098/1172/1312` | btr_store_big_rec_extern_fields / free_updated_extern_fields / free_externally_stored_fields / mark_not_partially_updatable ×2 |
-| `trx/trx0rec.cc:904/1000/1740/2469` | read_blob_update / report_blob_update / get_update / prev_version_build |
-| `row/row0purge.cc:702/1096/1363/1370` | upd_exist_or_extern / purge_record_func / add_lob_page / free_lob_pages |
-| `row/row0sel.cc:2725/2784/2818` | store_mysql_field / copy_externally_stored_field / lob_undo->apply |
-| `btr/btr0cur.cc:4089/4834` | mark_not_partially_updatable / free_externally_stored_fields |
-| `srv/srv0start.cc:1988/2036/2534` | redo 扫描 / apply / 回滚线程 |
-| `trx/trx0roll.cc:712/765/851` | 回滚入口三件套 |
-| `include/mtr0types.h:70/73/76/146` | MLOG_1BYTE / 2BYTES / 4BYTES / WRITE_STRING |
+
+### 社区文章 / 博客
+- 阿里内核月报：*[MySQL · 源码分析 · innodb-BLOB 演进与实现（张云乾/yunqian）](http://mysql.taobao.org/monthly/2022/09/01/)* —— 对源码与理论介绍非常详细，建议多遍读
+- 阿里内核月报：*[MySQL · 源码分析 · BLOB 字段 UPDATE 流程分析（zheyu）](http://mysql.taobao.org/monthly/2021/10/03/)*
+- [INNODB_BLOB — whoiami](https://whoiami.github.io/INNODB_BLOB)
+- [MySQL 8.0 Reference Manual → The BLOB and TEXT Types](https://dev.mysql.com/doc/refman/8.4/en/blob.html)
+- 内部文档：[《InnoDB 外部存储页》](https://iwiki.woa.com/p/1674338918#第二部分-外部存储页)
+
+### 相关主题
+- 行内外置列标志（`dfield_t::ext`、20B BLOB ref）见 [`record.md`](record.md)
+- 溢出页在 btr 中的交互、LOB 与 purge 见 [`../btr.md`](../btr.md) 与 [`../undo_log.md`](../undo_log.md)

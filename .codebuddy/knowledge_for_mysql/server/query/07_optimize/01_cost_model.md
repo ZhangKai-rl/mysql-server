@@ -5,6 +5,7 @@
 ## 目录
 
 - [零、总览](#零总览)
+- [设计思想与理论基础](#设计思想与理论基础)
 - [一、代价模型架构](#一代价模型架构)
 - [二、IO 代价：page_read_cost 与 in_mem](#二io-代价page_read_cost-与-in_mem)
 - [三、handler 层接口与引擎实现](#三handler-层接口与引擎实现)
@@ -32,6 +33,178 @@
 |------|------|------|
 | 表/索引统计 | `stats.records`、`rec_per_key[]`、NDV、页数 | `mysql.innodb_table_stats` / `innodb_index_stats` |
 | 列统计（直方图） | histogram JSON、采样率、NULL 比例、NDV | Data Dictionary `dd::Column_statistics`（经 `information_schema.COLUMN_STATISTICS` 暴露） |
+
+---
+
+## 设计思想与理论基础
+
+### 设计思想与权衡
+
+#### 1. 为什么是"半经验公式"而不是纯理论模型
+
+理论（Selinger 式）只提供公式的**结构**（IO + CPU、选择率连乘），具体参数几乎全部是**基准测试 + 线上回归反推**。源码里有大量直白的自我承认：
+
+| 位置 | 原文 |
+|---|---|
+| `handler::estimate_in_memory_buffer` | "if the size of the table/index is less than 20 percent (**pick any number**) of the memory buffer" |
+| `guess_rec_per_key` | "a = records matched by first key part (**1% of all records?**)" |
+| `find_worst_seeks` | "This is mostly a **crutch** to mitigate that we don't estimate the cache effects of ref accesses properly" |
+| `get_sort_and_sweep_cost` | 把 `key_compare_cost` 砍掉 10 倍："Until this constant is adjusted we introduce a constant that is **more realistic**" |
+| InnoDB `scan_time` | "we pretend that a sequential read takes the same time as a random disk read… which **would be physically realistic**" |
+
+**为什么接受半经验**：存储栈（buffer pool / OS cache / SSD / NVMe）不可观测，且优化器必须在**编译时**出结果、不能做任何探测。所以设计取向是——**先保证"计划排序正确"，再谈绝对精度**。`pick any number`、`crutch`、`more realistic` 这些词反复出现，就是这个取向的自白。
+
+#### 2. 代价常数是怎么标定的
+
+思路是**先定一个锚，再用相对 benchmark 比值推其余项**：
+
+| 常数 | 默认值 | 标定依据（注释原文） |
+|---|---|---|
+| `ROW_EVALUATE_COST` | **0.1** | 锚（"评估一行"），无 benchmark 注释 |
+| `KEY_COMPARE_COST` | **0.05** | 无注释（量纲直觉 = 半行评估） |
+| `MEMORY_TEMPTABLE_CREATE_COST` | **1.0** | "by benchmark found to be as costly as **writing 10 rows**" |
+| `MEMORY_TEMPTABLE_ROW_COST` | **0.1** | "equivalent to evaluating a row in the join engine" |
+| `DISK_TEMPTABLE_CREATE_COST` | **20.0** | "Creating a MyISAM table is **20 times slower** than creating a Memory table" |
+| `DISK_TEMPTABLE_ROW_COST` | **0.5** | "we do not have benchmarks for very large tables, so setting this factor **conservatively** to be 5 times slower" |
+| `MEMORY_BLOCK_READ_COST` | **0.25** | 无任何标定注释（是 fiat） |
+| `IO_BLOCK_READ_COST` | **1.0** | **整个模型的单位锚** |
+
+编译期硬编码（不可配）的 seek 常数则用**自洽方程**标定：平均一次 seek（跳过 `BLOCKS_IN_AVG_SEEK = 128` 块）总代价 = 1.0，解出 `DISK_SEEK_BASE_COST = 0.9`、`DISK_SEEK_PROP_COST = 0.1/128`（且带 `@todo` 承认未核实）。
+
+> 注意：**默认值需与 `mysql_system_tables.sql` 的 `default_value` 列两处同步**，源码顶部注释专门提醒了这一点。
+
+#### 3. 为什么代价单位是"抽象代价单位"而不是毫秒
+
+源码明确：
+
+> **Our cost units are "random disk seeks"**…
+
+- **好处**：硬件无关（同一套常数在 HDD / SSD / NVMe 上语义一致）；常数变动时计划的**相对排序**保持稳定，回归测试好做
+- **代价**：① 回答不了"这条 SQL 跑多久"；② 在 SSD 上 IO 与 CPU 的真实比例完全失真（这正是 `engine_cost` 可配的动机）；③ `worst_seeks` 这类人造上限本质就是**单位失真的补丁**
+
+#### 4. index dive 与统计估算为什么并存
+
+**dive 是按 range 数线性增长的**（每个等值 range 一次 B 树双向下潜），**统计是 O(1)** 查 `rec_per_key`：
+
+- 纯 dive：`IN (...)` 有上万个值时，优化期开销可能超过执行期
+- 纯统计：等值谓词是最常见的点查，用"全局平均 `rec_per_key`"估每个值，在倾斜列上错得离谱
+
+所以做成**按数量切换**（`eq_range_index_dive_limit = 200`），并允许 session + hint 覆盖、`0` 强制 dive。
+
+> ⚠️ **200 在源码中没有任何选择理由的注释**——应视为"经验阈值，无官方推导"，不要臆造理由。
+
+**超阈值后的四类偏差**：① 每个 range 都用同一个全局平均 `rec_per_key`（uniformity 假设，倾斜列上高频值被低估）；② **`x IS NULL` 被显式排除**（注释：该值数量"likely to be very different"，所以永远走 dive）；③ `rec_per_key` 本身是采样外推的，误差复合；④ 无 `rec_per_key` 时退化为 `rows = 1`（FORCE INDEX 分支），会极端低估。
+
+#### 5. 为什么 8.0 引入直方图
+
+**本质**：把"均匀分布假设"从**整列**细化到**桶内**——选择率从 `1/NDV` 变成 `freq(bucket)/num_distinct(bucket)`。
+
+> **关键理解**："均分"这一步**没有消失，只是作用域缩小了**。所以直方图能捕捉偏斜，但不能消除误差。
+
+**为什么不默认开启、也不自动更新**：
+
+1. **增量更新根本没实现**——源码原话："As of now, this means 'when the histogram was created' (**incremental updates are not supported**)"
+2. **构建是重操作**：全表扫描 + 内存有界采样，采样率由 `histogram_generation_max_mem_size`（默认 20MB）反推
+3. **能靠索引精确得到的就不建**："If it is [covered by a single-part unique index], we don't want to create histogram statistics"
+4. **过期风险用下限对冲而非自动刷新**：`get_selectivity()` 返回至少 **0.001**，注释详述了理由（采样 1000 页时漏掉选择率 0.001 值的概率约 1/e）与代价（大表上 0.1% 仍是很多行）
+
+**桶数默认 100**："A value of 100 is chosen because **the gain in accuracy above this point seems to be generally low**"（上限 1024）。
+
+**最值得整段引用的设计理由**是 equi-height 用 GEE 估桶内 NDV 的那段注释——它把"为什么这么估、为什么不改、未来怎么办"全写了：
+
+- 知道**页级采样破坏 GEE 假设**（GEE 是为均匀随机采样设计的），但**接受**，因为"we would rather **underestimate** than overestimate the number of distinct values"
+- 明确**拒绝** HyperLogLog / Count-Min，理由是"would require updating a sketch **on every table update**"——与"不自动更新"是同一个决策的两面
+
+#### 6. condition filtering 的设计动机
+
+它估的是 **"post read filtering"**：访问方法只覆盖部分谓词，其余谓词在读出行之后才评估，这部分过滤**不被任何访问方法反映**，必须单独估。
+
+**为什么必须估**：不估就等价于 `filter = 1.0`，而 `filter` 是**逐表相乘进 fanout** 的——N 表 join 时误差**连乘放大**。
+
+**"计算本身有代价，所以只在有意义时算"**（源码注释原话）。启用条件恰好暴露了设计考量：
+
+- `2b` 不是 join order 的最后一张表（"filtering only reduces the number of rows sent to the next step… therefore has **no effect** on the last table"）
+- `2c` 在子查询中（需要估算可能物化的子查询行数）
+- `2d` 在含 semijoin nest 的查询块（去重策略的代价依赖输出大小）
+- **单表查询直接忽略**："since single table optimization performance is so important"
+
+**它基于两个假设**：
+
+1. **谓词间独立**：AND 连乘（`P(A and B) = P(A) * P(B)`）、OR 容斥
+2. **无统计时按算子类型给固定系数**：`COND_FILTER_EQUALITY = 0.1`、`INEQUALITY = 0.3333`、`BETWEEN = 0.1111`
+
+并有**小表放宽**（`filter = max(1/records, default_filter)`）与**下界保护**（`filter >= 1/records`、fanout 下限 0.05）。
+
+> **fanout 下限 0.05 的 TODO 是极强的设计证据**：它本身会造成"不同 join order 估出不同结果集大小"的不自洽，但因为"去掉后 DBT-3 出现不良效果"就保留了——**纯经验回归驱动**。
+
+#### 7. InnoDB 统计为什么用随机采样
+
+默认值：**persistent 20 页、transient 8 页**；表级 `STATS_SAMPLE_PAGES` 范围 [1, 65535]（注释："65535 pages, 16kb each means to sample 1GB, which is impractical"）。
+
+**为什么不全表扫描**（源码给了两条理由）：
+
+1. **锁竞争**：采样路径需持有索引 `SX_LOCK`；扫超过 **1e6 页**时，宁可走无 `SX_LOCK` 的全扫
+2. **规模不经济**：`n_sample_pages × n_uniq` 超过总叶页数时，采样反而比全扫**更慢且更差** → 自动改走全扫
+
+⇒ **采样不是教条，是成本权衡。**
+
+**持久 vs 瞬态**：持久（20 页、分层随机采样、落盘）保证重启不丢 + 实例间计划稳定（避免主备漂移）；瞬态（8 页、仅内存）为无持久统计的场景提供廉价兜底。
+
+**自动更新按"变更行数比例"触发**：持久 > `n_rows/10`、瞬态 > `16 + n_rows/16`（`+16` 是避免"计数器表"被反复触发，注释明说）。因为统计的**相对误差取决于"变更量/总量"**，按比例才是与精度相关的正确量纲。另有 **10 秒 `MIN_RECALC_INTERVAL`** 节流。
+
+⇒ **"统计滞后"是被设计接受的**：10% 阈值 + 10 秒节流 + 后台线程，三层都是"宁可滞后，不可影响前台"。
+
+### 失效场景与已知短板（源码自认）
+
+#### 列独立性 / 零相关性假设
+
+最坦率的一处在 `EstimateFieldSelectivity()` 的 doc comment：
+
+> Assumes **equal distribution and zero correlation** between the two fields… If there are multiple ones, we choose the one with the **largest** selectivity (least selective)…
+> - Databases generally tend to **underestimate** join cardinality (due to assuming uncorrelated relations); if we're wrong, it would better be towards **overestimation**…
+> - **Overestimating** the number of rows generally leads to safer choices that are a little slower for few rows (e.g., hash join). **Underestimating**, however, leads to choices that can be **catastrophic** for many rows (e.g., nested loop against table scans).
+
+**"没有相关性检测，只能靠取最大选择性来补偿"** —— 这是对"社区版无列相关性统计"最直接的源码回答。全库**没有任何**列相关性/多列联合分布的统计结构（直方图是**单列**的）。
+
+**后果**：列相关时（如 `country='CN' AND city='Beijing'`）AND 连乘会**严重低估行数** ⇒ 优化器以为 index merge / nested loop 很便宜 ⇒ 实际行数爆炸。这正是"错选 index merge / 错选 join order"的机理。
+
+#### 源码自认的短板清单
+
+| 位置 | 原文 |
+|---|---|
+| `find_worst_seeks` | "This is mostly a **crutch**…" |
+| `EstimateCostForRefAccess` | "This is still a **very primitive, and rather odd**, cost model." |
+| `disk_seek_prop_cost` | `@todo Check that the BLOCKS_IN_AV_SEEK is correct…` |
+| fanout 下限 | `TODO: Should evaluate whether this restriction makes sense… some unwanted effects on DBT-3 was observed when removing it` |
+| equi-height GEE | 承认采样率 1% 时"the estimate could be off by a **factor 10** about 1/3 of the time" |
+| Singleton NDV | `TODO… If the histogram is based on sampling, then this estimate is potentially off by a factor 1/sampling_rate` |
+| ROR 选择率 | `FIXME: …the estimation is **probably wrong**` |
+
+#### 统一哲学
+
+> **所有不确定处的默认取向都是"宁可高估行数"。**
+
+直方图 0.001 下限、GEE 宁可低估 NDV（→ 高估选择率）、取最大选择性、`btr_estimate` 的 ×2 补偿与 `n_rows/2` 截断——全都是同一套。
+
+### 理论溯源
+
+- **Selinger《Access Path Selection in a Relational DBMS》(SIGMOD 1979)**：代价 = IO + CPU、选择率连乘，是这套公式结构的来源
+- **直方图**：equi-height + **GEE（Guaranteed Error Estimator）** 估桶内 NDV，来自论文；源码注释给出了 GEE 公式与误差界的推导
+- **InnoDB 采样外推**：基于"层间不同值比例相同"的假设外推到叶层
+
+### 他库对比与演进动机
+
+| 机制 | 引入版本 | 为什么引入 |
+|---|---|---|
+| 持久化统计 | 5.6 | 解决重启/主备计划漂移 |
+| **代价常数表化**（`mysql.server_cost` / `engine_cost`） | **5.7**（非 8.0） | 使 DBA 能不重编译地适配 SSD / 大内存 / 特定引擎；注释明说理想是"不同存储设备各一套常数"，但当前 `MAX_STORAGE_CLASSES = 1`（因为"we… does not have a way to know which storage device a given table is stored on"） |
+| condition filtering | 5.7 | 解决多表 join 行数估算的连乘放大 |
+| **直方图** | **8.0** | 第一个"按值分布"的统计结构，打破均匀分布假设 |
+| 直方图接入 condition filtering | 8.0 | "有直方图用直方图，没有就退回启发式常数" |
+
+** hypergraph 侧去掉了 `worst_seeks` 上限**——旧上限是"防止全表扫被过度选中"，那个前提建立在**只有 nested-loop** 的世界里；有了 hash join 之后全表扫不再天然危险，于是这个补丁被撤销。
+
+⇒ **代价模型的每一代人造常数，都绑定着当时的执行器能力。**
 
 ---
 

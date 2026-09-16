@@ -69,6 +69,9 @@
 | 文件 | 形态 | 内容 |
 |---|---|---|
 | [partitioning.md](partitioning.md) | B（生命周期） | 分区表全链路：元数据模型、DD 往返、裁剪、DML 路由、`ha_innopart` 上下文切换、TRUNCATE/EXCHANGE/ADD-DROP、分区统计与能力边界 |
+| [fts.md](fts.md) | A（按层分节） | 全文检索全链路：SQL 层（语法、`Item_func_match`、优化器、迭代器、filesort）→ 接口层（`_ft_vft` + hints 协议）→ InnoDB 层（辅助表、ilist、cache、sync/optimize、打分）→ 两层的结合点 + InnoDB/MyISAM 差异 |
+| [auto_increment.md](auto_increment.md) | A（按层分节） | 自增列全链路：SQL 层自增字段 → handler 区间分配接口 → InnoDB 三档 AUTOINC 锁模式（`innobase_lock_autoinc` 逐分支，★ mode1 降级旧模式的死锁规避）→ 计数器持久化（`dict_table_autoinc_log` 写 redo + DDTableBuffer）→ ★ 纠正"8.0 重启仍 SELECT MAX"误解（仅在 IMPORT 无 cfg/表空时兜底）→ DDL 保留计数器、空洞三来源、达到列上限行为 |
+| [generated_columns.md](generated_columns.md) | B（生命周期） | 生成列全链路：`Value_generator` 元数据与 DD→文本→`PARSE_GCOL_EXPR` 重解析、`vfield` 求值器与读写两条链路（惰性求值 + 覆盖索引短路）、虚拟列二级索引的物化与 `innobase_get_computed_value` 回调（含 purge 无 TABLE 开表求值）、undo 中 vcol 旧值（`old_v_val` + v_idx）、binlog 不对称镜像（INSERT 含 vcol / UPDATE 备库重算 / 功能索引过滤）、instant ADD/DROP 虚拟列、隐藏生成列家族（功能索引/多值索引/GIPK） |
 
 ## 什么时候该建新篇
 

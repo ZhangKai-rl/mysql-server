@@ -6,6 +6,13 @@
 
 - [核心概念：SID / SIDNO / GNO](#核心概念sid--sidno--gno)
 - [Gtid_set 结构](#gtid_set-结构)
+- [GTID 相关系统变量：读写语义](#gtid-相关系统变量读写语义)
+  - [gtid_mode](#gtid_mode)
+  - [enforce_gtid_consistency](#enforce_gtid_consistency)
+  - [gtid_next](#gtid_next)
+  - [gtid_purged](#gtid_purged)
+  - [gtid_executed / gtid_owned](#gtid_executed--gtid_owned)
+  - [binlog_gtid_simple_recovery / session_track_gtids / gtid_executed_compression_period](#binlog_gtid_simple_recovery--session_track_gtids--gtid_executed_compression_period)
 - [GNO 分配算法](#gno-分配算法)
 - [GTID 生命周期](#gtid-生命周期)
   - [服务器启动与初始化](#服务器启动与初始化)
@@ -65,6 +72,119 @@ Gtid_set
 ### gtids_only_in_table
 
 `gtids_only_in_table` 表示只在 `mysql.gtid_executed` 表中、不在 binlog 中的 GTID。这种情况出现在从库开启 binlog 但关闭 `log_replica_updates` 时——事务通过引擎提交刷入 GTID 表，但不写 binlog，所以 binlog 中没有对应的 `Gtid_log_event`。
+
+---
+
+## GTID 相关系统变量：读写语义
+
+> 变量描述符框架（`sys_var` 类树、SET 三趟、来源追踪）见 [`../infra/variables.md`](../infra/variables.md)。本节只讲这几个变量的**业务语义**：谁在何时能改、check/update 钩子做什么、背后维护什么状态。变量名（如 `fix_gtid_mode`）均已 grep 核实——8.0.39 中不存在的会明确标注。
+
+类树总览：
+
+```
+sys_var
+├── Sys_var_typelib → Sys_var_enum → Sys_var_gtid_mode            gtid_mode（GLOBAL）
+├── Sys_var_multi_enum → Sys_var_enforce_gtid_consistency         enforce_gtid_consistency（GLOBAL）
+├── Sys_var_gtid_next                                             gtid_next（SESSION_ONLY，直接继承 sys_var）
+├── Sys_var_gtid_purged                                           gtid_purged（GLOBAL，非 READ_ONLY！）
+└── Sys_var_charptr_func（构造即 READ_ONLY NON_PERSIST）
+    ├── Sys_var_gtid_executed                                     gtid_executed（GLOBAL 只读）
+    └── Sys_var_gtid_owned                                        gtid_owned（SESSION 只读）
+```
+
+### gtid_mode
+
+**只有 4 个取值，不是 8 个**（`Gtid_mode::value_type`）：`OFF=0 / OFF_PERMISSIVE=1 / ON_PERMISSIVE=2 / ON=3`，默认 OFF。名字数组是 `Gtid_mode::names[]`（`rpl_gtid_mode.cc`）——**不存在** `gtid_mode_typelib`/`gtid_mode_names` 符号。
+
+运行时修改的钩子是 `Sys_var_gtid_mode::global_update`（**不存在** `fix_gtid_mode`/`update_gtid_mode`，那是 5.7 的历史名字）。它的核心是**四把锁 + 系列约束检查 + 落地**：
+
+```cpp
+// 锁序：Gtid_mode::lock（trywrlock，抢不到直接报错不阻塞）
+//      → channel_map.wrlock → mysql_bin_log.get_log_lock → global_sid_lock->wrlock
+if (mysqld_server_started && abs((int)new_gtid_mode - (int)old_gtid_mode) > 1) {
+  my_error(ER_GTID_MODE_CAN_ONLY_CHANGE_ONE_STEP_AT_A_TIME, MYF(0));  // 一次只能走一步
+}
+...
+if (new_gtid_mode == Gtid_mode::ON && get_gtid_consistency_mode() != GTID_CONSISTENCY_MODE_ON) {
+  my_error(ER_CANT_SET_GTID_MODE, MYF(0), "ON", "ENFORCE_GTID_CONSISTENCY is not ON");
+}
+...
+// 落地
+global_var(ulong) = new_gtid_mode;      // 写背板 Gtid_mode::sysvar_mode（供 SHOW/持久化）
+global_gtid_mode.set(new_gtid_mode);    // 写原子值（全服务器其他代码读这个）
+LogErr(SYSTEM_LEVEL, ER_CHANGED_GTID_MODE, ...);
+mysql_bin_log.rotate(true, &dont_care); // 强制轮转 binlog，让新 Previous_gtids 反映新状态
+```
+
+约束清单：① **一次一步**（OFF→ON 必须经 OFF_PERMISSIVE→ON_PERMISSIVE，启动期 `mysqld_server_started==false` 免检，所以配置文件可直接设）；② ON 前要求 `enforce_gtid_consistency=ON`（双向联动，另一方向见下节）；③ ON 前要求无进行中的匿名事务（`get_anonymous_ownership_count()==0`）与无 AUTOMATIC 的 GTID-violating 事务；④ 设 OFF 前要求 `owned_gtids` 为空、无 AUTO_POSITION 通道、无 `WAIT_FOR_EXECUTED_GTID_SET` 等待者；⑤ 从 ON 往下改时无 `ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS=LOCAL/UUID`、`GTID_ONLY`、`source_connection_auto_failover` 通道；⑥ GR 运行中禁止改非 ON。
+
+启动路径不走钩子：`gtid_server_init()` 直接 `global_gtid_mode.set((value_type)Gtid_mode::sysvar_mode)`。
+
+### enforce_gtid_consistency
+
+值域 `OFF/ON/WARN`（别名 `FALSE/TRUE`），**8.0 默认 ON**。修改钩子 `Sys_var_enforce_gtid_consistency::global_update`（**不存在** `check_enforce_gtid_consistency`/`assert_enforce_gtid_consistency`，也**不扫描 binlog**）：
+
+```cpp
+global_sid_lock->wrlock();
+// 与 gtid_mode 联动：gtid_mode==ON 时禁改非 ON
+if (new_mode != GTID_CONSISTENCY_MODE_ON && gtid_mode == Gtid_mode::ON) {
+  my_error(ER_GTID_MODE_ON_REQUIRES_ENFORCE_GTID_CONSISTENCY_ON, MYF(0)); goto err;
+}
+// 有进行中的 GTID-violating 事务（automatic + anonymous 两个计数）时：
+//   目标是 ON → 报错 ER_CANT_ENFORCE_GTID_CONSISTENCY_WITH_ONGOING_GTID_VIOLATING_TX
+//   OFF→WARN → 只警告
+global_var(ulong) = new_mode;   // 写 _gtid_consistency_mode
+LogErr(INFORMATION_LEVEL, ER_CHANGED_ENFORCE_GTID_CONSISTENCY, ...);
+```
+
+注意落地**没有** binlog rotate（与 gtid_mode 不同）。变量本身只是阈值状态——语句执行时由 `binlog.cc` 的检查点读 `get_gtid_consistency_mode()` 决定报错或警告（消费端）。
+
+### gtid_next
+
+SESSION-only、`NO_CMD_LINE`、默认 `"AUTOMATIC"`。三种用户可见输入形态（内部 `enum_gtid_type` 另有 `UNDEFINED/NOT_YET_DETERMINED/PRE_GENERATE` 三个内部态）：
+
+| 输入 | 内部 | set_gtid_next 做什么 |
+|---|---|---|
+| `AUTOMATIC` | `AUTOMATIC_GTID=0` | 仅 `set_automatic()`，不获取任何所有权；提交时按 gtid_mode 决定生成 GTID 或匿名 |
+| `ANONYMOUS` | `ANONYMOUS_GTID` | 要求 `gtid_mode != ON`；置 `owned_gtid.sidno = OWNED_SIDNO_ANONYMOUS(-2)` + `acquire_anonymous_ownership()` |
+| `UUID:N` | `ASSIGNED_GTID` | 要求 `gtid_mode != OFF`；已执行则直接接受（语句稍后被跳过）；被占则 `wait_for_gtid` 阻塞；否则 `gtid_state->acquire_ownership()` 写 Owned_gtids + `thd->owned_gtid` |
+
+`check_gtid_next`（真实存在）三重校验：存储函数/触发器内禁止（`ER_VARIABLE_NOT_SETTABLE_IN_SF_OR_TRIGGER`）、**多语句事务进行中禁止**（`ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION`，XA PREPARED 例外）、权限 `SESSION_VARIABLES_ADMIN`/`SYSTEM_VARIABLES_ADMIN`/`SUPER`/`REPLICATION_APPLIER`。
+
+**关键语义：提交后 gtid_next 不是重置回 AUTOMATIC，而是进入 `UNDEFINED_GTID`**（`update_gtids_impl_own_gtid` 对 ASSIGNED 类型 `set_undefined()`），下一条语句被 `gtid_pre_statement_checks` 报 `ER_GTID_NEXT_TYPE_UNDEFINED_GTID` 强制"一个显式 GTID 只用于一个事务"；回滚/连接关闭的兜底才 `set_automatic()`（`sql_base.cc`，保证 DROP TEMPORARY TABLE 能生成自己的 GTID）。
+
+### gtid_purged
+
+**不是 READ_ONLY**——注册 flag 是 `NON_PERSIST GLOBAL_VAR(gtid_purged)`，无 READ_ONLY 位。所以运行时 `SET @@GLOBAL.gtid_purged` 能通过 resolve 的只读检查（权限仍要 SUPER/SYSTEM_VARIABLES_ADMIN），"只读型语义"由业务检查表达：
+
+```cpp
+// Gtid_state::add_lost_gtids —— 三个集合约束
+if (!starts_with_plus) {
+  if (!lost_gtids->is_subset(gtid_set))
+    my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, "the new value must be a superset of the old value");
+  gtid_set->remove_gtid_set(lost_gtids);       // 先剥掉已 purged 再查交集
+}
+if (executed_gtids.is_intersection_nonempty(gtid_set))
+  my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, "must not overlap with @@GLOBAL.GTID_EXECUTED");
+if (owned_gtids.is_intersection_nonempty(gtid_set))
+  my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, "must not overlap with @@GLOBAL.GTID_OWNED");
+// 落地：写 mysql.gtid_executed 表 → gtids_only_in_table/lost_gtids/executed_gtids 三集合都加
+//      → broadcast_sidnos 唤醒 wait_for_gtid 等待者
+```
+
+即"binlog 必须未开/executed 为空"的直觉说法，源码里是**三集合交集检查**：新增部分与 executed（去掉 lost）不相交、与 owned 不相交、且新值必须是旧值超集（只增不减）。`check_gtid_purged` 另拒 GR 运行中、拒 `SET DEFAULT`（该变量无默认值，`ER_NO_DEFAULT`）。启动初始化**不走**这个 sys_var——`mysql_bin_log.init_gtid_sets()` 直接算好集合改 `Gtid_state::lost_gtids`（mysqldump 的 `--set-gtid-purged` 走运行时 SET 路径）。
+
+### gtid_executed / gtid_owned
+
+真 READ_ONLY（`Sys_var_charptr_func` 构造带 `READ_ONLY NON_PERSIST`），SET 在 resolve 阶段直接被拒。读源：global 读 `Gtid_state::executed_gtids`/`owned_gtids`（持 `global_sid_lock` wrlock 后 to_string）；session 读 `thd->owned_gtid`（`sidno==0` 显示空、`-2` 显示 "ANONYMOUS"、`-1` 读 `thd->owned_gtid_set`）。
+
+**澄清：`gtid_current_pos` 在 MySQL 8.0.39 中不存在**（全仓库 grep 0 匹配）——它是 MariaDB 的变量，别当 MySQL 特性。
+
+### binlog_gtid_simple_recovery / session_track_gtids / gtid_executed_compression_period
+
+- **`binlog_gtid_simple_recovery` 默认是 true（ON），不是 false**；READ_ONLY（只能命令行/配置文件）。控制 `MYSQL_BIN_LOG::init_gtid_sets` 两处提前终止：反向扫描若最新 binlog 无任何 GTID 事件（`NO_GTIDS`）直接断定 executed/purged 为空；正向扫描只读第一个 binlog 的 `Previous_gtids_log_event` 就确定 purged。代价（注释明说）：旧 5.7.5 前 binlog + 混用 gtid_mode 的场景可能算出错误集合且不会自愈。
+- **`session_track_gtids`**（8.0.26+）：`OFF/OWN_GTID/ALL_GTIDS` 三值，SESSION 作用域，默认 OFF。`on_update` 钩子调 `Session_gtids_tracker::update` 注册/注销 `Session_consistency_gtids_ctx` 监听；OWN_GTID 收集本会话刚提交的 `thd->owned_gtid`，ALL_GTIDS 提交后快照整个 `executed_gtids`；经 OK 包的 `SESSION_TRACK_GTIDS` 类型实体上报客户端。
+- **`gtid_executed_compression_period`**：默认 0（8.0.23 起，之前 1000），控制 mysql.gtid_executed 表压缩线程 `compress_gtid_table` 的触发周期。**8.0.39 实测：该变量除注册/定义外没有任何代码读取**（`m_atomic_count` 无递增点），注释所称"按 period 计数触发"的路径已退化——压缩实际只由 binlog rotate 路径触发。变量仍在纯为向后兼容。
 
 ---
 
