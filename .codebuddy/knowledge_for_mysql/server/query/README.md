@@ -10,6 +10,7 @@
 - [完整主链调用栈](#完整主链调用栈)
 - [文件索引](#文件索引)
 - [关键答疑](#关键答疑)
+- [与 PostgreSQL 的架构对照](#与-postgresql-的架构对照)
 - [论文与设计思想](#论文与设计思想)
 - [与其他文档的关系](#与其他文档的关系)
 
@@ -184,7 +185,7 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 
 ## 文件索引
 
-### 主链（按时间顺序，01 → 11）
+### 主链（按时间顺序，01 → 13；11 归入下方「横切内容」）
 
 | 文件 | 阶段 | 核心内容 |
 |------|------|----------|
@@ -194,7 +195,7 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 | [04_parser.md](04_parser.md) | ② 语法 → Parse Tree | `sql_yacc.yy` 结构、`NEW_PTN` + mem_root、LEX 结构、PT/PTI 节点体系 |
 | [05_contextualize.md](05_contextualize.md) | ①→② | `contextualize()` 全景、各类节点做什么、Query_term 树（8.0.31 重构）、Item 与 `itemize`、完整分步示例 |
 | [06_resolver_prepare.md](06_resolver_prepare.md) | ②→③ | `Query_block::prepare()` 46 步、`setup_*` 函数族、`fix_fields`、name resolution、semi-join/derived 改写 |
-| **[07_optimize/](07_optimize/README.md)** | ③→④ | **优化器（11 篇，子目录）**：代价模型与统计、`logical/` 逻辑优化（子查询/semi-join/连接简化/谓词）、`physical/` 物理优化（join order/访问方法/range/hypergraph）、计划改进 |
+| **[07_optimize/](07_optimize/README.md)** | ③→④ | **优化器（15 篇，子目录）**：代价模型与统计、`logical/` 逻辑优化（子查询/semi-join/连接简化/谓词）、`physical/` 物理优化（join order/访问方法/range/hypergraph）、计划改进 |
 | [08_access_path.md](08_access_path.md) | ④ | AccessPath 44 种类型、新旧优化器两条创建路径、与 Iterator 1:1 |
 | **[09_executor_iterator.md](09_executor_iterator.md)** | ⑤ | **RowIterator 火山模型（算法级）**：火山契约、`unlock_row` 三种例外、NLJ 的 NULL 补全状态机、HashJoin 三形态与 chunk 估算、BKA 的 MRR cookie、**index merge 三个迭代器**（多路归并取交集/堆归并去重/两阶段 Unique）、排序/物化在 `Init()`、显式栈翻译、`ExecuteIteratorQuery` |
 | [10_dml.md](10_dml.md) | ⑤ DML 分支 | **DML 与 SELECT 的差异篇**（SELECT 是主链 02~09，不重复）：`Sql_cmd_dml` 类体系（SELECT 也继承它）、INSERT 的 `write_record` 链（不走迭代器）、UPDATE/DELETE 单表快路径 vs 多表迭代器、Halloween 问题与两阶段读、与 SELECT 在 read_set/write_set/ICP/覆盖索引的差异 |
@@ -205,7 +206,7 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 
 | 文件 / 目录 | 说明 |
 |------|------|
-| **[runtime/](runtime/README.md)** | **执行期专题（6 篇）**：filesort 与临时表、子查询运行期、CTE、窗口函数、join buffer、ROLLUP。是 09 篇执行器能力的横向展开 |
+| **[runtime/](runtime/README.md)** | **执行期专题（8 篇）**：filesort 与临时表、子查询运行期、CTE、窗口函数、join buffer、ROLLUP。是 09 篇执行器能力的横向展开 |
 | [11_explain_and_trace.md](11_explain_and_trace.md) | **调试与可观测性**（非主链步骤）：EXPLAIN（TRADITIONAL/TREE/JSON/ANALYZE）、optimizer trace。它横跨优化器与执行器，是"观察主链的工具" |
 
 ---
@@ -250,6 +251,53 @@ PT_select_stmt::make_cmd()             ← Parse Tree 根节点
 - **新 hypergraph**：`FindBestQueryPlan()` 直接产出 AccessPath，完全绕过 QEP_TAB
 - **汇合点**：两者都产出 AccessPath，然后走同一个 `CreateIteratorFromAccessPath()`
 - 开关：`set optimizer_switch="hypergraph_optimizer=on"`（`sys_vars.cc:3472`，打开时有实验性警告）
+
+---
+
+## 与 PostgreSQL 的架构对照
+
+上面的分层是 MySQL 自己的视角。换成 PostgreSQL 对照，才能看清 MySQL 架构的**特殊性**。
+
+PG 是教科书式的**五层单向流水线**，每层全新复制、上一层丢弃：
+
+```
+RawStmt（parse 语法树）
+  → Query（parse analysis：transformStmt 全新复制成语义树，表名→RangeTblEntry、列名→Var）
+  → RelOptInfo / Path（优化器：WHERE 拆成 baserestrictinfo/joininfo，不再是活树）
+  → Plan（物理计划树）
+  → PlanState（执行器状态）
+```
+
+| PG 层 | PG 做法 | MySQL 对应 | MySQL 做法 |
+|---|---|---|---|
+| RawStmt | 语法树 | `PT_*` | 语法树（相同） |
+| Query（全新语义树） | transformStmt **整体复制** | `Query_block` + `Item` + `Table_ref` | **半新半旧**：QB 新建、Table_ref 新建，但 **Item 是 parse 期对象原地变身** |
+| RelOptInfo/Path | WHERE 拆散，不再是活树 | 活 `Item` 树 + 新 `AccessPath` | 优化器**原地改 Item 树**（`li.remove`/`li.replace`） |
+| Plan（物理计划） | 全新 Plan 树 | `AccessPath` 树 | 换新树（相同） |
+| PlanState（执行器） | 全新 PlanState | `RowIterator` 树 | 换新树（相同） |
+
+**三个核心架构差异**：
+
+**① MySQL 没有 PG 式的"独立 Query 树"**
+
+PG 的 parse analysis 把 RawStmt **整体复制**成一棵全新 Query 树，RawStmt 用完即弃。MySQL 的"语义化"是：占位符原地换壳（itemize）→ 原地填字段引用（fix_fields），**不存在"从语法树复制出语义树"这一步**（这正是上文"为什么没有独立 AST 层"的根因）。
+
+**② MySQL 的优化器输入是"活着的 Item 树"**
+
+PG 优化器把 WHERE 表达式**拆散**成 `baserestrictinfo`/`joininfo`，路径生成时再重新组合——WHERE 表达式本身不再是执行时求值的那棵树。MySQL 恰好相反：WHERE 的 `Item_cond_and` 始终是那棵活树，优化器在上面做**局部手术**（`li.remove()` 删恒真项、`li.replace()` 替换常量），执行时 `FilterIterator` 直接调 `Item_cond_and::val_int()` 在同一棵树上短路求值。等值传播用的 `Item_equal` 通常**不被求值**（"employed only at the optimize phase"）。
+
+**③ 执行器是"最后才翻译出来"的**
+
+`AccessPath → RowIterator`（`CreateIteratorFromAccessPath`）是管线末端的一次翻译，与 PG 的 `Plan → PlanState` 对应。AccessPath 上保留反向指针 `RowIterator *iterator`（供 EXPLAIN ANALYZE 定位）。
+
+**"活树"的代价**（为什么这不是纯优点）：
+
+- 省一次全树复制、省内存、简单直接（`Item_field::val_int()` 直接 `field->val_int()`）
+- 但优化器改树容易出错（原地 `remove`/`replace` 必须小心别破坏其它引用）
+- 难以做"多版本计划"——同一棵 Item 树无法同时服务多个候选计划
+- 难以并行优化——活树是共享可变状态
+
+> PG 的"每层换新树"代价是内存与复制开销，换来的是每层结构**不可变、可并行、可复用**；MySQL 的"活树"代价是**处处共享可变状态**。两者是"复制 vs 原地演进"的经典权衡，MySQL 偏后者（历史包袱），PG 偏前者（设计使然）。
 
 ---
 

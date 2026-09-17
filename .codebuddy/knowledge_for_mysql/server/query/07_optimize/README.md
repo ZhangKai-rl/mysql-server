@@ -91,6 +91,7 @@ SQL 逻辑查询树（prepare 之后）
 | [11_optimizer_hints.md](11_optimizer_hints.md) | **Optimizer Hints**：双语法器（`sql_hints.yy`）+ 四层对象树（global/qb/table/key）、三类映射（开关/枚举/复杂）、JOIN_ORDER 转 `dependent` 链式依赖、INDEX 转索引位图集合运算、SET_VAR/MAX_EXECUTION_TIME、8.0 已废弃的 hint |
 | [12_partition_pruning.md](12_partition_pruning.md) | **分区裁剪**：归约到 range 分析（复用 `get_mm_tree`→SEL_TREE）、`find_used_partitions` 遍历 SEL_ARG 树、RANGE/LIST 二分 vs HASH/KEY 单点精确·范围枚举、子分区递归、read/lock_partitions 位图→handler→EXPLAIN |
 | [13_functional_mv_index.md](13_functional_mv_index.md) | **函数索引 + 多值索引**：隐藏生成列（`HT_HIDDEN_SQL`）、GC substitution（`get_gc_for_expr` 表达式等价匹配）、MEMBER OF 转等值 range、多值索引的唯一记录过滤器去重 |
+| [14_plan_stability.md](14_plan_stability.md) | **计划稳定性与优化器能力横向对照**（★ 不是实现剖析，是"有什么/缺什么"的对照）：**计划稳定性 / GROUP BY / 下推**三个维度，对照 **Oracle（SPM 计划基线）**、HyPer、Presto；计划回归的成因（统计刷新/数据量/版本/参数）与社区版能力边界（无 SPM、无 plan cache） |
 
 ## 逻辑优化 vs 物理优化（一句话界定）
 

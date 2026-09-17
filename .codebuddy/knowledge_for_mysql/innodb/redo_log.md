@@ -24,8 +24,10 @@
 - [sn 与 lsn 序号体系](#sn-与-lsn-序号体系)
 - [8.0 无锁化并发模型](#80-无锁化并发模型)
   - [并发 mtr 写 buffer：生产者侧的并发模型](#并发-mtr-写-buffer生产者侧的并发模型)
+  - [redo 的落盘时机：何时 write、何时 fsync](#redo-的落盘时机何时-write何时-fsync)
+- [redo 的 I/O 路径：与数据文件的对比](#redo-的-io-路径与数据文件的对比)
 - [checkpoint 机制](#checkpoint-机制)
-- [崩溃恢复](#崩溃恢复)
+- [崩溃恢复（redo 侧的衔接）](#崩溃恢复redo-侧的衔接)
 - [文件管理与 resize（水位线与容量体系）](#文件管理与-resize水位线与容量体系)
 - [文件级 redo 与 DDL（DROP/TRUNCATE）](#文件级-redo-与-ddldroptruncate)
 - [相关的系统变量/状态变量](#相关的系统变量状态变量)
@@ -171,7 +173,7 @@ LSN 空间 ───────────────────────
 | 2 | `LOG_ENCRYPTION`（:170） | redo 加密元信息 |
 | 3 | `LOG_CHECKPOINT_2`（:173） | 与 checkpoint 1 交替写，防 torn write |
 
-checkpoint 页内容：`checkpoint_no`(0, 8B) + `checkpoint_lsn`(8, 8B) + padding + 末尾 checksum（:241-245）。`checkpoint_lsn` 是崩溃恢复的扫描起点。
+checkpoint 页内容（8.0.30 新格式）：**只有 `checkpoint_lsn`(0, 8B) 一个有效字段** + padding + 末尾 checksum（:241-245）。旧的 `checkpoint_no` 字段**已废弃**——`Log_checkpoint_header`（log0types.h:236）只剩 `m_checkpoint_lsn`，`m_checkpoint_no` 仅存在于 pre-8.0.30 的 `Checkpoint_header`（log0pre_8_0_30.h:81，注释明写 "stored in older formats"）。**后果**：8.0.39 恢复时两个 checkpoint 槽位**比的是 lsn，不是 checkpoint_no**（详见 [`recovery.md`](recovery.md)）。`checkpoint_lsn` 是崩溃恢复的扫描起点。
 
 ### redo 文件格式演进（Log_format / ruleset）
 
@@ -1117,6 +1119,28 @@ os_event_wait_for(log.write_events[slot], max_spins, timeout, stop_condition);
 
 - **⑨ interrupted 重试**：等待中发现 paused 翻转（暂停/恢复竞态），goto retry 走正确分支
 
+### redo 的落盘时机：何时 write、何时 fsync
+
+redo 从产生到持久**分三个独立动作**，由不同角色在不同时机完成——这是理解持久性（D）的关键：
+
+| 动作 | 执行者 | 推进的水位 | 时机 |
+|------|--------|-----------|------|
+| memcpy 进 `log.buf` | **用户线程**（mtr commit） | `ready_for_write_lsn`（经 recent_written 缝合） | mtr 提交时；**既不 write 也不 fsync** |
+| `pwrite` 到 OS cache | **log_writer 线程** | `write_lsn` | 线程循环：有连续数据就写；无数据则在 `writer_event` 上等待（带超时）。用户线程 `log_write_up_to` 会 set 该事件催它 |
+| `fsync` 落盘 | **log_flusher 线程** | `flushed_to_disk_lsn` | 见下，受 `innodb_flush_log_at_trx_commit` 控制 |
+
+**fsync 的触发时机（关键，`srv_flush_log_at_trx_commit`，默认 1）**：
+
+1. **=1（默认）**：事务提交路径 `log_write_up_to(lsn, flush_to_disk=true)`，**等 fsync 完成才返回**。且 log_writer 每次推进 `write_lsn` 后，**只有 =1 时**才主动 `os_event_set(flusher_event)` 唤醒 flusher（log0write.cc:1591-1596）
+2. **=2**：提交时只等 write 到 OS（`flush_to_disk=false`）；fsync 交给 flusher 按 `innodb_flush_log_at_timeout`（默认 1s，srv0srv.cc:394；范围 0~2700）周期性做——**崩溃时可能丢最近 1s 的已提交事务**（OS 没崩则不丢）
+3. **=0**：提交时连 write 都不等，完全交给后台（writer 循环 + flusher 每秒）——**崩溃可能丢约 1s 的已提交事务**
+4. **组提交优化**（binlog 开启时）：prepare 阶段设 `HA_IGNORE_DURABILITY`，redo **不 fsync**；到 ordered_commit 的 **flush 阶段**由 `ha_flush_logs` 一次性批量 fsync 本组所有事务的 redo——把 N 次 fsync 降为 1 次（详见「redo 与 binlog 的一致性」）
+5. **刷脏页前**：刷某脏页前必须 `log_write_up_to(newest_modification, true)`——WAL 约束，保证修改该页的 redo 先落盘
+6. **checkpoint 推进时**：候选 lsn 本身被 `flushed_to_disk_lsn` 上限约束（三上限之一），所以 checkpoint 推进时 redo 必然已 fsync；注意 `log_checkpoint` 里的 `buf_flush_fsync()` fsync 的是**数据文件**，不是 redo
+7. **强制落盘点**：`log_make_latest_checkpoint`（shutdown / `ENABLE INNODB REDO_LOG` / redo resize）、DDL 关键步（如 DROP 删文件前 `log_write_up_to(commit_lsn, true)`）、redo 归档停止等
+
+**一句话**：mtr commit 只负责"进 buffer"，write 与 fsync 全在后台线程；**只有 `flush_log_at_trx_commit=1` 才保证每次提交都 fsync**，其余靠后台周期性落盘（有丢失窗口）。
+
 ### 后台线程的暂停与恢复（writer_threads_paused）
 
 **用途**：在"后台线程写"与"用户线程自己写"两条路径间动态切换。触发：`innodb_log_writer_threads` 变量（`log_control_writer_threads`，log0log.cc:1111——非 0 恢复、0 暂停）。
@@ -1150,6 +1174,117 @@ while (write_notifier_resume_lsn != 0 || flush_notifier_resume_lsn != 0)
 notifier 恢复后从 `resume_lsn + 1` 继续通知（log0write.cc:2671），切换期间落盘的 lsn 由 resume_lsn 精确交代，不漏通知。
 
 **为什么要有这套机制**：后台线程常驻对低负载是纯开销（轮询/自旋烧 CPU）；暂停后用户线程直接自己写（`log_self_write_up_to`），负载回升再切回。`log_write_up_to` 里的 paused 分支 + interrupted 重试，就是为这个切换设计的两侧协作。
+
+---
+
+## redo 的 I/O 路径：与数据文件的对比
+
+> 本章从 [`io.md`](io.md) 的「redo log 的 I/O」迁入，与上面的「落盘时机」互补：**那一节讲"什么时候 write / fsync"，这一节讲"谁来写、怎么写、以及 redo 与数据文件在 I/O 方式上的根本差异"**。
+
+### 写路径：五个专用后台线程
+
+8.0 把 redo 的写彻底从用户线程剥离，由专用线程承担（全部在 `log0log.cc:920-944` 创建）：
+
+| 线程 | 入口 | 职责 |
+|------|------|------|
+| `log_writer` | `log/log0write.cc:2236` | 把 log buffer 写到 redo 文件（`log_writer_write_buffer` → `log_write_buffer`） |
+| `log_flusher` | `log/log0write.cc:2501` | fsync redo，推进 `flushed_to_disk_lsn` |
+| `log_checkpointer` | `log/log0chkp.cc:991` | 定期写 checkpoint header |
+| `log_write_notifier` | `log/log0write.cc:2638` | 唤醒等 `write_lsn` 的用户线程 |
+| `log_flush_notifier` | `log/log0write.cc:2760` | 唤醒等 `flushed_to_disk_lsn` 的用户线程 |
+| `log_files_governor` | `log/log0files_governor.cc:1349` | 预创建/回收/resize redo 文件 |
+
+> **★ `log_closer` 线程在 8.0.39 已不存在**——只剩 `log.closer_mutex`（`log0log.cc:636`），由用户线程在 `log0buf.cc:1114` 抢锁代劳。
+
+`log_writer_write_buffer`（`log0write.cc:2122`）的关键片段：
+
+```cpp
+  size_t start_offset = last_write_lsn % log.buf_size;
+  size_t end_offset = next_write_lsn % log.buf_size;
+
+  if (start_offset >= end_offset) {
+    ut_a(next_write_lsn - last_write_lsn >= log.buf_size - start_offset);
+    end_offset = log.buf_size;
+    next_write_lsn = last_write_lsn + (end_offset - start_offset);
+  }
+  ...
+  byte *buf_begin =
+      log.buf + ut_uint64_align_down(start_offset, OS_FILE_LOG_BLOCK_SIZE);
+  byte *buf_end = log.buf + end_offset;
+
+  const dberr_t err = log_write_buffer(
+      log, buf_begin, buf_end - buf_begin,
+      ut_uint64_align_down(last_write_lsn, OS_FILE_LOG_BLOCK_SIZE));
+```
+
+**算法要点**：
+
+- log buffer 是**环形缓冲区**，用 `lsn % buf_size` 定位；`start >= end` 表示绕回，本次只写到 buffer 尾部。
+- **对齐到 `OS_FILE_LOG_BLOCK_SIZE`（512）**——这是 redo 对块设备提出的**唯一且最低**的原子性要求。
+
+刷盘由 `log_flush_low`（`log0write.cc:2427`）完成：
+
+```cpp
+static void log_flush_low(log_t &log) {
+  ut_ad(log_flusher_mutex_own(log));
+
+#ifndef _WIN32
+  bool do_flush = srv_unix_file_flush_method != SRV_UNIX_O_DSYNC;
+#else
+  bool do_flush = true;
+#endif
+  ...
+  if (do_flush) {
+    log_sync_point("log_flush_before_fsync");
+    log.m_current_file_handle.fsync();
+  }
+  ...
+  log.flushed_to_disk_lsn.store(flush_up_to_lsn);
+```
+
+**关键分支**：**只有 `innodb_flush_method != O_DSYNC` 时才调 fsync**——因为 O_DSYNC 模式下 redo 文件是用 `O_SYNC` 打开的，内核在每次 `pwrite` 返回时已保证落盘。
+
+### ★ redo 与数据文件的 I/O 方式差异
+
+| | 数据文件 | redo 文件 |
+|---|---|---|
+| O_DIRECT | **是**（仅 `OS_DATA_FILE`/`OS_CLONE_DATA_FILE`/`OS_DBLWR_FILE` 且 flush_method ∈ {O_DIRECT, O_DIRECT_NO_FSYNC}） | **否**（`OS_LOG_FILE` 不在该分支） |
+| O_SYNC | 否 | **是**（仅当 flush_method = O_DSYNC/littlesync） |
+| 写路径 | 异步 AIO（`io_submit`）为主 | **同步 `pwrite`**（log_writer 线程自己做） |
+| 大小对齐 | 页大小（16K 等） | **512 字节**（`OS_FILE_LOG_BLOCK_SIZE`），有断言 |
+| 文件锁 | 加 `os_file_lock` | 不加 |
+
+> **一句话**：**redo 永远不走 AIO**（`os_aio_func` 里有 `ut_a(!type.is_log())`），也**永不开 O_DIRECT**。它只有同步 `pwrite` + `fsync`（或 `O_SYNC`）。这与数据文件"异步 AIO + 可选 O_DIRECT"是完全不同的两条路。
+
+### write-ahead：避免 read-on-write
+
+`innodb_log_write_ahead_size`（默认 **8192**，`INNODB_LOG_WRITE_AHEAD_SIZE_DEFAULT`，`log0constants.h:521`；范围 `[512, ...]`，必须是 `OS_FILE_LOG_BLOCK_SIZE`(512) 的倍数，且被 `srv_page_size` 截断并向下取到 2 的幂）。
+
+**它解决什么问题**：现代磁盘的物理块（block size）通常是 4096 字节。如果一次只写 512 字节，设备必须先**把整个 4096 块读进内存、改写其中一部分、再整体写回**——这就是 **read-on-write（读改写）**。用 `srv_log_write_ahead_size` 对齐写入（尾部补零）就可以整块覆盖，免去读的那一半。
+
+```cpp
+// log/log0write.cc:1404
+      ut_uint64_align_down(real_offset, srv_log_write_ahead_size);
+```
+
+- 源码还有多处断言确保对齐：`log0write.cc:1504`、`1573`、`1619`。
+- **代价**：尾部补零带来的写放大；**收益**：消除读改写。**在云盘/网络存储上（读的代价尤其高）这个参数的价值更明显。**
+- 相关结构：`log_t::write_ahead_buf`（`log0sys.h:281`），`log.write_ahead_buf_size`。
+
+### fsync vs fdatasync
+
+`os_file_fsync_posix`（`os0file.cc:2815-2840`）封装了系统调用：
+
+```cpp
+const auto ret = srv_use_fdatasync ? fdatasync(file) : fsync(file);
+```
+
+- `fsync`：刷**数据 + 文件元数据**（大小、时间戳等）；
+- `fdatasync`：只刷**数据**（和必要的元数据），省掉元数据写入，**更快**。
+
+由 `innodb_use_fdatasync` 控制（默认 false，用 fsync）。**对 redo 这类"大小固定、只追加数据"的文件，fdatasync 更合适**；对数据文件（会改大小）则 fsync 更稳妥。
+
+> 三档刷盘策略（`innodb_flush_log_at_trx_commit` = 0/1/2）与组提交优化见上面[「redo 的落盘时机」](#redo-的落盘时机何时-write何时-fsync)，此处不重复。
 
 ---
 
@@ -1301,56 +1436,21 @@ last_checkpoint_lsn ≤ available_for_checkpoint_lsn
 checkpoint_age = current_lsn − last_checkpoint_lsn ≤ soft_logical_capacity   # 正常运行
 ```
 
-崩溃恢复：`recv_find_max_checkpoint` 读两个 checkpoint 页，取 `checkpoint_no` 大者，从 `checkpoint_lsn` 所在 block 开始扫 redo 重放。
+崩溃恢复：`recv_find_max_checkpoint` 遍历所有 redo 文件的两个 checkpoint 槽位，取 **`checkpoint_lsn` 最大**者（8.0.30 起 header 已无 `checkpoint_no`，别再写"取 checkpoint_no 大者"），并校验该 lsn 落在所属文件的 lsn 区间内，再从 `checkpoint_lsn` 所在 block 开始扫 redo 重放。
 
 ---
 
-## 崩溃恢复
+## 崩溃恢复（redo 侧的衔接）
 
-### 主链路（两阶段：先 redo 后 undo）
+> **边界**：崩溃恢复已**独立成篇**——两阶段模型（redo 前滚 / undo 回滚）、扫描与解析状态机、`recv_sys_t` 恢复上下文、hash 聚合与按页应用、文件级 redo、clone/MEB 分支，全部见 [`recovery.md`](recovery.md)。本节只交代 **redo 侧与恢复直接相关的三个衔接点**。
 
-```mermaid
-flowchart TD
-    A["① recv_find_max_checkpoint<br/>读两个 checkpoint 页，取 checkpoint_no 大者"] --> B["② recv_scan_log_recs<br/>从 checkpoint_lsn 所在 block 扫<br/>块 crc32 失败 / epoch_no 非法 / 无更多数据 → 停"]
-    B --> C["③ recv_parse_log_recs<br/>组解析：recv_single_rec / recv_multi_rec<br/>不完整尾组不入 hash（mtr 原子性）"]
-    C --> D["④ 页面级 redo 入 hash（space_id,page_no）<br/>MLOG_FILE_* 扫描期立即执行（文件级 redo 章）"]
-    D --> E["⑤ recv_apply_hashed_log_recs<br/>按页应用：FIL_PAGE_LSN 跳过已落盘部分（幂等）"]
-    E --> F["脏页刷盘 → 引擎进入运行态"]
-    E --> G["⑥ undo 阶段：扫 undo 表空间重建事务<br/>回滚未提交事务（trx_rollback_or_clean_recovered）"]
-```
+- **恢复起点就是 `checkpoint_lsn`**（checkpoint 章）：checkpoint 之前的 redo 所描述的修改已确认落盘，无需回放；checkpoint 推进得越勤，恢复要扫的 redo 越少
+- **扫描停点只认 checksum / `epoch_no` / 文件尾**：8.0 用并发 mtr 写 buffer（无锁化章），log buffer 里可能存在空洞，因此**不能**再假设"遇到 `data_len < 512` 的块就是最后一块"——5.7 时代的这条判据在 8.0 已不成立
+- **record group 是恢复的原子单位**：不见 `MLOG_MULTI_REC_END` 的尾组永不入 hash、永不应用（mtr 原子性小节）；单记录组靠 `MLOG_SINGLE_REC_FLAG` 识别
 
-各环节要点（细节散见各章，此处串成主链）：
+**上下游闭环**：上游 = 崩溃后重启，`srv_start` 调 `recv_recovery_from_checkpoint_start` 消费本文所述的 redo；下游 = 前滚完成后回滚未提交事务，见 [`recovery.md`](recovery.md) 与 [`undo_log.md`](undo_log.md)。
 
-- **① 恢复起点**：`checkpoint_lsn`（checkpoint 章）。checkpoint 之前的 redo 已确认落盘（脏页已刷），无需回放
-- **② 扫描停点**：块 crc32 失败即"abrupt end"停扫（log0recv.cc:3390-3405）；`epoch_no` 严格校验兜住上次恢复遗留的垃圾块（:3409-3419）。5.7 时代"回放到 data_len < 512 的块即最后一块"的说法在 8.0 不成立——8.0 的停点只认 checksum/epoch/文件尾
-- **③ 组解析**：`recv_multi_rec` 两阶段，不见 `MLOG_MULTI_REC_END` 不入 hash——**不完整尾组永不应用**（mtr 原子性小节）
-- **⑤ 幂等应用**：每个数据页头 `FIL_PAGE_LSN` 记录最后修改它的 redo end_lsn，`recv_recover_page` 跳过 `start_lsn ≤ 页 LSN` 的记录——已刷盘的修改不重放，恢复可重入
-- **⑥ redo 只恢复物理状态**：未提交事务的脏数据也回放到位，逻辑一致性交给 undo 回滚（两阶段恢复模型，理论章节）
 
-### 扫描与解析的增量细节
-
-扫描不是"读一段解析一段"的简单流式，而是**逐块增量喂进解析缓冲**的状态机：
-
-**解析起点 `parse_start_lsn` 的发现**（log0recv.cc:3421-3439）：扫描到第一个 `first_rec_group > 0` 的块才确立解析起点——`parse_start_lsn = 块 lsn + first_rec_group`。checkpoint_lsn 可能落在某个 mtr 的中间，所以要回退到该块内第一个 record group 的起点；`bytes_to_ignore_before_checkpoint` 记下"checkpoint 之前的尾巴字节数"，应用时跳过。
-
-**逐块追加**（`recv_sys_add_to_parsing_buf`，:3271-3328）：
-
-```cpp
-data_len = log_block_get_data_len(log_block);      // 块头记录的已写字节
-start_offset = max(data_len - more_len, LOG_BLOCK_HDR_SIZE);  // 跳过 12B 头
-end_offset   = min(data_len, OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE);  // 截断 4B 尾
-memcpy(recv_sys->buf + recv_sys->len, log_block + start_offset, end_offset - start_offset);
-```
-
-块的数据区被**连续拼进 `recv_sys->buf`**，块头/块尾被剥离——解析器看到的是一段连续 record 流，块边界完全透明。
-
-**跨块 record 的处理**：`recv_parse_log_rec` 解析不完整返回 NULL → `recv_multi_rec` 返回"需要更多数据"，等下一块追加进来再试（组完整性检查的一部分，原子性小节）。
-
-**消费与压缩**（`recv_reset_buffer`，:3331）：`recovered_offset` 之前的部分已被消费，`ut_memmove` 把剩余字节左移到 buf 起点，腾出尾部空间。
-
-**两阶段应用**：扫描全程只解析入 hash（`recv_sys->addr_hash`，按 (space_id,page_no) 聚合），全部扫完后 `recv_apply_hashed_log_recs` 才按页批量应用——**先收集后应用**，保证应用时所有 redo 已知（hash 满了也会中途触发 apply 腾空间）。
-
-**上下游闭环**：上游=崩溃/宕机后重启（srv_start → recv_recovery_from_checkpoint_start）；下游=脏页刷盘后引擎恢复运行，未提交事务回滚见 [`undo_log.md`](undo_log.md)，binlog 参与裁决见 [`trx.md`](trx.md)。
 
 ---
 
@@ -1822,6 +1922,22 @@ Last checkpoint at           LSN_PF     # last_checkpoint_lsn
 - 观测配合：`Innodb_log_waits`（累计等待次数）、`Innodb_redo_log_logical_size` vs `Innodb_redo_log_capacity_resized`、`Innodb_redo_log_resize_status`
 - 与 `log_writer_wait_on_consumers` 的区别：后者是 **writer 线程**等消费者（后台侧），前者是**用户线程**等 checkpoint（前台侧）——两者根因常常同一个：消费者不前进
 
+### redo 与 undo 的协同（为什么恢复必须先 redo 后 undo）
+
+redo 与 undo 不是两套并列的日志，而是**同一条恢复链上不可交换的两环**；而且 undo 自身也依赖 redo 才能存活。
+
+**1. undo 页本身受 redo 保护**：undo 就是 buffer pool 里的普通页，写 undo 记录同样产生 redo——`MLOG_UNDO_INSERT=20`、`MLOG_UNDO_INIT=22`、`MLOG_UNDO_HDR_REUSE=24`、`MLOG_UNDO_HDR_CREATE=25`（mtr0types.h:112-124）。所以**"redo 保住 undo"是两阶段恢复能成立的前提**：崩溃后 undo 段先被 redo 重建，才有东西可回滚。
+
+**2. 分工**：redo 保 **D**（已提交事务的修改不丢），而且**不区分提交与否**——未提交事务的脏数据一样被前滚回物理状态；undo 保 **A**（未提交事务不残留）。两者合起来才是 ARIES 的"A/D 分离"。
+
+**3. redo 里没有事务边界**：redo 只有一条条页级/记录级修改，**没有 begin/commit 标记**（`mlog_id_t` 76 种里没有"事务提交"类型）。事务的提交状态完全靠 **undo 段头的状态位**判定——`TRX_UNDO_ACTIVE=1` / `TRX_UNDO_PREPARED=6`（8.0.29+；5 是 `TRX_UNDO_PREPARED_80028`，7 是 `TRX_UNDO_PREPARED_IN_TC`，trx0undo.h:316-333）。这直接决定了恢复顺序：**必须先靠 redo 把 undo 页恢复到崩溃瞬间，才读得出谁没提交**，然后才轮到 `trx_rollback_or_clean_recovered` 回滚。
+
+**4. 2PC 下由 binlog 裁决**：处于 `TRX_UNDO_PREPARED` 的事务，恢复后提交还是回滚取决于 binlog 里有没有对应 XID——见「redo 与 binlog 的一致性」与 [`trx.md`](trx.md)。
+
+**5. 收尾**：回滚/提交后 undo 由 purge 异步清理，见 [`undo_log.md`](undo_log.md)。
+
+> 恢复侧的同一主题（前滚/回滚两阶段、扫描解析状态机）另见 [`recovery.md`](recovery.md)。
+
 ### redo 与 doublewrite 的分工（为什么 redo 防不了半页写）
 
 **redo 的能力边界**：redo 记录的是"页内逻辑操作"（如"在偏移 x 插入这条记录"），它假设**页本身是完整的**。如果崩溃时一个 16KB 页只写进去 6KB（partial page write），redo 重放就是在半个坏页上做手术——结果仍是损坏的。
@@ -2010,12 +2126,14 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 - 《源码分析 · InnoDB Redo Log 重构》(翊云)
 - 博客园《8.0.30 redo log 重构》(kerrycode, p/17546528)
 
-*恢复 / checkpoint / undo*
-- 内核月报《MySQL 崩溃恢复》(2015-06)
-- 《MySQL 的恢复》(code0xff.org, 2022-12，含 undo log 所有类型)
-- 《MySQL redo log 恢复原理》(StoneDB 技术分享会 #5, 2023-08)
+*checkpoint*
 - 博客园《InnoDB checkpoint》(binyue, p/17299558)、keithlan《fuzzy_checkpoint 触发条件》
+
+*内部 XA（redo/binlog 一致性）*
 - 内核月报《内部 XA 和组提交》(2020-05)：redo/binlog 一致性（详述见 [`trx.md`](trx.md)）
+
+*崩溃恢复*
+- 恢复类资料（前滚/回滚、扫描解析、checkpoint 与恢复起点）已归 [`recovery.md`](recovery.md)「参考」章，此处不重复列
 
 *其他*
 - 庖丁解 redo（catkang.github.io, 2020-02）：lsn/sn/offset 与无锁写
@@ -2026,7 +2144,8 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 > ⚠️ 以上月报/博客的函数名与行号多基于 5.7 或 8.0 早期版本，与 8.0.39 几乎全对不上——**只取问题视角与理论脉络，机制一律以本篇源码核实为准**（如 8.0.39 的 `log_buffer_reserve` 在旧文里叫 `log_reserve_and_write_fast`）。
 
 **相关文档**
-- undo 回滚与两阶段恢复见 [`undo_log.md`](undo_log.md)
+- **崩溃恢复**已独立成篇：两阶段模型（redo 前滚 / undo 回滚）、扫描与解析状态机、`recv_sys_t` 恢复上下文、hash 聚合应用，见 [`recovery.md`](recovery.md)
+- undo 的管理与 purge 见 [`undo_log.md`](undo_log.md)（恢复中的回滚阶段见 [`recovery.md`](recovery.md#redo-与-undo-的协同)）
 - 事务提交 / 内部 2PC 见 [`trx.md`](trx.md)
 - 脏页刷盘 / doublewrite 见 [`buffer_pool.md`](buffer_pool.md)
 - binlog 与 2PC 协调见 [`../server/replication/binlog.md`](../server/replication/binlog.md)

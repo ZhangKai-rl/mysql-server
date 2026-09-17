@@ -12,6 +12,7 @@
 - [六、Execution Phase：每种策略怎么执行](#六execution-phase每种策略怎么执行)
 - [七、五种策略的 JOIN ORDER 矩阵](#七五种策略的-join-order-矩阵)
 - [八、optimizer_switch 与 Hint](#八optimizer_switch-与-hint)
+- [九、深潜：早停对照、NOT IN 灾难与 antijoin 演进](#九深潜早停对照not-in-灾难与-antijoin-演进)
 
 ---
 
@@ -476,6 +477,119 @@ SELECT /*+ SEMIJOIN(DUPSWEEDOUT) */ ... WHERE s_suppkey IN (SELECT ps_suppkey ..
 
 ---
 
+
+## 九、深潜：早停对照、NOT IN 灾难与 antijoin 演进
+
+### 9.1 早停机制的跨算法对照
+
+MySQL 的 semi/anti join 早停（"找到一个匹配就跳下一个外层行"）**散落在执行器各处**，对照如下：
+
+| 执行路径 | 早停实现 | 落点 |
+|---|---|---|
+| **Nested Loop**（FirstMatch） | `JoinType::SEMI` 状态机：找到匹配后切回 `NEEDS_OUTER_ROW`（split jump） | 本篇 5.1 |
+| **Hash Join** | `JoinType::SEMI`：probe 到第一行匹配即返回，去下一行 probe | `05_join_buffer` / hash_join_iterator |
+| **LooseScan** | 索引 group 跳跃（天然跳过重复，不用"找到再跳"） | 本篇 5.2 |
+| **DuplicateWeedout** | **不是早停**——先按内连接跑全，再 rowid 去重 | 本篇 5.3 |
+
+**与 PG 的对照（为什么两边长得不一样）**：
+
+PG 侧（《PostgreSQL 子查询优化（七）》的核心结论）：NL/Hash/Merge 三种算法的早停**源码几乎完全相同**（`nl_NeedNewOuter` / `HJ_NEED_NEW_OUTER` / `EXEC_MJ_NEXTOUTER`，仅状态变量名不同），是**刻意的一致性设计**——因为 PG 的 SEMI/ANTI 是**一种显式 join 节点**（`JOIN_SEMI`/`JOIN_ANTI`），早停自然收拢在 join 节点层。
+
+MySQL 侧恰好相反：**没有统一的 semi/anti join 节点**，早停是**各策略各自实现**的（NL 状态机 / hash 的 probe 短路 / LooseScan 的索引跳跃）。这正是"五种策略"架构的直接后果——**策略分散，早停也分散**。
+
+另外 MySQL **没有 Merge Join**（`AccessPath` 枚举只有 `NESTED_LOOP_JOIN`/`BKA_JOIN`/`HASH_JOIN`），所以"三算法对照"在 MySQL 只剩"两算法 + 索引跳跃"。
+
+### 9.2 NOT IN 的灾难：为什么永远优先 NOT EXISTS
+
+NULL **语义**部分见 [`02_subquery.md`](02_subquery.md)（`abort_on_null`、null_problem 导致 NOT IN 拿不到 antijoin）。这里讲**性能**。
+
+| 写法 | PG | MySQL | 复杂度 |
+|---|---|---|---|
+| `NOT EXISTS` | ANTI JOIN（显式节点） | antijoin（FirstMatch/Weedout 等） | O(LHS + RHS) |
+| `NOT IN`（无 NULL 保护） | **SubPlan**：物化 RHS + 每行全表扫 | **物化子查询**：物化 RHS + 每行探查 | **O(LHS × RHS)** |
+| `LEFT JOIN ... IS NULL` | 自动转 ANTI JOIN（`reduce_outer_joins`） | aj-nest 收尾就是 `LEFT JOIN + IS NULL`（本篇 3.3） | O(LHS + RHS) |
+
+两边结论一致：**NOT IN 在含 NULL 时是灾难，永远优先 NOT EXISTS**。区别只在"灾难路径"的名字：PG 叫 SubPlan，MySQL 叫物化子查询（见 [`../../runtime/08_materialization.md`](../../runtime/08_materialization.md)）。
+
+### 9.3 antijoin 的版本演进
+
+- **MySQL 8.0.17 起**支持 antijoin 优化（NOT IN / NOT EXISTS → 反连接）。此前只能走物化子查询（每行探查）。⚠️ 版本号来自官方 Release Notes，**源码无版本痕迹**（与 CTE 演进同理）
+- antijoin 是 **semi-join 框架的"负模式"**（aj-nest，见本篇 3.3 的 NOT IN 表格），不是独立的 join 节点
+- **策略受限**：antijoin 会强制砍掉 LooseScan（`is_aj_nest()` 只允许 FirstMatch / Materialization / DupsWeedout，见本篇参数节）
+- **NULL 保护的必要性**：NOT IN 走 antijoin 的前提是子查询结果不含 NULL 或列不可空，否则退回物化（02 篇的 null_problem 分析）
+
+对比 PG：PG 的 ANTI JOIN 是显式 join 节点（`JOIN_ANTI`），MySQL 是半连接框架里的负模式——又一个"节点 vs 策略"的架构差异。
+
+### 9.4 节点 vs 策略：与 PG 的架构全面对照
+
+#### 先纠正一个常见误解：PG 的 SEMI JOIN 不是"只有一种实现"
+
+PG 的 `JOIN_SEMI` 是**逻辑节点**，节点之下有三种物理实现竞争——**Hash Semi Join / Merge Semi Join / Nested Loop Semi Join**（回归测试的 EXPLAIN 里就能看到这三种名字）。优化器为同一节点生成多条 path，代价选择。
+
+所以"PG 只有一种、MySQL 有五种"是对比**错了维度**：
+
+| 层 | PG | MySQL（旧优化器） | MySQL（hypergraph） |
+|---|---|---|---|
+| 逻辑层 | `JOIN_SEMI`/`JOIN_ANTI` 节点 | semi-join 框架（aj-nest 负模式） | `RelationalExpression::SEMIJOIN/ANTIJOIN` |
+| **算法维度** | Hash / Merge / NL **三算法竞争** | NL + hash（8.0.18 起，**无 Merge**） | Hash / NL 竞争（`ProposeHashJoin` / `ProposeNestedLoopJoin`） |
+| **去重维度** | 节点内置（找到即跳，写一处） | **五策略**（FM/LS/Weedout/Mat×2） | `DeduplicateForSemijoin`（LIMIT 1 / REMOVE_DUPLICATES） |
+| 执行器 | 节点直接执行 | `JoinType::SEMI/ANTI`（NL/Hash 迭代器分发） | 同左 |
+| 开关 | `enable_nestloop/hashjoin/mergejoin`（**逐算法**） | `semijoin/firstmatch/loosescan/...`（**逐策略**）；`hash_join` 开关**已失效** | 仅 `hypergraph_optimizer` 总开关 |
+
+#### 源码揭示的三个真相
+
+**① 执行器层 MySQL 其实有显式 SEMI/ANTI**
+
+`sql/join_type.h`：
+
+```cpp
+enum class JoinType { INNER, OUTER, ANTI, SEMI, FULL_OUTER };
+```
+
+`HashJoinIterator` 与 `NestedLoopIterator` 都按它分发行为（SEMI 找到即跳、ANTI 见行即弃）。所以"MySQL 无显式节点"**只对旧优化器层成立**——执行器层与 PG 的节点模型对得上。
+
+**② hash semi join 不是第六种策略，与五策略正交**
+
+`advance_sj_state` 全文**没有任何 hash join 分支**；`SJ_OPT_*` 枚举只有 6 值（含 NONE，无 HASH）。hash semi join 发生在**策略定稿之后**的执行准备阶段：
+
+```
+五策略（advance_sj_state → fix_semijoin_strategies）：决定"去重方式"
+      ↓ 定稿
+ConnectJoins() → CreateHashJoinAccessPath()：决定"连接算法"（NL 或 hash）
+```
+
+即：**五策略管"怎么去重"，hash join 管"怎么连接"**——两个正交维度。这也解释了为什么 `semijoin` 策略开关与 hash join 互不干扰。
+
+**③ hypergraph 优化器完全不读五策略**
+
+`sj_strategy`、`SJ_OPT_*`、五策略开关在 `sql/join_optimizer/` **零引用**。hypergraph 把 semi join 表达为 `RelationalExpression::SEMIJOIN`（与 `JoinType::SEMI` **同值**），代价模型同时提议 Hash/NL 两种候选，去重用 `DeduplicateForSemijoin`。
+
+**所以 MySQL 的新优化器其实已经走向 PG 式的"节点 + 算法竞争"模型**；五策略是旧优化器专属遗产。
+
+#### "谁更优"的准确回答
+
+**不是"策略多 = 更优"**：
+
+1. **MySQL 五策略是"NL-only 年代"的去重补丁**——因为 8.0.18 前没有 hash join，只能在 NL 框架内用各种 trick 做去重（每种策略都有严格前提：LooseScan 要索引、Materialize 要临时表、Weedout 零约束但重复行真的产生）。它的"丰富"恰恰暴露了当年的短板。
+2. **PG 的 Hash Semi Join 在多数场景下不逊于、甚至优于 MySQL 五策略**——O(1) 探测、可并行、去重建在算子内。
+3. **但 MySQL 确有 PG 没有的独特维度**：LooseScan 的索引跳跃（PG 的 Merge Semi Join 需要两个有序输入，LooseScan 只要一个索引）、FirstMatch 的零内存、以及**逐策略开关**的 DBA 可调性。
+4. **准确的表述**：两者在"物理实现多样性"上其实相当（PG 3 算法 × 1 去重 vs MySQL 2 算法 × 6 去重策略），但**多样性的维度不同**——PG 在算法维度（源自设计），MySQL 在去重维度（源自历史）。
+
+#### 三层三套抽象（旧优化器路径的代价）
+
+同一句"t1 SEMI JOIN t2"在旧优化器路径是**三个不互通的类型系统**：
+
+```
+优化器层：SJ_OPT_LOOSE_SCAN 等策略状态机（附着在 join 顺序搜索上）
+   ↓ 执行准备期二次解码（ConnectJoins / FindSubstructure）
+AccessPath 层：NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL 等节点
+   ↓
+迭代器层：JoinType::SEMI / NestedLoopSemiJoinWithDuplicateRemovalIterator
+```
+
+而 hypergraph 路径消除了"策略→节点"的翻译（`RelationalExpression` 与 `JoinType` **共享枚举值**）。PG 则从头到尾只有一棵 plan node 树——**这是 PG 架构统一性的真正优势**：语义在逻辑层定一次，物理层只竞争算法。
+
+---
 
 ## 参考
 

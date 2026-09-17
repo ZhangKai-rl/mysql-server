@@ -1,6 +1,8 @@
 # 云上网络深度解析（VPC/VIP/NAT/L3-L4-L7/Overlay-Underlay/PrivateLink）
 
 > 综合 K8s 网络、腾讯云网络组件（VPC/TGW/Proxy/jnsgw/vpcgw）、云数据库访问路径整理，作为后续云数据库架构文档的前置基础。
+>
+> **边界**：本篇讲**网络**（地址/网关/路由）；存储侧（云盘/块存储、attach/detach）见 [`cloud_storage.md`](cloud_storage.md)，数据库整体架构见 [`cloud_db.md`](cloud_db.md)。
 
 ## 目录
 

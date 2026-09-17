@@ -329,6 +329,31 @@ PQ2.0 引入 **Exchange 算子**，在 plan slice 之间传递中间结果，三
 
 ---
 
+## 六、补充：从 I/O 视角看 Parallel_reader
+
+> 本节从 [`io.md`](io.md) 的读路径章迁入，与第三章互补：第三章讲**算法与数据结构**，这里讲**它在 I/O 全景中的位置**。
+
+
+`include/row0pread.h:103`：
+
+| 函数 | 职责 |
+|------|------|
+| `Parallel_reader::run` / `worker` / `spawn` | 主流程与工作线程 |
+| `Parallel_reader::add_scan` | 添加一个扫描上下文（index + range） |
+| `Scan_ctx::create_ranges` / `partition` / `traverse` | 把 B-tree 切成若干 page range；分区表按分区切 |
+| `Ctx::traverse_recs` | 线程内遍历记录 |
+
+**★ 它的使用范围极其有限**——只服务：
+
+1. DDL 建二级索引 / 表重建（`handler0alter.cc`）
+2. 分区表扫描（`ha_innopart.cc:3185`）
+3. 直方图统计（`row0pread-histogram.cc`）
+4. DDL 扫描（`ddl0par-scan.cc`）
+
+> **社区版没有 SQL 层并行查询。** `sql/` 的优化器与执行器（`JOIN` / Iterators）没有任何并行执行框架；`innodb_parallel_read_threads` 是 InnoDB 私有 sysvar，不是 optimizer hint。
+
+---
+
 ## 参考
 
 **内核月报**

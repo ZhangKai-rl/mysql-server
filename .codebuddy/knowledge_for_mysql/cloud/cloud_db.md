@@ -1,6 +1,8 @@
 # 云数据库架构深度解析（以 TDSQL-C/NCDB 为例）
 
 > 综合知识库与源码研究整理，涵盖数据面/支撑环境分层、存算分离、网络体系（VPC/VIP/TGW/Proxy）、HA 切换、透明切换（L0-L6）、运维排查。
+>
+> **边界**：本篇讲云数据库**整体架构与管控链路**；底层云盘/块存储本身见 [`cloud_storage.md`](cloud_storage.md)，网络见 [`cloud_networking.md`](cloud_networking.md)。
 
 ## 目录
 

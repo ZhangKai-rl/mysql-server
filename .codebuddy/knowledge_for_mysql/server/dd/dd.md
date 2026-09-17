@@ -3,6 +3,18 @@
 > **定位**：MySQL 8.0 的**权威元数据**——存在哪、长什么样、怎么被缓存、怎么参与自举与原子 DDL。
 > **边界**：InnoDB 侧的内存字典（`dict_table_t` 等）见 [`innodb_dict.md`](innodb_dict.md)；表对象生命周期见 [`../table.md`](../table.md)；DDL 执行见 [`../../innodb/ddl.md`](../../innodb/ddl.md)。
 
+> **★ 两套并存的字典**（理解元数据问题的关键前提，也常被混淆）：
+>
+> | | server 层 DD（本篇） | InnoDB 内部字典（[`innodb_dict.md`](innodb_dict.md)） |
+> |---|---|---|
+> | 是什么 | 8.0 起的**全局唯一权威**元数据（取代 .frm） | 引擎私有的运行时字典 |
+> | 载体 | `mysql` 库下的 InnoDB 表（`mysql.tables` / `mysql.columns` / …） | `dict_sys_t` 内存结构 + `SYS_*` 内部表 |
+> | 持久化 | 存在 DD 表里（本身就是 InnoDB 表） | 崩溃后**从 DD 重建**，不独立持久化 |
+> | 关键对象 | `dd::Table` / `dd::Column` / `dd::Index` | `dict_table_t` / `dict_index_t` / `dict_col_t` |
+> | 谁写它 | DDL | 引擎加载（`dict0dd.cc` 读 DD 填内存） |
+>
+> **单向权威**：DD 是唯一真相，InnoDB dict 是它的**内存投影/缓存**。所以 8.0 里"字典不一致"类问题的排查方向总是"DD 对不对 → 加载逻辑对不对"，而不是反过来。
+
 ## 目录
 
 - [概述](#概述)（★ 全景总览图）
@@ -14,6 +26,7 @@
   - [2. 对象模型与 `se_private_data`](#2-对象模型与-se_private_data)（★ options vs se_private_data / ★ 全键名表）
   - [3. DD cache](#3-dd-cache)（Dictionary_client / RAII / 三 registry / Shared_dictionary_cache / COW）
   - [4. SDI](#4-sdiserialized-dictionary-information) / [5. 启动自举](#5-启动自举鸡生蛋问题) / [6. 原子 DDL 中的地位](#6-原子-ddl-中-dd-的地位) / [7. 升级](#7-升级)
+- [★ DD 里的 C++ 运用](#-dd-里的-c-运用)
 - [Misc](#misc)（易误解概念 / 观察技巧 / 待补清单）
 - [参考](#参考)
 
@@ -1500,6 +1513,466 @@ bool terminate(THD *thd);
 - ★ 版本记在 `dd_properties` 表：`DD_VERSION`（DD 结构版本）与 `MYSQL_VERSION_ID` 分开记；升级成功后 `update_versions` 重写。第（四）节的 `is_dd_upgrade_from_before(DD_VERSION_80016)`（check constraint 8.0.16 引入）判断数据来源就是它。
 - InnoDB 侧（`dict0upgrade.cc`）：只有 `srv_is_upgrade_mode` 为真的升级窗口才读 5.7 的 `SYS_*` 内部表（平时这些表已不存在）→ 逐表 fill `dd::Table` 灌入新 DD（见 [`innodb_dict.md`](innodb_dict.md)）。整个过程 = **把 5.7 的两套字典（frm + SYS_*）翻译成 8.0 的一份 DD**。
 - DBUG 测试点 `dd_upgrade_stage_2` 会在阶段 2 故意自杀，验证"崩溃后回滚、数据目录仍归 5.7"——**升级的崩溃安全是被测试显式守护的**。
+
+---
+
+## ★ DD 里的 C++ 运用
+
+> 与 [`../infra/io_cache.md`](../infra/io_cache.md)「这套体系里的 C++ 运用」对照读：那一篇讲 `IO_CACHE` 外层的 ostream 体系（装饰者、`unique_ptr` 转移、`= delete`、duck-typing 模板），这一篇讲 DD 的**双类体系、菱形虚继承、嵌套 RAII、tag dispatch**。两者是 MySQL server 层 C++ 最复杂的两块。
+
+### 0. DD 的 C++ 风格与"现代 C++"的三点不同
+
+先讲结论，避免用常规直觉去读 DD 代码：
+
+| 常规现代 C++ 直觉 | DD 的实际做法 | 原因 |
+|---|---|---|
+| 资源类应该 `= delete` 拷贝 | **几乎不 delete**（全仓库只 3 处） | ★ `clone()` 体系**依赖**拷贝构造函数做深拷贝（见 §1.3） |
+| 共享所有权用 `shared_ptr` | **0 处 `shared_ptr`** | 缓存的引用计数是 `Cache_element::m_ref_counter`（手写 `uint` + 外部加锁） |
+| 用 `enable_if` / CRTP 做类型派发 | **都没有** | 用**嵌套 typedef traits** + **空 tag 类型的函数重载**（见 §3、§4） |
+
+### 1. 双类体系：接口 `X` + 实现 `X_impl`
+
+DD 最显著的设计：`sql/dd/types/*.h` 是**纯虚接口**，`sql/dd/impl/types/*_impl.h` 是 **public 继承接口的实现类**。
+
+#### 1.1 继承树
+
+```
+                        dd::Weak_object          (types/weak_object.h)
+                        ─ 纯虚 debug_print()
+                        ─ @note: 直接子类必须 **虚继承**
+                                        ▲ virtual public
+        ┌───────────────────────────────┴──────────────────────────┐
+        │                                                           │
+  dd::Entity_object                          dd::Weak_object_impl_<bool use_pfs>
+  : virtual public Weak_object               ─ ★ 模板！bool 非类型参数
+  ─ ★ private virtual impl()                 ─ 自定义 operator new/delete → my_malloc(PFS)
+  ─   friend Storage_adapter /                using Weak_object_impl = Weak_object_impl_<true>;
+  ─   Entity_object_table_impl                        │
+        │                                             │
+        └───────────────┬─────────────────────────────┘
+                        │
+        dd::Entity_object_impl : virtual public Entity_object,
+                                 public Weak_object_impl
+                        │
+   ┌────────────────────┼────────────────────┬──────────────┐
+   │                    │                    │              │
+Schema_impl       Abstract_table_impl    Event_impl    Tablespace_impl
+: Entity_object_impl,  : Entity_object_impl, ...       ...
+  public Schema        virtual public Abstract_table
+                             │
+                  ┌──────────┴──────────┐
+                  │                     │
+             Table_impl              View_impl
+             : Abstract_table_impl,   : Abstract_table_impl,
+               virtual public Table     public View
+```
+
+接口侧全部 `virtual public`，为菱形服务：
+
+```
+Weak_object
+ └─ Entity_object : virtual public Weak_object
+     ├─ Abstract_table : virtual public Entity_object
+     │   ├─ Table : virtual public Abstract_table
+     │   └─ View  : virtual public Abstract_table
+     ├─ Schema / Tablespace / Index / Column / Event / Routine / Charset / Collation / ...
+     └─ Trigger
+```
+
+#### 1.2 接口类长什么样（`dd::Table`，`types/table.h:48`）
+
+```cpp
+class Table : virtual public Abstract_table {
+ public:
+  typedef Table_impl Impl;                    // ★ 关键 traits：接口→实现的反向指针
+  typedef Collection<Index *> Index_collection;
+  enum enum_row_format { RF_FIXED = 1, RF_DYNAMIC, RF_COMPRESSED, ... };
+
+  ~Table() override = default;
+
+  // ---- 全部是纯虚 getter/setter，★ 无数据成员 ----
+  virtual Object_id tablespace_id() const = 0;
+  virtual const String_type &engine() const = 0;
+  virtual const Properties &se_private_data() const = 0;
+  virtual Properties &se_private_data() = 0;          // ★ const/non-const 双重载
+  virtual Index *add_index() = 0;
+  virtual const Index_collection &indexes() const = 0;
+  virtual Index_collection *indexes() = 0;            // ★ 同上
+  // ... ~80 个纯虚 ...
+
+  // ---- 三个关键虚函数 ----
+  Table *clone() const override = 0;                     // ★ 协变返回类型
+  Table *clone_dropped_object_placeholder() const override = 0;
+  virtual void serialize(Sdi_wcontext *wctx, Sdi_writer *w) const = 0;
+  virtual bool deserialize(Sdi_rcontext *rctx, const RJ_Value &val) = 0;
+};
+```
+
+#### 1.3 实现类（`dd::Table_impl`，`impl/types/table_impl.h:68`）
+
+```cpp
+class Table_impl : public Abstract_table_impl, virtual public Table {
+ public:
+  bool restore_children(Open_dictionary_tables_ctx *otx) override;  // 子对象树加载
+  bool store_children(Open_dictionary_tables_ctx *otx) override;
+  bool restore_attributes(const Raw_record &r) override;            // 行 → 成员
+  bool store_attributes(Raw_record *r) override;                    // 成员 → 行
+  /* ... */
+
+  // ★★★ "Fix 'inherits ... via dominance' warnings" —— 菱形消歧（约 40 处）
+  Entity_object_impl *impl() override { return Entity_object_impl::impl(); }
+  Object_id id() const override { return Entity_object_impl::id(); }
+  const String_type &name() const override { return Entity_object_impl::name(); }
+  Object_id schema_id() const override { return Abstract_table_impl::schema_id(); }
+  // ...
+
+ private:
+  Object_id m_se_private_id;
+  String_type m_engine;
+  uint m_last_checked_for_upgrade_version_id = 0;      // NSDMI
+  /* ... Composite：子对象集合 ... */
+  Index_collection m_indexes;
+
+  Table_impl(const Table_impl &src);                   // ★ 私有拷贝构造（深拷贝整棵树）
+  Table_impl *clone() const override { return new Table_impl(*this); }
+
+  Table_impl *clone_dropped_object_placeholder() const override {
+    Table_impl *placeholder = new Table_impl();
+    placeholder->set_id(id());                          // 只保留 5 个 key 字段
+    placeholder->set_schema_id(schema_id());
+    /* ... */
+    return placeholder;
+  }
+};
+```
+
+**为什么 `_impl` 类"看起来不能"直接构造**：其实构造函数是 **public** 的。真正的原因是三层：
+
+1. **物理隔离**：`sql/dd/types/*.h` 只前向声明 `class Table_impl;`，实现头在 `impl/` 下。server 层代码只 include `types/`，**物理上构造不了**。
+2. **工厂 `dd::create_object<X>()` 是官方入口**：
+   ```cpp
+   // sql/dd/impl/dd.cc:78
+   template <typename X>
+   X *create_object() {
+     return dynamic_cast<X *>(new (std::nothrow) typename X::Impl());
+   }
+   ```
+   ★ 返回**接口指针** `X*`，调用者永远看不到 `X_impl` 的成员。且用 **`new (std::nothrow)`**——DD 全程不用异常。
+3. **拷贝构造是私有的**：只能通过 `clone()` 调用（成员函数能访问私有拷贝构造），因为 `clone()` 要做**深拷贝整棵对象树**（`m_indexes` / `m_partitions` 里每个元素都要拷）。
+
+### 2. ★ 菱形虚继承与 "inherits via dominance"
+
+#### 2.1 为什么要全 `virtual public`
+
+`Table_impl` 同时继承 `Abstract_table_impl`（含 `Entity_object_impl` 实现）和 `Table`（含 `Abstract_table` 接口）。如果不用虚继承，就会出现**两个 `Weak_object` 子对象**，导致：
+
+- 指针转换歧义（`Table_impl*` → `Weak_object*` 不知走哪条路）
+- 菱形顶部的成员重复
+
+所以从 `Weak_object` 开始**全部虚继承**，保证整个体系只有一个 `Weak_object` 子对象。
+
+#### 2.2 "inherits via dominance" 是什么
+
+菱形下，同名虚函数在两条路径上都有实现时，GCC 会警告 *"overloaded virtual function is inherited via dominance"*。DD 的解法是**在最终派生类里显式转发**：
+
+`Entity_object_table_impl`（`impl/types/entity_object_table_impl.h:45`）的全部方法体都是转发，目的只有一个——消警告：
+
+```cpp
+class Entity_object_table_impl : public Object_table_impl,
+                                 public Entity_object_table {
+ public:
+  bool restore_object_from_record(...) const override;
+  // Fix "inherits ... via dominance" warnings
+  const String_type &name() const override { return Object_table_impl::name(); }
+  Object_table_definition_impl *target_table_definition() override {
+    return Object_table_impl::target_table_definition();
+  }
+  /* ... 共 10 个纯转发 ... */
+};
+```
+
+`Table_impl` 里同样有约 40 处这样的转发。**这是菱形继承在真实工程里的"税"**——每加一层就要补一批转发。
+
+### 3. ★ 类型派发：嵌套 typedef traits（不是 `Object_type` 枚举）
+
+> **澄清**：DD 里**不存在** `dd::Object_type` 这种运行时类型枚举。全部靠 C++ 类型 + 嵌套 typedef 做**编译期**派发。
+
+每个可缓存的 DD 接口类都提供一组嵌套 typedef：
+
+| typedef | 含义 |
+|---------|------|
+| `Impl` | 对应的实现类（工厂用它 `new X::Impl()`） |
+| `DD_table` | 对应的 `mysql.*` 表描述类（如 `tables::Tables`） |
+| `Id_key` | 按 id 查找的 key 类 |
+| `Name_key` | 按名字查找的 key 类 |
+| `Aux_key` | 第三套索引 key（如 `(engine, se_private_id)`） |
+| `Cache_partition` | **缓存分区粒度**（见下） |
+
+派发实例：
+
+```cpp
+// impl/transaction_impl.h:87 —— 由 T::DD_table 决定打开哪张表
+template <typename T>
+Raw_table *get_table() const { return get_table(T::DD_table::instance().name()); }
+
+// impl/transaction_impl.h:92
+template <typename X>
+void register_tables() { X::Impl::register_tables(this); }   // static dispatch
+```
+
+#### ★ `Cache_partition` 为什么是 `Abstract_table`
+
+`mysql.tables` **同时存 `Table` 和 `View`**。所以缓存分区粒度只能是它们的共同基类 `Abstract_table`：
+
+```
+acquire<Table>()
+  → 按 Table::Cache_partition == Abstract_table 去 Shared_multi_map<Abstract_table> 查
+  → 拿到后 dynamic_cast<const Table*>(cached_object)
+  → cast 失败说明实际是 View → 返回 nullptr（合法）
+```
+
+这解释了 `Dictionary_client::acquire()` 里为什么到处是 `dynamic_cast` + `transfer_release`（见 §5.3）。
+
+### 4. ★ `Multi_map_base` 的 tag dispatch（为什么不用 SFINAE）
+
+`Multi_map_base<T>` 持有四张不同 key 类型的 map，要按 key 类型选出对应 map：
+
+```cpp
+template <typename T>
+class Multi_map_base {
+ private:
+  Element_map<const T *, Cache_element<T>>              m_rev_map;
+  Element_map<typename T::Id_key,   Cache_element<T>>   m_id_map;
+  Element_map<typename T::Name_key, Cache_element<T>>   m_name_map;
+  Element_map<typename T::Aux_key,  Cache_element<T>>   m_aux_map;
+
+  template <typename K> struct Type_selector {};        // ★ 空 tag 类型
+
+  Element_map<const T *, Cache_element<T>> *m_map(Type_selector<const T *>) { return &m_rev_map; }
+  const Element_map<const T *, Cache_element<T>> *m_map(Type_selector<const T *>) const { return &m_rev_map; }
+  Element_map<typename T::Id_key, Cache_element<T>> *m_map(Type_selector<typename T::Id_key>) { return &m_id_map; }
+  /* ... Name_key / Aux_key 各 2 个重载 ... */
+
+ protected:
+  // ★ 对外只暴露模板版本；注释明说 "We must use overloading to accomplish this"
+  template <typename K> Element_map<K, Cache_element<T>> *m_map() {
+    return m_map(Type_selector<K>());
+  }
+};
+```
+
+**★ 为什么不能用 `std::enable_if`**：`T::Name_key` 与 `T::Id_key` **可能是同一个类型**（例如某些类型两者都是 `Primary_id_key`）。SFINAE 会让重载集产生歧义；而 `Type_selector<K>` 是独立类型，只按 `K` **精确匹配**，不会退化。
+
+**代价**：派生类要用这种"怪语法"（`local_multi_map.h:70`）：
+
+```cpp
+template <typename K>
+Element_map<K, Cache_element<T>> *m_map() {
+  return Multi_map_base<T>::template m_map<K>();   // ★ template 关键字不可省
+}
+```
+
+### 5. ★ `Auto_releaser`：嵌套 RAII 与所有权上移
+
+#### 5.1 声明（`cache/dictionary_client.h:178`）
+
+```cpp
+class Auto_releaser {
+  friend class Dictionary_client;
+ private:
+  Dictionary_client *m_client;
+  Object_registry m_release_registry;   // ★ 值成员：自带一份 registry
+  Auto_releaser *m_prev;                // ★ 链表前驱 = 栈式嵌套
+
+  template <typename T> void auto_release(Cache_element<T> *element) {
+    assert(m_prev != nullptr);          // ★ default releaser 不能 auto_release
+    m_release_registry.put(element);
+  }
+  template <typename T> void transfer_release(const T *object);   // 上移到外层
+  template <typename T> Auto_releaser *remove(Cache_element<T> *element);
+
+  Auto_releaser();                      // 私有：只给 m_default_releaser 用
+ public:
+  explicit Auto_releaser(Dictionary_client *client);
+  ~Auto_releaser();
+};
+```
+
+#### 5.2 构造 / 析构：强制 LIFO
+
+```cpp
+Auto_releaser::Auto_releaser(Dictionary_client *client)
+    : m_client(client), m_prev(client->m_current_releaser) {
+  m_client->m_current_releaser = this;                  // 压栈
+}
+
+Auto_releaser::~Auto_releaser() {
+  // Make sure that we destroy auto_releaser object in LIFO order.
+  assert(m_client->m_current_releaser == this);         // ★ 强制 LIFO
+
+  m_client->release<Abstract_table>(&m_release_registry);
+  m_client->release<Schema>(&m_release_registry);
+  /* ... 9 个类型手工展开 ... */
+
+  m_client->m_current_releaser = m_prev;                // 出栈
+
+  if (m_client->m_current_releaser == &m_client->m_default_releaser) {
+    // 回到栈底：整个语句结束
+    if (!m_client->m_thd->m_transactional_ddl.inited())
+      m_client->m_registry_uncommitted.erase_all();
+    m_client->m_registry_dropped.erase_all();
+    delete_container_pointers(m_client->m_uncached_objects);
+  }
+}
+```
+
+**嵌套结构**：
+
+```
+栈（自下而上 = 声明顺序）：
+
+  m_default_releaser  (m_prev == nullptr, 私有构造)
+      ▲
+  Auto_releaser R1    ← 函数开头
+      ▲
+  Auto_releaser R2    ← acquire<Table>() 内部
+      ▲
+  Auto_releaser R3    ← 更深层
+      ▲
+  m_current_releaser ┘
+
+销毁必须严格 LIFO；回到 default releaser 才清 uncommitted/dropped
+```
+
+#### 5.3 ★ `transfer_release`：所有权从内层上移到外层
+
+`acquire()` 内部为了处理 `dynamic_cast` 失败自己开了一个 releaser；若 cast 成功、对象要**返回给调用者**，它的生命周期不能随内部 releaser 结束：
+
+```cpp
+template <typename T>
+bool Dictionary_client::acquire(Object_id id, const T **object) {
+  const typename T::Id_key key(id);
+  const typename T::Cache_partition *cached_object = nullptr;
+  Auto_releaser releaser(this);                    // ← 内部 releaser
+  bool error = acquire(key, &cached_object, &local_committed, &local_uncommitted);
+  if (!error) {
+    // Dynamic cast may legitimately return NULL if we e.g. asked
+    // for a dd::Table and got a dd::View in return.
+    *object = dynamic_cast<const T *>(cached_object);
+    if (!local_committed && !local_uncommitted && *object)
+      releaser.transfer_release(cached_object);    // ★ 过户给外层，延长生命周期
+  }
+  return error;
+}
+```
+
+```cpp
+template <typename T>
+void Dictionary_client::Auto_releaser::transfer_release(const T *object) {
+  Cache_element<T> *element = nullptr;
+  m_release_registry.get(object, &element);
+  m_release_registry.remove(element);               // 从本层摘掉
+  m_prev->auto_release(element);                    // 交给外层
+}
+```
+
+#### 5.4 ★ 与 MDL 的声明顺序是硬性约定
+
+**`Auto_releaser` 本身不持有 MDL ticket**——MDL 由另一个 RAII 类 `Schema_MDL_locker` 持有。两者的**声明顺序写死在注释里**（`dd_schema.h:86`）：
+
+```cpp
+  // We must make sure the schema is released and unlocked in the right order.
+  Schema_MDL_locker mdl_locker(m_thd);   // ① 先声明 → 后析构
+  Auto_releaser releaser(this);          // ② 后声明 → 先析构
+```
+
+> **顺序错了会发生什么**（`dictionary_client.cc:1044` 注释）：若 releaser 先于 mdl_locker 析构，会有一段"schema 的 MDL 已释放、但对象还被本地引用"的窗口——**另一个线程可能拿到 X 锁，而缓存元素的引用计数仍 > 0**，触发 shared cache 的 assert，并为不当使用打开口子。
+
+### 6. 缓存三级结构与可见性
+
+`Dictionary_client` 用**三个 `Object_registry` 实例**实现三级：
+
+| 级别 | 成员 | 含义 |
+|------|------|------|
+| L1a | `m_registry_committed` | 已与 `mysql.*` 表一致的 dd-object |
+| L1b | `m_registry_uncommitted` | 本线程已改、**未提交** |
+| L1c | `m_registry_dropped` | 本线程已删、**未提交** |
+
+```cpp
+std::vector<Entity_object *> m_uncached_objects;  // acquire_uncached() 的产物，最后统一 delete
+Object_registry m_registry_committed;
+Object_registry m_registry_uncommitted;
+Object_registry m_registry_dropped;
+```
+
+**可见性判定**（`acquire<K,T>`，三级 + 三次复查）：
+
+| 场景 | 结果 |
+|------|------|
+| 命中 uncommitted | **返回 uncommitted 版本**（本事务自己的修改优先可见） |
+| 命中 dropped | **返回 nullptr**（其他线程仍可见旧版） |
+| 命中 committed | 再**用 id key 复查 uncommitted**——因为对象可能已被改名或删除 |
+| 都没命中 | 走 `Shared_dictionary_cache` → 可能读盘；读到后**再复查一次**（防止 cache miss 期间本线程改名/删了它） |
+
+> **为什么要用 id key 复查**：按 name key 命中后，对象可能已被 rename，旧名字应视为"不存在"。这是"**同一对象多个版本**"问题的标准处理方式。
+
+### 7. 其他 C++ 特性清单
+
+| 特性 | 位置 | 说明 |
+|---|---|---|
+| **非类型模板参数 `bool`** | `impl/types/weak_object_impl.h:47` `template <bool use_pfs> class Weak_object_impl_` | 编译期开关 PFS 内存统计；`using Weak_object_impl = Weak_object_impl_<true>;` |
+| **`if (use_pfs)` 模拟 `if constexpr`** | 同上 | 运行期 `if`，但由于 `use_pfs` 是编译期常量，编译器完全优化掉另一分支（C++11 写法） |
+| **自定义 `operator new/delete` + `noexcept`** | 同上（唯一 4 处 `noexcept`） | `my_malloc(key_memory_DD_objects, ...)` |
+| **别名模板 `using`** | `string_type.h:48/56`、`dictionary_client.h:481` | `Char_string_template<A>`、`Const_ptr_vec<T>` |
+| **显式实例化** | `dd.cc:83-135`（25 个 `create_object` + 9 个 `create_map`）、`dictionary_client.cc`（~120 个） | ★ 控制编译时间 + 把模板实现藏进 `.cc` |
+| **显式特化** | `dictionary_client.cc:2625/2632`（`store<Table_stat>` / `store<Index_stat>`——这两种**不进缓存**） | |
+| **`std::hash` 特化** | `string_type.h:88` | 侵入 `namespace std`，用 murmur3_32 |
+| **自定义 allocator** | `string_type.h:43`、`element_map.h:75`、`free_list.h:55` | `Malloc_allocator<T>` 全 DD 缓存统一走 PSI |
+| **`Collection(const Collection&) = delete`** | `collection.h:164` | ★ 注意：写成了 `void operator=(Collection &)`（参数漏了 const），属于笔误级写法 |
+| **`enum class`** | 16 个文件（`enum_dd_init_type`、`enum_table_type`、`Stage`、`Common_index` 等） | 内部状态机用 scoped |
+| **unscoped enum** | `types/table.h:81` `enum_row_format` 等 | ★ **面向 SQL 的定义（字段序号、ENUM 列值）故意用 unscoped**，因为要 `static_cast` 成 int 写进 `mysql.tables` |
+| **`[[nodiscard]]`** | 43 处，集中在 `dictionary_client.h`(36) / `dictionary.h`(6) | DD **直接用标准 `[[nodiscard]]`**，没有 `NODISCARD` 宏 |
+| **`std::optional`** | 11 处（`column.h`、`spatial_reference_system.h`） | 可空字段 |
+| **`std::string_view`** | 1 处（`dictionary_client.cc:595`） | |
+| **`std::variant`** | **0 处** | |
+| **`override`** | 大量（`table_impl.h` 约 120 处） | **`final` 0 处** |
+| **`= delete`** | **仅 3 处**：`Properties::operator=`、`Import_target` 拷贝（move-only）、`Collection` 拷贝 | ★ 少的原因见 §0 |
+
+### 8. SDI 与"编译防火墙"
+
+`sql/dd/sdi_fwd.h` 只 include `rapidjson/fwd.h`（前向声明），把重型 rapidjson 模板**挡在所有 DD 头文件之外**：
+
+```cpp
+namespace dd {
+typedef rapidjson::GenericValue<RJ_Encoding, RJ_Allocator> RJ_Value;
+using RJ_Writer = rapidjson::Writer<...>;
+using Sdi_writer = RJ_Writer;
+class Sdi_rcontext;
+class Sdi_wcontext;
+}
+```
+
+这就是为什么 `table.h` 能写 `virtual void serialize(Sdi_wcontext *wctx, Sdi_writer *w) const = 0;` 而**不需要暴露 rapidjson 实现**。
+
+SDI 版本历史里还留着两个真实 bug 的记录（`impl/sdi.h:83-90`）：
+
+```
+  80016: - Bug#29210646: DD::INDEX_IMPL::M_HIDDEN NOT INCLUDED IN SDI
+  80019: - Bug#30326020: SUBPARTITIONING NOT REFLECTED IN SDI
+```
+
+### 9. 反直觉点 / 坑
+
+| 坑 | 说明 |
+|---|---|
+| **`clone()` 依赖拷贝构造，所以 DD 类不能 `= delete` 拷贝** | 与常规"现代 C++"直觉相反。`Table_impl` 的拷贝构造是**私有**的，只能被 `clone()` 调用 |
+| **`Void_key::operator<` 比较地址** | `bool operator<(const Void_key &rhs) const { return this < &rhs; }` —— 因为没有任何成员可比较，而 `Element_map` 用 `std::map` 需要严格弱序 |
+| **`Object_registry` 的 9 个 map 是 lazy `unique_ptr`** | `get()` 时若 map 未创建直接返回 nullptr（"没建过 ⇒ 对象不存在"）；`remove()` 则 assert map 必须已存在 |
+| **`create_map` 被刻意放到 `dd.cc` 显式实例化** | 注释明说："*it is big, and because it takes a lot of time for the compiler to instantiate*" |
+| **引用计数不是原子的** | `cache_element.h:61` 注释："*Locking at an outer level takes care of race conditions*"——锁在 `Shared_multi_map<T>::m_lock` |
+| **`Free_list` 是 `std::vector` + 线性查找移除** | O(n)，因为 LRU 链通常很短 |
+| **`Raw_key` 是纯 POD `struct` 不是 class** | 含 `uchar key[MAX_KEY_LENGTH]`（栈上大数组），是与 server `Field*` 交互的 C 边界 |
+| **DD 表定义是 C++ 硬编码** | `add_field(FIELD_ID, "FIELD_ID", "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT")`——**不能从元数据读**，因为要自举 |
 
 ---
 

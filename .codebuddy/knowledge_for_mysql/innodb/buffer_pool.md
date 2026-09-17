@@ -2,13 +2,22 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 控制块状态机、LRU 中点替换、预读、脏页刷盘（page cleaner）、doublewrite、自适应刷脏。
 >
-> **边界**：本篇讲 buffer pool 内部机制；redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)，B-tree 页内操作见 [`btr.md`](btr.md)，AHI 见 btr.md「自适应哈希索引」节，崩溃恢复见 redo_log.md。
+> **边界**：本篇讲 buffer pool 内部机制，**含完整的脏页刷盘**（page cleaner 批次组织、锁契约、邻接刷盘、全量刷脏、用户线程单页刷）；redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)，**doublewrite 的完整实现见 [`dblwr.md`](dblwr.md)**，dblwr 之下的 I/O 原语与 AIO 见 [`io.md`](io.md)、文件层见 [`fil.md`](fil.md)，B-tree 页内操作见 [`btr.md`](btr.md)，AHI 见 btr.md「自适应哈希索引」节，崩溃恢复见 [`recovery.md`](recovery.md)。
 
 ## 目录
 
 - [概述](#概述)
 - [理论基础](#理论基础)
 - [核心实现](#核心实现)
+  - [★ 刷脏批次的组织（single-flight + best effort）](#-刷脏批次的组织single-flight--best-effort)
+  - [邻接刷盘 `buf_flush_try_neighbors`](#邻接刷盘buf_flush_try_neighbors)
+  - [全量刷脏 `buf_flush_sync_all_buf_pools`](#全量刷脏buf_flush_sync_all_buf_pools)
+  - [用户线程自己刷一页：为什么慢](#用户线程自己刷一页为什么慢)
+  - [AIO 槽位耗尽会直接阻塞刷脏](#aio-槽位耗尽会直接阻塞刷脏)
+  - [读路径：一次缺页的完整流程](#读路径一次缺页的完整流程)
+  - [change buffer：用延迟写换随机读 I/O](#change-buffer用延迟写换随机读-io)
+  - [AHI：纯内存，零 I/O](#ahi纯内存零-io)
+  - [预读（read-ahead）](#预读read-ahead)
 - [相关的系统变量/状态变量](#相关的系统变量状态变量)
 - [Misc](#misc)
 - [关键源码位置速查](#关键源码位置速查)
@@ -125,6 +134,189 @@ slot-based buffer manager 的通用概念到 InnoDB 实现的对应（骨架源�
 | `buf_fix_count` | 读页线程（buf_page_get） | 防 LRU 淘汰/重定位 | 否（`buf_page_can_relocate` 只看 io_fix 与 fix_count，但查询 io_fix 可不持 block mutex） |
 | `io_fix` | 发起 I/O 的线程 | 防"读盘/刷盘进行中被别人动这页" | 是（改 io_fix 要持规定 latch） |
 
+### 读路径：一次缺页的完整流程
+
+```
+buf_page_get_gen（buf0buf.cc:4365）
+  └─ CRTP 派发到 Buf_fetch_normal::get（:3631）/ Buf_fetch_other::get（:3683）
+       ├─ BP 命中 → 直接返回（必要时做 ibuf merge）
+       └─ 未命中 → buf_read_page（buf0rea.cc:293）→ buf_read_page_low（:67）
+              └─ fil_io(sync=true) → **调用线程自己的 pread()**
+              buf_page_io_complete（buf0buf.cc:5614） ← 本线程自己调
+                  ① 解密（os 层的 os_file_io_complete）
+                  ② 解压（表压缩 zip）
+                  ③ checksum 校验
+                  ④ ibuf merge（把 change buffer 里攒的修改合并进刚读入的页）
+```
+
+#### ★ 必须纠正一个常见误解：单页缺页读**没有走异步 AIO**
+
+常见说法是"缺页读底层用异步 AIO 以便合并"，**这是错的**：单页缺页读 = 调用线程自己的 `pread()`，不占 AIO 槽位、不需要 io-handler 线程。
+
+（完整判定链 `sync=true` → `AIO_mode::SYNC` → `os_file_read_func` → `pread` 见 [`fil.md`](fil.md)「AIO 模式的三选一」。）
+
+即：**单页缺页读 = 调用线程自己的 `pread()`，不占 AIO 槽位，不需要 io-handler 线程。**
+
+`sync` 只是 `buf_read_page_low` 的参数。真正走 `sync=false`（真 AIO）的是这三条：
+
+| 调用者 | sync | 说明 |
+|---|---|---|
+| `buf_read_ahead_random` / `_linear` | **false** | 预读；用 `DO_NOT_WAKE` 攒批，最后统一唤醒（`buf0rea.cc:577`） |
+| `buf_read_ibuf_merge_pages` | 仅最后一页 true | `AIO_mode::IBUF` |
+| `buf_read_recv_pages` | 仅最后一页 true | 崩溃恢复 |
+
+而且**有些页会被强制降级为同步**（`buf_read_page_low:82-90`）：
+
+```cpp
+  if (ibuf_bitmap_page(page_id, page_size) || trx_sys_hdr_page(page_id)) {
+    /* Trx sys header is so low in the latching order that we play
+    safe and do not leave the i/o-completion to an asynchronous
+    i/o-thread. Ibuf bitmap pages must always be read with
+    synchronous i/o, to make sure they do not get involved in
+    thread deadlocks. */
+    sync = true;
+  }
+```
+
+> **⭐ 并发的真正来源**：N 个用户线程各缺一个**不同**的页 → N 个并发 `pread()`（内核层面天然并行）。**InnoDB 缺页读从不做页合并**——一次 `buf_read_page_low` 永远只发一个页。合并只发生在预读层，那也是**逐页循环发出**，只是攒批提交。
+
+#### ★ 并发请求同一个页：只发一次 I/O
+
+靠 `buf_page_init_for_read`（`buf0buf.cc:4798`）的**占位与查重的原子性**：
+
+```cpp
+  mutex_enter(&buf_pool->LRU_list_mutex);
+  hash_lock = buf_page_hash_lock_get(buf_pool, page_id);
+  rw_lock_x_lock(hash_lock, UT_LOCATION_HERE);
+
+  watch_page = buf_page_hash_get_low(buf_pool, page_id);
+
+  if (watch_page != nullptr && !buf_pool_watch_is_sentinel(buf_pool, watch_page)) {
+    /* The page is already in the buffer pool. */
+    ... 释放刚分配的 descriptor / buddy / block ...
+    bpage = nullptr;
+    goto func_exit;                      // ← 不发 IO
+  }
+```
+
+**"插入 page_hash" 与 "检查是否已存在" 在同一个 hash_lock X 锁临界区内**，所以对同一个 `page_id`，物理 IO 有且仅有一次。后到的线程要么 `lookup()` 命中后等待，要么进入 `buf_page_init_for_read` 发现已存在、返回 nullptr、`Buf_fetch` 的 `for(;;)` 再转一圈后命中。
+
+**`buf_wait_for_read` 的等待机制很妙**（`buf0buf.cc:3513`）——**没有任何 `os_event` / broadcast**：
+
+```cpp
+static void buf_wait_for_read(buf_block_t *block) {
+  while (block->page.was_io_fix_read()) {
+    /* Page is X-latched on block->lock until the read is completed.
+    Let's just wait for S-lock on block->lock, it will be granted as soon as the
+    read completes. */
+    rw_lock_s_lock(&block->lock, UT_LOCATION_HERE);
+    rw_lock_s_unlock(&block->lock);
+  }
+}
+```
+
+**"能拿到 S 锁"本身就是唤醒**。这成立靠三件事：
+
+1. `buf_page_init_for_read` 上的是 **pass 值 = `BUF_IO_READ` 的 X 锁**（`rw_lock_x_lock_gen(&block->lock, BUF_IO_READ)`）——**不可递归**，发起读的线程自己也不能在读完成前拿到它；
+2. 该 X 锁覆盖整个"读 + 后处理"窗口，由 `buf_page_io_complete` 在**做完解压/校验/ibuf merge 之后**才释放；
+3. `io_fix = NONE` 的设置在 `x_unlock` **之前**，所以等待者拿到 S 锁时 `was_io_fix_read()` 已是 false，不多转一圈。
+
+#### ★ `buf_page_io_complete`：后处理收口（`buf0buf.cc:5614`）
+
+sync 与 async 共用同一个后处理函数——sync 由发起线程自己调（`buf0rea.cc:148`），async 由 io-handler 线程调（`fil0fil.cc:7981`）。固定顺序：
+
+| # | 动作 | 说明 |
+|---|---|---|
+| ① | 解压（表压缩 zip） | `buf_zip_decompress(block, /*check=*/false)`——`check=false` 因为校验稍后统一做 |
+| ② | **page_id 自洽性检查** | 从 frame 读 `FIL_PAGE_OFFSET`/`SPACE_ID` 与 `bpage->id` 比对；全 0（未初始化页）合法 |
+| ③ | 透明页压缩检测 | `Compression::is_compressed_page()` 仍为真 ⇒ 本实例不支持该算法 ⇒ 等同 corrupt |
+| ④ | **checksum 校验** | `BlockReporter::is_corrupted()`（★ 8.0.39 已无 `buf_page_is_corrupted()`） |
+| ⑤ | Linux recovery 特例 | 扩展崩溃留下的 brand new 页 → `memset(0)` 并清除 corrupt 标记 |
+| ⑥ | 错误处理 | corrupt 且 `srv_force_recovery < SRV_FORCE_IGNORE_CORRUPT(1)` → `buf_read_page_handle_error` + 返回 false |
+| ⑦ | 应用 redo | `recv_recover_page`（仅 recovery 期间） |
+| ⑧ | **ibuf merge** | 见下面的 8 条条件 |
+| ⑨ | `io_fix = NONE` | **在放 X 锁之前** |
+| ⑩ | `rw_lock_x_unlock_gen(..., BUF_IO_READ)` | 这就是"唤醒等待者" |
+
+**为什么后处理必须在完成回调里**：发起时 `dst` 里还是垃圾；且异步路径下**发起线程已不在调用栈上**。更关键的是锁协议——`buf_page_init_for_read` 的注释明说"如果 X 锁可递归，同一线程会在读完成前非法拿到锁"，所以后处理必须在**解锁之前**完成，才能让"拿到任意 latch ⇒ 页已就绪"成为不变式。
+
+**两层解压不重复**（易混淆点）：
+
+| | `os_file_io_complete`（os 层，先执行） | `buf_page_io_complete`（buf 层，后执行） |
+|---|---|---|
+| 解密 | ✅ `Encryption::decrypt` | ❌ |
+| 解压 | ✅ 只解**透明页压缩**（`FIL_PAGE_COMPRESSED`） | ✅ 只解**表压缩**（`ROW_FORMAT=COMPRESSED`） |
+| checksum | ❌ | ✅ |
+| ibuf merge | ❌ | ✅ |
+
+两者靠**页类型标识**区分，不会重复处理。
+
+> **已纠正**：8.0.39 里 `buf_page_io_complete` 的第二个参数是 **`evict`**（只在 WRITE 路径有意义），**不是** `skip_ibuf`。读路径的 ibuf merge 是内联的 8 条条件判断。
+
+**⑧ 的 8 条条件**（`buf0buf.cc:5771-5778`）——任一条为假就跳过 merge：
+
+```cpp
+if (uncompressed &&                                 // ① 必须已有解压 frame
+    !Compression::is_compressed_page(frame) &&      // ② 不是透明压缩页
+    !recv_no_ibuf_operations &&                     // ③ recovery 允许 ibuf 操作
+    fil_page_get_type(frame) == FIL_PAGE_INDEX &&   // ④ 必须是索引页
+    page_is_leaf(frame) &&                          // ⑤ 必须是叶子页
+    !fsp_is_system_temporary(bpage->id.space()) &&  // ⑥ 不是临时表空间
+    !fsp_is_undo_tablespace(bpage->id.space()) &&   // ⑦ 不是 undo 表空间
+    !bpage->was_stale()) {                          // ⑧ 不是 stale 页
+  ibuf_merge_or_delete_for_page((buf_block_t *)bpage, bpage->id, &bpage->size, true);
+}
+```
+
+即：**只对二级索引的叶子页、非临时/非 undo 表空间、非 stale 页**做 merge。另一处 merge 在 `Buf_fetch` 的 `zip_page_handler`（`buf0buf.cc:3962-3970`）——压缩页解压后补做（因为 zip-only 时没有 frame 可 merge）。
+
+#### 读失败：不崩，但重试 100 次才 fatal
+
+| 层 | 行为 |
+|---|---|
+| `buf_page_io_complete` | corrupt → `buf_page_print(..., BUF_PAGE_PRINT_NO_CRASH)`（只打印）+ 返回 false。`srv_force_recovery >= 1` 时**吞掉错误**，坏页照样进 BP |
+| `Buf_fetch::read_page()` | 返回 false 只算一次 retry（`m_retries++`），**重试 100 次**（`BUF_PAGE_READ_MAX_RETRIES = 100`）仍失败 → `ib::fatal` **整个 mysqld 崩溃** |
+| `Fil_shard::do_io()` | `ut_a(req_type.is_dblwr() \|\| err == DB_SUCCESS)`——非 dblwr 的 IO 不允许出错返回（**`DB_CORRUPTION` 在 fil 层就 crash**，不会传到 buf 层） |
+
+### change buffer：用延迟写换随机读 I/O
+
+> **★ 完整剖析见专篇 [`ibuf.md`](ibuf.md)**——为什么只缓存**非唯一二级索引**的 INSERT（"必须读页做唯一性检查"与"页不在 BP 才缓存"逻辑互斥；而**唯一索引的 delete-mark / purge 反而可以缓存**）、ibuf 树与 bitmap 的物理布局、记录格式（counter 保证时序）、插入路径的 14 条否决条件、合并的 8 条触发条件、三级自我保护 contract、参数与监控。
+>
+> 本节只保留它与 **Buffer Pool 的接口**部分。
+
+**是什么**：二级索引页不在 Buffer Pool 时，InnoDB **不把页读进来**，而是把修改缓存到 change buffer（ibuf，系统表空间里的一棵 B-tree），等该页以后被读到时再合并。
+
+```
+不用 change buffer：  改 1 行 → 读二级索引页（随机读，云盘 0.1~3 ms）→ 改 → 后续刷脏
+用   change buffer：  改 1 行 → 写 ibuf（顺序）→ 立即返回
+                      同一页的多次修改合并 → 页被读时一次 merge
+```
+
+**与 BP 的接口**：merge 的调用点在**读页完成回调** `buf_page_io_complete` 里（`ibuf_merge_or_delete_for_page`），且只对**二级索引的叶子页、非临时/非 undo 表空间、非 stale 页**做（8 条条件）。
+
+| 代价 | 说明 |
+|---|---|
+| 读页时要 merge | 增加读路径 CPU 开销，且 merge **可能触发页分裂** |
+| 占用 BP | 上限 `innodb_change_buffer_max_size`%（默认 25） |
+| "写完立刻读"是负收益 | merge 被立刻触发，只增加开销 |
+
+> **★ 云盘上的意义**：change buffer 省的是**随机读**，而随机读在云盘上比本地盘贵一个数量级（0.1~3 ms vs ~100 µs），所以**云盘上收益更大**——这是它至今默认开启的原因。
+>
+> **什么时候该关**：负载若是"写入后立刻读同一批数据"（如批量导入后立即全表扫描）→ `innodb_change_buffering=none`。
+
+**相关源码**：
+
+| 函数 | 位置 | 职责 |
+|------|------|------|
+| `ibuf_insert` | `ibuf0ibuf.cc:3272` | 缓存一条修改 |
+| `ibuf_merge_or_delete_for_page` | `:3951` | 读页时合并（由 `buf_page_io_complete` 调用） |
+| `ibuf_merge_in_background` | `:2398` | **由 master 线程调用**（ibuf merge 无专用线程） |
+| `buf_read_ibuf_merge_pages` | `buf0rea.cc:592` | 批量读页做 merge，用 `AIO_mode::IBUF` 防槽位耗尽死锁 |
+
+### AHI：纯内存，零 I/O
+
+自适应哈希索引（`btr/btr0sea.cc`）在 B-tree 之上建内存哈希索引，**不产生任何文件 I/O**。它降低的是**逻辑读**（减少 B-tree 层数），从而**间接**减少物理读。8.0.30 起分片（详见 [`btr.md`](btr.md)）。
+
 ### LRU 中点替换
 
 LRU 被一个指针 `buf_pool->LRU_old` 分两段：**new 段**（头，热页，再次访问移到头）、**old 段**（尾，冷页，候选淘汰区）。常量（buf0lru.h）：
@@ -167,6 +359,18 @@ threshold = std::min(static_cast<page_no_t>(64 - srv_read_ahead_threshold),
 
 两者都过 `BUF_READ_AHEAD_PEND_LIMIT`（:64，值 2）限流：pending 读过多时不预读，防 IO-fixed 块灌满 buffer pool。
 
+#### 补充：四种预读入口与 SSD 上的取舍
+
+
+| 类型 | 函数 | 触发条件 | 参数 |
+|------|------|---------|------|
+| **随机预读** | `buf_read_ahead_random`（`buf0rea.cc:157`） | 一个 extent 内连续读到 ≥ 13 页 → 异步预读该 extent 剩余页 | `innodb_random_read_ahead`（默认 OFF） |
+| **线性预读** | `buf_read_ahead_linear`（`buf0rea.cc:334`） | 顺序访问超过阈值页 → 预读下一个 extent（64 页） | `innodb_read_ahead_threshold`（默认 56，内部用 `64 - threshold`） |
+| ibuf merge 批量读 | `buf_read_ibuf_merge_pages`（`buf0rea.cc:592`） | — | 用 `AIO_mode::IBUF` 防死锁 |
+| 恢复期区域预读 | `recv_read_in_area`（`log0recv.cc:1019`） | — | `RECV_READ_AHEAD_AREA = 32` |
+
+> **为什么需要预读**：迭代器模型是"一次一行"，天然产生随机读。预读是数据库把"逻辑上连续"翻译成"物理上批量"的手段。**在 SSD/云盘上收益变小甚至变负**（预读进来的页可能用不上，白占 BP 与 I/O），所以 SSD 环境常见做法是关掉随机预读。
+
 ### 脏页生成与 flush_list
 
 mtr commit 时若页被改，`buf_flush_note_modification`（buf0flu.cc）设 `oldest_modification`（首脏时，置为 mtr end_lsn）并插入 flush_list；后续修改只更新 `newest_modification`。flush_list 按 `oldest_modification` 升序——这是 page cleaner "刷老不刷新"与 checkpoint 推进的依据。
@@ -202,6 +406,113 @@ buf_flush_page_coordinator_thread (buf0flu.cc:3183)   ← 算刷脏量、派发 
 
 **路径3：用户线程单页同步刷**（sync, type=2）：`buf_flush_single_page_from_LRU`（:2159）→ `buf_flush_page(..., BUF_FLUSH_SINGLE_PAGE, sync=true)`。频繁发生 = free page 供给不上，对应 `Innodb_buffer_pool_wait_free`。
 
+### ★ 刷脏批次的组织：single-flight + best effort
+
+一个 flush batch 由 `buf_flush_do_batch` 驱动（`buf0flu.cc:2074`）：
+
+```cpp
+bool buf_flush_do_batch(buf_pool_t *buf_pool, buf_flush_t type, ulint min_n,
+                        lsn_t lsn_limit, ulint *n_processed) {
+  if (!buf_flush_start(buf_pool, type)) {
+    return (false);                       // ① 同类型批次已在跑
+  }
+  ulint page_count = buf_flush_batch(buf_pool, type, min_n, lsn_limit);
+  buf_flush_end(buf_pool, type);          // ② 末尾 dblwr::force_flush
+  if (n_processed != nullptr) *n_processed = page_count;
+  return (true);
+}
+```
+
+**① 返回 false 不是"失败"，是"没轮到我"**——`buf_flush_start` 用 `init_flush[type]` 做同类批次互斥：
+
+```cpp
+  if (buf_pool->n_flush[flush_type] > 0 || buf_pool->init_flush[flush_type] == true) {
+    /* There is already a flush batch of the same type running */
+    return false;
+  }
+```
+
+**② `buf_flush_end` 末尾会 `dblwr::force_flush()`**——把本批次堆在 dblwr 缓冲里的页真正推到磁盘。`page_count` 是"**已投递写请求的页数**"，不是"已落盘页数"。
+
+> **真正的并发度**来自"多 BP 实例 + page_cleaner 多线程按 slot 分摊实例"，**不是**同一实例上并发多个批次。
+
+#### 批次内部：跳过一页不意味着终止扫描
+
+`buf_do_flush_list_batch`（`buf0flu.cc:1883`）：
+
+```cpp
+  for (bpage = UT_LIST_GET_LAST(buf_pool->flush_list);
+       count < min_n && bpage != nullptr && len > 0 &&
+       bpage->get_oldest_lsn() < lsn_limit;
+       bpage = buf_pool->flush_hp.get(), ++scanned) {
+    prev = UT_LIST_GET_PREV(list, bpage);
+    buf_pool->flush_hp.set(prev);
+    buf_flush_page_and_try_neighbors(bpage, BUF_FLUSH_LIST, min_n, &count);
+    --len;
+  }
+```
+
+- `count < min_n`：刷够了才停；**跳过某页时 `count` 不变**，循环用 `flush_hp.get()` 继续往 flush_list 头部走。
+- **`flush_hp`（hazard pointer）**：`buf_flush_page_and_try_neighbors` 会**释放并重新获取** flush_list mutex，期间别的线程可能把 `bpage` 摘走，所以用 hazard pointer 保存 prev 并在返回后校验 `flush_hp.is_hp(prev)`。
+- `len`：从 flush_list 长度递减的保险丝，防止退化成 O(n²)。
+
+`buf_flush_LRU_list_batch`（:1764）的关键差异是 **不阻塞**：
+
+```cpp
+      auto acquired = mutex_enter_nowait(block_mutex) == 0;   // ★ 非阻塞
+      if (acquired && buf_flush_ready_for_replace(bpage)) {
+        ...直接淘汰干净页到 free list...
+      } else if (acquired && buf_flush_ready_for_flush(bpage, BUF_FLUSH_LRU)) {
+        mutex_exit(block_mutex);
+        buf_flush_page_and_try_neighbors(bpage, BUF_FLUSH_LRU, max, &count);
+      } else if (!acquired) {
+        ut_ad(buf_pool->lru_hp.is_hp(prev));                  // 拿不到锁：什么都不做，继续
+      }
+```
+
+**为什么必须 `nowait`**：LRU flush 的调用链（`buf_LRU_get_free_block`）可能持有 page latch，一旦阻塞在 block mutex 上就可能死锁。
+
+#### `buf_flush_page` 的锁契约（最容易踩坑）
+
+进入时必须持有 `block_mutex`；**返回值决定 mutex 归谁释放**：
+
+- **返回 true** → 本函数内部**已释放** `block_mutex`（以及 `BUF_FLUSH_SINGLE_PAGE` 时的 `LRU_list_mutex`）；
+- **返回 false** → **仍由调用者持有**，调用者自己释放。
+
+决定"刷不刷"的三分支：
+
+| 情形 | 结果 |
+|---|---|
+| 压缩页（`BUF_BLOCK_ZIP_DIRTY`） | `flush = true`（不受 buf_fix 影响，压缩页无 rw_lock） |
+| 未压缩 + `buf_fix_count > 0` 且不是 LIST 刷 | `flush = false`（"heuristic，避免昂贵的 SX 尝试"） |
+| 其余 | LRU/SINGLE 用 `rw_lock_sx_lock_nowait` 抢 SX latch（抢不到就不刷）；**LIST 先跳过加锁**，稍后再加 |
+
+**★ LIST 刷的"延迟 SX 加锁"是唯一可能阻塞的点**：
+
+```cpp
+    if (flush_type == BUF_FLUSH_LIST && is_uncompressed &&
+        !rw_lock_sx_lock_nowait(rw_lock, BUF_IO_WRITE, UT_LOCATION_HERE)) {
+      if (!fsp_is_system_temporary(bpage->id.space()) && dblwr::is_enabled()) {
+        dblwr::force_flush(flush_type, buf_pool_index(buf_pool));   // 先解开潜在的 latch 等待环
+      } else {
+        buf_flush_sync_datafiles();
+      }
+      rw_lock_sx_lock_gen(rw_lock, BUF_IO_WRITE, UT_LOCATION_HERE);  // 阻塞式
+    }
+```
+
+> 注意 `dblwr::force_flush` 出现在这里的深意：**把 dblwr 缓冲里挂着的页先刷出去**，避免本线程持有一部分资源去等 SX 锁、而锁的持有者又在等 dblwr，形成环。
+
+另外：`ut_ad(!sync || flush_type == BUF_FLUSH_SINGLE_PAGE)` —— **只有用户线程单页刷是同步写**，批次刷全是异步。
+
+#### 跳过会不会漏刷？——三层保证
+
+1. **本轮不中断**：跳过只影响 `count`，扫描继续到 flush_list 头部 / LRU 满足条件。
+2. **下一轮还会看到**：被跳过的页**仍然脏、仍在 flush_list 上**（`oldest_modification != 0`）。page cleaner 每轮重新从 flush_list 尾扫。
+3. **被跳过的页本来就"有人负责"**：`buf_flush_ready_for_flush` 返回 false 只有两类——`io_fix != BUF_IO_NONE`（正被别人读/写/flush）或 `BUF_BLOCK_REMOVE_HASH`（正在被摘除，即将消失）。
+
+> **LRU 刷 vs LIST 刷的分工**：LRU 路径会因 `buf_fix_count > 0` 或 SX latch 被占而跳过；**LIST 路径不看 `buf_fix_count`**（`no_fix_count || flush_type == BUF_FLUSH_LIST` 恒真），所以 age-based 刷脏最终一定会刷到它，**不会饥饿**。
+
 ### 刷脏前的 WAL：redo 先落盘
 
 `buf_flush_write_block_low`（:1174）写数据页前先同步等 redo fsync（:1205-1221）：
@@ -215,7 +526,11 @@ if (log_sys->flushed_to_disk_lsn.load() < flush_to_lsn) {
 
 - **WAL/ARIES**：数据页新版本写盘前，对应 redo 必须先落盘，否则崩溃恢复无法重放/回滚。
 - **用 newest 而非 oldest**：要保证该页**所有**修改的 redo 落盘，水位必须推到 newest（最大 LSN）。`oldest_modification` 是首脏 LSN（进 flush_list 依据），`newest_modification` 是最近修改 LSN。
-- 优化：先查 `flushed_to_disk_lsn < flush_to_lsn`，redo 已 flush 到更新位置就不调（避免无谓等待 + 污染 log 线程调用计数器）。
+- 优化：先查 `flushed_to_disk_lsn < flush_to_lsn`，redo 已 flush 到更新位置就不调（源码注释明说：避免大量无谓进入 log 线程的原子计数自旋）。
+- **随后** `buf_flush_init_for_writing` 把 `newest_lsn` 写进页头 `FIL_PAGE_LSN`（崩溃恢复判断"页是否比 checkpoint 新"的唯一依据）并重算 checksum。
+- **★ `dblwr::write` 是唯一出口，没有 bypass**。
+
+> **与存储介质的关系**：这个 fsync 是每次刷脏批次的固定成本。云盘上 fsync 比本地盘贵一个数量级，所以 **redo 与数据文件应放同一块卷**（跨卷快照不一致 + fsync 打两处）。
 
 ### 自适应刷脏（Adaptive Flushing）
 
@@ -242,7 +557,106 @@ return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
 
 **为什么必须 doublewrite——防半页写（torn page）**：InnoDB 页 16KB，操作系统/磁盘扇区通常 4KB（甚至 512B）。一次 16KB 写若中途崩溃，只有部分扇区落盘，页撕裂。若有 doublewrite：数据文件里的撕裂页可从 doublewrite buffer 的完整副本恢复；若无，撕裂页无 redo 保护（redo 只记逻辑修改，假设页本身完整），崩溃恢复会因 checksum 校验失败而无法重放。
 
-8.0.20+ 重构：doublewrite 从 shared tablespace 的固定区域改为独立文件（`#ib_16384_0.dblwr` 等），双池（active + ready）轮换，允许并发写不同 instance，避免 truncate 表空间时的双写区竞争。`m_dblwr_id`（buf_page_t 字段）在写时分配 instance 序号，IO 完成时据此回收。
+刷脏经 `dblwr::write` 进入时有两条分支：
+
+| 分支 | 条件 | 行为 |
+|---|---|---|
+| **批量** | `!sync && flush_type != BUF_FLUSH_SINGLE_PAGE` | 页进 batch buffer，攒一批后一次写 dblwr +（可选）一次 fsync，再**异步 AIO** 写数据文件 |
+| **同步单页** | `sync==true` 或 `BUF_FLUSH_SINGLE_PAGE` | 抢一个 SYNC 槽位 → 写 dblwr → fsync → **同步**写数据文件 → `fil_flush` |
+
+> **注意：单页刷盘也走 dblwr**（用文件尾部的 `SYNC_PAGE_FLUSH_SLOTS = 512`），不是"单页就跳过"。只有三类完全跳过：`innodb_doublewrite=OFF`、临时表空间、只读模式。
+
+8.0.20+ 重构：dblwr 从系统表空间的固定区域改为独立文件（`#ib_<page_size>_<id>.dblwr`），与系统表空间解耦、可经 `innodb_doublewrite_dir` 放到别的设备。
+
+> **★ 矫正一处常见说法**：多个 dblwr 文件**不是"双池（active + ready）轮换"**，而是**奇偶 id 的功能切分**——奇数 id 文件承载 **LRU 批量段 + 全部单页 SYNC 槽位**，偶数 id 文件承载 **flush list 批量段**。
+
+**★ doublewrite 的完整剖析见专篇 [`dblwr.md`](dblwr.md)**——文件布局（无文件头的扁平页数组）、批量/单页两条路径的完整源码、崩溃恢复时如何用 dblwr 修页、加密帧为什么单独存在、`O_DIRECT_NO_FSYNC` 下哪些 fsync 被跳过、参数与监控、源码里的已知 TODO。
+
+### 邻接刷盘：`buf_flush_try_neighbors`
+
+`buf0flu.cc:1475`：
+
+```cpp
+  if (UT_LIST_GET_LEN(buf_pool->LRU) < BUF_LRU_OLD_MIN_LEN ||
+      srv_flush_neighbors == 0) {
+    /* If there is little space or neighbor flushing is
+    not enabled then just flush the victim. */
+    low = page_id.page_no();
+    high = page_id.page_no() + 1;
+  } else {
+    buf_flush_area = std::min(buf_pool->read_ahead_area,
+                              static_cast<page_no_t>(buf_pool->curr_size / 16));
+    low = (page_id.page_no() / buf_flush_area) * buf_flush_area;
+    high = (page_id.page_no() / buf_flush_area + 1) * buf_flush_area;
+    ...
+  }
+```
+
+| 值 | 行为 |
+|----|------|
+| `0` | 只刷被选中的页 |
+| `1`（默认） | `[low, high)` 是 area 对齐窗口，再向两侧**收缩到连续脏页区间** |
+| `2` | 不收缩，刷整个对齐窗口 |
+
+> **★ 这是为机械盘"把随机写顺序化"设计的**。SSD / 云盘上收益为零，却带来写放大与窗口扫描开销——**云上必须设 `innodb_flush_neighbors=0`**。
+
+### 全量刷脏：`buf_flush_sync_all_buf_pools`
+
+```cpp
+void buf_flush_sync_all_buf_pools() {
+  bool success;
+  ulint n_pages;
+  do {
+    n_pages = 0;
+    success = buf_flush_lists(ULINT_MAX, LSN_MAX, &n_pages);
+    buf_flush_wait_batch_end(nullptr, BUF_FLUSH_LIST);      // 等所有实例 n_flush==0
+    if (!success) MONITOR_INC(MONITOR_FLUSH_SYNC_WAITS);
+  } while (!success);
+
+  ut_a(success);
+
+  /* All pages have been written to disk, but we need to make fsync for files
+  to which the writes have been made. */
+  buf_flush_fsync();                                        // ★ 批量 fsync，只调一次
+}
+```
+
+**五点解释**：
+
+1. **`min_n = ULINT_MAX`** 的作用：`buf_flush_lists` 里只有 `min_n != ULINT_MAX` 才做 `min_n / srv_buf_pool_instances` 的均摊。传 `ULINT_MAX` = 每个实例都刷到 `lsn_limit`、不做均摊；配合 `lsn_limit = LSN_MAX`，循环退化为"扫到 flush_list 头部"。
+2. **遍历"所有 BP 实例"**是 `for (i = 0; i < srv_buf_pool_instances; i++)` **串行**调用，不是并发。
+3. **`do...while(!success)` 只处理"并发批次冲突"**，不处理"有页被跳过"（跳过不构成重试理由）。
+4. **`buf_flush_wait_batch_end(nullptr, ...)`** 对每个实例 `os_event_wait(no_flush[BUF_FLUSH_LIST])`，等价于"等所有已投递的异步写完成"（含 dblwr 两次写）。
+5. **★ `buf_flush_fsync()` 在循环外、只调一次** —— 先把所有页 write 完，再一次性 `fil_flush_file_spaces()` 批量 fsync。**这是 dblwr 之后第二次"批量摊薄 fsync"的机会。**
+
+> 注意：本函数**不写 checkpoint**，调用者通常紧跟 `log_make_latest_checkpoint()`。
+
+**调用者**：恢复完成后（`srv0start.cc:2078`）、升级完成（`dict0upgrade.cc:1477`）、`log_request_sync_flush`（checkpoint 前，`log0chkp.cc:735`）、开启 undo 加密后、`innodb_buf_flush_list_now`、shutdown 间接路径。
+
+### 用户线程自己刷一页：为什么慢
+
+`buf_flush_single_page_from_LRU`（`buf0flu.cc:2161`）是 free list 不足时的最后手段。**慢在四条叠加**：
+
+1. **`mutex_enter`（阻塞）**——与 LRU 批次的 `mutex_enter_nowait` 相反；
+2. **全程持有 `LRU_list_mutex`**——阻塞其它所有需要 LRU 的操作；
+3. **`sync = true`** —— 同步写盘，不进 AIO 队列、不合并、不等批处理，写放大最差；
+4. **一次只一页** —— 不走 `buf_flush_try_neighbors`，没有邻居合并。
+
+而且**释放后并不保证这个线程拿到它**（注释：*"There is no guarantee that this page has actually been freed, only that it has been flushed to disk"*——IO 完成回调把它放 free list，所有用户线程抢）。
+
+频繁发生 = free page 供给不上，对应 `Innodb_buffer_pool_wait_free` 上涨。
+
+### AIO 槽位耗尽会直接阻塞刷脏
+
+完整调用链：
+
+```
+buf_flush_write_block_low → dblwr::write → fil_io(NORMAL) → os_aio_func → AIO::reserve_slot  ← 阻塞
+```
+
+`reserve_slot` 在槽位满时 `os_event_wait(m_not_full)`。于是 page cleaner 的批次卡住、`n_flush[]` 不归零、`no_flush[]` 事件不 set；用户线程走 `buf_flush_single_page_from_LRU` 同样可能卡在这。上层表现为 `buf_LRU_get_free_block` 迭代次数飙升，最终打 **"Difficult to find free blocks in the buffer pool"** 警告。
+
+> **这解释了为什么 `innodb_io_capacity` 调得过高（超过磁盘真实能力）反而会让刷脏和前台查询一起抖动**：投递速度超过收割速度 → 槽位打满 → 阻塞。（槽位机制见 [`io.md`](io.md)）
 
 ### 压缩页（ROW_FORMAT=COMPRESSED）三态与刷盘
 
@@ -450,6 +864,6 @@ purge 删 secondary index 的 delete-marked 记录时，页若不在 buffer pool
 
 **相关文档**
 - 上游（buffer pool 谁调用）见 [`../server/handler.md`](../server/handler.md)（handler 取行下推到引擎）
-- redo 刷盘与 LSN 体系、崩溃恢复见 [`redo_log.md`](redo_log.md)
+- redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)；崩溃恢复（前滚/回滚）见 [`recovery.md`](recovery.md)
 - B-tree 页内操作与 AHI 见 [`btr.md`](btr.md)
 - 行读取主循环 `row_search_mvcc` 见 [`row_search.md`](row_search.md)
