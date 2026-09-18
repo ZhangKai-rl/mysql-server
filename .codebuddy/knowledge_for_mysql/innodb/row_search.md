@@ -4,20 +4,24 @@
 >
 > **边界**：SQL 层如何调 handler 见 [`../server/query/09_executor_iterator.md`](../server/query/09_executor_iterator.md)；handler 接口语义（`position`/`ref`/`rnd_pos`）见 [`../server/handler.md`](../server/handler.md)；可见性判断（read view、版本回溯）见 [`mvcc.md`](mvcc.md)。
 
-## 目录
-
 - [概述](#概述)
-- [设计思想与理论基础](#设计思想与理论基础)
-- [从 handler 到 row_search_mvcc](#从-handler-到-row_search_mvcc)
-- [不同隔离级别下的表现](#不同隔离级别下的表现)
-- [direction 与游标推进](#direction-与游标推进)
-- [need_to_process](#need_to_process)
-- [行格式：rec_t 磁盘行与 record[0] 的转换](#行格式rec_t-磁盘行与-record0-的转换)
-- [MVCC 可见性：快照读与二级索引回表](#mvcc-可见性快照读与二级索引回表)
-- [B-tree 定位：btr_cur_search_to_nth_level](#b-tree-定位btr_cur_search_to_nth_level)
-- [加锁：sel_set_rec_lock 与隐式锁转显式](#加锁sel_set_rec_lock-与隐式锁转显式)
-- [持久游标：store_position / restore_position](#持久游标store_position--restore_position)
+- [理论基础](#理论基础)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [从 handler 到 row_search_mvcc](#从-handler-到-row_search_mvcc)
+    - [行格式：rec_t 磁盘行与 record[0] 的转换](#行格式rec_t-磁盘行与-record0-的转换)
+  - 行为与游标
+    - [不同隔离级别下的表现](#不同隔离级别下的表现)
+    - [direction 与游标推进](#direction-与游标推进)
+    - [need_to_process](#need_to_process)
+  - 读路径
+    - [MVCC 可见性：快照读与二级索引回表](#mvcc-可见性快照读与二级索引回表)
+    - [B-tree 定位：btr_cur_search_to_nth_level](#b-tree-定位btr_cur_search_to_nth_level)
+    - [持久游标：store_position / restore_position](#持久游标store_position--restore_position)
+  - 加锁
+    - [加锁：sel_set_rec_lock 与隐式锁转显式](#加锁sel_set_rec_lock-与隐式锁转显式)
 - [关键源码位置速查](#关键源码位置速查)
+- [参考](#参考)
 
 ---
 
@@ -34,7 +38,7 @@ SQL 层每次 `iterator->Read()` 穿过 handler 进入 `row_search_mvcc`，后�
 
 ---
 
-## 设计思想与理论基础
+## 理论基础
 
 ### row_search_mvcc：为什么是"怪兽函数"
 
@@ -476,7 +480,9 @@ MyISAM 无 MVCC、无行锁、无 undo，读就是读：`ha_myisam::index_next` 
 
 ---
 
-## 从 handler 到 row_search_mvcc
+## 核心实现
+
+### 从 handler 到 row_search_mvcc
 
 ```
 （SQL 层）TableScanIterator::Read
@@ -627,7 +633,7 @@ int ha_innobase::general_fetch(uchar *buf, uint direction, uint match_mode) {
 
 ---
 
-## 不同隔离级别下的表现
+### 不同隔离级别下的表现
 
 ### 三把开关
 
@@ -742,7 +748,7 @@ const bool use_semi_consistent =
 
 ---
 
-## direction 与游标推进
+### direction 与游标推进
 
 ### direction 是什么
 
@@ -769,7 +775,7 @@ const bool use_semi_consistent =
 
 ---
 
-## need_to_process
+### need_to_process
 
 `sel_restore_position_for_mysql`（`row0sel.cc:3406`）的返回值：调 `pcur->restore_position` 恢复之前 `store_position` 保存的位置，返回 true 表示"恢复后需重新处理游标现在指向的记录"（原记录被删、位置失效时，按 `moves_up` 调 `move_to_next` 前移）。
 
@@ -780,7 +786,7 @@ const bool use_semi_consistent =
 
 ---
 
-## 行格式：rec_t 磁盘行与 record[0] 的转换
+### 行格式：rec_t 磁盘行与 record[0] 的转换
 
 ### rec_t 的物理布局
 
@@ -938,7 +944,7 @@ if (clust_templ_for_sec) {
 
 ---
 
-## MVCC 可见性：快照读与二级索引回表
+### MVCC 可见性：快照读与二级索引回表
 
 ### 快照读（聚簇索引）
 
@@ -1059,7 +1065,7 @@ for (i = 0; i < n; i++) {
 
 ---
 
-## B-tree 定位：btr_cur_search_to_nth_level
+### B-tree 定位：btr_cur_search_to_nth_level
 
 > 本节从「取行」视角概述搜索；B-tree 搜索算法 / 分裂 / 合并 / AHI 的完整机制（latch_mode 全表、8.0 SMO 锁预测裁剪、意图升级重搜等）详见 [`btr.md`](btr.md)。
 
@@ -1156,7 +1162,7 @@ if (rw_lock_get_writer(btr_get_search_latch(index)) == RW_LOCK_NOT_LOCKED &&
 
 ---
 
-## 加锁：sel_set_rec_lock 与隐式锁转显式
+### 加锁：sel_set_rec_lock 与隐式锁转显式
 
 ### sel_set_rec_lock 的分派
 
@@ -1246,7 +1252,7 @@ if (!recv_recovery_is_on() && !can_older_trx_be_still_active(max_trx_id)) {
 
 ---
 
-## 持久游标：store_position / restore_position
+### 持久游标：store_position / restore_position
 
 > 本节从「取行」视角讲恢复协议；`btr_pcur_t` 结构全字段、乐观/悲观恢复算法与跨页推进的锁序细节详见 [`btr.md`](btr.md)。
 

@@ -4,18 +4,21 @@
 
 > **边界**：本篇讲 **AHI 本身**。B-tree 的游标搜索与页面结构见 [`btr.md`](btr.md)；Buffer Pool 的读页与预读见 [`buffer_pool.md`](buffer_pool.md)；change buffer 见 [`ibuf.md`](ibuf.md)。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [核心实现一：整体结构](#核心实现一整体结构)
-- [核心实现二：★ 哈希键的自适应算法（前缀长度学习）](#核心实现二哈希键的自适应算法前缀长度学习)
-- [核心实现三：查询路径 `btr_search_guess_on_hash`](#核心实现三查询路径-btr_search_guess_on_hash)
-- [核心实现四：维护路径（建 / 删 / 改）](#核心实现四维护路径建--删--改)
-- [核心实现五：★ 锁协议与分片](#核心实现五锁协议与分片)
-- [核心实现六：开关、内存与监控](#核心实现六开关内存与监控)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [整体结构](#整体结构)
+  - 构建与维护
+    - [★ 哈希键的自适应算法（前缀长度学习）](#哈希键的自适应算法前缀长度学习)
+    - [维护路径（建 / 删 / 改）](#维护路径建--删--改)
+  - 读路径
+    - [查询路径 `btr_search_guess_on_hash`](#查询路径-btr_search_guess_on_hash)
+  - 并发与治理
+    - [★ 锁协议与分片](#锁协议与分片)
+    - [开关、内存与监控](#开关内存与监控)
 - [相关的系统变量](#相关的系统变量)
-- [Misc](#misc)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---
@@ -141,9 +144,11 @@ index. */
 
 ---
 
-## 核心实现一：整体结构
+## 核心实现
 
-### 1.1 三层结构
+### 整体结构
+
+#### 1.1 三层结构
 
 ```
 btr_search_sys（全局单例，btr_search_sys_t*）
@@ -192,7 +197,7 @@ extern btr_search_sys_t *btr_search_sys;
 
 > **★ latch 保护什么（关键语义）**：注释明说——**只保护"记录在页内的位置"，不保护记录内容**。正因如此，AHI 能用于唯一索引搜索（跳过 `dict_index_t::lock`），也解释了为什么 UPDATE 只改非排序字段时不需要动 AHI。
 
-### 1.2 `hash_table_t` 是通用表，但 AHI 不用它的内部锁
+#### 1.2 `hash_table_t` 是通用表，但 AHI 不用它的内部锁
 
 `hash_table_t` 同时服务 `buf_pool->page_hash`、`lock_sys->rec_hash` 和 AHI。区分点：
 
@@ -228,7 +233,7 @@ struct ha_node_t {
 
 生产编译下 `sizeof(ha_node_t) = 24`。由 `rec_t*` 反查 block 用 `buf_block_from_ahi`。
 
-### 1.3 ★ 页级字段：`buf_block_t::ahi_t`
+#### 1.3 ★ 页级字段：`buf_block_t::ahi_t`
 
 > **矫正**：`search_index` / `n_fields` / `n_bytes` / `curr_*` 这些是 **5.6 及更早**的字段名，**8.0.39 全部不存在**。现在打包成 `ahi_t` + 一个 64 位原子结构。
 
@@ -262,7 +267,7 @@ struct alignas(alignof(uint64_t)) btr_search_prefix_info_t {
 
 `n_hash_helps` 在 `buf_block_t` 上但**不在 `ahi_t` 内**——源码注释解释得很清楚：`n_hash_helps` 应该放进 `ahi_t`，但放外面能让 `made_dirty_with_no_latch` 复用那 8 字节对齐空间，**给这个高频对象省 8 字节**。
 
-### 1.4 索引级：`btr_search_t`
+#### 1.4 索引级：`btr_search_t`
 
 挂在 `dict_index_t::search_info`（`dict0mem.h`）。字段（`include/btr0sea.h`）：
 
@@ -279,7 +284,7 @@ struct alignas(alignof(uint64_t)) btr_search_prefix_info_t {
 
 索引级还有开关 `dict_index_t::disable_ahi`（`dict0mem.h`）——目前只用于 intrinsic 临时表与 SDI 表，因为**它们的 index id 不唯一**，而 AHI 校验依赖 index id。
 
-### 1.5 阈值常量
+#### 1.5 阈值常量
 
 | 常量 | 值 | 含义 |
 |---|---|---|
@@ -306,7 +311,7 @@ struct alignas(alignof(uint64_t)) btr_search_prefix_info_t {
 
 > **推论**：**页越小越容易进 AHI**。一个 1000 条记录的页要被"帮" 62 次以上；一个 16 条记录的页只要 1 次。
 
-### 1.6 ★ 统计字段故意不加锁
+#### 1.6 ★ 统计字段故意不加锁
 
 ```c
 /** Updates the search info of an index about hash successes. NOTE that info
@@ -318,9 +323,9 @@ are consistent.
 
 ---
 
-## 核心实现二：★ 哈希键的自适应算法（前缀长度学习）
+### ★ 哈希键的自适应算法（前缀长度学习）
 
-### 2.1 输入：字节级匹配数
+#### 2.1 输入：字节级匹配数
 
 叶子层搜索时（`btr0cur.cc`）走的是 `page_cur_search_with_match_bytes`（不是普通的 `_with_match`），多返回 `up_bytes` / `low_bytes`：
 
@@ -337,7 +342,7 @@ are consistent.
 
 > **AHI 只在叶子页（height == 0）上构建和查找**；R-tree 完全不支持。
 
-### 2.2 节流：`btr_search_info_update`
+#### 2.2 节流：`btr_search_info_update`
 
 ```c
 static inline void btr_search_info_update(btr_cur_t *cursor) {
@@ -353,7 +358,7 @@ static inline void btr_search_info_update(btr_cur_t *cursor) {
 }
 ```
 
-### 2.3 ★ 核心算法：`btr_search_info_update_hash`
+#### 2.3 ★ 核心算法：`btr_search_info_update_hash`
 
 **这是全文最难的一段**，也是"自适应"三个字的全部含义。
 
@@ -445,7 +450,7 @@ AHI 每个"相等前缀组"**只存一条**（最左或最右，由 `left_side` 
 
 > **这就是"自适应"的本质**：查询模式变了（比如从用 2 列变成用 3 列），前缀会自动变长/变短，无需人工干预。
 
-### 2.4 fold 计算：`rec_hash` 与 `dtuple_hash` 必须逐位一致
+#### 2.4 fold 计算：`rec_hash` 与 `dtuple_hash` 必须逐位一致
 
 - **物理记录** → `rec_hash(rec, offsets, n_fields, n_bytes, seed, index)`（`rem0rec.ic`）
 - **查询元组** → `dtuple_hash(tuple, n_fields, n_bytes, seed)`（`data0data.ic`）
@@ -467,9 +472,9 @@ AHI 每个"相等前缀组"**只存一条**（最左或最右，由 `left_side` 
 
 ---
 
-## 核心实现三：查询路径 `btr_search_guess_on_hash`
+### 查询路径 `btr_search_guess_on_hash`
 
-### 3.1 触发：8 道门禁
+#### 3.1 触发：8 道门禁
 
 `btr0cur.cc`：
 
@@ -501,7 +506,7 @@ AHI 每个"相等前缀组"**只存一条**（最左或最右，由 `left_side` 
 | 7 | `btr_search_enabled` | 全局开关（dirty read，函数内再确认） |
 | 8 | `!modify_external` | 要改 BLOB 不走 |
 
-### 3.2 完整流程
+#### 3.2 完整流程
 
 ```c
 bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
@@ -586,7 +591,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 **三重校验的最后一重** `btr_search_check_guess`（`btr0sea.cc`）有个重要限制：当调用方**只持有 AHI S-latch 但没有页 latch** 时，只能比较游标下那条记录，**不能看前后记录**，猜不中只能返回 false。
 
-### 3.3 命中/未命中分别做什么
+#### 3.3 命中/未命中分别做什么
 
 | | 命中 | 未命中 |
 |---|---|---|
@@ -595,7 +600,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 | 事后 | — | 到叶子层调 `btr_search_info_update` → 可能建 AHI / 补哈希项 |
 | 计数 | `btr_cur_n_sea++` | `btr_cur_n_non_sea++` |
 
-### 3.4 ★ 与 `row_search_mvcc` 的关系（两条路径）
+#### 3.4 ★ 与 `row_search_mvcc` 的关系（两条路径）
 
 **路径 A（常规）**：`row_search_mvcc` → `btr_pcur_t::open*` → `btr_cur_search_to_nth_level` → `btr_search_guess_on_hash`。
 
@@ -629,9 +634,9 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 ---
 
-## 核心实现四：维护路径（建 / 删 / 改）
+### 维护路径（建 / 删 / 改）
 
-### 4.1 建：`btr_search_build_page_hash_index`
+#### 4.1 建：`btr_search_build_page_hash_index`
 
 `btr0sea.cc`。核心逻辑：
 
@@ -681,7 +686,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 2. **临界区外预计算所有 fold**——把 `hashes[]`/`recs[]` 缓存在栈上，只在最后插入时持 X latch。这是缩短持锁时间的关键优化。
 3. **`update` 决定等不等锁**——启发式建索引用 nowait（失败就下次再试）；页分裂/合并后的重建**必须**阻塞等（不更新会留下错误项）。
 
-### 4.2 删：`btr_search_drop_page_hash_index`
+#### 4.2 删：`btr_search_drop_page_hash_index`
 
 `btr0sea.cc`。要点：
 
@@ -704,7 +709,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
          btr_search_enabled));
 ```
 
-### 4.3 改：DML 维护
+#### 4.3 改：DML 维护
 
 #### INSERT
 
@@ -770,9 +775,9 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 ---
 
-## 核心实现五：★ 锁协议与分片
+### ★ 锁协议与分片
 
-### 5.1 是什么锁
+#### 5.1 是什么锁
 
 - **类型**：`rw_lock_t`（InnoDB 自研读写锁）
 - **位置**：`btr_search_sys->parts[i].latch`
@@ -780,7 +785,7 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 > **PFS 里看到的 `innodb/btr_search_latch` 是 8 个分片锁共用的一个 PFS key**，不是"还有一把全局锁"。
 
-### 5.2 ★ 路由：按 (space_id, index_id)，不是 page_id
+#### 5.2 ★ 路由：按 (space_id, index_id)，不是 page_id
 
 ```c
 static inline size_t btr_search_hash_index_id(const dict_index_t *index) {
@@ -804,7 +809,7 @@ static inline rw_lock_t *btr_get_search_latch(const dict_index_t *index) {
 > 分片只解决了"多索引/多表之间"的争用，**解决不了单索引热点**。
 > 一个热点索引上的高并发点查，在 8.0.39 里仍然全部打在同一把 latch 上。
 
-### 5.3 8.0 的十项优化（代码证据）
+#### 5.3 8.0 的十项优化（代码证据）
 
 | 优化 | 位置 | 说明 |
 |---|---|---|
@@ -819,7 +824,7 @@ static inline rw_lock_t *btr_get_search_latch(const dict_index_t *index) {
 | ⑨ 统计字段完全无锁 | `btr0sea.h` | "NOT protected by any semaphore, to save CPU time" |
 | ⑩ 加锁前无锁预判 |  / `btr0cur.cc` | dirty check 大概率快速返回 |
 
-### 5.4 仍是瓶颈的证据
+#### 5.4 仍是瓶颈的证据
 
 - `mysql-test/lock_order_dependencies.txt` 里 `sxlock/innodb/btr_search_latch` 出现在**上百条** ARC 中——它是 latch 层次图的高位节点，持有后几乎不能再拿别的锁。
 - `buf0buf.cc`：`DEBUG_SYNC_C("purge_wait_for_btr_search_latch")`——purge 与 AHI latch 有已知交互。
@@ -828,9 +833,9 @@ static inline rw_lock_t *btr_get_search_latch(const dict_index_t *index) {
 
 ---
 
-## 核心实现六：开关、内存与监控
+### 开关、内存与监控
 
-### 6.1 内存来源
+#### 6.1 内存来源
 
 AHI 的节点（24 字节/个）来自 **buffer pool 的空闲帧**：
 
@@ -848,7 +853,7 @@ AHI 的节点（24 字节/个）来自 **buffer pool 的空闲帧**：
 
 即 `总 cell 数 ≈ BP 字节数 / 512`，平均分给 8 个 part，再经 `ut::find_prime` 取素数。例：128 GiB BP → 262144 个 cell（总）→ 每片 32768。
 
-### 6.2 ★ 关闭 AHI 的危险代码
+#### 6.2 ★ 关闭 AHI 的危险代码
 
 `btr_search_await_no_reference`（`btr0sea.cc`）：
 
@@ -872,7 +877,7 @@ AHI 的节点（24 字节/个）来自 **buffer pool 的空闲帧**：
 > **★ 等 600 秒 ref_count 还不归零就 `ut_a` 失败（crash）**，注释原文是 "commit suicide"。
 > 相关错误码 `ER_IB_LONG_AHI_DISABLE_WAIT`。这是 AHI 最危险的一段代码，也是"线上动态关 AHI 要谨慎"的源码依据。
 
-### 6.3 监控
+#### 6.3 监控
 
 **`SHOW ENGINE INNODB STATUS`** 的 AHI 部分由相关函数输出，典型形态：
 

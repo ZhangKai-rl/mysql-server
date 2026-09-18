@@ -6,30 +6,26 @@
 >
 > 承接：`rec_t` 的字段级编码（变长长度列表 / NULL 位图 / 记录头）见 [`record.md`](record.md)；本篇讲这些记录**在页内怎么摆放、怎么被找到**，以及各类管理页/系统页的内部结构。
 
-## 目录
-
-- [页的物理布局](#页的物理布局)
-- [page header（56 字节）](#page-header56-字节)
-- [infimum / supremum 伪记录](#infimum--supremum-伪记录)
-- [记录在页内的组织](#记录在页内的组织)
-- [页内记录查找：page_cur_search](#页内记录查找page_cur_search)
-- [页的写操作与维护](#页的写操作与维护)
-  - [页内插入：page_cur_insert_rec_low](#页内插入page_cur_insert_rec_low)
-  - [page directory 维护：slot 分裂与合并](#page-directory-维护slot-分裂与合并)
-  - [页内删除：page_cur_delete_rec](#页内删除page_cur_delete_rec)
-  - [页重组：btr_page_reorganize_low](#页重组btr_page_reorganize_low)
-  - [页分裂概览](#页分裂概览)
-- [页类型与全页类型清单](#页类型与全页类型清单)
-  - [完整清单（30 种）](#完整清单30-种)
-  - [常见页的逐字节 layout](#常见页的逐字节-layout)
-  - [四分类与布局归属](#四分类与布局归属)
-- [page size](#page-size)
-- [extent / segment / tablespace 层级（交叉引用）](#extent--segment--tablespace-层级交叉引用)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [页的物理布局](#页的物理布局)
+    - [page header（56 字节）](#page-header56-字节)
+    - [infimum / supremum 伪记录](#infimum--supremum-伪记录)
+    - [记录在页内的组织](#记录在页内的组织)
+  - 读路径
+    - [页内记录查找：page_cur_search](#页内记录查找page_cur_search)
+  - 写路径
+    - [页的写操作与维护](#页的写操作与维护)
+  - 类型清单
+    - [页类型与全页类型清单](#页类型与全页类型清单)
+    - [大页（large page）支持：页的物理内存从哪来](#大页（large-page）支持页的物理内存从哪来)
 - [参考](#参考)
 
 ---
 
-## 页的物理布局
+## 核心实现
+
+### 页的物理布局
 
 ### 完整布局图（默认 16KB / COMPACT 格式）
 
@@ -135,7 +131,7 @@ constexpr uint32_t FIL_PAGE_SPACE_VERSION = 12;  // 顶替 FIL_PAGE_NEXT
 
 ---
 
-## page header（56 字节）
+### page header（56 字节）
 
 `PAGE_HEADER` 不是 C struct，而是**偏移常量表**，通过 `page_header_get_field/set_field` 按 2 字节字段读写。
 
@@ -164,7 +160,7 @@ constexpr uint32_t FIL_PAGE_SPACE_VERSION = 12;  // 顶替 FIL_PAGE_NEXT
 
 ---
 
-## infimum / supremum 伪记录
+### infimum / supremum 伪记录
 
 infimum（下界）和 supremum（上界）是两条**固定伪记录**，永远占据 `PAGE_DATA` 之后第一、第二个位置，把用户记录夹在中间。
 
@@ -193,7 +189,7 @@ REC_STATUS_SUPREMUM = 3;  // 011
 
 ---
 
-## 记录在页内的组织
+### 记录在页内的组织
 
 三种结构，三个不同的"序"：
 
@@ -217,7 +213,7 @@ REC_STATUS_SUPREMUM = 3;  // 011
 
 ---
 
-## 页内记录查找：page_cur_search
+### 页内记录查找：page_cur_search
 
 `page_cur_search_with_match`（`page0cur.cc:334`），两段式查找：
 
@@ -247,7 +243,7 @@ REC_STATUS_SUPREMUM = 3;  // 011
 
 ---
 
-## 页的写操作与维护
+### 页的写操作与维护
 
 > 查找只用 page directory 二分；但插入/删除/分裂会**改 directory、改链表、改位图**，这些是页作为容器的真正难点。本节补全页的五类写操作。
 
@@ -559,7 +555,7 @@ bool btr_page_reorganize_low(bool recovery, ulint z_level, page_cur_t *cursor,
 
 ---
 
-## 页类型与全页类型清单
+### 页类型与全页类型清单
 
 ### 完整清单（30 种）
 
@@ -843,7 +839,7 @@ tablespace (space_id)
 
 ---
 
-## 大页（large page）支持：页的物理内存从哪来
+### 大页（large page）支持：页的物理内存从哪来
 
 前面讲的是页的**逻辑格式**；页在内存里放在哪、用什么粒度分配，是另一回事——这就是 large page 优化的领域。
 

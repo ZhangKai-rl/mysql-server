@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 MDL 锁类型分级、双兼容性矩阵（granted/waiting）、`can_grant_lock` 排队语义、防饥饿优先级切换、wait-for graph 死锁检测、5.6 排队问题与 online/instant DDL 演进。
 >
-> **边界**：本篇讲 server 层 MDL 元数据锁；InnoDB 行锁/间隙锁/死锁检测见 [`../innodb/lock.md`](../innodb/lock.md)；MDL 与 InnoDB 行锁的分工见本文 Misc。
+> **边界**：本篇讲 server 层 MDL 元数据锁；InnoDB 行锁/间隙锁/死锁检测见 [`innodb_trx_lock.md`](innodb_trx_lock.md)；MDL 与 InnoDB 行锁的分工见本文 Misc。
 
 ## 目录
 
@@ -181,7 +181,7 @@ bool Deadlock_detection_visitor::inspect_edge(MDL_context *node) {
 
 ### 易混淆概念
 
-- **MDL vs InnoDB 行锁**：MDL 是 **SQL 层**的元数据锁，保护**表结构**（DDL 与 DML 互斥）；InnoDB 行锁是**引擎层**的，保护**数据行**（事务间并发）。二者独立：一个 DML 同时持 MDL 的 SW 锁（元数据层面）+ InnoDB 行锁（数据层面）。见 [`../innodb/lock.md`](../innodb/lock.md)。
+- **MDL vs InnoDB 行锁**：MDL 是 **SQL 层**的元数据锁，保护**表结构**（DDL 与 DML 互斥）；InnoDB 行锁是**引擎层**的，保护**数据行**（事务间并发）。二者独立：一个 DML 同时持 MDL 的 SW 锁（元数据层面）+ InnoDB 行锁（数据层面）。见 [`innodb_trx_lock.md`](innodb_trx_lock.md)。
 - **MDL 的 X 锁 vs InnoDB 的 X 锁**：同名不同物。MDL X 是元数据排他锁（DDL），InnoDB X 是行级排他锁（行锁）。
 - **"写锁"不是 MDL 术语**：MDL 里 DML 用 `MDL_SHARED_WRITE`（SW，共享写锁），DDL 用 `MDL_EXCLUSIVE`（X，排他锁）。口语里的"DDL 写锁"指的是 X 锁。
 - **排队语义 vs 锁不兼容**：DDL 的 X 锁阻塞后续 SELECT，**不是因为 SR 和 X 不兼容**（它们确实不兼容），而是因为 X 在**等待队列**里通过 `waiting_incompat_map` 影子阻塞了后来的 SR——即使这些 SR 和已授予的 SR 是兼容的。这是"防饥饿"导致的额外阻塞，不是锁语义本身。
@@ -195,5 +195,5 @@ bool Deadlock_detection_visitor::inspect_edge(MDL_context *node) {
 - MySQL 8.0 Reference Manual → Online DDL Operations
 
 **相关文档**
-- InnoDB 行锁/间隙锁/死锁检测见 [`../innodb/lock.md`](../innodb/lock.md)
-- server 层锁顺序工具见 [`vio.md`](infra/vio.md) 相邻的 lock order 主题（待补链接）
+- InnoDB 行锁/间隙锁/死锁检测见 [`innodb_trx_lock.md`](innodb_trx_lock.md)
+- 锁全景与分类见 [`../README.md`](../README.md)；server 层锁顺序工具（`LOCK_ORDER` 编译选项 + `sql/debug_lock_order.cc` 锁序图）见锁全景的类型学一节

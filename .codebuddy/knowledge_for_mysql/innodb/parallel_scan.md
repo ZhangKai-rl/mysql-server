@@ -2,18 +2,25 @@
 
 > 澄清一个常见误解：**标准 MySQL 8.0.39 没有 SQL 层并行查询执行器**——普通 `SELECT` 没有并行执行计划、没有并行 join。它有的只是 **InnoDB 内部的并行扫描**（`Parallel_reader`），用途极窄。真正的 SQL 层并行查询（PolarDB/TXSQL/Aurora）是怎么实现的，见第四节。
 
-## 目录
-
-- [一、结论先行](#一结论先行)
-- [二、SQL 层：没有并行执行计划](#二sql-层没有并行执行计划)
-- [三、InnoDB Parallel_reader 深度剖析](#三innodb-parallel_reader-深度剖析)
-- [四、SQL 层并行查询怎么实现（以 PolarDB 为例）](#四sql-层并行查询怎么实现以-polardb-为例)
-- [五、标准 MySQL 为什么不做](#五标准-mysql-为什么不做)
+- [概述](#概述)
+- [理论基础](#理论基础)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [二、SQL 层：没有并行执行计划](#二sql-层没有并行执行计划)
+    - [三、InnoDB Parallel_reader 深度剖析](#三innodb-parallel_reader-深度剖析)
+  - 扩展与对比
+    - [四、SQL 层并行查询怎么实现（以 PolarDB 为例）](#四sql-层并行查询怎么实现以-polardb-为例)
+    - [五、标准 MySQL 为什么不做](#五标准-mysql-为什么不做)
+  - 补充视角
+    - [六、补充：从 I/O 视角看 Parallel_reader](#六补充从-IO-视角看-Parallel_reader)
 - [关键源码位置速查](#关键源码位置速查)
+- [参考](#参考)
 
 ---
 
-## 一、结论先行
+## 概述
+
+### 一、结论先行
 
 | 维度 | 标准 MySQL 8.0.39 |
 |------|-------------------|
@@ -26,7 +33,9 @@
 
 ---
 
-## 二、SQL 层：没有并行执行计划
+## 核心实现
+
+### 二、SQL 层：没有并行执行计划
 
 全库搜索 `ParallelIterator` / `parallel_scan` / `parallel_query`：
 - `sql/` 层**没有任何** `ParallelIterator`、并行 join 迭代器
@@ -37,7 +46,7 @@
 
 ---
 
-## 三、InnoDB Parallel_reader 深度剖析
+### 三、InnoDB Parallel_reader 深度剖析
 
 > 文件：`storage/innobase/include/row0pread.h`、`storage/innobase/row/row0pread.cc`。
 
@@ -241,7 +250,7 @@ if (prebuilt->trx->isolation_level > TRX_ISO_READ_UNCOMMITTED &&  // ① RC/RR
 
 ---
 
-## 四、SQL 层并行查询怎么实现（以 PolarDB 为例）
+### 四、SQL 层并行查询怎么实现（以 PolarDB 为例）
 
 > 以下基于阿里云《PolarDB 并行查询深入剖析》（2022/01）。**这是 PolarDB 私有特性，非标准 MySQL 源码**，这里只讲它的设计思路，作为"如果要 SQL 层并行查询该怎么改"的参考。
 >
@@ -299,7 +308,7 @@ PQ2.0 引入 **Exchange 算子**，在 plan slice 之间传递中间结果，三
 
 ---
 
-## 五、标准 MySQL 为什么不做
+### 五、标准 MySQL 为什么不做
 
 标准 MySQL 8.0.39 的"并行"停在 **InnoDB 内部对全表扫描类操作做并行扫描 + 给二级引擎喂数据**，原因可归纳：
 

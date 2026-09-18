@@ -589,6 +589,119 @@ AccessPath 层：NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL 等节点
 
 而 hypergraph 路径消除了"策略→节点"的翻译（`RelationalExpression` 与 `JoinType` **共享枚举值**）。PG 则从头到尾只有一棵 plan node 树——**这是 PG 架构统一性的真正优势**：语义在逻辑层定一次，物理层只竞争算法。
 
+### 9.5 已知正确性缺陷：EXISTS 转 semi-join（Bug #110819）
+
+这是本目录记录的**第一个正确性 bug**（而非性能问题），值得单独记住。
+
+#### 现象
+
+数据：3 行，全部是 `("a", 1)`，id 为 1/2/3：
+
+```sql
+SELECT id FROM bug_t t1 WHERE EXISTS (
+  SELECT 1 FROM bug_t t2
+  WHERE t1.id > t2.id                  -- 相关、非等值
+    AND t1.col_str = t2.col_str        -- 等值
+    AND t1.col_int = t2.col_int);
+-- 期望 {2, 3}；实际只返回 {2}
+```
+
+#### 关键事实
+
+| 项 | 值 |
+|---|---|
+| Bug 号 | **#110819** |
+| 标题 | EXISTS with dependent subquery can return incorrect results |
+| 严重性 | **S2 (Serious)** |
+| 状态 | **Verified**（2023-04 提交） |
+| 影响版本 | **8.0.16+**（8.0.15 及以下不复现） |
+| 标签 | **regression**（回归） |
+| 规避方法 | `SET optimizer_switch='semijoin=off';` |
+
+#### 根因：WL#4389「Transform EXISTS subqueries to semi-join」
+
+官方 bisect 定位到首个坏提交（Roy Lyseng，2018-11）：
+
+> **WL#4389** Transform EXISTS subqueries to semi-join — *Extend semi-join check to accept EXISTS subqueries in addition to IN. Filter out non-deterministic subqueries.*
+
+即：**8.0.16 把 semi-join 转换的适用范围从 `IN` 扩展到了 `EXISTS`**——这正是本篇"四种 SQL 等价变换形式"里 EXISTS 那一条的由来。这个扩展引入了正确性回归。
+
+#### Bug #28805105 **不是**成因（源码已推翻报告者的推断）
+
+8.0.16 changelog 里那条：
+
+> ...but because the subquery is not correlated... we use **two equal constant items as keys**, to ensure that the materialized query gets the constant as a key (and so that the materialized table consists of at most one row). (Bug #28805105)
+
+报告者怀疑它导致本 bug。**源码证明不成立**，两道独立排除：
+
+**排除一：补丁根本不触发**。它在 `Query_block::build_sj_cond()` 里，唯一触发条件是 `sj_inner_exprs` 为空：
+
+```cpp
+if (nested_join->sj_inner_exprs.empty()) {
+  Item *const_item = new Item_int(1);
+  nested_join->sj_inner_exprs.push_back(const_item);   // "两个相等常量"= 同一个 Item_int(1) 塞两边
+  nested_join->sj_outer_exprs.push_back(const_item);
+}
+```
+
+本例两条等值被去相关塞进 `sj_inner_exprs = (t2.col_str, t2.col_int)`，**非空** ⇒ 不触发。
+
+**排除二：物化被独立关掉**。即使触发，`sql/sql_optimizer.cc` 的 `optimize_semijoin_nests_for_materialization()` 有：
+
+```cpp
+if (sj_nest->nested_join->sj_corr_tables) continue;   // 相关 semi-join 不做物化
+```
+
+本例 `sj_corr_tables = {t1}` ≠ 0 ⇒ 物化整条路径出局。
+
+**最硬的证据**：`JOIN::setup_semijoin_materialized_table()` 用 `sj_inner_exprs` 建物化表，本例列只有 `(col_str, col_int)` —— **物化表里根本没有 `t2.id`**，`t1.id > t2.id` 在其上无法求值。所以物化不可能产生 `{2}`（若忽略残差得 `{1,2,3}`；若 t2.id 固定为 X 得 `{X+1..3}`，无解为 `{2}`）。
+
+#### 真正的机制：LooseScan 的"命中即跳组"
+
+转换后三个条件命运不同（关键）：
+
+| 条件 | 处理 |
+|---|---|
+| `t1.col_str = t2.col_str` | **去相关** → 进 `sj_inner_exprs`（成为 key） |
+| `t1.col_int = t2.col_int` | **去相关** → 进 `sj_inner_exprs`（成为 key） |
+| `t1.id > t2.id` | **不去相关**：`can_decorrelate_operator()` 对 `GT_FUNC` 返回 false（semi-join 路径 `op_types == nullptr` 只去相关 `=`）→ **残留**在 WHERE |
+
+LooseScan 逐行推演（`col_str` 索引跳组）：
+
+1. `'a'` 只有**一组**；组内按二级索引 `(col_str, PK)` 序为 t2.id = 1, 2, 3
+2. LooseScan **每组只取第一行** → **t2.id = 1**
+3. `t1.id=2`：`2 > 1` ✓ → 输出 **2**，随即**跳过整组**（`tab->match_tab = last_sj_tab->idx()`）
+4. ⇒ **t2.id=2、t2.id=3 永远不会被取到**，`t1.id=3` 唯一能成立的路径（需 `3 > 2`）从未被探测 → **丢失**
+
+> 本质：LooseScan 把作用在**组内非分组列 `t2.id`** 上的相关非等值条件，误当成"只依赖分组键 `col_str`"的条件。
+
+#### 一处精妙的护栏（也是未完全确定的点）
+
+LooseScan 准入条件 (5) 与 (6) 对"t1 是否在剩余表"的要求**互斥**：
+
+```cpp
+!(remaining_tables_incl & sj_corr_tables) &&   // (5) 要求 t1 已进前缀
+(remaining_tables_incl  & sj_depends_on)       // (6) 要求 t1 仍在剩余
+```
+
+本例 `sj_corr_tables == sj_depends_on == {t1}` ⇒ 两者不可能同时成立 ⇒ **LooseScan 应被排除**。护栏意图见源码注释：*"All non-IN-equality correlation references from this sj-nest are bound"*。
+
+于是**静态推演的结果是 8.0.39 应返回正确的 `{2,3}`**，与 bug 报告（8.0.16+ 复现）**矛盾**。矛盾焦点收敛到一个运行期量：`sj_corr_tables = sj_cond->used_tables() & outer_tables_map`，它受 `Item_cond::used_tables_cache` 是否刷新影响——**此层无法仅凭读源码定死，不做断言**。
+
+**一锤定音的方法**：`EXPLAIN` + `SET optimizer_trace='enabled=on'`，看 `semijoin_strategy_choice` 与 `final_semijoin_strategy`：
+- 显示 **LooseScan** → 坐实上述机制（护栏失效，`sj_corr_tables` 实为 0）
+- 显示 FirstMatch / DuplicateWeedout 且结果仍错 → 问题在别处
+
+> 另：FirstMatch（仅 t1→t2 顺序可用）与 DuplicateWeedout 的逐行推演均为正确的 `{2,3}`。
+
+#### 为什么值得记
+
+1. **semi-join 是"改写"，不是"等价保证"**——它是一个**有正确性边界的优化**。加了 `semijoin` 转换，就可能引入结果错误（不同于代价估算错误只影响性能）。
+2. **EXISTS 的转换比 IN 晚、也更危险**：IN→semi-join 从 5.6 就有，EXISTS→semi-join 是 **8.0.16 才引入**（WL#4389），所以它是"新且未经充分验证"的那一块。
+3. **排查信号**：遇到 `EXISTS` + 相关子查询 + 结果行数偏少，优先试 `semijoin=off` 验证；若规避后正确，即命中此 bug。
+
+> ⚠️ 本仓库为 8.0.39，该 bug 报告的影响范围标注为 "8.0.16+, 8.0.33"，且报告未显示已修复版本——**8.0.39 很可能仍受影响**，实际遇到时请以复现为准。
+
 ---
 
 ## 参考
@@ -606,4 +719,7 @@ AccessPath 层：NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL 等节点
 
 **阿里云 PolarDB 官方文档**
 - [《图解 MySQL 8.0 优化器对子查询 JOIN 与分区表的转换优化》](https://help.aliyun.com/zh/polardb/polardb-for-mysql/optimizer-based-query-conversion-in-mysql-8) —— `convert_subquery_to_semijoin` 四种模式（IN/EXISTS/NOT EXISTS/NOT IN）、`flatten_subqueries` 优先级、anti-join 的 `can_do_aj`（本篇 3.1/3.3 对齐此文）
+
+**已知缺陷**
+- [MySQL Bug #110819](https://bugs.mysql.com/bug.php?id=110819) —— *EXISTS with dependent subquery can return incorrect results*（8.0.16+ 回归，WL#4389 引入，S2，见 9.5）
 

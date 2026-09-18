@@ -4,34 +4,28 @@
 >
 > 注：本工作区源码含中文研读批注，部分行号与官方 8.0.39 有偏移，引用时以函数名为主。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [存储体系总览（五层结构）](#存储体系总览五层结构)
-- [Undo Tablespace 与 DDL](#undo-tablespace-与-ddl)
-- [Rollback Segment（rseg）与 Undo Segment](#rollback-segmentrseg与-undo-segment)
-- [Undo Page 布局](#undo-page-布局)
-- [Undo Record 格式与记录类型](#undo-record-格式与记录类型)
-- [Undo 生成路径](#undo-生成路径)
-- [Undo 与事务回滚](#undo-与事务回滚)
-- [Undo 与 MVCC](#undo-与-mvcc)
-- [History List](#history-list)
-- [Purge 机制](#purge-机制)
-  - [Purge 线程模型](#purge-线程模型)
-  - [Purge 边界](#purge-边界)
-  - [Buffer Pool Watch 与 purge](#buffer-pool-watch-与-purge)
-  - [trx_purge 主循环](#trx_purge-主循环)
-  - [rseg 遍历：TrxUndoRsegsIterator](#rseg-遍历trxundorsegsiterator)
-  - [trx_purge_attach_undo_recs 与分组](#trx_purge_attach_undo_recs-与分组)
-  - [单条 undo rec 的 purge](#单条-undo-rec-的-purge)
-  - [Purge 与 change buffer 的协同](#purge-与-change-buffer-的协同)
-  - [History list truncate](#history-list-truncate)
-  - [Purge 滞后与限流](#purge-滞后与限流)
-- [DDL 与 Undo](#ddl-与-undo)
-- [GTID 持久化与 Undo](#gtid-持久化与-undo)
-- [Undo 与 Clone / 备份](#undo-与-clone--备份)
-- [Misc](#misc)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [存储体系总览（五层结构）](#存储体系总览五层结构)
+  - 物理层
+    - [Undo Tablespace 与 DDL](#undo-tablespace-与-ddl)
+    - [Rollback Segment（rseg）与 Undo Segment](#rollback-segmentrseg与-undo-segment)
+    - [Undo Page 布局](#undo-page-布局)
+    - [Undo Record 格式与记录类型](#undo-record-格式与记录类型)
+  - 写路径
+    - [Undo 生成路径](#undo-生成路径)
+    - [Undo 与事务回滚](#undo-与事务回滚)
+  - 读路径
+    - [Undo 与 MVCC](#undo-与-mvcc)
+  - 清理与协同
+    - [History List](#history-list)
+    - [Purge 机制](#purge-机制)
+    - [DDL 与 Undo](#ddl-与-undo)
+    - [GTID 持久化与 Undo](#gtid-持久化与-undo)
+    - [Undo 与 Clone / 备份](#undo-与-clone--备份)
+- [Misc](#Misc)
 - [关键源码位置速查](#关键源码位置速查)
 - [参考](#参考)
 
@@ -129,7 +123,9 @@ InnoDB 位置的代价是：长链查询慢（外链随机 I/O）、history 堆�
 
 ---
 
-## 存储体系总览（五层结构）
+## 核心实现
+
+### 存储体系总览（五层结构）
 
 undo 的物理组织是严格分层的，理解这个层级是理解后面所有章节的基础：
 
@@ -155,7 +151,7 @@ undo tablespace（.ibu 文件，space_id ∈ [s_min_undo_space_id, s_max_undo_sp
 
 ---
 
-## Undo Tablespace 与 DDL
+### Undo Tablespace 与 DDL
 
 ### CREATE / ALTER / DROP UNDO TABLESPACE 路径
 
@@ -286,7 +282,7 @@ trx_rseg_array_create(space_id, &mtr);                                     // St
 
 ---
 
-## Rollback Segment（rseg）与 Undo Segment
+### Rollback Segment（rseg）与 Undo Segment
 
 ### trx_rseg_t 内存对象
 
@@ -405,7 +401,7 @@ rseg 选择策略（trx0trx.cc）：`get_next_redo_rseg_from_undo_spaces()`**rou
 
 ---
 
-## Undo Page 布局
+### Undo Page 布局
 
 ### 页头 TRX_UNDO_PAGE_HDR
 
@@ -478,7 +474,7 @@ log N 的记录区间 = [log N 的 LOG_START, log N 的 NEXT_LOG 或 PAGE_FREE)
 
 ---
 
-## Undo Record 格式与记录类型
+### Undo Record 格式与记录类型
 
 ### 物理头尾：next / prev
 
@@ -584,7 +580,7 @@ bit:  55    54.........48  47...................16  15.........0
 
 ---
 
-## Undo 生成路径
+### Undo 生成路径
 
 ### 总入口 `trx_undo_report_row_operation`
 
@@ -709,7 +705,7 @@ roll_ptr 的回填发生在**数据页的 mtr** 里（不是 undo 的 mtr），�
 
 ---
 
-## Undo 与事务回滚
+### Undo 与事务回滚
 
 ### 三条入口，收敛到一个函数
 
@@ -817,7 +813,7 @@ XA ROLLBACK 时则反向操作：把段状态写回 `TRX_UNDO_ACTIVE` 并落 red
 
 ---
 
-## Undo 与 MVCC
+### Undo 与 MVCC
 
 > **边界**：本篇只讲 **undo 侧**——版本链怎么组织、怎么沿链回溯、怎么重建出旧版本。read view 的四字段与 `changes_visible` 的可见性规则、RR/RC 下 view 的创建时机、AC-NL-RO 的 view 生命周期，见 [`mvcc.md`](mvcc.md)。两者的接口只有一句：`view->changes_visible(trx_id, name)` 返回 true 表示"这个版本够老了，可以停"。
 
@@ -948,7 +944,7 @@ for (;;) {
 
 ---
 
-## History List
+### History List
 
 ### 组织与入链
 
@@ -1005,7 +1001,7 @@ insert undo **永不进 history list**（commit 后即无用）。
 
 ---
 
-## Purge 机制
+### Purge 机制
 
 ### Purge 线程模型
 
@@ -1248,7 +1244,7 @@ history list length 监控：`SHOW ENGINE INNODB STATUS` 的 "History list lengt
 
 ---
 
-## DDL 与 Undo
+### DDL 与 Undo
 
 DROP TABLE 和 TRUNCATE TABLE **不记录用户数据的 undo log**——它们不像 `DELETE FROM t` 那样为每一行产生 undo record。它们保证原子性和可恢复性靠的是 DDL log 和数据字典元数据的 undo。
 
@@ -1288,7 +1284,7 @@ TRUNCATE 先 rename 旧表空间文件而非直接删，这样即使 create 失�
 
 ---
 
-## GTID 持久化与 Undo
+### GTID 持久化与 Undo
 
 InnoDB 的 GTID 持久化与 undo log 紧密耦合，有三条持久化路径：binlog 文件（Gtid_log_event）/ binlog rotate 刷表 / InnoDB undo log 异步刷表。
 
@@ -1302,7 +1298,7 @@ InnoDB 的 GTID 持久化与 undo log 紧密耦合，有三条持久化路径：
 
 ---
 
-## Undo 与 Clone / 备份
+### Undo 与 Clone / 备份
 
 备份与 undo 的关系分两类：**逻辑备份**通过持有 read view 间接钉死 purge 边界；**物理备份**（Clone / MEB）则必须把 undo 表空间作为数据集的一部分带走。两者机制完全不同，故障表现也不同。
 

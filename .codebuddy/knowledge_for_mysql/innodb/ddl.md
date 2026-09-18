@@ -2,28 +2,28 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 DDL 全流程（COPY / INPLACE / INSTANT 三种算法的选择策略与 MDL 三段式）、**DDL 的引擎接口**（handler / handlerton 如何承载 DDL：inplace alter 四件套、handlerton flags 决定路径、原子 DDL 的 `dd::Table` 条件持久化、`ha_extra`）、**并行 DDL**（社区版 8.0.27+ 确有：三阶段并行粒度、Loader 状态机、分片机制）、**Instant DDL 深度剖析**（行版本号机制、记录头版本字节、DD se_private_data）、**DDL 行为速查**（四维评估、VARCHAR 256 边界、Instant 限制、工具切表也要 MDL-X）、**待优化点**（分区级 MDL 等社区版可优化空间）、原子 DDL 与 `mysql.innodb_ddl_log`（记录类型与生命周期）、online DDL 的 row log（格式 / 生成 / 回放 / 两种形态）、DROP TABLE 与 TRUNCATE TABLE 的 InnoDB 实现、B-tree 物理释放（btr_free 机制）。本文件内容由 undo_log.md 的"DDL 与 Undo"章节独立而成——DDL log 只是因"DDL 不记数据 undo"而生，其机制本身与 undo 无直接关系。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [DDL 全流程](#ddl-全流程)
-- [DDL 的引擎接口：handler / handlerton 如何承载 DDL](#ddl-的引擎接口handler--handlerton-如何承载-ddl)
-- [DDL 行为速查：四维评估与实战陷阱](#ddl-行为速查四维评估与实战陷阱)
-- [并行 DDL（社区版 8.0.27+ 确有）](#并行-ddl社区版-8027-确有)
-- [Instant DDL 深度剖析](#instant-ddl-深度剖析)
-- [待优化点](#待优化点)
-- [为什么 DROP/TRUNCATE 不记数据 undo](#为什么-droptruncate-不记数据-undo)
-- [DDL log](#ddl-log)
-- [online DDL 与 row log](#online-ddl-与-row-log)
-- [DDL 操作：各类 DDL 的具体实现](#ddl-操作各类-ddl-的具体实现)
-  - [COPY DDL 完整流程](#copy-ddl-完整流程)
-  - [DROP TABLE 流程](#drop-table-流程)
-  - [TRUNCATE TABLE：rename + drop + create](#truncate-tablerename--drop--create)
-  - [B-tree 的物理释放（btr_free 机制）](#b-tree-的物理释放btr_free-机制)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [DDL 全流程](#ddl-全流程)
+    - [DDL 的引擎接口：handler / handlerton 如何承载 DDL](#ddl-的引擎接口handler--handlerton-如何承载-ddl)
+  - 行为速查与实战
+    - [DDL 行为速查：四维评估与实战陷阱](#ddl-行为速查四维评估与实战陷阱)
+    - [为什么 DROP/TRUNCATE 不记数据 undo](#为什么-droptruncate-不记数据-undo)
+  - 日志体系
+    - [DDL log](#ddl-log)
+    - [online DDL 与 row log](#online-ddl-与-row-log)
+  - 各类 DDL 实现
+    - [DDL 操作：各类 DDL 的具体实现](#ddl-操作各类-ddl-的具体实现)
+    - [并行 DDL（社区版 8.0.27+ 确有）](#并行-ddl社区版-8027-确有)
+    - [Instant DDL 深度剖析](#instant-ddl-深度剖析)
+  - 治理
+    - [待优化点](#待优化点)
 - [核心调用栈](#核心调用栈)
-- [相关的系统变量/状态变量](#相关的系统变量状态变量)
-- [Misc](#misc)
-- [关键源码位置速查](#关键源码位置速查)
+- [相关的系统变量/状态变量](#相关的系统变量/状态变量)
+- [Misc](#Misc)
+- [参考](#参考)
 
 ---
 
@@ -75,7 +75,9 @@
 
 ---
 
-## DDL 全流程
+## 核心实现
+
+### DDL 全流程
 
 本章给出 DDL 的**骨架**：先把"server 层怎么选算法、MDL 怎么拿放"讲清，后面各章（DDL log、row log、DROP/TRUNCATE）都是这条骨架上的某个环节。
 
@@ -153,7 +155,7 @@ ALTER TABLE 有三种算法，描述的是**执行逻辑**（数据怎么搬）�
 
 ---
 
-## DDL 的引擎接口：handler / handlerton 如何承载 DDL
+### DDL 的引擎接口：handler / handlerton 如何承载 DDL
 
 前面「DDL 全流程」讲的是** server 层的调度逻辑**。本章落到**接口层**：这些调度最终通过 handler / handlerton 的哪些方法落到引擎？（两层接口的完整剖析见 [`../server/handler.md`](../server/handler.md)，本章只讲与 DDL 相关的部分。）
 
@@ -237,7 +239,7 @@ virtual int optimize(THD *, HA_CHECK_OPT *) { return HA_ADMIN_NOT_IMPLEMENTED; }
 
 ---
 
-## DDL 行为速查：四维评估与实战陷阱
+### DDL 行为速查：四维评估与实战陷阱
 
 > 参考月报《云原生数据库 PolarDB MySQL 8.0.2 DDL 介绍》（2023/09）的组织思路，但**所有结论均回社区版 8.0.39 源码核实**，并标注哪些是 PolarDB 私有增强。
 
@@ -413,7 +415,7 @@ static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_INSTANT_ALLOWED =
 
 ---
 
-## 为什么 DROP/TRUNCATE 不记数据 undo
+### 为什么 DROP/TRUNCATE 不记数据 undo
 
 DROP TABLE 和 TRUNCATE TABLE **不记录用户数据的 undo log**——它们不像 `DELETE FROM t` 那样为每一行产生 undo record。原因：
 
@@ -425,7 +427,7 @@ DROP TABLE 和 TRUNCATE TABLE **不记录用户数据的 undo log**——它们�
 
 ---
 
-## DDL log
+### DDL log
 
 ### 存储与记录类型
 
@@ -476,7 +478,7 @@ DROP TABLE 和 TRUNCATE TABLE **不记录用户数据的 undo log**——它们�
 
 ---
 
-## online DDL 与 row log
+### online DDL 与 row log
 
 > 上一节的 DDL log 与这里的 row log 名字都带 log，但**完全是两回事**：DDL log 管"DDL 崩溃恢复/原子性"，row log 管"online DDL 重建期间的 DML 并发"。
 
@@ -591,7 +593,7 @@ dict_table_rename_in_cache(ctx->new_table, old_name, false);       // 新表 →
 
 ---
 
-## DDL 操作：各类 DDL 的具体实现
+### DDL 操作：各类 DDL 的具体实现
 
 前面几章讲的是 DDL 的**通用骨架**（算法选择、MDL 流转、DDL log、row log）。本章落到**具体每类 DDL 怎么做**。
 
@@ -886,7 +888,7 @@ void Log_DDL::replay_free_tree_log(space_id_t space_id, page_no_t page_no, ulint
 
 ---
 
-## 并行 DDL（社区版 8.0.27+ 确有）
+### 并行 DDL（社区版 8.0.27+ 确有）
 
 社区版 8.0.39 **支持**并行 DDL（`innodb_ddl_threads` 于 8.0.27 引入），但并行**仅限 InnoDB 层的部分阶段**，不是全链路并行。
 
@@ -969,7 +971,7 @@ Parallel_reader                 // 一次并行读的总调度
 
 ---
 
-## Instant DDL 深度剖析
+### Instant DDL 深度剖析
 
 ### 核心思想：只改元数据 + 行版本号
 
@@ -1295,7 +1297,7 @@ WHERE  t.NAME = 'your_db/your_table'
 
 ---
 
-## 待优化点
+### 待优化点
 
 对比云厂商（PolarDB / AliSQL）的增强，社区版 8.0.39 在 DDL 与并行方面仍有明显可优化空间：
 

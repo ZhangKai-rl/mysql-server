@@ -1,7 +1,7 @@
 # 表（Table）：元数据与通用操作
 
 > **定位**：SQL 层"表"这条线的完整视图——三层元数据对象、表缓存、以及表的全部通用操作（开表 / 锁表 / CREATE / ALTER / RENAME / TRUNCATE / DROP / FLUSH）。
-> **边界**：MDL 的细粒度语义见 [`mdl.md`](mdl.md)；server↔引擎分界面见 [`handler.md`](handler.md)；InnoDB 侧 `dict_table_t` 与 COPY/INPLACE/INSTANT 算法选型见 [`../innodb/ddl.md`](../innodb/ddl.md)；表空间级 DDL（CREATE TABLESPACE）见 [`../innodb/physical/tablespace.md`](../innodb/physical/tablespace.md)；分区表见 [`../feat/partitioning.md`](../feat/partitioning.md)；临时表见 [`query/runtime/07_temptable.md`](query/runtime/07_temptable.md)。
+> **边界**：MDL 的细粒度语义见 [`../lock/transactional/mdl.md`](../lock/transactional/mdl.md)；server↔引擎分界面见 [`handler.md`](handler.md)；InnoDB 侧 `dict_table_t` 与 COPY/INPLACE/INSTANT 算法选型见 [`../innodb/ddl.md`](../innodb/ddl.md)；表空间级 DDL（CREATE TABLESPACE）见 [`../innodb/physical/tablespace.md`](../innodb/physical/tablespace.md)；分区表见 [`../feat/partitioning.md`](../feat/partitioning.md)；临时表见 [`query/runtime/07_temptable.md`](query/runtime/07_temptable.md)。
 
 ---
 

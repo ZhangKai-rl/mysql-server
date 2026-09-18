@@ -1,7 +1,7 @@
 # 自增列（AUTO_INCREMENT）
 
 > **定位**：自增从 SQL 解析到 InnoDB 落地的完整链路——server 层自增字段描述、handler 区间分配接口、InnoDB 的 AUTOINC 三种锁模式、计数器持久化、以及"空洞/重启回退/上限"这些常见疑问的源码答案。
-> **边界**：自增列的元数据字段（`TABLE_SHARE` 四处定位信息、`TABLE` 运行时字段）见 [`../server/table.md`](../server/table.md)；AUTOINC 表锁在锁系统中的位置见 [`../innodb/lock.md`](../innodb/lock.md)；复制格式与 SBR 安全性见 [`../server/replication/binlog.md`](../server/replication/binlog.md)。
+> **边界**：自增列的元数据字段（`TABLE_SHARE` 四处定位信息、`TABLE` 运行时字段）见 [`../server/table.md`](../server/table.md)；AUTOINC 表锁在锁系统中的位置见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)；复制格式与 SBR 安全性见 [`../server/replication/binlog.md`](../server/replication/binlog.md)。
 
 ---
 

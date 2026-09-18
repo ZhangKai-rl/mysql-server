@@ -4,23 +4,24 @@
 >
 > **边界**：本篇讲 query graph 执行模型的**通用机制**（构建 / 调度 / 挂起 / 唤醒）；回滚图（roll_node 外层 + undo graph 内层的两层结构）与事务回滚的剖析见 [`trx.md`](trx.md)「回滚机制」。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
 - [核心实现](#核心实现)
-  - [查询图的构建](#查询图的构建)
-  - [核心概念：fork / thr / node 三层架构](#核心概念fork--thr--node-三层架构)
-  - [节点类型与 C 风格多态](#节点类型与-c-风格多态)
-  - [row_prebuilt_t 与查询图的关系](#row_prebuilt_t-与查询图的关系)
-  - [SELECT 不走查询图](#select-不走查询图)
-  - [执行调度器：que_run_threads 与 que_thr_step](#执行调度器que_run_threads-与-que_thr_step)
-  - [thr 状态机](#thr-状态机)
-  - [锁等待挂起机制](#锁等待挂起机制)
-  - [精确唤醒：从 2PL 放锁到 os_event_set](#精确唤醒从-2pl-放锁到-os_event_set)
-  - [srv_sys->tasks 全局队列与 purge 调度](#srv_systasks-全局队列与-purge-调度)
-  - [两种执行模型对比：1:1 阻塞 vs task queue 分发](#两种执行模型对比11-阻塞-vs-task-queue-分发)
-- [Misc](#misc)
+  - 主线与基础构件
+    - [查询图的构建](#查询图的构建)
+    - [核心概念：fork / thr / node 三层架构](#核心概念fork--thr--node-三层架构)
+    - [节点类型与 C 风格多态](#节点类型与-c-风格多态)
+    - [row_prebuilt_t 与查询图的关系](#row_prebuilt_t-与查询图的关系)
+    - [SELECT 不走查询图](#select-不走查询图)
+  - 执行与调度
+    - [执行调度器：que_run_threads 与 que_thr_step](#执行调度器que_run_threads-与-que_thr_step)
+    - [thr 状态机](#thr-状态机)
+    - [锁等待挂起机制](#锁等待挂起机制)
+    - [精确唤醒：从 2PL 放锁到 os_event_set](#精确唤醒从-2pl-放锁到-os_event_set)
+  - 全局队列与执行模型
+    - [srv_sys->tasks 全局队列与 purge 调度](#srv_systasks-全局队列与-purge-调度)
+    - [两种执行模型对比：1:1 阻塞 vs task queue 分发](#两种执行模型对比11-阻塞-vs-task-queue-分发)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---

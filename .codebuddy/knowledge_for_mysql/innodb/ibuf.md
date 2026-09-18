@@ -4,19 +4,23 @@
 
 > **边界**：本篇讲 **change buffer 本身**。Buffer Pool 的读页与预读见 [`buffer_pool.md`](buffer_pool.md)；二级索引的 B-tree 操作见 [`btr.md`](btr.md)；purge 与 undo 见 [`undo_log.md`](undo_log.md)；崩溃恢复见 [`recovery.md`](recovery.md)。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [核心实现一：物理结构](#核心实现一物理结构)
-- [核心实现二：ibuf 记录格式](#核心实现二ibuf-记录格式)
-- [核心实现三：插入路径 `ibuf_insert`](#核心实现三插入路径-ibuf_insert)
-- [核心实现四：★ 合并路径](#核心实现四合并路径)
-- [核心实现五：ibuf bitmap 的维护](#核心实现五ibuf-bitmap-的维护)
-- [核心实现六：崩溃恢复](#核心实现六崩溃恢复)
-- [核心实现七：purge 与 ibuf](#核心实现七purge-与-ibuf)
-- [核心实现八：参数与监控](#核心实现八参数与监控)
-- [Misc](#misc)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [物理结构](#物理结构)
+    - [ibuf 记录格式](#ibuf-记录格式)
+  - 写路径（插入）
+    - [插入路径 `ibuf_insert`](#插入路径-ibuf_insert)
+  - 读路径（合并）
+    - [★ 合并路径](#合并路径)
+    - [ibuf bitmap 的维护](#ibuf-bitmap-的维护)
+  - 协同与生命周期
+    - [崩溃恢复](#崩溃恢复)
+    - [purge 与 ibuf](#purge-与-ibuf)
+  - 治理
+    - [参数与监控](#参数与监控)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---
@@ -162,9 +166,11 @@ free bits could momentarily be set too high. */
 
 ---
 
-## 核心实现一：物理结构
+## 核心实现
 
-### 1.1 ibuf 树的位置
+### 物理结构
+
+#### 1.1 ibuf 树的位置
 
 | 常量 | 值 | 定义位置 |
 |---|---|---|
@@ -177,7 +183,7 @@ free bits could momentarily be set too high. */
 
 > **为什么要单独的 header page(3) 而不直接用 root page(4)**：`ibuf_add_free_page` 的注释说明——避免在持有 ibuf 树 latch 时递归进入 ibuf。
 
-### 1.2 ibuf bitmap 页
+#### 1.2 ibuf bitmap 页
 
 **布局**：
 
@@ -226,9 +232,9 @@ static inline ulint ibuf_index_page_calc_free_bits(ulint page_size,
 
 ---
 
-## 核心实现二：ibuf 记录格式
+### ibuf 记录格式
 
-### 2.1 5.5+ 格式（当前）
+#### 2.1 5.5+ 格式（当前）
 
 ```
  field#0  SPACE    : 4 bytes  (space id)
@@ -269,7 +275,7 @@ typedef enum {
 
 > 注释警告：**"DO NOT CHANGE THE VALUES OF THESE, THEY ARE STORED ON DISK."**
 
-### 2.2 ★ COUNTER 为什么存在
+#### 2.2 ★ COUNTER 为什么存在
 
 源码注释（`ibuf0ibuf.cc`）：
 
@@ -277,20 +283,20 @@ typedef enum {
 
 即：**保证同一页上多个操作在 merge 时按加入顺序应用**。counter = 该 `(space, page_no)` 最后一条记录的 counter + 1（`ibuf_get_entry_counter_func`）。
 
-### 2.3 解析与空间估算
+#### 2.3 解析与空间估算
 
 - `ibuf_rec_get_info_func`用 `len % 6` 判断格式：0 = REDUNDANT 老格式，1 = COMPACT 老格式，4 = 5.5+ 新格式。
 - `ibuf_rec_get_volume_func`：`DELETE_MARK`/`DELETE` 返回 **0**（"Delete-marking a record doesn't take any additional space"）；INSERT 返回 `rec_get_converted_size + page_dir_calc_reserved_space(1)`。
 
 ---
 
-## 核心实现三：插入路径 `ibuf_insert`
+### 插入路径 `ibuf_insert`
 
-### 3.1 入口条件
+#### 3.1 入口条件
 
 `btr0cur.cc`：只有 `buf_page_get_gen(..., Page_fetch::IF_IN_POOL, ...)` 返回 **nullptr**（页不在 BP）时才尝试 ibuf。这本身就是第一条否决条件。
 
-### 3.2 `ibuf_insert` 的决策矩阵
+#### 3.2 `ibuf_insert` 的决策矩阵
 
 ```c
 bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
@@ -337,7 +343,7 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
 - **entry 太大不缓存**：`entry_size >= 空页可用空间/2`（约 8 KB）→ 放弃（否则 merge 时装不下）。
 - **两级重试**：先 `BTR_MODIFY_PREV`（乐观），返回 `DB_FAIL` 后用 `BTR_MODIFY_TREE`（悲观，可能引 ibuf 树分裂）。
 
-### 3.3 ★ 不缓存的 14 条条件（完整清单）
+#### 3.3 ★ 不缓存的 14 条条件（完整清单）
 
 | # | 条件 | 位置 |
 |---|---|---|
@@ -365,7 +371,7 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
   }
 ```
 
-### 3.4 ibuf 大小限制与三级自我保护
+#### 3.4 ibuf 大小限制与三级自我保护
 
 **初始化**：
 
@@ -403,7 +409,7 @@ const ulint IBUF_CONTRACT_DO_NOT_INSERT = 10;
 
 **第二种自我保护**：当发现某页的 FREE 位装不下新操作时，不是简单放弃，而是 `do_merge = true` + `buf_read_ibuf_merge_pages` —— **把附近页一起读进来触发 merge，腾出空间**。
 
-### 3.5 ibuf 自身的 redo（★ 常见误解）
+#### 3.5 ibuf 自身的 redo（★ 常见误解）
 
 **8.0.39 中只有一种 `MLOG_IBUF_*` 类型**：
 
@@ -426,9 +432,9 @@ const ulint IBUF_CONTRACT_DO_NOT_INSERT = 10;
 
 ---
 
-## 核心实现四：★ 合并路径
+### ★ 合并路径
 
-### 4.1 8 条提前返回条件
+#### 4.1 8 条提前返回条件
 
 `ibuf_merge_or_delete_for_page`（`ibuf0ibuf.cc`）：
 
@@ -443,7 +449,7 @@ const ulint IBUF_CONTRACT_DO_NOT_INSERT = 10;
 | 7 | （若 update_ibuf_bitmap）用真实 page_size 重查 #5 | |
 | 8 | `IBUF_BITMAP_BUFFERED == 0` → 什么都不用做；`space == nullptr`（表空间已删）→ 降级为"只删 ibuf 记录" | |
 
-### 4.2 合并主流程
+#### 4.2 合并主流程
 
 ```c
 loop:
@@ -510,7 +516,7 @@ reset_bit:
 3. **可能触发页分裂**：`ibuf_insert_to_index_page` 是真正的 `btr_cur_optimistic_insert`，页满时会退化为悲观插入 → 分裂。这就是"merge 可能触发页分裂"的源码证据。
 4. 最后 `reset_bit` 清空 `BUFFERED` 位并重算 `FREE` 位。
 
-### 4.3 其他 merge 入口
+#### 4.3 其他 merge 入口
 
 | 函数 | 位置 | 触发者 |
 |------|------|--------|
@@ -521,17 +527,52 @@ reset_bit:
 | `ibuf_merge_in_background` |  | **由 master 线程调用**（ibuf merge **无专用线程**） |
 | `buf_read_ibuf_merge_pages` | `buf0rea.cc` | 批量读页做 merge |
 
-### 4.4 ★ 为什么用 `AIO_mode::IBUF`
+#### 4.4 ★ 为什么用 `AIO_mode::IBUF`
 
 `buf_read_ibuf_merge_pages` 用 `AIO_mode::IBUF`，**单独的 AIO 数组 + 单独的线程**。
 
 原因：ibuf merge 时要读入二级索引页。如果它和普通读抢同一批 AIO 槽位，可能出现**"所有槽位都被 ibuf merge 的读占满，而 ibuf merge 又在等这些读完成"的死锁**。单独一个 `s_ibuf` 数组把这个环切断（详见 [`io.md`](io.md) / [`fil.md`](fil.md)）。
 
+#### 4.5 ★ Bug#120698：`access_time` 不是可靠的 merge 门控
+
+> **边界**：本节省掉 buffer pool 侧（压缩页驱逐竞态窗口、`HASH_DELETE`/`HASH_INSERT`、`access_time` 继承）的完整分析见 [`buffer_pool.md`](buffer_pool.md)「压缩页驱逐与 change buffer 竞态」。本节只写 change buffer 侧的判据问题。
+
+**缺陷**：压缩页解压路径 `Buf_fetch::zip_page_handler`（buf0buf.cc:3962-3970）用 `access_time != 0` 作为"跳过 merge"的判据：
+
+```c
+if (!recv_no_ibuf_operations) {
+  if (access_time != std::chrono::steady_clock::time_point{}) {
+    /* 跳过 merge —— 假定"页被访问过 ⇒ 已 merge 过" */
+  } else {
+    ibuf_merge_or_delete_for_page(block, m_page_id, &m_page_size, true);
+  }
+}
+```
+
+该假定在压缩页驱逐解压帧后被打破——描述符被 `HASH_INSERT` 插回 `page_hash` 时带着**继承来的非零 `access_time`**（stale），但它已是新 incarnation，窗口期缓冲的 ibuf entry 尚未应用 ⇒ merge 被永久跳过 ⇒ 页分裂后记录落错页 ⇒ B+tree 页间顺序违反（`btr_check_sibling_boundary` 报错）。
+
+**change buffer 侧的正确判据在函数内部**。`ibuf_merge_or_delete_for_page`（ibuf0ibuf.cc:4030-4040）自己读 bitmap 的 `IBUF_BITMAP_BUFFERED` 位，无缓冲变更即返回：
+
+```c
+bitmap_bits = ibuf_bitmap_page_get_bits(bitmap_page, page_id, *page_size,
+                                        IBUF_BITMAP_BUFFERED, &mtr);
+ibuf_mtr_commit(&mtr);
+if (!bitmap_bits) {
+  /* No inserts buffered for this page */
+  fil_space_release(space);
+  return;
+}
+```
+
+因此**无条件调用它是安全的**（无 BUFFERED 时仅多读一次 bitmap 页），而 `access_time` 这个外部快捷判断既多余又危险。官方认可修复：释放压缩页时置 `access_time = 0`，且改为无条件进入本函数、由内部 BUFFERED 位裁决。
+
+**教学价值**：这是"把判据放在离真正权威状态最远的地方"的典型反面案例——`access_time` 本职是预读启发式（首次访问时间），却被重载成"是否已 merge"的代理变量，而真正的权威状态（bitmap 的 BUFFERED 位）就躺在被调用函数内部。
+
 ---
 
-## 核心实现五：ibuf bitmap 的维护
+### ibuf bitmap 的维护
 
-### 5.1 读写函数
+#### 5.1 读写函数
 
 | 函数 | 位置 | 职责 |
 |------|------|------|
@@ -552,7 +593,7 @@ reset_bit:
 
 > 注意这里 `page_size.physical` 被当作"页数"用——设计上 `XDES_DESCRIBED_PER_PAGE == UNIV_PAGE_SIZE`。
 
-### 5.2 何时置/清
+#### 5.2 何时置/清
 
 | 位 | 置 | 清 |
 |---|---|---|
@@ -562,7 +603,7 @@ reset_bit:
 
 ---
 
-## 核心实现六：崩溃恢复
+### 崩溃恢复
 
 ibuf 的修改**全部记 redo**（见 [3.5](#35-ibuf-自身的-redo-常见误解)），所以崩溃安全。
 
@@ -576,7 +617,7 @@ ibuf 的修改**全部记 redo**（见 [3.5](#35-ibuf-自身的-redo-常见误�
 
 ---
 
-## 核心实现七：purge 与 ibuf
+### purge 与 ibuf
 
 **为什么 delete/purge 也能被缓存**：
 
@@ -605,9 +646,9 @@ ibuf 的修改**全部记 redo**（见 [3.5](#35-ibuf-自身的-redo-常见误�
 
 ---
 
-## 核心实现八：参数与监控
+### 参数与监控
 
-### 8.1 参数
+#### 8.1 参数
 
 | 变量 | 默认 | 范围 | 定义位置 |
 |------|------|------|---------|
@@ -627,7 +668,7 @@ void ibuf_max_size_update(ulint new_val) {
 }
 ```
 
-### 8.2 监控
+#### 8.2 监控
 
 `SHOW ENGINE INNODB STATUS` 的 INSERT BUFFER 部分：
 

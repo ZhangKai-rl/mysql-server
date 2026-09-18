@@ -4,20 +4,23 @@
 
 > **边界**：本篇讲 **fil 层（表空间元数据与 I/O 分发）**。它下面的 `os_file` 原语（O_DIRECT / fsync / `os_file_io` 总收口）与 AIO 子系统见 [`io.md`](io.md)；Buffer Pool 的刷脏与读页见 [`buffer_pool.md`](buffer_pool.md)；redo 的格式见 [`redo_log.md`](redo_log.md)；崩溃恢复中 fil 的角色见 [`recovery.md`](recovery.md)。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [核心实现一：三层结构与分片](#核心实现一三层结构与分片)
-- [核心实现二：文件类型与后缀](#核心实现二文件类型与后缀)
-- [核心实现三：主链路 fil_io → Fil_shard::do_io](#核心实现三主链路-fil_io--fil_sharddo_io)
-- [核心实现四：★ AIO 模式的三选一（含缺页读为何是同步）](#核心实现四-aio-模式的三选一含缺页读为何是同步)
-- [核心实现五：I/O 并发控制（flag 与计数器体系）](#核心实现五io-并发控制flag-与计数器体系)
-- [核心实现六：文件扩展 space_extend](#核心实现六文件扩展-space_extend)
-- [核心实现七：刷盘与 fsync 并发去重 space_flush](#核心实现七刷盘与-fsync-并发去重-space_flush)
-- [核心实现八：文件生命周期（打开 / 关闭 / 删除）](#核心实现八文件生命周期打开--关闭--删除)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [三层结构与分片](#三层结构与分片)
+    - [文件类型与后缀](#文件类型与后缀)
+  - 主链路（读写共用）
+    - [主链路 fil_io → Fil_shard::do_io](#主链路-fil_io--fil_sharddo_io)
+    - [★ AIO 模式的三选一（含缺页读为何是同步）](#-aio-模式的三选一含缺页读为何是同步)
+  - 写路径
+    - [I/O 并发控制（flag 与计数器体系）](#io-并发控制flag-与计数器体系)
+    - [文件扩展 space_extend](#文件扩展-space_extend)
+    - [刷盘与 fsync 并发去重 space_flush](#刷盘与-fsync-并发去重-space_flush)
+  - 生命周期
+    - [文件生命周期（打开 / 关闭 / 删除）](#文件生命周期打开--关闭--删除)
 - [相关的系统变量](#相关的系统变量)
-- [Misc](#misc)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---
@@ -120,7 +123,9 @@ req_type.block_size(file->block_size);
 
 ---
 
-## 核心实现一：三层结构与分片
+## 核心实现
+
+### 三层结构与分片
 
 ```
 fil_system（全局单例，fil0fil.cc）
@@ -172,9 +177,9 @@ constexpr size_t MAX_SHARDS = 68;
 
 ---
 
-## 核心实现二：文件类型与后缀
+### 文件类型与后缀
 
-### 类型常量：不是 enum，是 `static const ulint`
+#### 类型常量：不是 enum，是 `static const ulint`
 
 `include/os0file.h`：
 
@@ -192,15 +197,15 @@ constexpr size_t MAX_SHARDS = 68;
 
 **这些类型决定 O_DIRECT 是否生效**：只有 `OS_DATA_FILE` / `OS_CLONE_DATA_FILE` / `OS_DBLWR_FILE` 会走 O_DIRECT 分支，`OS_LOG_FILE` 不会（见 [`io.md`](io.md)）。
 
-### 文件后缀
+#### 文件后缀
 
 `enum ib_file_suffix`（`fil0fil.h`）：`.ibd` / `.cfg` / `.cfp` / `.ibt` / `.ibu` / `.dblwr` / `.bdblwr`。
 
 ---
 
-## 核心实现三：主链路 `fil_io` → `Fil_shard::do_io`
+### 主链路 `fil_io` → `Fil_shard::do_io`
 
-### 入口
+#### 入口
 
 `storage/innobase/fil/fil0fil.cc`：
 
@@ -217,7 +222,7 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 }
 ```
 
-### `Fil_shard::do_io` 的尾部：所有附加语义在这里补上
+#### `Fil_shard::do_io` 的尾部：所有附加语义在这里补上
 
 `fil0fil.cc`：
 
@@ -256,9 +261,9 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 
 ---
 
-## 核心实现四：★ AIO 模式的三选一（含缺页读为何是同步）
+### ★ AIO 模式的三选一（含缺页读为何是同步）
 
-### `Fil_shard::get_AIO_mode`（`fil0fil.cc`）
+#### `Fil_shard::get_AIO_mode`（`fil0fil.cc`）
 
 ```cpp
 AIO_mode Fil_shard::get_AIO_mode(const IORequest &type, bool sync) {
@@ -279,7 +284,7 @@ AIO_mode Fil_shard::get_AIO_mode(const IORequest &type, bool sync) {
 
 > **`IBUF` 为什么单独存在**：ibuf merge 时要读入二级索引页。如果它和普通读抢同一批 AIO 槽位，可能出现"所有槽位都被 ibuf merge 的读占满，而 ibuf merge 又在等这些读完成"的死锁。**单独的 `s_ibuf` 数组 + 单独的线程**把这个环切断。
 
-### ★ 缺页读为什么是 `SYNC`（完整判定链）
+#### ★ 缺页读为什么是 `SYNC`（完整判定链）
 
 这是理解 InnoDB 读路径最容易搞错的一处。完整证据链：
 
@@ -293,7 +298,7 @@ AIO_mode Fil_shard::get_AIO_mode(const IORequest &type, bool sync) {
 
 **结论：单页缺页读 = 调用线程自己的 `pread`，不占 AIO 槽位，不需要 io-handler 线程。**
 
-### 真正走 `sync=false`（真 AIO）的三条路径
+#### 真正走 `sync=false`（真 AIO）的三条路径
 
 | 调用者 | sync | 说明 |
 |---|---|---|
@@ -301,7 +306,7 @@ AIO_mode Fil_shard::get_AIO_mode(const IORequest &type, bool sync) {
 | `buf_read_ibuf_merge_pages` | 仅最后一页 true | `AIO_mode::IBUF` |
 | `buf_read_recv_pages` | 仅最后一页 true | 崩溃恢复 |
 
-### 有些页会被强制降级为同步（`buf0rea.cc`）
+#### 有些页会被强制降级为同步（`buf0rea.cc`）
 
 ```cpp
   if (ibuf_bitmap_page(page_id, page_size) || trx_sys_hdr_page(page_id)) {
@@ -323,7 +328,7 @@ AIO_mode Fil_shard::get_AIO_mode(const IORequest &type, bool sync) {
         !ibuf_bitmap_page(...) || sync);
 ```
 
-### ⭐ 并发的真正来源
+#### ⭐ 并发的真正来源
 
 N 个用户线程各缺一个**不同**的页 → N 个并发 `pread`（内核层面天然并行）。
 
@@ -331,7 +336,7 @@ N 个用户线程各缺一个**不同**的页 → N 个并发 `pread`（内核�
 
 ---
 
-## 核心实现五：I/O 并发控制（flag 与计数器体系）
+### I/O 并发控制（flag 与计数器体系）
 
 对**同一个文件**的并发操作不靠锁，靠一组标志位与计数器。这套机制决定了"为什么大表 DROP/TRUNCATE 有时会卡住"。
 
@@ -359,11 +364,11 @@ N 个用户线程各缺一个**不同**的页 → N 个并发 `pread`（内核�
 
 ---
 
-## 核心实现六：文件扩展 `space_extend`
+### 文件扩展 `space_extend`
 
 `Fil_shard::space_extend`（`fil0fil.cc`）。
 
-### 排队：为什么是轮询
+#### 排队：为什么是轮询
 
 ```cpp
   for (;;) {
@@ -386,7 +391,7 @@ N 个用户线程各缺一个**不同**的页 → N 个并发 `pread`（内核�
 
 **为什么要释放 shard mutex 再等待**：扩展过程要做 `posix_fallocate` / 写零（毫秒级阻塞），持锁会冻结整个 shard。释放期间必须有 `is_being_extended` 表示"正在扩展"。
 
-### 怎么扩展
+#### 怎么扩展
 
 ```
 posix_fallocate(fd, node_start, len)     ← 预留空间、更新 FS 元数据，不写数据
@@ -397,7 +402,7 @@ fil_write_zeros(...)                      ← 按 1MB 一批写零
 - 失败时 `EINVAL`（ext3 + O_DIRECT）/ `EINTR`（被信号中断）不报错，直接走写零；其它错误报 `ER_IB_MSG_319`。
 - `atomic_write`（FusionIO）时跳过写零。
 
-### ★ 会产生 redo，但故意不 `log_write_up_to`
+#### ★ 会产生 redo，但故意不 `log_write_up_to`
 
 ```cpp
       fil_op_write_space_extend(space->id, node_start, len, &mtr);   // MLOG_FILE_EXTEND
@@ -411,11 +416,11 @@ fil_write_zeros(...)                      ← 按 1MB 一批写零
 - **为什么不刷 redo**：扩展是幂等的、文件只增不减，重复扩展无害——**这是有意违反 WAL**。
 - **例外**：临时表空间（`FIL_TYPE_TEMPORARY`）与系统表空间不记 redo（前者每次启动重建，后者不 resize）。
 
-### ★ 末尾一定 `space_flush`
+#### ★ 末尾一定 `space_flush`
 
 哪怕 `O_DIRECT_NO_FSYNC`。因为**文件大小变化必须同步 FS 元数据**，否则重启后可能读到"短文件"。
 
-### undo 的自适应扩展量
+#### undo 的自适应扩展量
 
 `fil_space_t::m_undo_extend`（`fsp_try_extend_data_file` + `adjust_undo_extend`）：
 
@@ -426,11 +431,11 @@ fil_write_zeros(...)                      ← 按 1MB 一批写零
 
 ---
 
-## 核心实现七：刷盘与 fsync 并发去重 `space_flush`
+### 刷盘与 fsync 并发去重 `space_flush`
 
 `Fil_shard::space_flush`（`fil0fil.cc`）。
 
-### ★ 合并 fsync
+#### ★ 合并 fsync
 
 ```cpp
     while (file.n_pending_flushes > 0 && !skip_flush) {
@@ -459,7 +464,7 @@ fil_write_zeros(...)                      ← 按 1MB 一批写零
 
 多个线程同时想 fsync 同一个文件时，**只有一个真做**，其余等 `sync_event`；醒来后若发现 `flush_counter >= old_mod_counter` 就**直接跳过**。这正是 `sync_event` 注释说的 *"event that groups and serializes calls to fsync"*。
 
-### 三个计数器（不是两个）
+#### 三个计数器（不是两个）
 
 | 字段 | 何时更新 | 用途 |
 |---|---|---|
@@ -471,7 +476,7 @@ fil_write_zeros(...)                      ← 按 1MB 一批写零
 - 判定"要不要刷"用**快照** `old_mod_counter`（进入时取），而不是 `file.modification_counter`——因为 fsync 期间（无锁）可能有新写进来，那些不该算"我已刷"。
 - **为什么需要 `flush_size`**：`O_DIRECT_NO_FSYNC` 模式下每次写后立即 `set_flushed`，`mod/flush_counter` **恒相等**，无法判断。此时唯一需要 fsync 的事件是**文件变大**，所以用 `flush_size != size` 触发。
 
-### `is_fast_shutdown` 跳过但仍记账
+#### `is_fast_shutdown` 跳过但仍记账
 
 ```cpp
 static bool is_fast_shutdown {
@@ -481,7 +486,7 @@ static bool is_fast_shutdown {
 
 `innodb_fast_shutdown=2`（crash-style）且已进入最后阶段 → **不 fsync**，但仍执行 `flush_counter = old_mod_counter` 记账（一致性由崩溃恢复保证）。
 
-### `flush_file_spaces` 的遍历策略
+#### `flush_file_spaces` 的遍历策略
 
 ```cpp
 void Fil_shard::flush_file_spaces {
@@ -508,7 +513,7 @@ void Fil_shard::flush_file_spaces {
 
 ---
 
-## 核心实现八：文件生命周期（打开 / 关闭 / 删除）
+### 文件生命周期（打开 / 关闭 / 删除）
 
 | 操作 | 入口 | 说明 |
 |------|------|------|

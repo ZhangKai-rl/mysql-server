@@ -2,36 +2,29 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 redo 组织结构（LSN 空间 → 文件 → block → record 层级）、内存 buffer 布局（log_t）、mtr 生命周期与 log mode、mtr commit 写入路径、8.0 无锁化并发模型、checkpoint 机制、文件管理与 resize（水位线与容量体系）、文件级 redo 与 DDL（DROP/TRUNCATE）、sn/lsn 序号体系。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [组织结构总览（LSN 空间）](#组织结构总览lsn-空间)
-- [文件层（物理结构）](#文件层物理结构)
-  - [redo 文件格式演进（Log_format / ruleset）](#redo-文件格式演进log_format--ruleset)
-- [log block 层（512B）](#log-block-层512b)
-- [redo record 层](#redo-record-层)
-  - [写入原语：mlog_open / close / catenate](#写入原语mlog_open--mlog_close--mlog_catenate)
-  - [★ mlog_open_and_write_index](#mlog_open_and_write_index记录级-redo-的核心)
-  - [主要 record 类型的完整布局](#主要-record-类型的完整布局)
-  - [解析侧：如何把 redo 变回页面](#解析侧如何把-redo-变回页面)
-  - [mtr record group（原子应用单位）](#mtr-record-group原子应用单位)
-- [内存 buffer 布局（log_t）](#内存-buffer-布局log_t)
-  - [log buffer 的在线变更](#log-buffer-的在线变更)
-- [mtr（mini-transaction）](#mtrmini-transaction)
-  - [mtr 的原子性如何实现](#mtr-的原子性如何实现写时连续读时丢尾组)
-- [mtr commit 写入路径](#mtr-commit-写入路径)
-- [sn 与 lsn 序号体系](#sn-与-lsn-序号体系)
-- [8.0 无锁化并发模型](#80-无锁化并发模型)
-  - [并发 mtr 写 buffer：生产者侧的并发模型](#并发-mtr-写-buffer生产者侧的并发模型)
-  - [redo 的落盘时机：何时 write、何时 fsync](#redo-的落盘时机何时-write何时-fsync)
-- [redo 的 I/O 路径：与数据文件的对比](#redo-的-io-路径与数据文件的对比)
-- [checkpoint 机制](#checkpoint-机制)
-- [崩溃恢复（redo 侧的衔接）](#崩溃恢复redo-侧的衔接)
-- [文件管理与 resize（水位线与容量体系）](#文件管理与-resize水位线与容量体系)
-- [文件级 redo 与 DDL（DROP/TRUNCATE）](#文件级-redo-与-ddldroptruncate)
-- [相关的系统变量/状态变量](#相关的系统变量状态变量)
-- [Misc](#misc)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [组织结构总览（LSN 空间）](#组织结构总览lsn-空间)
+  - 物理层（文件 → block → record）
+    - [文件层（物理结构）](#文件层物理结构)
+    - [log block 层（512B）](#log-block-层512b)
+    - [redo record 层](#redo-record-层)
+  - 内存与写入
+    - [内存 buffer 布局（log_t）](#内存-buffer-布局log_t)
+    - [mtr（mini-transaction）](#mtrmini-transaction)
+    - [mtr commit 写入路径](#mtr-commit-写入路径)
+    - [sn 与 lsn 序号体系](#sn-与-lsn-序号体系)
+    - [8.0 无锁化并发模型](#80-无锁化并发模型)
+    - [redo 的 I/O 路径：与数据文件的对比](#redo-的-io-路径与数据文件的对比)
+  - 生命周期与治理
+    - [checkpoint 机制](#checkpoint-机制)
+    - [崩溃恢复（redo 侧的衔接）](#崩溃恢复redo-侧的衔接)
+    - [文件管理与 resize（水位线与容量体系）](#文件管理与-resize水位线与容量体系)
+    - [文件级 redo 与 DDL（DROP/TRUNCATE）](#文件级-redo-与-ddldroptruncate)
+- [相关的系统变量/状态变量](#相关的系统变量/状态变量)
+- [Misc](#Misc)
 - [关键源码位置速查](#关键源码位置速查)
 - [参考](#参考)
 
@@ -130,7 +123,9 @@ redo 要同时满足三件事：崩溃后恢复已提交修改（正确性）、
 
 ---
 
-## 组织结构总览（LSN 空间）
+## 核心实现
+
+### 组织结构总览（LSN 空间）
 
 redo 全局只有一个**线性 LSN 空间**（编号包含块头/块尾开销）。内存 buffer 与物理文件都是这个空间的载体，三者关系：
 
@@ -146,7 +141,7 @@ LSN 空间 ───────────────────────
 
 ---
 
-## 文件层（物理结构）
+### 文件层（物理结构）
 
 ### 文件集合：32 段循环
 
@@ -225,7 +220,7 @@ checkpoint 页内容（8.0.30 新格式）：**只有 `checkpoint_lsn`(0, 8B) �
 
 ---
 
-## log block 层（512B）
+### log block 层（512B）
 
 ### 块布局
 
@@ -256,7 +251,7 @@ buffer 与文件共用同一格式（`OS_FILE_LOG_BLOCK_SIZE=512`，os0file.h:19
 
 ---
 
-## redo record 层
+### redo record 层
 
 ### 单条 record 格式
 
@@ -570,7 +565,7 @@ bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
 
 ---
 
-## 内存 buffer 布局（log_t）
+### 内存 buffer 布局（log_t）
 
 ### log.buf：环形缓冲
 
@@ -629,7 +624,7 @@ log.buf_size_sn = log_translate_lsn_to_sn(log.buf_size);   // ← 必须最后�
 
 ---
 
-## mtr（mini-transaction）
+### mtr（mini-transaction）
 
 ### 是什么：redo 的生产者与三条职责
 
@@ -728,7 +723,7 @@ mtr.start()                                    # 标记同步/异步（m_sync）
 
 ---
 
-## mtr commit 写入路径
+### mtr commit 写入路径
 
 ```mermaid
 flowchart TD
@@ -781,7 +776,7 @@ void mtr_t::Command::execute() {
 
 ---
 
-## sn 与 lsn 序号体系
+### sn 与 lsn 序号体系
 
 - **sn（sequence number）**：只数**数据字节**的序号，连续无洞
 - **lsn（log sequence number）**：数**全部字节**（含每块 12B 头 + 4B 尾），是对外统一使用的序号（LSN_MAX 2^63-1，log0constants.h:159）
@@ -861,7 +856,7 @@ file_0: [8192, 3,282,944)        file_1: [3,282,944, 6,557,696)    …
 
 ---
 
-## 8.0 无锁化并发模型
+### 8.0 无锁化并发模型
 
 - **recent_written**（Link_buf）：跟踪 buffer 中哪些 lsn 区间已被完整拷贝。`log_buffer_write_completed` 调 `add_link_advance_tail`（log0buf.cc:1106）推进 `buf_ready_for_write_lsn`，log_writer 只能写水位以下的连续区间
 - **recent_closed**（Link_buf）：跟踪哪些区间对应的脏页已挂入 flush list（`log_buffer_close`，log0buf.cc:1142）。checkpoint 推进必须等脏页挂链完成，否则恢复时丢失 oldest_modification 起点
@@ -1177,7 +1172,7 @@ notifier 恢复后从 `resume_lsn + 1` 继续通知（log0write.cc:2671），切
 
 ---
 
-## redo 的 I/O 路径：与数据文件的对比
+### redo 的 I/O 路径：与数据文件的对比
 
 > 本章从 [`io.md`](io.md) 的「redo log 的 I/O」迁入，与上面的「落盘时机」互补：**那一节讲"什么时候 write / fsync"，这一节讲"谁来写、怎么写、以及 redo 与数据文件在 I/O 方式上的根本差异"**。
 
@@ -1288,7 +1283,7 @@ const auto ret = srv_use_fdatasync ? fdatasync(file) : fsync(file);
 
 ---
 
-## checkpoint 机制
+### checkpoint 机制
 
 ### 语义：redo 回收的分界点
 
@@ -1440,7 +1435,7 @@ checkpoint_age = current_lsn − last_checkpoint_lsn ≤ soft_logical_capacity  
 
 ---
 
-## 崩溃恢复（redo 侧的衔接）
+### 崩溃恢复（redo 侧的衔接）
 
 > **边界**：崩溃恢复已**独立成篇**——两阶段模型（redo 前滚 / undo 回滚）、扫描与解析状态机、`recv_sys_t` 恢复上下文、hash 聚合与按页应用、文件级 redo、clone/MEB 分支，全部见 [`recovery.md`](recovery.md)。本节只交代 **redo 侧与恢复直接相关的三个衔接点**。
 
@@ -1454,7 +1449,7 @@ checkpoint_age = current_lsn − last_checkpoint_lsn ≤ soft_logical_capacity  
 
 ---
 
-## 文件管理与 resize（水位线与容量体系）
+### 文件管理与 resize（水位线与容量体系）
 
 ### 消费者（consumer）模型
 
@@ -1798,7 +1793,7 @@ logical_size ≤ soft < hard ≤ (32−2)/32 × physical − overhead
 
 ---
 
-## 文件级 redo 与 DDL（DROP/TRUNCATE）
+### 文件级 redo 与 DDL（DROP/TRUNCATE）
 
 ### MLOG_FILE_* 记录格式
 

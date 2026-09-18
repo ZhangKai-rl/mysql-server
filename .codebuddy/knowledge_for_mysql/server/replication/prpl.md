@@ -92,6 +92,13 @@ MySQL 的主从复制是构建高可用架构的基石。自 5.7 版本引入 LO
    - 12.16 GTID 空洞与 preserve_commit_order：历史与演进
    - 12.17 Commit_order_queue 内部机制：sequence_nr 的真实作用
    - 12.18 preserve_commit_order 的真正串行化位置：BGC Stage#0 vs ha_commit_low
+13. [第十三章：MTS Crash Recovery 与静默丢数据缺陷](#第十三章mts-crash-recovery-与静默丢数据缺陷)
+   - 13.1 为什么需要 recovery
+   - 13.2 位图（生产侧）与游标（消费侧）
+   - 13.3 缺陷：游标不重置
+   - 13.4 8.0.39 vs 5.7：GTID 旁路的位置
+   - 13.5 现场特征：执行模式翻转
+   - 13.6 修复与防御
 
 ---
 
@@ -2339,3 +2346,248 @@ ht->commit() 做的事（轻量）:
 ```
 
 **结论**：`preserve_commit_order` 串行化的只是提交顺序（binlog 写入顺序 + InnoDB 提交顺序），不串行 DML 执行。undo/索引/MVCC 仍然是多 Worker 并行的。Stage#0 的额外等待仅当快事务提前完成时需要等慢事务——这保证了因果一致性，代价是偶尔的空闲等待。
+
+---
+
+## 第十三章：MTS Crash Recovery 与静默丢数据缺陷
+
+> 本章基于 8.0.39 源码逐段剖析 MTS crash-recovery 的"位图 + 游标"机制，并收录一个 TXSQL 5.7 生产事故的缺陷分析（iWiki 4041668646，2026-09-17）：`clear_mts_recovery_groups()` 释放恢复位图时**未复位游标**，导致"新位图配旧游标"，applier 读错位把从未执行的事务整组**静默跳过**（不执行、不取 GTID、无任何告警）。本章同时给出该缺陷在 8.0.39 的现状核对结论。
+
+### 13.1 为什么需要 recovery：LWM 落后于 worker 实况
+
+第十章讲过：coordinator 的 LWM 只推进到"**连续**完成"的位置。worker 之间进度不齐，可能出现 worker-3 已完成第 9 组、worker-2 还卡在第 5 组的情形。此时若从库崩溃：
+
+- LWM（已持久化）落后于部分 worker 的实际完成进度
+- 重启后从 LWM 回放，那些"已执行但未计入 LWM"的组如果重放，会**重复执行**（非 GTID 模式下直接双写/主键冲突）
+
+recovery 的目的：**把"已执行"的组标记出来跳过，只补"未执行"的 gap**。数据来源是 `slave_worker_info` 表里每个 worker 的 checkpoint（`checkpoint_seqno` + `group_executed` 位图，见第十章 10.4）。
+
+MTS recovery 用**一张位图 + 一个游标**决定"哪些组跳过"。理解缺陷的前提是分清两者的坐标系。
+
+### 13.2 位图（生产侧）与游标（消费侧）
+
+#### 生产侧：`mts_recovery_groups()`（rpl_replica.cc）
+
+入口有两道闸（rpl_replica.cc:6217-6238）：
+
+```cpp
+  /*
+     Although mts_recovery_groups() is reentrant it returns
+     early if the previous invocation raised any bit in
+     recovery_groups bitmap.
+  */
+  if (rli->is_mts_recovery()) return false;        // ① 同一轮不重复计算（cnt != 0 即已在恢复中）
+
+  /*
+    The process of relay log recovery for the multi threaded applier
+    is focused on marking transactions as already executed so they are
+    skipped when the SQL thread applies them. ...
+    When GTID_MODE=ON however we can use the old relay log position, even if
+    stale as applied transactions will be skipped due to GTIDs auto skip
+    feature.
+  */
+  if (global_gtid_mode.get() == Gtid_mode::ON && rli->mi &&
+      rli->mi->is_auto_position()) {
+    rli->mts_recovery_group_cnt = 0;
+    return false;                                  // ② ★ GTID 旁路（见 13.4）：整个位图机制不启用
+  }
+```
+
+第一步，筛选"有价值的 worker"（rpl_replica.cc:6261-6291）：worker 记录的最后执行位置 `w_last` **大于** coordinator 的 LWM 坐标 `cp` 才纳入 `above_lwm_jobs`，否则说明该 worker 干的活已全部被 LWM 覆盖，直接删掉。
+
+第二步，**从 LWM 开始扫 relay log，逐个数组**，找到每个 worker 的 checkpoint 坐标后做平移（rpl_replica.cc:6337-6432）：
+
+```cpp
+    recovery_group_cnt = 0;
+    not_reached_commit = true;
+    ...
+    offset = rli->get_group_relay_log_pos();        // ① 起点 = 当前 LWM
+
+    while (not_reached_commit) {
+      if (relaylog_file_reader.open(linfo.log_file_name, offset)) { ... }
+
+      while (not_reached_commit &&
+             (ev = relaylog_file_reader.read_event_object())) {
+        if (ev->get_type_code() == binary_log::ROTATE_EVENT ||
+            ev->get_type_code() == binary_log::FORMAT_DESCRIPTION_EVENT ||
+            ev->get_type_code() == binary_log::PREVIOUS_GTIDS_LOG_EVENT) {
+          delete ev; ev = nullptr; continue;        // ② 三种管理事件不计数
+        }
+
+        if (ev->starts_group()) {
+          flag_group_seen_begin = true;
+        } else if ((ev->ends_group() || !flag_group_seen_begin) &&
+                   !is_gtid_event(ev)) {            // ③ ★ 组边界判定
+          flag_group_seen_begin = false;
+          recovery_group_cnt++;                     // ④ 数到自 LWM 起第 cnt 组
+
+          if ((ret = mts_event_coord_cmp(&ev_coord, &w_last)) == 0) {
+            for (uint i = (w->worker_checkpoint_seqno + 1) - recovery_group_cnt,
+                      j = 0;
+                 i <= w->worker_checkpoint_seqno; i++, j++) {   // ⑤ ★ 坐标平移
+              if (bitmap_is_set(&w->group_executed, i)) {
+                bitmap_test_and_set(groups, j);     //    局部位 → 全局槽位
+              }
+            }
+            not_reached_commit = false;             // ⑥ 找到该 worker 的 checkpoint 即停
+          } else
+            assert(ret < 0);
+        }
+        delete ev; ev = nullptr;
+      }
+      relaylog_file_reader.close();
+      offset = BIN_LOG_HEADER_SIZE;                 // ⑦ 跨文件继续找
+      if (not_reached_commit && rli->relay_log.find_next_log(&linfo, true)) { ... }
+    }
+
+    rli->mts_recovery_group_cnt =
+        (rli->mts_recovery_group_cnt < recovery_group_cnt
+             ? recovery_group_cnt
+             : rli->mts_recovery_group_cnt);        // ⑧ ★ 取所有 worker 扫出的最大组数
+```
+
+由此得到**位图坐标系**：
+
+| 属性 | 含义 |
+|---|---|
+| 槽位 `j` | **从 LWM 起算、relay log 顺序上的第 j 个组**（0-based） |
+| `j` 位 = 1 | 该组上一 session **已被某个 worker 执行过** → 应跳过 |
+| `j` 位 = 0 | 该组是 **gap** → 必须执行 |
+| 原点 | **计算那一刻的 LWM**（`get_group_relay_log_pos()`） |
+
+⑤ 的平移把 worker 局部坐标（`checkpoint_seqno`）换算到全局坐标：代入 `i = checkpoint_seqno` 得 `j = recovery_group_cnt − 1`，即该 worker 最后执行的那组恰好落在全局最后一个槽位——**平移本身正确**。
+
+#### 消费侧：`mts_recovery_index`（游标）
+
+跳过决策（log_event.cc:3085-3108）：
+
+```cpp
+  if (rli->is_mts_recovery()) {
+    bool skip = bitmap_is_set(&rli->recovery_groups, rli->mts_recovery_index) &&
+                (get_mts_execution_mode(rli->mts_group_status ==
+                                        Relay_log_info::MTS_IN_GROUP) ==
+                 EVENT_EXEC_PARALLEL);
+    if (skip) {
+      return 0;                                  // ★ 整组静默跳过：不执行、不取 GTID、无告警
+    } else {
+      int error = do_apply_event(rli);           // gap 组由 coordinator 自己执行
+      ...
+    }
+  }
+```
+
+游标推进（rpl_replica.cc:4721-4731）：
+
+```cpp
+    if (!error && rli->is_mts_recovery() &&
+        ev->get_type_code() != binary_log::ROTATE_EVENT && ...) {
+      if (ev->starts_group()) {
+        rli->mts_recovery_group_seen_begin = true;
+      } else if ((ev->ends_group() || !rli->mts_recovery_group_seen_begin) &&
+                 !is_gtid_event(ev)) {
+        rli->mts_recovery_index++;               // ★ 每消费一组 +1
+        if (--rli->mts_recovery_group_cnt == 0) {  // ★ 只有完整跑完才归零
+          rli->mts_recovery_index = 0;
+          LogErr(INFORMATION_LEVEL, ER_RPL_MTA_RECOVERY_COMPLETE, ...);
+        }
+      }
+    }
+```
+
+注意两边的**组判定是同一条**（`(ends_group() || !seen_begin) && !is_gtid_event()`，rpl_replica.cc:6377 与 :4727）——所以**位图本身不会算错，错的只可能是读它的游标**。
+
+#### 不变式
+
+> applier 正在看"自 LWM 起第 j 个组"时，`mts_recovery_index` 必须恰好等于 j。
+> 即：**位图的原点与游标的起点必须是同一个 LWM。**
+
+而 recovery 每成功恢复一组，LWM 就会前进并落盘。于是每轮 `START SLAVE`：
+
+| | 原点/起点 | 每轮 START SLAVE |
+|---|---|---|
+| 位图 | 计算时的 LWM | **重新计算，原点跟着新 LWM 前移** |
+| 游标 | 应为 0（从 LWM 开始读） | **不复位，保留上一轮的累加值**（见 13.3） |
+
+### 13.3 缺陷：`clear_mts_recovery_groups()` 不重置游标
+
+缺陷函数（rpl_rli.h:1367-1373）：
+
+```cpp
+  inline void clear_mts_recovery_groups() {
+    if (recovery_groups_inited) {
+      bitmap_free(&recovery_groups);
+      mts_recovery_group_cnt = 0;
+      recovery_groups_inited = false;
+      // ← mts_recovery_index、mts_recovery_group_seen_begin 都不在此
+    }
+  }
+```
+
+`mts_recovery_index` 的**全部**赋值点（全库仅 3 处）：
+
+| 位置 | 动作 |
+|---|---|
+| rpl_rli.cc:181 | 构造函数置 0 |
+| rpl_replica.cc:4729 | 每恢复一组 `++` |
+| rpl_replica.cc:4731 | **仅当 recovery 完整跑完**（`--cnt == 0`）归 0 |
+
+**触发链**：
+
+1. R2：recovery 启动，成功恢复 k 组 → `index = k`（LWM 前移 k 组并落盘）
+2. 第 k+1 组（gap）应用时撞临时错误（如 1205）→ 重试耗尽 → SQL 线程 abort
+3. abort 退出路径（rpl_replica.cc:7339-7341）`clear_mts_recovery_groups()`：位图释放、cnt 归 0，**游标残留 k**
+4. R3：`START SLAVE` → `rli_init_info`（rpl_rli.cc:1515-1517）重新调 `mts_recovery_groups()`：位图原点 = 新 LWM（前移了 k 组）
+5. applier 从新 LWM 读，第一个组（槽位 0）却被读成 `bit[k]` —— **错位**
+
+**错位为何"看起来没出错"**（事故文档的精华）：错位让各组读到**邻居的位**。后面的组本就"已执行、该跳过"，读邻居的 1 照样跳过——"侥幸正确"。**唯一的实质损失是槽位 0 的那个 gap**：它是唯一"本该执行却被读成已执行"的组。所以每次错位只丢一个事务，复制状态一切正常，只在后续依赖它的语句报 1032 时才间接暴露。
+
+**数值推演**（事故复现的真实数据）：R2 后 `gtid_executed = 1-6:8-15`（G1=6 已补、T=7 仍缺，index=1）；R3 位图重算后 `SKIP_bits={1..8}`（槽位 0=T 未置位，位图正确），但 index 仍为 1 → applier 看 T 时读 `bit[1]`（=1）→ **T 被静默跳过**；8~14 连锁读邻居位跳过；15 读越界外 0 → 恢复计数归零、恢复结束。决定性日志：`SILENTLY SKIPPING GTID 7 (recovery_index=1)`。
+
+### 13.4 8.0.39 vs 5.7：GTID 旁路的位置（★ 事故配置在 8.0 是否可达）
+
+事故实例配置是 **GTID ON + AUTO_POSITION=1**，那么 8.0.39 会不会踩同一个坑？答案是：**不会走到位图路径**。
+
+上游 5.7 也有 GTID 旁路，但放在**调用方** `init_recovery()`（rpl_slave.cc）：
+
+```cpp
+  /* Set the recovery_parallel_workers to 0 if Auto Position is enabled. */
+  bool is_gtid_with_autopos_on =
+      ((get_gtid_mode(GTID_MODE_LOCK_NONE) == GTID_MODE_ON &&
+        mi->is_auto_position()) ? true : false);
+  if (is_gtid_with_autopos_on)
+    rli->recovery_parallel_workers = 0;      // 绕过 mts_recovery_groups() 调用
+```
+
+8.0.39 把旁路**挪进函数内部**（rpl_replica.cc:6234-6238，见 13.2）：`gtid_mode==ON && is_auto_position()` → `mts_recovery_group_cnt = 0; return false;`。`cnt == 0` ⇒ `is_mts_recovery()` 为假 ⇒ 位图与游标整条路径都不启用，靠 **GTID auto-skip** 兜底（已执行的 GTID 自动跳过，未执行的自然会执行，与 relay log 位置无关）。
+
+| | GTID ON + AUTO_POSITION（事故配置） | 非 GTID 复制 / GTID ON 但 auto_position=0 |
+|---|---|---|
+| 5.7（上游） | 旁路（调用方置 `recovery_parallel_workers=0`） | **走位图路径，缺陷可达** |
+| 8.0.39 | 旁路（函数内 return） | **走位图路径，缺陷代码同构存在** |
+
+两点结论：
+
+1. **8.0.39 的缺陷代码与 5.7 同构**（`clear_mts_recovery_groups` 同样不重置游标），**但事故同配置（GTID ON + AUTO_POSITION）下不可达**；在非 GTID 复制（或 GTID ON 但 `auto_position=0`）下，"恢复中途成功若干组后 abort → 再 START SLAVE"的配方依然能触发错位——这是 8.0 分支需要修的残留风险
+2. **疑点留给 TXSQL 确认**：事故实例 5.7.44-txsql 在 GTID ON + AUTO_POSITION=1 下仍计算了位图（复现日志有 `SKIP_bits`），而上游 5.7 的 `init_recovery()` 有上述旁路——说明 TXSQL 5.7.44 与该旁路有出入（删改或入口路径不同），需对照 TXSQL 源码核实
+
+### 13.5 现场特征：执行模式翻转
+
+`is_parallel_exec()`（rpl_rli.h:1378-1384）：
+
+```cpp
+  inline bool is_parallel_exec() const {
+    bool ret = (replica_parallel_workers > 0) && !is_mts_recovery();
+    assert(!ret || !workers.empty());
+    return ret;
+  }
+```
+
+recovery 模式下它为假 → 事件不分发 worker、由 coordinator 自己 apply → error log 出现"`Slave SQL thread retried transaction`"（无 `Worker N` 前缀）。所以事故中 R1/R3（正常 MTS 的 `Worker N` 形态）与 R2/R4/R5（单线程形态）的**翻转本身就是"进入/退出 recovery 模式"的可观测指纹**。
+
+### 13.6 修复与防御
+
+- **主修复**（8.0 同构适用）：`clear_mts_recovery_groups()` 补 `mts_recovery_index = 0; mts_recovery_group_seen_begin = false;`——确保"新位图必配新游标"
+- **防御性加固**：消费点（log_event.cc:3086）读取前校验 `mts_recovery_index < mts_recovery_group_cnt`，不一致**报错停复制**——宁可停，不静默跳
+- **运维侧**：MTS 从库因临时错误 abort 后，先确认阻塞源（长事务/锁）已消除再 `START SLAVE`；监控增加 `gtid_executed` 连续性（空洞）检查，比 `Seconds_Behind_Master` 更早暴露此类静默丢失
+
+> 本章缺陷分析与复现数据源自事故报告 iWiki 4041668646（2026-09-17）；全部代码均已在 8.0.39 源码逐一核对，5.7 侧旁路以 mysql/mysql-server 5.7 分支源码为准。

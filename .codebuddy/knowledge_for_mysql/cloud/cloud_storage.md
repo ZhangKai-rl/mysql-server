@@ -195,9 +195,9 @@ gp2 模型（老）：
 
 | 缺口 | 数据库的补救 | 源码落点 |
 |------|------------|---------|
-| 半页写 | **doublewrite buffer**：页先整页写到 dblwr 文件并 fsync，再写数据文件；恢复时用 dblwr 副本修复 | [`buf0dblwr.cc`](../innodb/io.md#核心实现四doublewrite) |
-| 刷盘持久化 | **fsync / fdatasync** 或 `O_DIRECT` | [`os_file_fsync_posix`](../innodb/io.md#核心实现二os_file-与-io-方式o_direct--o_sync--fsync) |
-| 延迟不稳定 | WAL（redo 顺序写）+ 后台异步刷脏，把随机写延迟从前端事务路径上摘掉 | [`buf_flush_write_block_low`](../innodb/io.md#-云盘上的-mysql-io) |
+| 半页写 | **doublewrite buffer**：页先整页写到 dblwr 文件并 fsync，再写数据文件；恢复时用 dblwr 副本修复 | [`buf0dblwr.cc`](../innodb/io.md#doublewrite) |
+| 刷盘持久化 | **fsync / fdatasync** 或 `O_DIRECT` | [`os_file_fsync_posix`](../innodb/io.md#os_file-与-io-方式o_direct--o_sync--fsync) |
+| 延迟不稳定 | WAL（redo 顺序写）+ 后台异步刷脏，把随机写延迟从前端事务路径上摘掉 | [`buf_flush_write_block_low`](../innodb/io.md#云盘上的-mysql-io) |
 
 > **这就是"重复的原子性"**：存储层如果提供 **16KB 原子写（atomic write）**，doublewrite 就可以完全关掉，写放大直接减半。部分厂商做了（Fusion-io 的 atomic write、部分云盘的 16K 原子写），MySQL 也留了口子（`innodb_doublewrite=OFF` + 设备保证），但**社区版默认不敢依赖**，因为块存储契约里没有这一条。这是"最小契约"设计的长期成本。
 
@@ -504,7 +504,7 @@ gp2 模型（老）：
 
 > 前面讲的都是云侧。本节只给**结论级**的衔接：**MySQL 对云盘完全无感知**，以及由此必须手工完成的配置。
 >
-> **MySQL 侧的完整 I/O 栈**——WAL 屏障、doublewrite、`pwrite` vs `io_submit`、fsync 失败处理、`innodb_io_capacity` 自适应算法、邻接刷盘源码——见 **[`../innodb/io.md`](../innodb/io.md)**，尤其其中的 [「★ 云盘上的 MySQL I/O」](../innodb/io.md#-云盘上的-mysql-io) 一节。
+> **MySQL 侧的完整 I/O 栈**——WAL 屏障、doublewrite、`pwrite` vs `io_submit`、fsync 失败处理、`innodb_io_capacity` 自适应算法、邻接刷盘源码——见 **[`../innodb/io.md`](../innodb/io.md)**，尤其其中的 [「★ 云盘上的 MySQL I/O」](../innodb/io.md#云盘上的-mysql-io) 一节。
 
 ### ★ MySQL 对云盘完全无感知
 

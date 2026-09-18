@@ -4,27 +4,29 @@
 >
 > **边界**：本篇讲 **MySQL 与文件系统/块设备之间**的 I/O。Buffer Pool 的替换算法与 LRU 见 [`buffer_pool.md`](buffer_pool.md)；redo 的**格式、写/刷路径、后台线程与 checkpoint 语义**见 [`redo_log.md`](redo_log.md)（本篇只保留 redo 在 I/O 全景中的**横切对比**）；崩溃恢复见 [`recovery.md`](recovery.md)；DDL 的临时文件与 row log 见 [`ddl.md`](ddl.md)；**表空间元数据与 I/O 分发（fil 层）**见 [`fil.md`](fil.md)；**刷脏批次的组织、读路径与预读**见 [`buffer_pool.md`](buffer_pool.md)；**doublewrite 的完整实现**见 [`dblwr.md`](dblwr.md)；**InnoDB 并行扫描**见 [`parallel_scan.md`](parallel_scan.md)；**云存储（EBS/云盘）本身**见 [`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)。
 
-## 目录
-
 - [概述](#概述)
-- [全景分层图与 I/O 子系统总览](#全景分层图与-io-子系统总览)
 - [理论基础](#理论基础)
-- [核心实现一：文件与表空间层（fil）](#核心实现一文件与表空间层fil)
-- [核心实现二：os_file 与 I/O 方式（O_DIRECT / O_SYNC / fsync）](#核心实现二os_file-与-io-方式o_direct--o_sync--fsync)
-- [核心实现三：AIO 子系统](#核心实现三aio-子系统)
-- [核心实现四：doublewrite](#核心实现四doublewrite)
-- [核心实现五：redo log 的 I/O（归位）与各文件 I/O 总览](#核心实现五redo-log-的-io归位与各文件-io-总览)
-- [核心实现六：server 层 I/O 全景](#核心实现六server-层-io-全景)
-- [核心实现七：其他文件 I/O](#核心实现七其他文件-io)
-- [核心实现八：I/O 线程模型](#核心实现八io-线程模型)
-- [核心实现九：压缩、加密与 punch hole](#核心实现九压缩加密与-punch-hole)
-- [核心实现十：读路径、预读与并行扫描（归位）](#核心实现十读路径预读与并行扫描归位)
-- [核心实现十一：刷脏批次与文件管理（归位）](#核心实现十一刷脏批次与文件管理归位)
-- [核心实现十二：特殊 I/O 场景](#核心实现十二特殊-io-场景)
-- [★ 云盘上的 MySQL I/O](#-云盘上的-mysql-io)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [文件与表空间层（fil）](#文件与表空间层fil)
+    - [os_file 与 I/O 方式（O_DIRECT / O_SYNC / fsync）](#os_file-与-io-方式o_direct--o_sync--fsync)
+  - 异步 I/O
+    - [AIO 子系统](#aio-子系统)
+  - 写路径专题
+    - [doublewrite](#doublewrite)
+    - [redo log 的 I/O（归位）与各文件 I/O 总览](#redo-log-的-io归位与各文件-io-总览)
+    - [server 层 I/O 全景](#server-层-io-全景)
+    - [其他文件 I/O](#其他文件-io)
+  - 线程模型
+    - [I/O 线程模型](#io-线程模型)
+  - 横切专题
+    - [压缩、加密与 punch hole](#压缩加密与-punch-hole)
+    - [读路径、预读与并行扫描（归位）](#读路径预读与并行扫描归位)
+    - [刷脏批次与文件管理（归位）](#刷脏批次与文件管理归位)
+    - [特殊 I/O 场景](#特殊-io-场景)
+    - [★ 云盘上的 MySQL I/O](#-云盘上的-mysql-io)
 - [相关的系统变量](#相关的系统变量)
-- [诊断与观测](#诊断与观测)
-- [Misc](#misc)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---
@@ -65,7 +67,7 @@ MySQL 的 I/O 是**两套并行体系**：
 
 > **为什么演进**：8.0 对 redo 大改是为了消除 `log_sys->mutex` 的全局争用（见[理论溯源](#理论溯源)）；doublewrite 独立成文件是为了让它可迁移到更快的设备，并解除对系统表空间的依赖。
 
-## 全景分层图与 I/O 子系统总览
+### 全景分层图与 I/O 子系统总览
 
 一次 I/O 从 SQL 到磁盘要穿过七层。理解这张图，后面每个子系统的位置就不用死记。
 
@@ -282,14 +284,16 @@ fsync(fd)
 | O_DIRECT | 否 | 每次写直接落盘 | 对齐的 pread/pwrite | 数据文件（flush_method=O_DIRECT） |
 | O_DSYNC | 是（但 write 即刷） | 每次 write | 单次 write | redo log（flush_method=O_DSYNC） |
 
-## 核心实现一：文件与表空间层（fil）
+## 核心实现
+
+### 文件与表空间层（fil）
 
 > **★ fil 层的完整剖析见专篇 [`fil.md`](fil.md)**——三层结构与 68 分片、文件类型常量、`Fil_shard::do_io` 的压缩/加密/打洞注入、**AIO 模式三选一的完整判定链（含"缺页读为何是同步 `pread`"）**、并发控制 flag 体系、`space_extend`、`space_flush` 的 fsync 合并。
 > 本节只保留 I/O 全景所需的概要。
 
 所有 InnoDB 的表空间 I/O 都汇聚到 `fil_io` 这一个入口，再由它按 `space_id` 路由到某个 `Fil_shard`。
 
-### 文件类型：不是 enum，是常量
+#### 文件类型：不是 enum，是常量
 
 `include/os0file.h` —— 用 `static const ulint` 而非 enum（避免 `-fshort-enums` 带来的 ABI 问题，这类细节见 `../server/plugin/abi.md`）：
 
@@ -305,7 +309,7 @@ fsync(fd)
 
 文件后缀（`enum ib_file_suffix`，`fil0fil.h`）：`.ibd` / `.cfg` / `.cfp` / `.ibt` / `.ibu` / `.dblwr` / `.bdblwr`。
 
-### 三层结构与分片
+#### 三层结构与分片
 
 ```
 fil_system（全局单例）
@@ -318,7 +322,7 @@ fil_system（全局单例）
 
 **为什么要 68 个分片**：把 `fil_system` 的全局 mutex 拆成 68 把。高并发建表 / 删表 / 刷表空间时，不同 `space_id` 落在不同 shard，锁争用大幅下降。**undo 单独分片**是因为 undo 表空间的 extend 会持锁较久，不能让它卡住普通表空间。
 
-### 主链路：`fil_io` → `Fil_shard::do_io`
+#### 主链路：`fil_io` → `Fil_shard::do_io`
 
 `storage/innobase/fil/fil0fil.cc`：
 
@@ -370,7 +374,7 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 3. **加密注入**：`fil_io_set_encryption` 把密钥信息塞进 `IORequest`，真正的加密在更底层的 `os_file_encrypt_page` 做（见[核心实现九](#核心实现九压缩加密与-punch-hole)）。
 4. **下发**：`os_aio` 是同步/异步的分流点。
 
-### AIO 模式的三选一
+#### AIO 模式的三选一
 
 `Fil_shard::get_AIO_mode`（`fil0fil.cc`）：
 
@@ -382,7 +386,7 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 
 > `IBUF` 模式为什么单独存在：ibuf merge 时需要读入二级索引页，如果它和普通读抢同一批 AIO 槽位，可能出现"所有槽位都被 ibuf merge 的读占满，而 ibuf merge 又在等这些读完成"的死锁。**单独一个 `s_ibuf` 数组 + 单独一个线程**把这个环切断。
 
-### I/O 并发控制：flag 与计数器体系（概要）
+#### I/O 并发控制：flag 与计数器体系（概要）
 
 对**同一个文件**的并发操作不靠锁（底层 `pread`/`pwrite` 天然安全），而靠一组 flag + 计数器：`n_pending_ios`（阻止 close）、`n_pending_flushes`（阻止 drop / 合并 fsync）、`is_being_extended`（扩展之间互斥）、`stop_new_ops`（DROP/TRUNCATE 中禁止新操作）。
 
@@ -391,11 +395,11 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 
 ---
 
-## 核心实现二：os_file 与 I/O 方式（O_DIRECT / O_SYNC / fsync）
+### os_file 与 I/O 方式（O_DIRECT / O_SYNC / fsync）
 
 `innodb_flush_method` 决定数据文件走哪条路，redo log、doublewrite、sort 临时文件又各有独立开关。
 
-### 枚举值与语义
+#### 枚举值与语义
 
 `innodb_flush_method`（ha_innodb.cc，只读变量）六个取值，映射到 `srv_unix_flush_t`（srv0srv.h）：
 
@@ -410,7 +414,7 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 
 **关键点**：`O_DIRECT` 系列**只影响数据文件**，redo log 的 fsync 不受影响（redo 独立由 `innodb_flush_log_at_trx_commit` 控制）。`O_DIRECT` 与 `O_DIRECT_NO_FSYNC` 的区别在于——数据文件用 O_DIRECT 后，`fsync` 是否还需要（因为 O_DIRECT 绕过了 page cache，很多场景 fsync 意义变小，但文件元数据/目录项可能仍需刷）。
 
-### 数据文件的 O_DIRECT 判定
+#### 数据文件的 O_DIRECT 判定
 
 数据文件到底用不用 O_DIRECT，源码在 os0file.cc，只对**数据类文件**调用：
 
@@ -426,7 +430,7 @@ if ((!read_only || type == OS_CLONE_DATA_FILE) && *success &&
 
 即：`OS_DATA_FILE`（.ibd）、`OS_DBLWR_FILE`（doublewrite）、clone 数据文件三者，在 `O_DIRECT` 模式下才绕过 page cache。
 
-### 双重缓存（double buffering）问题
+#### 双重缓存（double buffering）问题
 
 默认 `fsync` 模式下，InnoDB 数据页在内存里**存了两份**：
 
@@ -439,7 +443,7 @@ if ((!read_only || type == OS_CLONE_DATA_FILE) && *success &&
 
 这也是为什么 `innodb_dedicated_server=ON` 时（ha_innodb.cc），若用户没显式指定 flush_method，会自动设成 `O_DIRECT_NO_FSYNC`——专属服务器上内存更该留给 Buffer Pool，而非被 page cache 重复占用。
 
-### ★ I/O 层的总收口：`os_file_io`（压缩 → 加密 → 读写 → 部分重试）
+#### ★ I/O 层的总收口：`os_file_io`（压缩 → 加密 → 读写 → 部分重试）
 
 所有**同步** I/O 最终都汇聚到一个函数：`os_file_io`（`os0file.cc`）。调用链是
 `os_file_write_func` → `os_file_write_page`→ `os_file_pwrite`→ **`os_file_io`** → `SyncFileIO::execute`。
@@ -562,7 +566,7 @@ if ((!read_only || type == OS_CLONE_DATA_FILE) && *success &&
 
 三个提示：① 文件系统不支持这么大的文件；② 磁盘满；③ 磁盘配额超限。且用 `os_has_said_disk_full` 保证**只报一次**（避免刷屏）。
 
-### fsync 的失败处理：EIO 即崩溃
+#### fsync 的失败处理：EIO 即崩溃
 
 `storage/innobase/os/os0file.cc`：
 
@@ -627,7 +631,7 @@ static int os_file_fsync_posix(os_file_t file) {
 
 > **设计哲学**：**MySQL 对 I/O 错误的默认策略是"崩溃而不是静默继续"**（`ENOSPC` 除外）。这个选择在云盘上有个反直觉的副作用，见 [★ 云盘上的 MySQL I/O](#-云盘上的-mysql-io)。
 
-### O_DIRECT 的对齐：靠分配器保证，不是运行时校验
+#### O_DIRECT 的对齐：靠分配器保证，不是运行时校验
 
 一个常见误解是"MySQL 每次 I/O 前会检查缓冲区对齐"。**实际上没有**。相关代码只有三处：
 
@@ -647,9 +651,9 @@ static int os_file_fsync_posix(os_file_t file) {
 
 ---
 
-## 核心实现三：AIO 子系统
+### AIO 子系统
 
-### 同步 I/O 与异步 I/O 的分工
+#### 同步 I/O 与异步 I/O 的分工
 
 MySQL 有两条**完全不同**的 I/O 下发路径，分岔点在 `os_aio_func`（`os0file.cc`）：
 
@@ -689,7 +693,7 @@ MySQL 有两条**完全不同**的 I/O 下发路径，分岔点在 `os_aio_func`
 
 > **为什么同步路径不能省**：同步路径不占 AIO 槽位、不需要回调上下文、调用者自己等。在"必须立刻拿到结果"或"批量提交后统一唤醒"（`IORequest::DO_NOT_WAKE`）的场景下，它比异步更简单可靠。另外注意 **异步并不等于"调用者不等"**——缺页读对调用者仍然是同步语义，异步只是下发方式。
 
-### 三套实现并存，8.0.39 仍无 io_uring
+#### 三套实现并存，8.0.39 仍无 io_uring
 
 `os0file.cc` 的架构注释描述了一个 AIO 抽象层下的三套实现：
 
@@ -701,7 +705,7 @@ MySQL 有两条**完全不同**的 I/O 下发路径，分岔点在 `os_aio_func`
 
 > **8.0.39 全仓库 grep `io_uring` → 0 匹配。** 仍停留在 libaio。`SimulatedAIOHandler`（`os0file.cc`）**依然存在**，它会合并最多 `OS_AIO_MERGE_N_CONSECUTIVE = 64` 个连续 I/O。`innodb_use_native_aio` 变量也仍在（默认 true）。
 
-### ★ native AIO 的降级探测：tmpdir 会决定用哪套
+#### ★ native AIO 的降级探测：tmpdir 会决定用哪套
 
 选择逻辑在 `AIO::start`（`os0file.cc`）：
 
@@ -748,7 +752,7 @@ bool AIO::is_linux_native_aio_supported {
 >
 > 所以：**不要把 `tmpdir` 放在 tmpfs 上**，除非你明确知道后果。
 
-### 模拟 AIO（SimulatedAIOHandler）的工作原理
+#### 模拟 AIO（SimulatedAIOHandler）的工作原理
 
 当 native AIO 不可用时（非 Linux/Windows，或上面探测失败），走模拟路径：
 
@@ -798,7 +802,7 @@ bool AIO::is_linux_native_aio_supported {
 
 **槽位耗尽与 IBUF 独立数组**：模拟 AIO 下槽位耗尽是真实风险（请求要排队等空槽）。所以 ibuf 的读走**独立的 `s_ibuf` 数组 + 独立线程**——否则"ibuf merge 的读把槽位占满，导致 ibuf merge 自己等不到读完成"就死锁了（详见[核心实现一](#核心实现一文件与表空间层fil)）。
 
-### 槽位数与并发上限
+#### 槽位数与并发上限
 
 ```cpp
 bool os_aio_init(ulint n_readers, ulint n_writers) {
@@ -817,7 +821,7 @@ bool os_aio_init(ulint n_readers, ulint n_writers) {
 
 > **实践意义**：默认 `innodb_write_io_threads=4`，在途写在默认配置下只有几十个。**现代 NVMe 与云盘的队列深度远大于此**，这就是为什么高并发写入场景必须调大 `innodb_write_io_threads`（8~16），否则设备根本喂不饱。
 
-### 提交：`os_aio_func`
+#### 提交：`os_aio_func`
 
 `storage/innobase/os/os0file.cc`：
 
@@ -906,7 +910,7 @@ err_exit:
   return (ret == 1);
 ```
 
-### 收割：`LinuxAIOHandler::collect`
+#### 收割：`LinuxAIOHandler::collect`
 
 `os0file.cc`：
 
@@ -954,7 +958,7 @@ void LinuxAIOHandler::collect {
 
 ---
 
-## 核心实现四：doublewrite
+### doublewrite
 
 > **★ 完整剖析见专篇 [`dblwr.md`](dblwr.md)**——文件布局（**无文件头**的扁平页数组、批量区 + 512 个单页 SYNC 槽位、**奇偶文件功能切分**）、批量与单页两条路径的完整源码、崩溃恢复时如何用 dblwr 修页、加密帧为什么单独存在、`O_DIRECT_NO_FSYNC` 下五处 fsync 的取舍、`innodb_doublewrite` 的 6 个取值、参数与监控（`innodb_doublewrite_batch_size` 是 no-op）、源码里的 TODO。
 >
@@ -974,13 +978,13 @@ void LinuxAIOHandler::collect {
 
 ---
 
-## 核心实现五：redo log 的 I/O（归位）与各文件 I/O 总览
+### redo log 的 I/O（归位）与各文件 I/O 总览
 
 > **★ redo 的写/刷完整实现见 [`redo_log.md`](redo_log.md)「redo 的 I/O 路径」**——五个专用后台线程（`log_writer` / `log_flusher` / `log_checkpointer` / 两个 notifier / `log_files_governor`）、`log_writer_write_buffer` 的环形写与 512 对齐、`log_flush_low` 的 O_DSYNC 分支、**redo 与数据文件的 I/O 方式差异表**、write-ahead（`innodb_log_write_ahead_size` 与 read-on-write）、fsync vs fdatasync。
 >
 > 本节只保留 I/O 全景需要的**横切对比**，以及不属于 redo 的部分。
 
-### 各文件 I/O 路径总览
+#### 各文件 I/O 路径总览
 
 InnoDB 与 server 层里不同文件的 I/O 走不同路径，对应不同的持久性要求：
 
@@ -1000,7 +1004,7 @@ InnoDB 与 server 层里不同文件的 I/O 走不同路径，对应不同的持
 2. **redo 不开 O_DIRECT**——`OS_LOG_FILE` 不在 O_DIRECT 分支里（只有 `OS_DATA_FILE` / `OS_CLONE_DATA_FILE` / `OS_DBLWR_FILE` 在）。
 3. **redo 的写是同步的、由 `log_writer` 单线程做**——顺序追加、量小、在关键路径上，AIO 的并发收益为零。
 
-### sort 临时文件的独立开关
+#### sort 临时文件的独立开关
 
 DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool**（没有 `space_id`/`page_no`），它唯一的缓存是 OS page cache。`innodb_disable_sort_file_cache`（默认 OFF）决定它是否用 O_DIRECT 绕过（`ddl0ddl.cc`）：
 
@@ -1011,12 +1015,12 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 
 ---
 
-## 核心实现六：server 层 I/O 全景
+### server 层 I/O 全景
 
 > **这一层完全独立于 InnoDB 的 I/O 栈**：不用 `IORequest`、不走 `os_file_*`、不用 AIO、不开 O_DIRECT。它用的是 `mysys` 的一套原语与 `IO_CACHE`。
 > 本节按"通用原语 → 具体子系统"组织：mysys 原语 / `IO_CACHE` / 临时文件 / binlog / 各类日志 / **内部临时表与排序文件** / 导入导出 / 其他引擎。
 
-### mysys 原语：裸系统调用 + 错误处理
+#### mysys 原语：裸系统调用 + 错误处理
 
 | 函数 | 文件 | 职责 |
 |------|------|------|
@@ -1034,7 +1038,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 > 1. **`my_*` 本身不带 PFS 埋点**。PFS 埋点在 `mysql_file_*` 这一层（`include/mysql/psi/mysql_file.h`），是"调用点按需包裹"：`PSI_FILE_CALL(start_file_open_wait)` → `my_open` → `PSI_FILE_CALL(end_file_open_wait_and_bind_to_descriptor)`。
 > 2. **`my_sync` 用 `fdatasync` 是编译期决定的，与 `innodb_use_fdatasync` 完全无关**——后者只在 InnoDB 的 `os0file.cc` 里有效。
 
-### `IO_CACHE`：server 层的通用带缓冲 I/O
+#### `IO_CACHE`：server 层的通用带缓冲 I/O
 
 `mysys/mf_iocache.cc`。它是 binlog、日志、排序文件、LOAD DATA 的共同底座。
 
@@ -1051,7 +1055,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 | **可选 fsync** | `info->disk_sync` 标志，只有 `SELECT INTO OUTFILE` 的 `select_into_disk_sync` 会打开 |
 | **`SEQ_READ_APPEND`** | 循环双缓冲仍在，但 8.0.39 的 `sql/` 层**已无调用点**（binlog 改走 `IO_CACHE_ostream`），属遗留能力 |
 
-### 临时文件：创建即 unlink
+#### 临时文件：创建即 unlink
 
 唯一入口 `create_temp_file`（`mysys/mf_tempfile.cc`），三条实现分支：
 
@@ -1070,7 +1074,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 >
 > 目录取 `mysql_tmpdir`（支持**多目录 round-robin**）。`my_tmpfile` 在 8.0.39 **已不存在**（全仓库 0 命中）。
 
-### binlog
+#### binlog
 
 | 组件 | 位置 | 职责 |
 |------|------|------|
@@ -1089,7 +1093,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 - `sync_binlog=N` 的作用点在 `binlog.cc`（`sync_period && ++sync_counter >= sync_period`）与 （决定是否引入 group-commit 延迟）。`=0` 只 write 不 fsync；`=1` 每个事务组都 fsync。
 - 创建新 binlog 文件后还会 `my_sync_dir_by_file` 同步**目录项**（否则机器崩溃后新 binlog 文件可能"消失"）。
 
-### slow log / general log
+#### slow log / general log
 
 | 组件 | 位置 |
 |------|------|
@@ -1100,7 +1104,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 | `File_query_log` | `sql/log.cc`（封装 IO_CACHE + 表） |
 | `log_slow_statement` | `sql/log.cc` |
 
-### error log（组件化流水线）
+#### error log（组件化流水线）
 
 `filter → write → sink` 三段式：
 
@@ -1112,7 +1116,7 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 
 入口 `log_builtins_init`（`sql/server_component/log_builtins.cc`），刷栈 `log_builtins_error_stack_flush`。
 
-### ★ 内部临时表与排序文件（最容易产生"意外 I/O"的地方）
+#### ★ 内部临时表与排序文件（最容易产生"意外 I/O"的地方）
 
 SQL 层的内部临时表是**三级降级**：
 
@@ -1163,14 +1167,14 @@ SQL 层的内部临时表是**三级降级**：
 
 **同样的 `open_cached_file` 模式还用在**：`Unique`（去重，`sql/uniques.cc`）、**hash join 的 chunk**（`sql/iterators/hash_join_chunk.cc`）、多表 UPDATE 的 rowid 缓冲（`sql/sql_update.cc`）。
 
-### LOAD DATA / SELECT INTO OUTFILE
+#### LOAD DATA / SELECT INTO OUTFILE
 
 | 方向 | 入口 | I/O |
 |------|------|-----|
 | **导入** | `Sql_cmd_load_table::execute_inner`（`sql/sql_load.cc`；★ 旧名 `mysql_load` 已不存在） | `mysql_file_open(O_RDONLY)` → `READ_INFO` 用 `init_io_cache(READ_CACHE / READ_FIFO / READ_NET)`；FIFO 有专门分支；`secure_file_priv` 检查在 `is_secure_file_path` |
 | **导出** | `create_file`（`sql/query_result.cc`）+ `Query_result_export` / `Query_result_dump`（★ 旧名 `select_export` / `select_dump` 已不存在） | `mysql_file_create(..., O_EXCL)` → `init_io_cache(cache, file, select_into_buffer_size, WRITE_CACHE, ...)`；**可选 fsync**：`select_into_disk_sync` 打开 `cache->disk_sync`，每次 flush 后 `mysql_file_sync` |
 
-### 其他存储引擎的文件 I/O
+#### 其他存储引擎的文件 I/O
 
 | 引擎 | 文件 | I/O 方式 |
 |------|------|---------|
@@ -1181,7 +1185,7 @@ SQL 层的内部临时表是**三级降级**：
 
 > **★ 一个反直觉的事实**：8.0 的 mysql 系统表**并非全部 InnoDB**——`mysql.general_log` 与 `mysql.slow_log` 仍是 **CSV 引擎**（`scripts/mysql_system_tables.sql:357/360`）。所以 `log_output=TABLE` 时，日志写入的是 CSV 表：无 fsync、O_APPEND 追加、且有表级锁竞争。**高负载下开 TABLE 输出是 I/O 与锁的双重负担。**
 
-### 其他产生文件 I/O 的 server 层组件
+#### 其他产生文件 I/O 的 server 层组件
 
 | 组件 | 位置 | I/O |
 |------|------|-----|
@@ -1191,7 +1195,7 @@ SQL 层的内部临时表是**三级降级**：
 | **persisted variables / auto.cnf** | `sql/persisted_variable.cc` / `mysqld.cc` | buffered write + `my_sync` |
 | **PFS file 埋点** | `include/mysql/psi/mysql_file.h` | 每次被 instrument 的 I/O 前后各一次 `PSI_FILE_CALL`；`file_summary_by_instance` 按文件实例聚合，**文件多时内存与哈希开销线性增长** |
 
-### server 层 vs InnoDB 层：一张对照表
+#### server 层 vs InnoDB 层：一张对照表
 
 | 维度 | server 层（`sql/`+`mysys/`+非 InnoDB 引擎） | InnoDB |
 |------|-------------------------------------------|--------|
@@ -1211,7 +1215,7 @@ SQL 层的内部临时表是**三级降级**：
 
 ---
 
-## 核心实现七：其他文件 I/O
+### 其他文件 I/O
 
 | 子系统 | 入口 | ★ 关键事实 |
 |--------|------|-----------|
@@ -1226,7 +1230,7 @@ SQL 层的内部临时表是**三级降级**：
 
 ---
 
-## 核心实现八：I/O 线程模型
+### I/O 线程模型
 
 | 线程 | 入口 | 数量由谁决定 |
 |------|------|------------|
@@ -1247,9 +1251,9 @@ SQL 层的内部临时表是**三级降级**：
 
 ---
 
-## 核心实现九：压缩、加密与 punch hole
+### 压缩、加密与 punch hole
 
-### 三种"压缩"在不同层
+#### 三种"压缩"在不同层
 
 | 类型 | 层次 | I/O 影响 |
 |------|------|---------|
@@ -1257,7 +1261,7 @@ SQL 层的内部临时表是**三级降级**：
 | **page compression** | **I/O 层** | 写入前 `os_file_compress_page`，写后 `os_file_punch_hole` 把多余空间还给文件系统 |
 | redo 压缩 | 无 | — |
 
-### punch hole（page compression）
+#### punch hole（page compression）
 
 `os_file_punch_hole`（`os0file.cc`）→ `os_file_punch_hole_posix`：
 
@@ -1270,7 +1274,7 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 - 优化：压缩后尺寸与原始相同则跳过打洞（除非设了 `DISABLE_PUNCH_HOLE_OPTIMISATION`）。
 - 文件扩展用 `fallocate(FALLOC_FL_ZERO_RANGE)`：`os_file_set_size_fast`（`os0file.cc`）。
 
-### 加密在哪一层，会不会改变 I/O 大小
+#### 加密在哪一层，会不会改变 I/O 大小
 
 | 对象 | 层 | 函数 |
 |------|-----|------|
@@ -1281,7 +1285,7 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 
 ---
 
-## 核心实现十：读路径、预读与并行扫描（归位）
+### 读路径、预读与并行扫描（归位）
 
 > **读路径与预读是 Buffer Pool 的职责，并行扫描已有专篇**。本节只给归位表，避免三处重复。
 
@@ -1297,7 +1301,7 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 | **两种预读（线性 / 随机）** | [`buffer_pool.md`](buffer_pool.md) | 另有 ibuf merge 批量读与恢复期区域预读；**SSD 上收益可变负** |
 | **并行扫描 `Parallel_reader`** | [`parallel_scan.md`](parallel_scan.md) | 只服务 DDL / 分区 / 直方图；**社区版无 SQL 层并行查询** |
 
-### 一处必须留在 I/O 全景里的结论：真异步只读预读
+#### 一处必须留在 I/O 全景里的结论：真异步只读预读
 
 **只有这三条真正走 `sync=false`（真 AIO）**（判定链见 [`fil.md`](fil.md)「AIO 模式的三选一」）：
 
@@ -1313,7 +1317,7 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 
 ---
 
-## 核心实现十一：刷脏批次与文件管理（归位）
+### 刷脏批次与文件管理（归位）
 
 > 前面几章讲"一页怎么读写"。**刷脏批次的组织属于 Buffer Pool 的职责，文件管理属于 fil 层**——两者都已独立成篇。本节只给归位表 + 一处与 AIO 直接相关的结论，避免三处重复。
 
@@ -1330,7 +1334,7 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 | **fsync 并发去重 `space_flush`（合并 fsync）** | [`fil.md`](fil.md) | `sync_event` + 四计数器；`O_DIRECT_NO_FSYNC` 下只在文件变大时刷 |
 | **doublewrite 的完整实现** | [`dblwr.md`](dblwr.md) | 见[核心实现四](#核心实现四doublewrite) |
 
-### AIO 槽位耗尽会直接阻塞刷脏
+#### AIO 槽位耗尽会直接阻塞刷脏
 
 完整调用链：
 
@@ -1346,9 +1350,9 @@ buf_flush_write_block_low → dblwr::write → fil_io(NORMAL) → os_aio_func �
 
 ---
 
-## 核心实现十二：特殊 I/O 场景
+### 特殊 I/O 场景
 
-### `buf_flush_sync_all_buf_pools`：同步刷所有实例全部脏页
+#### `buf_flush_sync_all_buf_pools`：同步刷所有实例全部脏页
 
 `buf0flu.cc`。调用点：
 
@@ -1364,19 +1368,19 @@ buf_flush_write_block_low → dblwr::write → fil_io(NORMAL) → os_aio_func �
   buf_flush_fsync;
 ```
 
-### `FLUSH TABLES` 不等于"刷脏页"
+#### `FLUSH TABLES` 不等于"刷脏页"
 
 server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表缓存 + 让存储引擎把表刷到磁盘**（`ha_flush` / `closefrm`），**不是** InnoDB 全量刷脏。带 `WITH READ LOCK` 走 `flush_tables_with_read_lock`（`sql/sql_reload.cc`）。
 
 > 想要"把所有脏页刷下去"，看 `buf_flush_sync_all_buf_pools` 的调用点，而不是 `FLUSH TABLES`。
 
-### TRUNCATE / DROP 的文件删除是同步的
+#### TRUNCATE / DROP 的文件删除是同步的
 
 `os_file_delete_func`（`os0file.cc`）= `unlink`，`fil_delete_tablespace`（`fil0fil.cc`）同步调用它。
 
 > **★ 没有异步/AIO 后台清理机制。** 大表 DROP 时 `unlink` 大文件会让文件系统忙一阵（ext4 尤甚，xfs 好得多）。唯一的"延迟"部分是 **buffer pool 中该表空间页的失效**（`buf_LRU_remove_pages` / `fil_space_t::set_deleted` + `bump_version`），那是内存清理，不是文件删除。
 
-### 其他
+#### 其他
 
 | 场景 | 入口 | 说明 |
 |------|------|------|
@@ -1387,11 +1391,11 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 ---
 
-## ★ 云盘上的 MySQL I/O
+#### ★ 云盘上的 MySQL I/O
 
 > 云存储（EBS / 云盘 / CBS / ESSD）本身的定义、卷类型与选型见 [`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)。本节只讲**云盘对这套 I/O 栈意味着什么**。
 
-### MySQL 对云盘完全无感知（有证据）
+#### MySQL 对云盘完全无感知（有证据）
 
 对 `storage/innobase` 检索 `EBS`、`cloud`、`network storage`、`SAN`、`iSCSI`、`SSD`、`NVMe`：
 
@@ -1403,7 +1407,7 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 **契约面只有 6 个系统调用**（`open` / `pread` / `pwrite` / `io_submit`+`io_getevents` / `fsync`+`fdatasync` / `fcntl(O_DIRECT)`），也没有任何与云存储相关的系统变量。唯一的"设备自适应"是 `innodb_dedicated_server`，但它自适应的是**内存**，不是存储。
 
-### WAL 屏障：刷脏页前必须先刷 redo
+#### WAL 屏障：刷脏页前必须先刷 redo
 
 `storage/innobase/buf/buf0flu.cc`：
 
@@ -1429,7 +1433,7 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 > **云盘相关性**：这个 `fsync` 是每次刷脏批次的固定成本。云盘 fsync 比本地盘贵一个数量级，所以 **redo 与数据文件应放同一块卷**（跨卷快照不一致 + fsync 打两处）。
 
-### 五条隐含假设（云盘上每条都更脆弱）
+#### 五条隐含假设（云盘上每条都更脆弱）
 
 | # | 假设 | 源码落点 | 云盘上的风险 |
 |---|------|---------|------------|
@@ -1439,7 +1443,7 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 | 4 | 设备能力 = `innodb_io_capacity` | 默认 **200**，无自动探测 | 与实际云盘差 1~2 个数量级 → 刷脏跟不上 |
 | 5 | I/O 要么成功要么报错 | `os_file_fsync_posix` 遇 EIO 即 fatal | 云盘更常 **hang 而非报错** → 整实例挂起，无超时保护 |
 
-### ★ 最危险的一条：`innodb_dedicated_server` 的静默改写
+#### ★ 最危险的一条：`innodb_dedicated_server` 的静默改写
 
 `ha_innodb.cc`：
 
@@ -1458,14 +1462,14 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 > **结论：云上必须显式设置 `innodb_flush_method=O_DIRECT`。**
 
-### 故障模式的差异（最容易被忽略）
+#### 故障模式的差异（最容易被忽略）
 
 | | 本地盘 | 云盘 |
 |---|--------|------|
 | 典型故障 | 返回 `EIO` | **长时间 hang** |
 | MySQL 行为 | `ib::fatal` 崩溃 → HA 接管（快速、明确） | 卡在 `pwrite` / `fsync` / `io_getevents`（**这些调用都没有超时**）→ 整实例挂起，HA 心跳可能一起卡住 |
 
-### 云上三件套
+#### 云上三件套
 
 | 参数 | 建议 | 理由 |
 |------|------|------|
@@ -1538,7 +1542,10 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 ---
 
-## 诊断与观测
+## Misc
+
+### 诊断与观测
+
 
 ### 状态变量
 
@@ -1572,7 +1579,6 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 
 ---
 
-## Misc
 
 ### 选择建议
 

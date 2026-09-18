@@ -19,6 +19,6 @@
 | DDL 的三种算法与执行（COPY / INPLACE / INSTANT、row log、DDL log） | [`../../innodb/ddl.md`](../../innodb/ddl.md) |
 | 分区表的 DD 往返与裁剪 | [`partitioning.md`](../../feat/partitioning.md) |
 | 生成列表达式的 DD 文本往返 | [`generated_columns.md`](../../feat/generated_columns.md) |
-| MDL（元数据**锁**，与元数据本身不同） | [`../mdl.md`](../mdl.md) |
+| MDL（元数据**锁**，与元数据本身不同） | [`../../lock/transactional/mdl.md`](../../lock/transactional/mdl.md) |
 | `row_prebuilt_t` / `mysql_row_templ_t`（运行期行转换模板） | [`../handler.md`](../handler.md) |
 | `DB_ROW_ID` 与 DICT_HDR 的 row_id 计数器 | [`../../innodb/physical/record.md`](../../innodb/physical/record.md) |

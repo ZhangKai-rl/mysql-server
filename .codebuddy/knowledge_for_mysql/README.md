@@ -42,72 +42,79 @@
 
 ## 目录索引
 
+> **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`lock/` 是**横切主题**（锁横跨 include/mysys/sql/innodb）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
+
 ### server/ —— Server 层
 
 **SQL 处理主链**：见 **[query/README.md](server/query/README.md)**（35 篇 = 主链 12 篇 + [`07_optimize/`](server/query/07_optimize/) 优化器 15 篇 + [`runtime/`](server/query/runtime/) 执行期专题 8 篇；主链：协议分发 → 解析 → contextualize → prepare → 优化 → AccessPath → 迭代器执行 → DML）
 
 | 文件 / 目录 | 内容 |
 |---|---|
-| [table.md](server/table.md) | **表**：四层表示（DD → `TABLE_SHARE` → `TABLE` → `Table_ref`）、三个缓存分工（TDC / `table_open_cache` 16 分片 / InnoDB dict）、表的八种通用操作（open / lock / CREATE / ALTER / RENAME / TRUNCATE / DROP / FLUSH）与各自入口函数、分区表 SHARE↔`dict_table_t` 一对多 |
+| [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
-| [mdl.md](server/mdl.md) | MDL 元数据锁：表结构保护、双兼容性矩阵排队语义、wait-for graph 死锁检测 |
-| [auth/](server/auth/) | 认证与授权：security_context.md（认证上下文）、mfa.md（多因素认证）、definer.md（definer 与 SQL SECURITY） |
-| [replication/](server/replication/) | 复制：binlog.md（格式/组提交/2PC）、gtid.md、replication.md（主从）、prpl.md（并行复制） |
-| [datatype/](server/datatype/) | 数据类型：json.md（JSON 二进制/部分更新/索引）、gis.md（空间/R-tree） |
-| [dd/](server/dd/) | **数据字典**（两套并存）：dd.md（8.0 权威 DD：DD 表体系、`dd::Table` 对象模型、DD↔文本往返、DD cache、SDI、`innodb_dynamic_metadata`）、innodb_dict.md（引擎侧 `dict_sys`：DICT_HDR 页、`SYS_*` 内部表、`dict_table_t`/`dict_index_t`、dict cache、从 DD 加载） |
-| [infra/](server/infra/) | 通用机制：list.md（侵入式链表）、dbug.md（DBUG 框架）、pfs.md（PFS 可观测性）、memory.md（内存分配器矩阵）、vio.md（VIO 通信抽象）、variables.md（变量体系）、**io_cache.md（`IO_CACHE` 与 server 层 I/O 继承体系：数据结构双缓冲指针、函数指针"穷人版多态"、延迟建文件、`READ_NET` 把网络伪装成文件、透明加解密、`Basic_ostream`→`Truncatable_ostream`→`IO_CACHE_ostream`/`Binlog_encryption_ostream` 装饰者链与 `Binlog_ofile` 门面）**、**reading_guide.md（★ 源码阅读知识地图：七个知识域、C 预处理器与 C++ 惯用法清单、设计模式与 MySQL 源码完整对照表、分阶段学习路线、"读不懂"的自诊断流程）** |
-| [plugin/](server/plugin/) | 可扩展框架：plugin.md（插件体系：ABI/类型/加载安装/引用计数延迟收割）、component.md（组件基础设施：minimal chassis/dynamic loader/mysql.component/manifest/内置组件清单）、service.md（服务：C ABI 契约/registry/default/acquire_related/老版 plugin service）、abi.md（**横切专题**：C++ ABI 五个不稳定点/符号可见性/异常防线/旧结构迁移/.pp 指纹门禁）；具体插件分析（如 clone_plugin.md）后续进此目录 |
+| [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
+| [replication/](server/replication/) | 复制：binlog（格式/组提交/2PC）、gtid、replication（主从）、prpl（并行复制） |
+| [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
+| [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |
+| [infra/](server/infra/) | 通用机制：list（侵入式链表）、dbug、pfs、memory、vio、variables、encoding、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
+| [plugin/](server/plugin/) | 可扩展框架：plugin（插件体系）、component（组件）、service（服务）、abi（C++ ABI 横切专题） |
+| [logging/](server/logging/) | 服务器日志：error_log、general_log、slow_log |
 
 ### [innodb/](innodb/) —— 存储引擎
 
-> **物理结构**（表空间空间管理/页/行/LOB 四篇）集中在 [`innodb/physical/`](innodb/physical/) 子目录：`tablespace`（表空间/段/区/碎片度量）、`page_structure`（页 + 全页类型清单）、`record`（行）、`lob`（大对象）。
+> **物理结构**（表空间/页/行/LOB）集中在 [`innodb/physical/`](innodb/physical/) 子目录。
 
 | 文件 | 内容 |
 |------|------|
-| [buffer_pool.md](innodb/buffer_pool.md) | **Buffer Pool**：slot-based 骨架与 chunk 布局、`buf_page_t`/`buf_block_t` 状态机与 `buf_page_in_file`、io_fix 声明式 latch 协议校验（`Stateful_latching_rules`）、**★ 完整读路径**（缺页读全流程 = 调用线程 `pread()` 非异步 AIO、并发同页只发一次 I/O 的 hash_lock 临界区、★ `buf_wait_for_read` **无 os_event**——"能拿到 S 锁"即唤醒、`buf_page_io_complete` 十步后处理、**os 层与 buf 层两层解压不重复**、读失败重试 100 次才 fatal）、**change buffer**（延迟写换随机读，**云盘收益更大**、"写完立刻读"该关）、AHI、线性/随机预读与四种预读入口、LRU 中点替换（old/new + `old_blocks_time` 时间窗抗扫描污染）、**★ 完整脏页刷盘**：三路径汇聚 `buf_flush_write_block_low`、刷脏批次 single-flight（`buf_flush_do_batch` 返回 false = 没轮到我）、hazard pointer 扫描与 LRU 的 `mutex_enter_nowait`、`buf_flush_page` 锁契约（返回值决定 mutex 归属）、跳过不漏刷的三层保证、邻接刷盘 `buf_flush_try_neighbors`、全量刷脏 `buf_flush_sync_all_buf_pools`、用户线程单页刷为什么慢、AIO 槽位耗尽阻塞刷脏；自适应刷脏（LSN age 因子 sqrt 非线性）、压缩页三态、page cleaner coordinator/worker、Buffer Pool Watch 哨兵 |
-| [dblwr.md](innodb/dblwr.md) | **doublewrite 完整实现**：★ 为什么必须有（torn page 与 **redo 的能力边界**）与何时能关（FusionIO 原子写互斥）、类结构（`Double_write`/`Segment`/`Batch_segment`/`Reduced_double_write`）、**文件布局（无文件头的扁平页数组、批量区 + 512 个 SYNC 槽位、★ 奇偶文件功能切分不是轮换）**、批量写完整流程（`enqueue`→`flush_to_disk`→`write_dblwr_pages`→`write_data_pages`→`write_complete`）、同步单页七步、`write_to_datafile` 的 IORequest 标志、**崩溃恢复时序与 torn page 三 case 判定**、★ 加密帧为什么单独存在（绕过 fil 层故须提前压缩+加密）、`O_DIRECT_NO_FSYNC` 下五处 fsync 的取舍、`force_flush` 四个调用点、参数（`innodb_doublewrite` 6 值、`batch_size` 是 no-op）、监控、源码 TODO |
-| [ahi.md](innodb/ahi.md) | **自适应哈希索引（AHI）**：★ 是什么（B-tree 之上`rec_t*` 内存指针的**可丢弃**缓存）与三不保证（不检查页边界 / 可能碰撞 / **惰性修补**）；三层结构与 `btr_ahi_parts=8` 分片、`hash_table_t` 内部零锁；**★ 哈希键的前缀长度自适应算法**（用 low/up 的 match/bytes 反推最小区分长度）；查询路径 8 道门禁与 `btr_search_guess_on_hash` 逐步（nowait S 锁、先 fix 页后放 AHI 锁、三重校验）；维护路径（build/drop/insert/delete/move/惰性修补）与 **nowait 哲学**；★ **锁按 (space_id, index_id) 路由 ⇒ 同一索引所有页同一把 latch，单索引热点无解**；关闭 AHI 等 `ref_count` 归零 **600 秒后 crash**；命中率低时该关 |
-| [ibuf.md](innodb/ibuf.md) | **change buffer（insert buffer）**：★ 为什么只缓存**非唯一二级索引**的 INSERT（唯一性检查与「页不在 BP 才缓存」**逻辑互斥**），而**唯一索引的 delete-mark / purge 反而可缓存**；物理布局（ibuf 树在 space 0，header page 3 / root page 4；bitmap 每 16384 页一张，4 bit/页 = FREE 2bit + BUFFERED + IBUF）；记录格式（counter 保证时序）；**插入的 14 条否决条件**、合并的 8 条触发条件、三级自我保护 contract（0/5/10）；★ redo 真相（ibuf 树走**普通 B-tree redo**，唯一的 `MLOG_IBUF_*` 是 BITMAP_INIT）；**merge 可能触发页分裂**、`AIO_mode::IBUF` 防死锁；**云盘上收益更大** |
-| [mvcc.md](innodb/mvcc.md) | read view、可见性判断、半一致性读 |
-| [row_search.md](innodb/row_search.md) | `row_search_mvcc`、游标推进（承接 handler.md） |
-| [btr.md](innodb/btr.md) | **索引 B-tree 结构与操作（btr 模块全套）**：游标体系与 `btr_cur_search_to_nth_level` 搜索（latch coupling + 8.0 SMO 锁预测裁剪）、乐观/悲观插入与页分裂（顺序插入感知 / 根页抬高）、删除与合并（merge_threshold / lift 降高）、更新三条路径、持久游标恢复协议、自适应哈希索引 AHI（8.0.30 分片）、`Btree_load` 排序批量构建 |
-| [tablespace.md](innodb/physical/tablespace.md) | **表空间物理结构与空间管理**：FSP header 112B / XDES 40B / inode 192B / fseg header 10B 逐字节布局、segment header → inode → fseg 解析链、`fseg_alloc_free_page_low` 七分支 / `fsp_alloc_free_page` / `fsp_free_page` / `fseg_mark_page_used` / lease 机制 / reserve factor、`FSP_FLAGS` 位域、系统表空间页布局、碎片度量（`DATA_FREE` / `FREE_EXTENTS`） |
-| [page_structure.md](innodb/physical/page_structure.md) | **页物理结构与全页类型清单**：FIL header/page header、infimum/supremum、heap + 单向链表 + page directory 稀疏索引、`page_cur_search` 页内二分、30 种页类型清单、**12 类常见页的逐字节 layout**（INDEX / FSP_HDR / XDES / INODE / IBUF_BITMAP / COMPRESSED / RSEG_ARRAY / TRX_SYS / BLOB-LOB / UNDO / SDI / ENCRYPTED） |
-| [record.md](innodb/physical/record.md) | **行记录格式与 offsets 数组**：record header 5/6 字节与 info bits、变长长度编码（1/2 字节 + 外置 0x40 位）、NULL 位图、`rec_get_offsets` 全链、offsets 前缀和 + 高 4 位标志协议、REDUNDANT 1/2 字节目录、instant V1/V2 行版本状态机、写方向 `rec_convert_dtuple_to_rec`、固定 offsets 缓存 |
-| [lob.md](innodb/physical/lob.md) | 大对象存储（JSON 部分更新的物理基础） |
-| [lock.md](innodb/lock.md) | 行锁、间隙锁、死锁检测 |
-| [redo_log.md](innodb/redo_log.md) | **redo**：格式（文件→block→record 三层）、LSN/sn 序号、mtr 与 log mode、8.0 无锁化写路径、**★ redo 的 I/O 路径（五个专用后台线程 `log_writer`/`log_flusher`/`log_checkpointer`/两个 notifier/`log_files_governor`；`log_writer_write_buffer` 环形写与 512 对齐；`log_flush_low` 的 O_DSYNC 分支；redo 与数据文件的 I/O 方式差异表 —— redo 不走 AIO、不开 O_DIRECT、只有同步 `pwrite`+fsync；write-ahead 与 read-on-write；fsync vs fdatasync）**、落盘时机三档与组提交、后台线程暂停与恢复、checkpoint、文件管理与 resize |
-| [recovery.md](innodb/recovery.md) | **崩溃恢复**：两阶段模型（redo 前滚 / undo 回滚）、扫描与解析状态机、`recv_sys_t` 恢复上下文、hash 聚合与按页应用、文件级 redo、clone/MEB 分支 |
+| [buffer_pool.md](innodb/buffer_pool.md) | **Buffer Pool**：页状态机与 fix 体系、★ 完整缺页读路径（同步 `pread`、`buf_wait_for_read` 等 S 锁技巧）、★ 完整脏页刷盘（三路径/批次 single-flight/邻接刷/自适应刷脏）、LRU 中点替换、预读、压缩页三态 |
+| [dblwr.md](innodb/dblwr.md) | **doublewrite**：为什么必须有（torn page 与 redo 的能力边界）、文件布局（批量区 + SYNC 槽位、奇偶文件功能切分）、批量/单页写流程、崩溃恢复时序与 torn page 判定 |
+| [ahi.md](innodb/ahi.md) | **自适应哈希索引**：B-tree 之上的可丢弃缓存、8.0.30 分片、★ 哈希键前缀长度自适应算法、构建双门槛与全 nowait 哲学、锁按 (space_id, index_id) 路由的局限 |
+| [ibuf.md](innodb/ibuf.md) | **change buffer（insert buffer）**：为什么只缓存非唯一二级索引 INSERT、物理布局、插入 14 条否决条件与合并 8 条触发条件、merge 可能触发页分裂 |
+| [mvcc.md](innodb/mvcc.md) | **MVCC**：ReadView 结构与三层漏斗判定、二级索引 `PAGE_MAX_TRX_ID` 页级粗筛、undo 版本链回溯、半一致性读、purge 与最老 ReadView 的水位闭环 |
+| [row_search.md](innodb/row_search.md) | `row_search_mvcc`：取行主链与游标推进（承接 handler.md） |
+| [btr.md](innodb/btr.md) | **索引 B-tree 结构与操作**：`btr_cur_search_to_nth_level` 逐行解析、页内二分、乐观/悲观插入与页分裂、删除与合并、更新三路径、索引锁完整语义、node pointer、`Btree_load` 批量构建、树生命周期（创建/分配/释放/截断） |
+| [physical/tablespace.md](innodb/physical/tablespace.md) | 表空间物理结构与空间管理：FSP/XDES/inode 逐字节布局、fseg 分配与释放、`FSP_FLAGS`、碎片度量 |
+| [physical/page_structure.md](innodb/physical/page_structure.md) | 页物理结构与全页类型清单：页头/infimum/supremum/heap/目录槽、12 类常见页逐字节 layout |
+| [physical/record.md](innodb/physical/record.md) | 行记录格式：record header、变长编码、NULL 位图、offsets 数组协议、instant 行版本状态机 |
+| [physical/lob.md](innodb/physical/lob.md) | 大对象存储（JSON 部分更新的物理基础） |
+| [redo_log.md](innodb/redo_log.md) | **redo**：三层格式、LSN、mtr 与 log mode、★ redo 的 I/O 路径（五个后台线程、环形写、redo 与数据文件 I/O 方式差异表）、组提交、checkpoint、文件管理与 resize |
+| [recovery.md](innodb/recovery.md) | **崩溃恢复**：两阶段模型（redo 前滚/undo 回滚）、扫描与解析状态机、hash 聚合与按页应用 |
 | [undo_log.md](innodb/undo_log.md) | undo 表空间、purge |
 | [query_graph.md](innodb/query_graph.md) | InnoDB 内部执行模型（fork/thr/node） |
 | [ddl.md](innodb/ddl.md) | online DDL |
-| [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`）：核心数据结构、**B+ 树按子树切分算法**、线程队列与同步、三个实际消费者、触发条件；SQL 层并行查询怎么实现（PolarDB 的物理计划 clone + Exchange 算子 + DOP）、**标准 MySQL 为什么不做**；补充「从 I/O 视角看 Parallel_reader」（函数清单、四个使用范围、★ 社区版无 SQL 层并行查询，`innodb_parallel_read_threads` 是 InnoDB 私有 sysvar 不是 optimizer hint） |
-| [fil.md](innodb/fil.md) | **表空间与文件层（fil）**：三层结构与 `Fil_shard`×68 分片（`space_id%64` + undo 专用）、文件类型常量（`OS_DATA_FILE`/`OS_LOG_FILE`/`OS_DBLWR_FILE`…）、`fil_io`→`Fil_shard::do_io` 主链路（LBA 映射 / punch hole / 加密注入）、★ **AIO 模式三选一含"缺页读为何是同步 `pread`"的完整判定链**、并发控制 flag 体系（`n_pending_ios`/`n_pending_flushes`/`is_being_extended`/`stop_new_ops`）、`space_extend`（fallocate+写零，★ 记 redo 但故意不 `log_write_up_to`）、`space_flush` 的 **fsync 合并**与四计数器（`modification_counter`/`flush_counter`/`flush_size`） |
-| [io.md](innodb/io.md) | **MySQL I/O 全景（从 SQL 到系统调用）**：七层分层图与 11 类 I/O 子系统总览；设计权衡（为什么数据库必须绕过 OS 自己管 I/O、redo 同步写 vs 数据页异步 AIO、doublewrite 为何存在）；核心实现 11 章——fil 表空间层（`Fil_shard` 68 分片 / `IORequest` 位标志 / `get_AIO_mode` 三模式）、`os_file` 与 O_DIRECT·O_SYNC·fsync（**EIO 即 `ib::fatal`**）、AIO 子系统（**同步/异步的分工**与全场景清单、libaio + Simulated + Windows 三套实现、**无 io_uring**、★ native AIO 启用前会探测 tmpdir，失败则静默退化）、**server 层 I/O 全景**（mysys 原语与 PFS 埋点层 / `IO_CACHE` 与 spill 机制 / **创建即 unlink 的临时文件** / binlog·relay log / slow·general·error log / **内部临时表三级降级与 filesort 临时文件** / 导入导出 / MyISAM·CSV·ARCHIVE，★ 全程无 O_DIRECT、无 libaio、目录项无 fsync）、I/O 线程模型、压缩加密与 punch hole（**不改变 I/O 大小**）、特殊场景（`FLUSH TABLES` ≠ 刷脏、DROP 同步 unlink）；★ 云盘上的 MySQL I/O 与五条隐含假设。★ **读路径/预读/change buffer 已归位 [`buffer_pool.md`](innodb/buffer_pool.md)、并行扫描归位 [`parallel_scan.md`](innodb/parallel_scan.md)、刷脏同前、dblwr 归位 [`dblwr.md`](innodb/dblwr.md)、**redo 的写/刷实现归位 [`redo_log.md`](innodb/redo_log.md)**——本篇保留各自的归位表与"真异步只读预读"等 I/O 视角结论 |
+| [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`）：B+ 树按子树切分算法；★ 社区版为什么没有 SQL 层并行查询 |
+| [fil.md](innodb/fil.md) | 表空间与文件层（fil）：`Fil_shard`×68 分片、`fil_io` 主链路、★ AIO 模式三选一判定链（含"缺页读为何是同步 `pread`"） |
+| [io.md](innodb/io.md) | **MySQL I/O 全景（从 SQL 到系统调用）**：七层分层、AIO 子系统（三套实现、无 io_uring）、server 层 I/O 全景、★ 云盘上的 MySQL I/O 与隐含假设；详写内容多已归位各专篇（读路径/刷脏/dblwr/redo I/O），本篇保留总览与归位表 |
 | [trx.md](innodb/trx.md) | InnoDB 事务（`trx_t`） |
 
 ### [feat/](feat/) —— 跨层端到端特性
 
-> 这些主题**同时改动多个层**（语法 → 优化器 → 引擎存储），按"特性"归位，不按层拆开。判据见下面「第一步：决定放哪」与「边界归属」两节；**篇内怎么组织（按层分节 vs 生命周期）见 [`feat/README.md`](feat/README.md)**。
+> 这些主题**同时改动多个层**（语法 → 优化器 → 引擎存储），按"特性"归位，不按层拆开。判据见下面「第一步：决定放哪」与「边界归属」两节；**篇内怎么组织见 [`feat/README.md`](feat/README.md)**。
 
 | 文件 | 内容 |
 |---|---|
-| [partitioning.md](feat/partitioning.md) | **分区表**（全链路单篇）：`partition_info` 元数据模型、DD 持久化与"DD→文本→重解析"往返、分区裁剪（假索引复用 range 优化器）、`Partition_helper` 的 DML 路由、`ha_innopart` 的分区上下文切换与 per-partition `dict_table_t`、TRUNCATE/EXCHANGE/ADD-DROP PARTITION、分区统计与能力边界 |
-| [fts.md](feat/fts.md) | **全文检索**（全链路单篇）：`MATCH...AGAINST` 语法与 `Item_func_match` 生命周期、优化器 `FT_KEYPART`/`JT_FT` 与 hints 下推、`FullTextSearchIterator`、filesort 的 FTS 特例、11 张辅助表与 ilist/VLC 编码、`FTS_DOC_ID`、`fts_cache` 与 sync/后台 optimize、墓碑删除与 OPTIMIZE 重写、布尔 AST 三遍遍历、`tf × idf²` 打分、崩溃恢复、InnoDB 与 MyISAM 差异 |
-| [auto_increment.md](feat/auto_increment.md) | **自增列**（全链路单篇）：三档 AUTOINC 锁模式与 `innobase_lock_autoinc` 逐分支（★ 默认 2 = NO_LOCKING 且为只读变量；mode1 检测到他人持表锁时"先放 mutex 再降级"规避死锁）、handler 区间分配与 `nb_desired_values` 的可靠性边界、★ 计数器持久化（`dict_table_autoinc_log` 写 redo + DDTableBuffer，8.0 重启不回退）、★ 纠正"重启必 SELECT MAX"（仅 IMPORT 无 cfg/表空时兜底）、DDL 保留计数器、空洞三来源与达到列上限行为 |
-| [generated_columns.md](feat/generated_columns.md) | **生成列**（全链路单篇）：VIRTUAL/STORED 语义、`Value_generator` 元数据与打开表时 `PARSE_GCOL_EXPR` 重解析、`vfield` 单遍求值器（依赖位图 + 拓扑序假设）、读写两条求值链路与覆盖索引短路、虚拟列二级索引（索引页物化 vcol 值 + `innobase_get_computed_value` 回调 + purge 无 TABLE 开表求值）、undo 中的 vcol 旧值与 v_idx、binlog 不对称镜像与备库重算、instant ADD/DROP 虚拟列、隐藏生成列家族（功能索引/多值索引/GIPK） |
+| [partitioning.md](feat/partitioning.md) | **分区表**（全链路单篇）：元数据模型、分区裁剪、DML 路由、分区 DDL、能力边界 |
+| [fts.md](feat/fts.md) | **全文检索**（全链路单篇）：语法→优化器→辅助表与编码→打分→崩溃恢复 |
+| [auto_increment.md](feat/auto_increment.md) | **自增列**（全链路单篇）：AUTOINC 锁三模式、handler 区间分配、★ 计数器持久化（8.0 重启不回退） |
+| [generated_columns.md](feat/generated_columns.md) | **生成列**（全链路单篇）：求值链路、虚拟列二级索引、隐藏生成列家族（功能索引/多值索引/GIPK） |
 
-### [log/](log/) —— 服务器日志
+### [lock/](lock/) —— 锁与同步（跨层主题）
 
-[error_log.md](log/error_log.md) · [general_log.md](log/general_log.md) · [slow_log.md](log/slow_log.md)
+> 锁横跨 `include/`、`mysys/`、`sql/`、`innodb/`，按**主题**独立成目录。**先分清两类**：同步原语（线程持、保护内存）vs 事务锁（事务持、保护数据库对象）——见 [`lock/README.md`](lock/README.md)（含全量锁盘点与待补清单）。
 
-### [cloud/](cloud/) —— 云环境
+| 文件 | 锁类别 | 内容 |
+|------|--------|------|
+| [rcu.md](lock/primitives/rcu.md) | 同步原语 | RCU：`MyRcuLock<T>` 逐行剖析、SSL acceptor context 场景、受限之处 |
+| [mdl.md](lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：双兼容性矩阵排队语义、wait-for graph 死锁检测 |
+| [innodb_trx_lock.md](lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁（`lock_t` 一统表锁/行锁）：四种行锁形态、隐含锁、等待唤醒、wait-for graph 死锁检测、锁与 MVCC/半一致性读边界 |
+
+### [cloud/](cloud/) —— 云环境（外部知识）
 
 | 文件 | 内容 |
 |---|---|
-| [cloud_storage.md](cloud/cloud_storage.md) | **云存储（EBS / 云盘 / 分布式块存储）**：EBS vs 云盘的专名/通名之辨（★ Aurora/PolarDB 存储**不是**云盘）、网络块存储的定位与设计权衡（被否决的三方案、三副本为什么是 3、超售与 burst credit 的失效场景、块语义最小契约如何逼数据库自造 doublewrite、**控制权让渡**）、**attach/detach ≠ mount/umount** 的分层与 HA 换机链路、各家卷类型官方规格（gp3/io2/ESSD/增强型·极速型 SSD）、快照的 lazy load 冷启动与"快照≠数据库一致性备份"、RDS 三种存储形态（本地盘/云盘/存算分离）、★ MySQL 对云盘无感知的 grep 证据与五条隐含假设。（MySQL 侧 I/O 栈源码见 `innodb/io.md`） |
-| [cloud_db.md](cloud/cloud_db.md) | 云数据库架构：数据面/支撑环境分层、存算分离、网络体系、HA 切换、透明切换 L0-L6 |
-| [cloud_networking.md](cloud/cloud_networking.md) | 云上网络：VPC/子网、EIP/NAT、VIP/RS、L3-L4-L7、网关体系、安全组、PrivateLink、K8s 网络、VXLAN |
+| [cloud_storage.md](cloud/cloud_storage.md) | 云存储（EBS/云盘）：设计权衡、attach/detach ≠ mount/umount、快照语义、★ MySQL 对云盘无感知的证据与隐含假设 |
+| [cloud_db.md](cloud/cloud_db.md) | 云数据库架构：数据面/支撑环境分层、存算分离、HA 切换、透明切换 L0-L6 |
+| [cloud_networking.md](cloud/cloud_networking.md) | 云上网络：VPC、L3-L4-L7、网关体系、安全组、PrivateLink、K8s 网络 |
 
 ### [papers/](papers/) —— 外部论文剖析
 
@@ -115,7 +122,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [btrlog.md](papers/btrlog.md) | **BtrLog（VLDB 2026）云上 WAL 日志服务**：三重困局（EBS 慢且贵 / 对象存储延迟高按次贵 / 专有后端不可复用）、**单写者假设如何省掉整个排序层**（Paxos 4 跳 vs Corfu 6 跳 vs Scalog 4 跳 vs BtrLog 1 RTT）、SSD 日志节点 Quorum + 对象存储异步段归档的分层设计、容错协议（wtoken fencing / 日志尾保守推断 / epoch 去重 / 段快照刷盘）、面向微秒级的工程（自研 io_uring 运行时、UDP、对称网络 + `reply_to`、LSN 窗口）、全量评估数据（70 µs vs EBS 318 µs、$0.00125 vs $0.0036 每百万追加、跨三云 2.6~6.4× 差距）；★ 附「**对象存储为什么成本低、延迟高**」的成本六因与延迟七因分析；含「批判性审视」与「对 MySQL 的启示」 |
+| [btrlog.md](papers/btrlog.md) | **BtrLog（VLDB 2026）云上 WAL 日志服务**：单写者假设省掉排序层、SSD 日志节点 Quorum + 对象存储异步归档、微秒级工程与全量评估；附"对象存储为什么成本低延迟高"分析 |
 
 ---
 
@@ -147,6 +154,9 @@
   ├─ 是存储引擎内部实现吗？
   │     是 → innodb/
   │
+  ├─ 是锁/同步机制吗？（横跨 include/mysys/sql/innodb 的主题）
+  │     是 → lock/（同步原语进 primitives/，事务锁进 transactional/）
+  │
   ├─ 是外部论文的深度剖析吗？（事实来源是论文，不是本仓库源码）
   │     是 → papers/，一篇论文一个文件；文首「边界」行必须与相关源码文档互指
   │
@@ -155,7 +165,7 @@
         ├─ binlog 与复制                    → server/replication/
         ├─ 被全局复用的通用机制             → server/infra/
         ├─ 插件/组件/服务（可扩展框架）     → server/plugin/
-        └─ 服务器日志                       → log/
+        └─ 服务器日志（error/general/slow） → server/logging/
 ```
 
 ### 第二步：判断该独立成篇，还是并入现有篇
@@ -222,7 +232,7 @@
 2. **可能被多个引擎实现**：按引擎拆篇会让 N 个引擎变成 N 篇，且每篇都要复述一遍 server 层。正确做法是一篇 + "引擎差异"小节（例：分区表只 InnoDB/NDB 两家，NDB 走 `HA_USE_AUTO_PARTITION` 自动分区并保留 `nodegroup_id`，未声明 native 分区能力的引擎直接被拒）。
 3. **读者需要一次读完闭环**：分区表的 DML 路径横跨 `ph_write_row`（SQL 层算分区号）与 `set_partition`（引擎换 `dict_table_t`），中间只隔一层虚调用，拆开则两篇都断头。
 
-不属于此类的仍按层归位：纯引擎内部机制（buffer pool、redo）→ `innodb/`；纯 SQL 层机制（MDL、优化器）→ `server/`；**两层接口本身** → `server/handler.md`（它属于"接口"而非"特性"）。
+不属于此类的仍按层归位：纯引擎内部机制（buffer pool、redo）→ `innodb/`；纯 SQL 层机制（优化器）→ `server/`；**两层接口本身** → `server/handler.md`（它属于"接口"而非"特性"）。**锁与同步是例外**：横跨 include/mysys/sql/innodb，按主题进 `lock/`（见第一步决策树）。
 
 > **★ `feat/` 篇的骨架另有要求**（两种形态，按"两层耦合方式"选），见 [`feat/README.md`](feat/README.md)「篇内骨架」。
 > 这是全库**唯一**的目录级骨架规范；除它之外，单篇骨架一律以 [`_template.md`](_template.md) 为准。

@@ -4,32 +4,27 @@
 >
 > **边界**：本篇讲**崩溃恢复**——即 redo 与 undo 如何把库带回一致状态。redo 自身的格式、LSN 序号、checkpoint 推进、无锁写路径见 [`redo_log.md`](redo_log.md)；事务提交状态裁决见 [`trx.md`](trx.md)；undo 的管理与 purge 见 [`undo_log.md`](undo_log.md)。
 
-## 目录
-
 - [概述](#概述)
-  - [是什么](#是什么)
-  - [用途](#用途)
-  - [版本演进](#版本演进)
 - [理论基础](#理论基础)
-  - [设计思想与权衡](#设计思想与权衡)
-  - [理论溯源](#理论溯源)
-  - [算法与数据结构](#算法与数据结构)
-  - [他库对比与演进动机](#他库对比与演进动机)
 - [核心实现](#核心实现)
-  - [主链路](#主链路)
-  - [checkpoint：恢复的起点](#checkpoint恢复的起点)
-  - [恢复入口：recv_recovery_from_checkpoint_start](#恢复入口recv_recovery_from_checkpoint_start)
-  - [扫描驱动：recv_recovery_begin](#扫描驱动recv_recovery_begin)
-  - [扫描主循环：recv_scan_log_recs](#扫描主循环recv_scan_log_recs)
-  - [解析：mtr 分组与两遍扫描](#解析mtr-分组与两遍扫描)
-  - [recv_sys_t：恢复上下文的完整结构](#recv_sys_t恢复上下文的完整结构)
-  - [应用：hash 聚合与按页重放](#应用hash-聚合与按页重放)
-  - [单页重放：recv_recover_page_func 的幂等](#单页重放recv_recover_page_func-的幂等)
-  - [redo 与 undo 的协同](#redo-与-undo-的协同)
-  - [文件级 redo 与 DDL 在恢复期的处理](#文件级-redo-与-ddl-在恢复期的处理)
-  - [clone / MEB 数据目录的恢复分支](#clone--meb-数据目录的恢复分支)
-- [相关的系统变量/状态变量](#相关的系统变量状态变量)
-- [Misc](#misc)
+  - 主线与基础构件
+    - [主链路](#主链路)
+    - [checkpoint：恢复的起点](#checkpoint恢复的起点)
+    - [recv_sys_t：恢复上下文的完整结构](#recv_sys_t恢复上下文的完整结构)
+  - 扫描与解析（redo 前滚）
+    - [恢复入口：recv_recovery_from_checkpoint_start](#恢复入口recv_recovery_from_checkpoint_start)
+    - [扫描驱动：recv_recovery_begin](#扫描驱动recv_recovery_begin)
+    - [扫描主循环：recv_scan_log_recs](#扫描主循环recv_scan_log_recs)
+    - [解析：mtr 分组与两遍扫描](#解析mtr-分组与两遍扫描)
+  - 应用与协同
+    - [应用：hash 聚合与按页重放](#应用hash-聚合与按页重放)
+    - [单页重放：recv_recover_page_func 的幂等](#单页重放recv_recover_page_func-的幂等)
+    - [redo 与 undo 的协同](#redo-与-undo-的协同)
+  - 特殊分支
+    - [文件级 redo 与 DDL 在恢复期的处理](#文件级-redo-与-ddl-在恢复期的处理)
+    - [clone / MEB 数据目录的恢复分支](#clone--meb-数据目录的恢复分支)
+- [相关的系统变量/状态变量](#相关的系统变量/状态变量)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---

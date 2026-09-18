@@ -292,6 +292,64 @@ my_net_write → net_write_buff（缓冲）→ net_write_packet（可选压缩�
 
 关键行号：`Protocol_classic::write` `:1380`、`flush` `:3038`、`end_row` `:3363-3367`、`net_send_ok` 的 `my_net_write + net_flush` `:966-967`。
 
+### 1.10 结果集发送的三级缓冲、背压与 SHOW PROCESSLIST 状态
+
+1.9 讲了**调用链**，本节讲**物理缓冲**——数据真正到客户端要过三道缓冲：
+
+```
+① MySQL 用户态：net_buffer（NET::buff，初始 = net_buffer_length，默认 16KB）
+      ↓ my_net_write / net_flush → send()
+② 服务端内核：socket send buffer（Linux /proc/sys/net/core/wmem_default ≈ 208KB）
+      ↓ 网络（TCP 滑动窗口 + 拥塞控制）
+③ 客户端内核：socket receive buffer → 应用读取
+```
+
+**背压（为什么卡在 Sending to client）**：客户端不消费 → ③ receive buffer 满 → TCP 窗口通告为 0 → ② send buffer 无法清空 → send buffer 满 → `send()` 阻塞 → MySQL 停在 1.9 的 `vio_write`。**此时 SQL 已经执行完**，只是结果发不出去。
+
+**State 的判定是两个互斥分支**（`sql/sql_show.cc:2787`）：
+
+```cpp
+static const char *thread_state_info(THD *invoking_thd, THD *inspected_thd) {
+  if (inspected_thd->get_protocol()->get_rw_status()) {
+    if (...get_rw_status() == 2) return "Sending to client";   // 正在写网络
+    if (inspected_thd->get_command() == COM_SLEEP) return "";
+    return "Receiving from client";                             // 正在读
+  } else {
+    const char *proc_info = inspected_thd->proc_info_session(...);
+    if (proc_info) return proc_info;                            // stage，如 "executing"
+    if (inspected_thd->current_cond.load()) return "Waiting on cond";
+  }
+}
+```
+
+- `rw_status == 2` → **`Sending to client`**
+- `rw_status == 0` → 显示当前 **stage**（`executing`；**8.0.17 之前叫 `Sending data`**，8.0.17 起合并为 `executing`）
+
+**两个状态的实践判别**（排查方向完全不同）：
+
+| State | 含义 | 排查方向 |
+|-------|------|---------|
+| `executing` / `Sending data` | 语句**正在执行**（含等锁、排序、聚合） | **服务端**：锁等待、执行计划、扫描行数 |
+| `Sending to client` | **SQL 已执行完**，在往网络写 | **客户端**：消费慢、网络、结果集过大 |
+
+**为什么等锁也显示 `executing`**：stage 是**粗粒度**标记——`ExecuteIteratorQuery`（`sql/sql_union.cc:1673`）入口设置后**整个执行期保持**，不区分内部在做什么；锁等待发生在 handler 层（`ha_innobase::index_read`），不会触发状态切换。所以 `executing` 时间长 **≠** 在计算，要查 `performance_schema.data_lock_waits` / `SHOW ENGINE INNODB STATUS` 才能确认是否在等锁。
+
+**纠偏：`net_buffer_length` 只是初始值，调大它不能消除背压**
+
+- `NET::max_packet` 初始 = `net_buffer_length`（`sql/sql_client.cc:40`）
+- 不够时通过 `net_realloc` **动态增长**（`sql-common/net_serv.cc:210`、`:1549`、`:1748`）
+
+所以调大 `net_buffer_length` 只减少 realloc 次数。**瓶颈在客户端消费速度（TCP 窗口），不在用户态 buffer 大小**——即使 net buffer 装下整个结果集，数据仍要推到 ② send buffer，满了照样阻塞。
+
+正确缓解方向：
+
+| 方向 | 做法 |
+|------|------|
+| 根本 | 客户端及时消费：`mysql_store_result`（一次读完）优于 `mysql_use_result`（流式，客户端慢处理即卡服务端） |
+| 减小压力 | 加 `LIMIT`、只取需要的列 |
+| 排查 | 客户端 GC / 网络延迟 / 应用线程阻塞 |
+| 治标 | 增大 OS 层 `net.core.wmem_default`——只缓冲更多，不根治 |
+
 ---
 
 ## 二、连接与 THD

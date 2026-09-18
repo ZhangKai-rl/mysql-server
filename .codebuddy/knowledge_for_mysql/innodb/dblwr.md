@@ -4,23 +4,27 @@
 
 > **边界**：本篇讲 **doublewrite 本身**。刷脏（page cleaner、flush list、邻接刷盘、io_capacity 自适应）见 [`buffer_pool.md`](buffer_pool.md)；redo 的**写/刷路径**与格式见 [`redo_log.md`](redo_log.md)；dblwr 之下的 `os_file` 原语与 AIO 见 [`io.md`](io.md)；表空间元数据与 I/O 分发见 [`fil.md`](fil.md)；崩溃恢复整体见 [`recovery.md`](recovery.md)。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [核心实现一：整体类结构](#核心实现一整体类结构)
-- [核心实现二：文件布局](#核心实现二文件布局)
-- [核心实现三：批量写完整流程](#核心实现三批量写完整流程)
-- [核心实现四：同步单页 flush](#核心实现四同步单页-flush)
-- [核心实现五：`write_to_datafile`](#核心实现五write_to_datafile)
-- [核心实现六：崩溃恢复时如何使用 dblwr](#核心实现六崩溃恢复时如何使用-dblwr)
-- [核心实现七：加密帧 `get_encrypted_frame`](#核心实现七加密帧-get_encrypted_frame)
-- [核心实现八：O_DIRECT 与 fsync 的完整交互](#核心实现八o_direct-与-fsync-的完整交互)
-- [核心实现九：`force_flush` 的四个调用点](#核心实现九force_flush-的四个调用点)
-- [核心实现十：监控与状态变量](#核心实现十监控与状态变量)
-- [核心实现十一：reduced 模式（DETECT_ONLY）](#核心实现十一reduced-模式detect_only)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [整体类结构](#整体类结构)
+    - [文件布局](#文件布局)
+  - 写路径
+    - [批量写完整流程](#批量写完整流程)
+    - [同步单页 flush](#同步单页-flush)
+    - [`write_to_datafile`](#write_to_datafile)
+    - [加密帧 `get_encrypted_frame`](#加密帧-get_encrypted_frame)
+  - 崩溃恢复
+    - [崩溃恢复时如何使用 dblwr](#崩溃恢复时如何使用-dblwr)
+  - 工程细节
+    - [O_DIRECT 与 fsync 的完整交互](#o_direct-与-fsync-的完整交互)
+    - [`force_flush` 的四个调用点](#force_flush-的四个调用点)
+  - 治理
+    - [监控与状态变量](#监控与状态变量)
+    - [reduced 模式（DETECT_ONLY）](#reduced-模式detect_only)
 - [相关的系统变量](#相关的系统变量)
-- [Misc](#misc)
+- [Misc](#Misc)
 - [参考](#参考)
 
 ---
@@ -132,7 +136,9 @@ dblwr 的存在源于**块设备契约不保证多块写原子性**。若设备�
 
 ---
 
-## 核心实现一：整体类结构
+## 核心实现
+
+### 整体类结构
 
 `buf0dblwr.cc` 中定义的类（共 9 个）：
 
@@ -165,7 +171,7 @@ Double_write::s_LRU_batch_segments / s_flush_list_batch_segments  (mpmc_bq<Batch
 Double_write::s_single_segments   (mpmc_bq<Segment*>*)     ← 512 个单页槽位
 ```
 
-### `Segment`：文件内的一段区间
+#### `Segment`：文件内的一段区间
 
 `buf0dblwr.cc`：
 
@@ -208,7 +214,7 @@ class Segment {
 
 > **矫正一处常见说法**：`Segment::start` 方法**不存在**；`Double_write::init` 也**不存在**（初始化入口是 `create_v2`）。
 
-### `Double_write`：一个 dblwr 实例
+#### `Double_write`：一个 dblwr 实例
 
 关键成员（`buf0dblwr.cc`）：
 
@@ -304,9 +310,9 @@ Double_write::Double_write(uint16_t id, uint32_t n_pages) noexcept
 
 ---
 
-## 核心实现二：文件布局
+### 文件布局
 
-### 文件名
+#### 文件名
 
 `dblwr_file_open`（`buf0dblwr.cc`）：
 
@@ -318,7 +324,7 @@ Double_write::Double_write(uint16_t id, uint32_t n_pages) noexcept
 
 即 `#ib_<page_size>_<id>.dblwr`；reduced 为 `.bdblwr`。默认目录 `"."`（datadir），由 `innodb_doublewrite_dir` 覆盖。
 
-### ★ 没有文件头——扁平的页数组
+#### ★ 没有文件头——扁平的页数组
 
 `.dblwr` 文件是**纯物理页数组，0 字节文件头**。整个布局由 `dblwr::open`（`buf0dblwr.cc`）在启动时算出来：
 
@@ -386,7 +392,7 @@ constexpr uint32_t SYNC_PAGE_FLUSH_SLOTS = 512;    // buf0dblwr.cc
 | 1 个文件 | 512 页全在文件 0 尾部；批量段按 `is_odd(id)` 交替分给 LRU / flush list 队列 |
 | N 个文件 | **只在奇数 id（LRU）文件**上，每个 `512/(N/2)` 页，合计恒为 512 |
 
-### ★ `n_files = 2` 的含义：奇偶文件功能切分（不是轮换）
+#### ★ `n_files = 2` 的含义：奇偶文件功能切分（不是轮换）
 
 ```cpp
   bool is_for_lru const { return is_odd; }   // 奇数 id → LRU
@@ -424,9 +430,9 @@ File::s_n_pages = n_pages * 5
 
 ---
 
-## 核心实现三：批量写完整流程
+### 批量写完整流程
 
-### 调用链
+#### 调用链
 
 ```
 buf_flush_page / buf_flush_try_neighbors
@@ -451,7 +457,7 @@ buf_page_io_complete
                  └─ [最后一个] → fil_flush_file_spaces + 归还段
 ```
 
-### 入口 `dblwr::write` 的两分支
+#### 入口 `dblwr::write` 的两分支
 
 `buf0dblwr.cc`：
 
@@ -476,7 +482,7 @@ buf_page_io_complete
 
 > **★ 所有 `BUF_FLUSH_SINGLE_PAGE` 走同步分支**，即使调用方请求 async。`buf0lru.cc` 的注释明确记录了这一点并标注为待确认的 TODO（见 [Misc](#misc)）。
 
-### `enqueue`：缓冲满了就强制刷盘
+#### `enqueue`：缓冲满了就强制刷盘
 
 `buf0dblwr.cc`：
 
@@ -517,7 +523,7 @@ buf_page_io_complete
 
 > 所以 dblwr 批量写 = **把页内容复制到实例私有对齐缓冲**，攒满后一次写。压缩页也占一整页槽位（只拷 `n_bytes`，但按 `m_phy_size` 前进）。
 
-### `flush_to_disk` 与"上一批未完成"的等待
+#### `flush_to_disk` 与"上一批未完成"的等待
 
 `buf0dblwr.cc`：
 
@@ -551,7 +557,7 @@ buf_page_io_complete
 
 > **同一个 dblwr 实例同一时刻只有一个 batch 在飞**（`m_batch_running`）。这是 dblwr 在高并发刷脏时的主要阻塞点，`MONITOR_DBLWR_FLUSH_WAIT_EVENTS` 就是它的计数。
 
-### `write_pages`：先 dblwr，再数据文件
+#### `write_pages`：先 dblwr，再数据文件
 
 `buf0dblwr.cc`：
 
@@ -604,7 +610,7 @@ void Double_write::write_data_pages(buf_flush_t flush_type,
 
 > **★ "写完 dblwr 后把页写到数据文件"发生在 `write_data_pages`，不是 `write_complete` 回调里。** `write_complete` 是数据文件写**完成之后**的收尾。
 
-### `write_complete`：收尾与 fsync 摊薄
+#### `write_complete`：收尾与 fsync 摊薄
 
 `buf0dblwr.cc`：
 
@@ -630,7 +636,7 @@ void Double_write::write_data_pages(buf_flush_t flush_type,
 
 ---
 
-## 核心实现四：同步单页 flush
+### 同步单页 flush
 
 `Double_write::sync_page_flush`（`buf0dblwr.cc`）完整七步：
 
@@ -678,7 +684,7 @@ dberr_t Double_write::sync_page_flush(buf_page_t *bpage,
 
 ---
 
-## 核心实现五：`write_to_datafile`
+### `write_to_datafile`
 
 `buf0dblwr.cc`：
 
@@ -713,11 +719,11 @@ dberr_t Double_write::write_to_datafile(const buf_page_t *in_bpage, bool sync,
 
 ---
 
-## 核心实现六：崩溃恢复时如何使用 dblwr
+### 崩溃恢复时如何使用 dblwr
 
 **★ `Double_write::recover` 不存在**。恢复用的是 `dblwr::recv::` 命名空间下的一套独立结构，入口 `dblwr::recv::Pages::recover`。
 
-### 时序（按实际执行顺序）
+#### 时序（按实际执行顺序）
 
 | 步骤 | 位置 | 做什么 |
 |------|------|--------|
@@ -757,7 +763,7 @@ static void recv_init_crash_recovery {
 
 用 `max(srv_buf_pool_instances, ids.back+1)` 个文件 id 去尝试打开——这样 `innodb_buffer_pool_instances` 变过也能覆盖全部历史文件。
 
-### torn page 的三个判定 case
+#### torn page 的三个判定 case
 
 `dblwr::recv::Pages::dblwr_recover_page`（`buf0dblwr.cc`）：
 
@@ -825,7 +831,7 @@ static void recv_init_crash_recovery {
 
 ---
 
-## 核心实现七：加密帧 `get_encrypted_frame`
+### 加密帧 `get_encrypted_frame`
 
 `buf0dblwr.cc`（核心片段）：
 
@@ -858,7 +864,7 @@ static void recv_init_crash_recovery {
   return e_block;
 ```
 
-### ★ 为什么需要"单独的加密帧"
+#### ★ 为什么需要"单独的加密帧"
 
 调用处的注释一句话点破（`buf0dblwr.cc`）：
 
@@ -889,9 +895,9 @@ struct Block {
 
 ---
 
-## 核心实现八：O_DIRECT 与 fsync 的完整交互
+### O_DIRECT 与 fsync 的完整交互
 
-### `is_fsync_required`
+#### `is_fsync_required`
 
 `buf0dblwr.cc`：
 
@@ -905,7 +911,7 @@ struct Block {
 
 > **★ `O_DIRECT` 和 `O_DIRECT_NO_FSYNC` 都不 fsync dblwr 文件**。只有 `fsync` / `O_DSYNC` / `littlesync` / `nosync` 才 fsync。
 
-### 五处 fsync 点及其在 `O_DIRECT_NO_FSYNC` 下的行为
+#### 五处 fsync 点及其在 `O_DIRECT_NO_FSYNC` 下的行为
 
 | # | 位置 | 代码 | NO_FSYNC 下 |
 |---|------|------|------------|
@@ -942,7 +948,7 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
 
 > 即：`O_DIRECT_NO_FSYNC` 下**只有文件被扩展（size 变了）时才 fsync**，普通页写一律不 fsync（依赖 O_DIRECT 绕过 page cache）。完整机制见 [`fil.md`](fil.md)「刷盘与 fsync 并发去重」。
 
-### dblwr 文件本身也开 O_DIRECT
+#### dblwr 文件本身也开 O_DIRECT
 
 `os0file.cc`：
 
@@ -960,7 +966,7 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
 
 ---
 
-## 核心实现九：`force_flush` 的四个调用点
+### `force_flush` 的四个调用点
 
 实例级（`buf0dblwr.cc`）：
 
@@ -1003,9 +1009,9 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
 
 ---
 
-## 核心实现十：监控与状态变量
+### 监控与状态变量
 
-### `MONITOR_DBLWR_*`
+#### `MONITOR_DBLWR_*`
 
 `srv0mon.h`：
 
@@ -1016,7 +1022,7 @@ static inline bool fil_disable_space_flushing(const fil_space_t *space) {
 | `MONITOR_DBLWR_FLUSH_REQUESTS` | `buf0dblwr.cc` | 实际发起的批量 flush 次数 |
 | `MONITOR_DBLWR_FLUSH_WAIT_EVENTS` | `buf0dblwr.cc` | ★ **因上一批还在跑而阻塞等待的次数**（dblwr 的主要阻塞指标） |
 
-### 状态变量（★ 累加时机值得注意）
+#### 状态变量（★ 累加时机值得注意）
 
 | 变量 | 位置 | 语义 |
 |------|------|------|
@@ -1029,7 +1035,7 @@ shutdown 时还会打印累计写入字节数：`"Bytes written to disk by DBLWR
 
 ---
 
-## 核心实现十一：reduced 模式（DETECT_ONLY）
+### reduced 模式（DETECT_ONLY）
 
 8.0.30+ 引入。**只记 16 字节的三元组，不记页面内容**：
 

@@ -2,20 +2,23 @@
 
 > 基于 MySQL 8.0.39 源码。LOB（Large Object）是 InnoDB 8.0 重写的大对象存储子系统，是 JSON 部分更新能落地的物理基础。本文独立于 [`server/datatype/json.md`](../../server/datatype/json.md)，那边只保留"JSON 当 BLOB 存"的结论。
 
-## 目录
-
 - [概述](#概述)
 - [理论基础](#理论基础)
-- [一、物理结构：三类页 + 一个 ref](#一物理结构三类页--一个-ref)
-- [二、版本机制：lob_version 与 COW](#二版本机制lob_version-与-cow)
-- [三、写入路径](#三写入路径)
-- [四、读路径：版本化 MVCC 读](#四读路径版本化-mvcc-读)
-- [五、purge 回收](#五purge-回收)
-- [六、回滚](#六回滚)
-- [七、崩溃恢复](#七崩溃恢复)
+- [核心实现](#核心实现)
+  - 主线与基础构件
+    - [一、物理结构：三类页 + 一个 ref](#一物理结构三类页--一个-ref)
+    - [二、版本机制：lob_version 与 COW](#二版本机制lob_version-与-cow)
+  - 写路径
+    - [三、写入路径](#三写入路径)
+  - 读路径
+    - [四、读路径：版本化 MVCC 读](#四读路径版本化-mvcc-读)
+  - 生命周期
+    - [五、purge 回收](#五purge-回收)
+    - [六、回滚](#六回滚)
+    - [七、崩溃恢复](#七崩溃恢复)
 - [核心调用栈](#核心调用栈)
-- [Misc](#misc)
-- [关键源码位置速查](#关键源码位置速查)
+- [Misc](#Misc)
+- [参考](#参考)
 
 ---
 
@@ -65,7 +68,9 @@ LOB 是 InnoDB 存储**外部列（off-page BLOB/TEXT/JSON/GEOMETRY）**的子�
 
 ---
 
-## 一、物理结构：三类页 + 一个 ref
+## 核心实现
+
+### 一、物理结构：三类页 + 一个 ref
 
 ### 1.1 三类页
 
@@ -141,7 +146,7 @@ const ulint BTR_EXTERN_LEN      = 12;  // 8B（高 2 位 flag，低 4B+4B 长度
 
 ---
 
-## 二、版本机制：lob_version 与 COW
+### 二、版本机制：lob_version 与 COW
 
 ### 2.1 只有"大改动"才递增
 
@@ -215,7 +220,7 @@ buf_block_t *first_page_t::replace(trx_t *trx, ulint offset, const byte *&ptr,
 
 ---
 
-## 三、写入路径
+### 三、写入路径
 
 ```
 ha_innobase::update_row → calc_row_difference (ha_innodb.cc:9808)
@@ -257,7 +262,7 @@ blobref.set_offset(lob_version, mtr);            // 版本号写回行内 ref
 
 ---
 
-## 四、读路径：版本化 MVCC 读
+### 四、读路径：版本化 MVCC 读
 
 **两阶段**：先按版本选页（大改动用），再打 undo diff 补丁（小改动用）。
 
@@ -329,7 +334,7 @@ row_sel_store_mysql_field()                     row0sel.cc:2725
 
 ---
 
-## 五、purge 回收
+### 五、purge 回收
 
 ### 5.1 调用链
 
@@ -421,7 +426,7 @@ void first_page_t::mark_cannot_be_partially_updatable(trx_t *trx) {
 
 ---
 
-## 六、回滚
+### 六、回滚
 
 ### 6.1 小改动：`apply_undolog`
 
@@ -463,7 +468,7 @@ void first_page_t::mark_cannot_be_partially_updatable(trx_t *trx) {
 
 ---
 
-## 七、崩溃恢复
+### 七、崩溃恢复
 
 ### 7.1 redo：没有 LOB 专属类型
 
