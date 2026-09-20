@@ -864,7 +864,7 @@ DEBUG 校验里 `rec_offs_validate` 对 `offsets[2] == nullptr`（缓存态）�
 
 ### 消费方清单
 
-offsets 协议的下游（各篇详述）：比较 `cmp_dtuple_rec`（搜索/插入定位）、`row_build` 与 `rec_copy_prefix_to_dtuple`（record → dtuple）、`row_search_mvcc` 的游标推进（见 [`row_search.md`](../row_search.md)）、行锁的 `lock_rec_*`（见 [`../../lock/transactional/innodb_trx_lock.md`](../../lock/transactional/innodb_trx_lock.md)）、purge 与 undo 回放（见 [`undo_log.md`](../undo_log.md)）、instant DDL 的行迁移（见 [`ddl.md`](../ddl.md)）。
+offsets 协议的下游（各篇详述）：比较 `cmp_dtuple_rec`（搜索/插入定位）、`row_build` 与 `rec_copy_prefix_to_dtuple`（record → dtuple）、`row_search_mvcc` 的游标推进（见 [`row_search.md`](../row_search.md)）、行锁的 `lock_rec_*`（见 [`../../lock/transactional/innodb_trx_lock.md`](../../infra/lock/transactional/innodb_trx_lock.md)）、purge 与 undo 回放（见 [`undo_log.md`](../undo_log.md)）、instant DDL 的行迁移（见 [`ddl.md`](../ddl.md)）。
 
 ---
 

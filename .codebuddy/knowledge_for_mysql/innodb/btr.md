@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。剖析 InnoDB 索引 B-tree 的全套结构操作：游标搜索（`btr0cur`）、页面分裂/合并/根页管理（`btr0btr`）、持久游标（`btr0pcur`）、自适应哈希索引 AHI（`btr0sea`）、排序批量构建（`btr0load`）。
 >
-> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](physical/record.md)；latch 体系与行锁见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](redo_log.md)；undo 与 purge 见 [`undo_log.md`](undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](ddl.md)。
+> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](physical/record.md)；latch 体系与行锁见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](redo_log.md)；undo 与 purge 见 [`undo_log.md`](undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](ddl.md)。
 
 ## 目录
 
@@ -2792,7 +2792,7 @@ ulint btr_get_size(dict_index_t *index, ulint flag, mtr_t *mtr) {
 - 上游 SQL 层行读取主链（`row_search_mvcc`、行缓冲转换）见 [`row_search.md`](row_search.md)
 - 下游页结构（页头/目录槽/页内二分 `page_cur_search_with_match` 详情）见 [`physical/page_structure.md`](physical/page_structure.md)
 - 记录格式与 offsets（`rec_get_offsets`、node pointer 字段解析）见 [`physical/record.md`](physical/record.md)
-- 行锁/间隙锁/latch 体系（`index->lock`、`lock_update_split_*` 的锁继承）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)
+- 行锁/间隙锁/latch 体系（`index->lock`、`lock_update_split_*` 的锁继承）见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)
 - mtr 与 redo 日志（`MLOG_LIST_*` 重放、`mtr_set_log_mode`）见 [`redo_log.md`](redo_log.md)
 - undo 与 purge（物理删除入口、delete-mark）见 [`undo_log.md`](undo_log.md)
 - LOB 外存字段（`lob::BtrContext`、extern 引用前缀）见 [`physical/lob.md`](physical/lob.md)

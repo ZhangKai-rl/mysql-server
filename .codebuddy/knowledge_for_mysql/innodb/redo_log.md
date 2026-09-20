@@ -1453,7 +1453,91 @@ checkpoint_age = current_lsn − last_checkpoint_lsn ≤ soft_logical_capacity  
 
 ### 消费者（consumer）模型
 
-8.0.30 把"谁还需要旧 redo"抽象为注册的 `Log_consumer`（log0consumer.h）。`oldest_needed_lsn` = 最滞后消费者的 `consumed_lsn`（`log_consumer_get_oldest`，log0consumer.cc:86），是文件回收与容量计算的下界。
+8.0.30 把"谁还需要旧 redo"抽象为注册的 `Log_consumer`（`include/log0consumer.h`）。`oldest_needed_lsn` = 最滞后消费者的 `consumed_lsn`，是文件回收与容量计算的下界。
+
+> ⚠️ **与 Performance Schema 的 consumer 无关**：这里 `Log_consumer` 是 **InnoDB 内部**（`storage/innobase`）的抽象——"谁还需要旧 redo 文件、别回收"。而 PFS 的 consumer（`setup_consumers` 表、`storage/perfschema`）是**观测层**的"性能数据采集开关"（`events_waits_current/history` 等表的数据流向哪个 consumer）。两者只是英文同名，分属完全不同的子系统，没有调用关系。见 [`../server/infra/pfs.md`](../server/infra/pfs.md)。
+
+**接口本身极简**——三个纯虚函数就是"消费者"的全部契约：
+
+```cpp
+class Log_consumer {
+ public:
+  virtual ~Log_consumer() {}
+  /** @return Name of this consumer. */
+  virtual const std::string &get_name() const = 0;
+  /** @return Maximum LSN up to which this consumer has consumed redo. */
+  virtual lsn_t get_consumed_lsn() const = 0;
+  /** Request the log consumer to consume faster. Called whenever this
+  consumer is the most lagging one and it is critical to consume the
+  oldest redo log file. */
+  virtual void consumption_requested() = 0;
+};
+```
+
+三个虚函数：`get_name`（是谁，供 warning 点名）、`get_consumed_lsn`（读到哪了）、`consumption_requested`（催它快点消费）。**没有任何"写入"接口**——消费者只"读"redo 并报告进度，不生产 redo。
+
+**三个实现类**（`log0consumer.cc`）：
+
+```cpp
+// 通用消费者：外部（MEB/clone）主动 set 进度，无法被催
+class Log_user_consumer : public Log_consumer {
+  void set_consumed_lsn(lsn_t consumed_lsn) {
+    if (consumed_lsn % OS_FILE_LOG_BLOCK_SIZE == 0) {
+      consumed_lsn += LOG_BLOCK_HDR_SIZE;   // ★ 512 对齐的 lsn 跳过块头
+    }
+    ut_a(m_consumed_lsn <= consumed_lsn);   // 只许前进
+    m_consumed_lsn = consumed_lsn;
+  }
+  lsn_t get_consumed_lsn() const override { return m_consumed_lsn; }
+  void consumption_requested() override {}  // ★ 空实现：用户消费者无法被催
+ private:
+  const std::string m_name;
+  lsn_t m_consumed_lsn{};
+};
+
+// 常驻消费者：checkpoint 进度，通常是最慢的那个
+class Log_checkpoint_consumer : public Log_consumer {
+  lsn_t get_consumed_lsn() const override {
+    return log_get_checkpoint_lsn(m_log);          // 就是 last_checkpoint_lsn
+  }
+  void consumption_requested() override {
+    log_request_checkpoint_in_next_file(m_log);    // 催 checkpoint 落到下一文件
+  }
+ private:
+  log_t &m_log;
+};
+```
+
+`Arch_log_consumer`（redo 归档）同理，`get_consumed_lsn` 返回归档进度、`consumption_requested` 催归档线程加速。
+
+**注册/注销/取最老**——就是对一个 `std::set<Log_consumer *>` 的插入、删除、扫描：
+
+```cpp
+void log_consumer_register(log_t &log, Log_consumer *log_consumer) {
+  ut_ad(log_files_mutex_own(log) || srv_is_being_started);
+  log.m_consumers.insert(log_consumer);
+}
+void log_consumer_unregister(log_t &log, Log_consumer *log_consumer) {
+  ut_ad(log_files_mutex_own(log) || srv_is_being_started ||
+        srv_shutdown_state.load() != SRV_SHUTDOWN_NONE);
+  log.m_consumers.erase(log_consumer);
+}
+
+Log_consumer *log_consumer_get_oldest(const log_t &log, lsn_t &oldest_needed_lsn) {
+  Log_consumer *oldest_consumer{nullptr};
+  oldest_needed_lsn = LSN_MAX;
+  for (auto consumer : log.m_consumers) {          // 线性扫，找最小 consumed_lsn
+    const lsn_t oldest_lsn = consumer->get_consumed_lsn();
+    if (oldest_lsn < oldest_needed_lsn) {
+      oldest_consumer = consumer;
+      oldest_needed_lsn = oldest_lsn;
+    }
+  }
+  return oldest_consumer;
+}
+```
+
+要点：注册/注销/取最老都要求持 `log_files_mutex`（或启动期/shutdown 期）；`get_oldest` 是 O(消费者数) 线性扫（消费者个数极少，通常 ≤4，无需堆结构）。
 
 | consumer | 注册点 | consumed_lsn | 被催时动作（consumption_requested） |
 |----------|--------|--------------|-------------------------------------|
@@ -2004,89 +2088,6 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 
 ---
 
-## 关键源码位置速查
-
-| 位置 | 说明 |
-|------|------|
-| `mtr0types.h:42` | `mtr_log_t` 四种 log mode |
-| `mtr0types.h:63` | `mlog_id_t` redo record 类型枚举（76 种） |
-| `mtr0types.h:67` / `:150` | `MLOG_SINGLE_REC_FLAG`(128) / `MLOG_MULTI_REC_END`(31) |
-| `mtr0types.h:261-270` | 8.0.30+ 统一记录级 type：`MLOG_REC_INSERT`(67) / `CLUST_DELETE_MARK`(68) / `REC_DELETE`(69) / `REC_UPDATE_IN_PLACE`(70) |
-| `mtr0log.ic:41` / `:58` | `mlog_open`（预留区，不记账）/ `mlog_close`（按实际末尾回收） |
-| `mtr0log.ic:169` / `:191` | `mlog_write_initial_log_record_low` / `_fast`（后者含 doublewrite 过滤） |
-| **`mtr0log.cc:795`** | **`mlog_open_and_write_index`（记录级 redo 核心）** |
-| `mtr0log.cc:521` / `:591-646` / `:694` / `:710` | `log_index_get_size_needed` / log version+flag+counts / 字段 len 编码 / `log_index_fields` |
-| `mtr0log.cc:656` / `:881-888` | `close_and_reopen_log`（index 元信息跨 block） |
-| `mtr0log.cc:1215` / `:1242` / `:1018` | `mlog_parse_index` / `mlog_parse_index_v1` / `parse_index_fields` |
-| `mtr0log.cc:414` | `mlog_parse_index_8027`（≤8.0.27 兼容格式） |
-| `mtr0log.cc:256` / `:327` / `:342` | `mlog_write_ulint` / `mlog_write_string` / `mlog_log_string` |
-| `mtr0log.cc:60` | `mlog_catenate_string` |
-| `dyn0buf.h:184/201/237` / `dyn0types.h:45` | `dyn_buf_t::open/close/push`；`DYN_ARRAY_DATA_SIZE = 512` |
-| `mtr0log.h:65` / `:272` | `REDO_LOG_INITIAL_INFO_SIZE = 11` / `MLOG_BUF_MARGIN = 256` |
-| `page0cur.cc:978` / `:2253` | `page_cur_insert_rec_write_log` / `page_cur_delete_rec_write_log` |
-| `btr0cur.cc:3314` / `:4355` | `btr_cur_update_in_place_log` / `btr_cur_del_mark_set_clust_rec_log` |
-| `log0recv.cc:1582` / `:1927/1952/2007/2226` | `recv_parse_or_apply_log_rec_body` 及记录级 case |
-| `log0recv.cc:2821/2965/3069` | `recv_parse_log_rec` / `recv_single_rec` / `recv_multi_rec` |
-| `mach0data.ic:156` | `mach_write_compressed`（1~5B 编码规则） |
-| `mtr0mtr.cc:439` | `s_mode_update` log mode 状态机 |
-| `mtr0mtr.cc:760` | `prepare_write`：SINGLE_REC_FLAG / MULTI_REC_END |
-| `mtr0mtr.cc:842` | `Command::execute`：mtr commit 写 redo 主流程 |
-| `mtr0mtr.h:180` | `mtr_t::Impl`：m_memo（资源栈）+ m_log（私有 redo buffer） |
-| `mtr0types.h:280` | `mtr_memo_type_t`：memo slot 类型（PAGE_S/X/SX_FIX、BUF_FIX、S/X_LOCK） |
-| `mtr0mtr.cc:319` | `Add_dirty_blocks_to_flush_list`：commit 时挂脏页 |
-| `mtr0mtr.cc:819` | `release_all`：逆序释放 memo 中的 latch |
-| `buf0flu.ic:57` | `buf_flush_note_modification`：设 oldest_modification 并入 flush list |
-| `log0buf.cc:859` | `log_buffer_reserve`：预留 sn 区间并换算 lsn |
-| `log0buf.cc:922` | `log_buffer_write`：memcpy 进 log.buf，跳过块头尾 |
-| `log0buf.cc:1061` | `log_buffer_write_completed`：recent_written 推进 |
-| `log0buf.cc:1142` | `log_buffer_close`：recent_closed 推进 |
-| `log0write.cc:1534` | `prepare_full_blocks`：写盘前回填块头 |
-| `log0write.cc:1617` | `copy_to_write_ahead_buffer`：未完成块快照 + write-ahead |
-| `log0files_io.h:627` | `log_data_block_header_serialize`：块头序列化 + checksum |
-| `log0constants.h:253-306` | log block 12B 头 / 4B 尾布局常量 |
-| `log0constants.h:167-245` | 文件头 4 block + checkpoint 页布局 |
-| `log0sys.h:111-124` | `log.buf` / `buf_size_sn` / `buf_size` |
-| `log0sys.h:143-297` | `log_t` 辅助结构（Link_buf×2、水位线、事件槽、write_ahead_buf、m_current_file） |
-| `log0types.h:454-519` | `Log_file`：m_start_lsn/m_end_lsn、offset 换算 |
-| `log0chkp.cc:208` | `log_compute_available_for_checkpoint_lsn`：checkpoint 候选 LSN 三上限 |
-| `log0chkp.cc:471` | `log_checkpoint`：checkpoint 主流程（含 `buf_flush_fsync`） |
-| `log0chkp.cc:864` | `log_should_checkpoint`：三类触发条件 |
-| `log0chkp.cc:991` | `log_checkpointer`：后台线程主循环 |
-| `log0chkp.cc:1207` | `log_update_limits_low`：checkpoint 后放大 `free_check_limit_lsn` |
-| `log0files_capacity.h:112` | `Log_files_capacity`：flush/checkpoint 激进阈值模型 |
-| `log0consumer.cc:86` | `log_consumer_get_oldest`：最滞后消费者（oldest_needed_lsn） |
-| `log0files_governor.cc:611` | `log_files_logical_size_and_checkpoint_age`：logical_size/age 计算 |
-| `log0files_governor.cc:1229` | `log_files_governor_iteration_low`：governor 迭代（消费/催熟/建文件） |
-| `log0files_capacity.cc:273` | `hard_logical_capacity_for_physical`：physical→hard 公式 |
-| `log0files_capacity.cc:475` | `update_exposed`：hard→soft→各 age 梯度 |
-| `log0files_capacity.cc:226` | `update_target`：resize up/down 分叉 |
-| `log0write.cc:2076` | writer 硬闸（hard_logical_capacity） |
-| `log0sys.h:503` | `log.m_consumers`：注册的消费者集合 |
-| `os0file.h:193` | `OS_FILE_LOG_BLOCK_SIZE=512` |
-| `dict0dict.ic:1055` | `dict_disable_redo_if_temporary`：临时表设 NO_REDO |
-| `mtr0mtr.cc:898` | `mtr_t::Logging::enable`：全局 redo disable/enable |
-| `btr0btr.cc:1141` | `btr_page_reorganize_low`：LOG NONE + 逻辑日志范例 |
-| `log0recv.cc:3069` | `recv_multi_rec`：两阶段组解析，不完整组不入 hash |
-| `log0recv.cc:3390` | `recv_scan_log_recs`：块 checksum 失败即停扫（abrupt end） |
-| `log0recv.cc:2099` | 恢复时重放 `MLOG_PAGE_REORGANIZE` |
-| `fil0fil.cc:4416` | `fil_op_write_log`：MLOG_FILE_* 文件级记录格式 |
-| `fil0fil.cc:4493` | `Fil_shard::space_delete`：DROP 写 MLOG_FILE_DELETE，先落盘再删文件 |
-| `fil0fil.cc:5404` | `fil_rename_tablespace`：TRUNCATE 第一步 rename 为临时名 |
-| `fil0fil.cc:5744` | `fil_ibd_create`：写 MLOG_FILE_CREATE |
-| `ha_innodb.cc:14558` | `innobase_truncate::truncate`：rename+drop+create 流程 |
-| `log0recv.cc:1590` | `recv_parse_or_apply_log_rec_body`：MLOG_FILE_* 扫描期立即执行 |
-| `ut0link_buf.h:78` | `Link_buf` 模板：无锁区间完成度跟踪（m_links 环形数组 + m_tail） |
-| `ut0link_buf.h:306` | `advance_tail_until`：CAS 推进协议（消费 link / 重试 / wrap） |
-| `log0log.cc:1281` | `log_buffer_resize`：SET GLOBAL innodb_log_buffer_size 在线路径 |
-| `log0buf.cc:778` | reserve 时自动扩容（len > buf_size_sn，S-latch 路径，×1.382） |
-| `log0log.cc:1315` | `log_calc_buf_size`：buf_size_sn 必须最后更新 |
-| `log0constants.h:493-509` | recent_written(1MB)/recent_closed(2MB) 默认+范围 |
-| `log0types.h:138` | `Log_format` 枚举（LEGACY=0 / 5.7.9 / VERSION_8_0_30=6=CURRENT） |
-| `log0types.h:172` | `Log_files_ruleset`（PRE_8_0_30 ib_logfile vs CURRENT #ib_redo） |
-| `log0pre_8_0_30.cc` | 旧格式发现与兼容升级 |
-| `log0write.cc:1416` | `compute_write_size`：write-ahead 决策 |
-
----
 
 ## 参考
 

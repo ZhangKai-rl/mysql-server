@@ -1129,6 +1129,8 @@ GTID 的持久化时机被两条约束夹住，注释编号列出：
 
 ### 事务与 binlog：2PC
 
+> **边界**：本节是**内部 XA**（binlog 当协调者）。由外部 TM 裁决的**外部 XA** 已独立成篇，见 [`../server/xa.md`](../server/xa.md)（含 `XA_prepare_log_event`、`Xa_state_list` 六态、`xa_detach_on_prepare`）。
+
 #### 为什么需要：两个独立的日志系统
 
 一个事务的持久化数据分散在两处：InnoDB 的 redo/undo（引擎内部原子性）与 binlog（复制与 PITR）。两者必须原子地一起提交，否则主从不一致。

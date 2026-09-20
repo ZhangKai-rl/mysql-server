@@ -1,6 +1,8 @@
 # GIS / GeoJSON 与 JSON 的关系
 
-> 基于 MySQL 8.0.39 源码。本文是**占位/概览文档**，只回答"GIS 与前面讲的 JSON 是什么关系"，GIS 内部实现（R-Tree、MBR、空间运算、gcalc）待后续展开。
+> 基于 MySQL 8.0.39 源码。本文是**占位/概览文档**，只回答"GIS 与前面讲的 JSON 是什么关系"，GIS 内部实现（**R-Tree 索引结构**、MBR 作为索引键、空间运算 gcalc）待后续展开。
+>
+> **边界**：R-Tree 空间索引使用的**谓词锁**（`LOCK_PREDICATE` / `LOCK_PRDT_PAGE`）第一主语是"锁"而非"GIS"——它挂在 `lock_sys->prdt_hash`、参与统一死锁检测与 CATS，故已在 [`../../lock/transactional/innodb_trx_lock.md`](../../infra/lock/transactional/innodb_trx_lock.md)「谓词锁（R-Tree 空间索引）」节完整剖析，本篇不重复。**待补的是 R-Tree 索引结构本身**（节点布局、MBR 索引键、分裂/合并、SSN 分裂检测）。
 
 ## 目录
 

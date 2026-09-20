@@ -2,11 +2,11 @@
 
 > MySQL/InnoDB 的锁横跨 `include/`（原语封装）、`mysys/`（原语实现）、`sql/`（MDL 等 server 层锁）、`innodb/`（行锁 + 内部 latch）四个模块，故按**主题**独立成目录，不按层拆散。本篇是对 MySQL 8.0 **全部锁的盘点**。
 
-## 一、最重要的分类：同步原语 vs 事务锁
+## 一、最重要的分类：并发原语 vs 事务锁
 
 MySQL 里的"锁"其实是**两类完全不同的东西**，读任何锁相关代码前先分清它属于哪一类：
 
-| 维度 | **同步原语**（synchronization primitives） | **事务锁 / 语义锁**（transactional / semantic locks） |
+| 维度 | **并发原语**（concurrency primitives） | **事务锁 / 语义锁**（transactional / semantic locks） |
 |------|-------------------------------------------|------------------------------------------------------|
 | 本质 | 并发编程**基础设施** | 数据库**语义**的一部分 |
 | 解决什么问题 | 多线程如何**安全访问共享内存**（临界区互斥、内存可见性） | 事务之间如何**协调对数据库对象的访问**（表结构、数据行） |
@@ -15,9 +15,18 @@ MySQL 里的"锁"其实是**两类完全不同的东西**，读任何锁相关�
 | 保护对象 | 内存对象：缓存条目、队列、引用计数 | 数据库对象：表元数据、索引记录、间隙 |
 | 语义 | 无业务含义，纯技术手段 | 有业务含义：可表达"并发 DDL 与 DML 互斥"、"幻读防护" |
 | 死锁处理 | 一般不检测（靠加锁顺序规约避免；个别如 latch 有内部调试检测） | **检测并回滚受害者**（InnoDB 死锁检测、MDL wait-for graph） |
-| 典型例子 | mutex / rwlock / condvar / RCU / atomic / InnoDB latch | MDL / 行锁 / 间隙锁 / 表锁 / AUTOINC 锁 |
+| 典型例子 | **同步原语**：mutex / rwlock / cond / InnoDB latch；**无锁结构**：RCU / LF_HASH / `ut_lock_free_hash_t` / `Seq_lock` / `Link_buf` | MDL / 行锁 / 间隙锁 / 表锁 / AUTOINC 锁 |
 
-**一句话判据**：问"这把锁在保护**内存**还是保护**数据库对象**？由**线程**持还是**事务**持？"——保护内存、线程持、临界区级 → 原语；保护表/行、事务持、跨事务 → 事务锁。
+**一句话判据**：问"这把锁在保护**内存**还是保护**数据库对象**？由**线程**持还是**事务**持？"——保护内存、线程持、临界区级 → 并发原语；保护表/行、事务持、跨事务 → 事务锁。
+
+**并发原语下再分两个子类**（这就是 LF_HASH 这类无锁容器不该叫"同步原语"的原因）：
+
+| 子类 | 是什么 | 例子 |
+|---|---|---|
+| **同步原语**（synchronization primitives） | 互斥/同步**机制**：临界区互斥、等待通知 | mutex / rwlock / cond / sem / event / latch |
+| **无锁数据结构**（lock-free data structures） | 用 atomic/CAS 搭的并发**容器**，对用户透明地并发增删查 | LF_HASH / `ut_lock_free_hash_t` / RCU / `Seq_lock` / `Link_buf` / MPMC 队列（文档在 [`../infra/structure/`](../structure/)） |
+
+两者共同点：线程持、保护内存、临界区级；区别：同步原语是"加锁/解锁"的动作，无锁结构是"**用原子操作取代锁**"的成品容器。
 
 **为什么不能混**：
 
@@ -31,7 +40,7 @@ MySQL 里的"锁"其实是**两类完全不同的东西**，读任何锁相关�
 
 MySQL 的锁可以沿三个正交维度切分，任何一把锁都落在下面的格子里：
 
-| | **同步原语**（线程持） | **事务锁**（事务持） |
+| | **并发原语**（线程持） | **事务锁**（事务持） |
 |---|---|---|
 | **标准库 / mysys** | `std::mutex`/`std::shared_mutex`、`mysql_mutex_t`/`rwlock`/`prlock`/`cond`、`my_atomic`、RCU | `THR_LOCK` 排队锁（LOCK TABLES 表锁语义） |
 | **sql（server 层）** | THD 族 / binlog 组提交 / GTID 复制 / table cache / DD 缓存 / XA / 时区等实例（A2） | **MDL 框架**（18 namespace，含备份锁、用户级锁）+ `Global_read_lock`（FTWRL） |
@@ -71,7 +80,7 @@ Global_read_lock（sql_class.h）→ 全局读锁（FTWRL）
 
 **收敛性洞察**：server 层的事务锁看似很多（元数据锁、备份锁、用户级锁……），其实**都收敛在 MDL 一个框架**里（不同 namespace）；引擎侧收敛在 `lock_t` 一个结构里（`type_mode` 区分表锁/行锁）。真正独立的小类是 THR_LOCK 表锁和 FTWRL 全局读锁。
 
-## 三、盘点 A：同步原语（线程持、保护内存）
+## 三、盘点 A：并发原语（线程持、保护内存）
 
 ### A1. 原语谱系：两棵从 OS 派生的"族谱树"
 
@@ -96,13 +105,16 @@ L3  实例            LOCK_open、THD::LOCK_thd_data、Global_sid_lock、COND_op
 | `std::mutex`/`std::shared_mutex`/`std::atomic` | C++ 标准库 | 8.0 **新模块直接用标准库**（XA `m_xa_lock`、DD 内部）——不带 PFS 埋点 |
 | `my_atomic_*` | `include/atomic/` | 原子操作封装 |
 | `MyRcuLock<T>`（RCU） | `include/my_rcu_lock.h` | 读多写少全局指针保护 ✅ [rcu.md](primitives/rcu.md) |
+| `LF_HASH`（无锁哈希） | `include/lf.h` + `mysys/lf_hash.cc` | 无锁可扩展哈希（split-ordered list + hazard pointer），MDL_map/ACL cache 用 ✅ [hash.md](../structure/hash.md) |
 
 #### 谱系树 2：InnoDB 侧（实现 + 策略两维模板）
 
 ```
-L0  OS 原语        futex / std::atomic / pthread / sem_t / std::condition_variable
+L0  OS 原语        futex（**裸 syscall，无封装层**）/ std::atomic / pthread（cond + mutex）
+                    ⚠️ sem_t 在 8.0.39 已完全不用；无 ut0futex.h / FutexWait
                     │
-L1  底层等待         FutexWait / os_event（自旋+信号量两级等待，"InnoDB 的条件变量"）/ sync0arr（wait array）
+L1  底层等待         os_event（manual-reset 事件，包 pthread_cond）/ sync0arr（wait array）
+                    ⚠️ 「FutexWait」不存在（旧资料/月报常见），futex 由 ib0mutex.h 直接 syscall
                     │
 L2  实现模板        TTASFutexMutex<Policy>（TTAS 自旋 + futex 睡眠）
   （ib0mutex.h）    TTASEventMutex<Policy>（TTAS 自旋 + os_event 睡眠）
@@ -123,9 +135,9 @@ InnoDB 旁支（不挂主干的独立原语）：
 
 | 族 | 位置 | 说明 |
 |----|------|------|
-| `latch_t`（页 latch） | `sync0types.h:962` | buf 页 latch 原型，声明式协议校验（`Stateful_latching_rules`，见 `innodb/buffer_pool.md`） |
-| `Seq_lock` | `ut0seq_lock.h:49` | 序号锁：读者无锁读计数器 |
-| 无锁 hash | `ut0lock_free_hash.h` | lock-free 结构 |
+| `latch_t` | `sync0types.h` | UNIV_DEBUG 下所有可校验 latch 的**调试基类**（持 `latch_id_t`、`get_level()` 查金字塔锁序），`rw_lock_t` 在 DEBUG 下继承它——**不是** buf 页 latch（那是 `buf_block_t::lock`，一个 `rw_lock_t`）。声明式校验是 `ut::Stateful_latching_rules`（目前唯一用户是 `buf_page_t::io_fix` 状态机）。见 [`primitives/innodb_sync.md`](primitives/innodb_sync.md) |
+| `Seq_lock` | `ut0seq_lock.h` | 序号锁（seqlock）：读者无锁读计数器，引 HPL-2012-68 ✅ [seq_lock.md](primitives/seq_lock.md) |
+| `ut_lock_free_hash_t`（无锁哈希） | `ut0lock_free_hash.h` | 开放寻址 + 链表数组扩容 + 256 分片无锁引用计数，bp 每索引页数统计 ✅ [hash.md](../structure/hash.md) |
 | latch 序与调试 | `lock0latches.cc`（latch_level + `Shard_latches_guard`）、`sync0debug.cc` | 按级别加锁防死锁 + 锁序调试 |
 
 **谱系的阅读价值**：①server 侧 `mysql_*_t` 都是 L1 的 PFS 包装——所以 server 锁都能被 `performance_schema.mutex_instances` 看到，而 InnoDB 用 L2/L3 自研实现，只有通过 `sync0sync.cc` 注册 PFS key 的那批（A3）才可见；②InnoDB 的 Policy 模板把"锁机制"（L2）与"统计/调试"（L3）正交分解——这是它比 server 侧先进的地方（server 侧埋点硬编码在 L2 里）；③`mysql_prlock_t` 与 `mysql_rwlock_t` 同源（L1）不同实现——前者读者永不被写者阻塞。
@@ -222,6 +234,28 @@ InnoDB 的读写锁是自研的 `rw_lock_t`（不是 server 的 `mysql_rwlock_t`
 
 > 另有 `buf_block_debug_latch`（仅 `UNIV_DEBUG`）不纳入。与 server 侧对比：**server 只有 5 个 rwlock，InnoDB 有 15 个**——因为 InnoDB 的树/页/表空间等"按对象实例化"的结构天然适合读写锁（读者并发高、写者少），server 层多是全局单例更适合 mutex。
 
+### A4. 无锁容器全景清单（盘点盲区的补课）
+
+> ★ 本节是初版盘点的"补漏"。复盘：初版以 `debug_lock_order.cc` 锁序图 + `sync0sync.cc` 的 PFS key 注册表 + mutex/rwlock 实例清单为锚点——**这三个锚点只登记同步原语**。无锁容器的本质是"用原子操作取代锁"，它们不注册任何 PFS 锁、不进锁序图，**用"锁清单"盘点锁，无锁结构天然在盲区**（当时 `ut_lock_free_hash_t` 只在旁支表留了 4 个字，`LF_HASH` 完全没出现）。正确的盘点对象是"**并发基础设施**"（同步原语 + 无锁容器），无锁容器要靠 grep `lock_free|lock-free|wait-free|lockless` 主动找。
+
+| 结构 | 位置 | 类型 | 用户/用途 | 文档状态 |
+|---|---|---|---|---|
+| `LF_HASH` | `include/lf.h` + `mysys/lf_hash.cc` | 无锁哈希（split-ordered list + hazard pointer，有论文原型） | MDL_map / Acl_cache / PFS 对象表 | ✅ [hash.md](../structure/hash.md) |
+| `ut_lock_free_hash_t` | `ut0lock_free_hash.h` | 无锁哈希（开放寻址 + 链表数组，无论文原型） | `buf_stat_per_index`（bp 每索引页数） | ✅ [hash.md](../structure/hash.md) |
+| `ut_lock_free_cnt_t` | 同上 | 无锁引用计数（256 分片按 CPU 摊派） | 上述 hash 的数组节点配套 | ✅（同上篇内） |
+| `MyRcuLock<T>`（RCU） | `include/my_rcu_lock.h` | RCU（读计数等零） | `ssl_acceptor_context_data` | ✅ [rcu.md](primitives/rcu.md) |
+| `Link_buf<Position>` | `ut0link_buf.h` | 无锁环形"链缓冲"（乱序 add_link + tail 沿链推进） | redo `recent_written` / `recent_closed`（`log0sys.h`，cache line 对齐） | ✅ [link_buf.md](../structure/link_buf.md) |
+| `Seq_lock<data_t>` | `ut0seq_lock.h` | 序号锁（回调式 seqlock，引 HPL-2012-68） | `mt_fast_modulo_t`（hash 表快速取模的 {mod,inv} 对） | ✅ [seq_lock.md](primitives/seq_lock.md)（锁模式，归锁原语） |
+| `ib_counter_t` | `ut0counter.h` | 分片计数器（RDTSC 散槽 + cache line 隔离，读 fuzzy） | `srv0srv.h` 5 个 typedef + 全局统计 | ✅ [counter.md](../structure/counter.md) |
+| `Counter::Shards` | `ut0counter.h` | 分片计数器第二代（真原子 + Pad，读精确） | bp `m_n_page_gets`、no-logging mtr、Parallel_reader | ✅（同上 counter.md） |
+| `mpmc_bq` | `ut0mpmcbq.h` | 有界 MPMC 队列（Vyukov 算法，引 1024cores.net） | dblwr `Segments`/`Batch_segments`、FTS `Docq` | ✅ [queue.md](../structure/queue.md) |
+| `Integrals_lockfree_queue` | `sql/containers/integrals_lockfree_queue.h` | server 层无锁队列（仅整型元素，虚拟索引 + MSB 占用位） | **唯一用户** `Bgc_ticket_manager`（binlog 组提交 ticket，8.0.28 开发周期） | ✅ [queue.md](../structure/queue.md) |
+| `Bgc_ticket_manager` | `sql/binlog/group_commit/bgc_ticket_manager.h` | lock-free ticket 分配（63 位值 + 1 位 MSB 锁 + 计数对齐放行） | binlog 组提交 | ✅ binlog.md「BGC Ticket 系统」章已补底层实现 |
+
+**口径外**（按"只考虑 MySQL server + InnoDB"不纳入，仅留线索）：TempTable 引擎的 `lock_free_pool`（`storage/temptable/`，属其他引擎）；MySQL Router 的 `mpmc_queue`/`mpsc_queue` 与组复制插件的 `gcs_mpsc_queue`（属组件）。
+
+**盘点已按"类型一篇一主题"重组**（2026-09-20）：hash 三实现合 [hash.md](../structure/hash.md)、两个 MPMC 队列合 [queue.md](../structure/queue.md)、两代计数器合 [counter.md](../structure/counter.md)、`Seq_lock` 归锁原语 [seq_lock.md](primitives/seq_lock.md)、`Link_buf` 单篇 [link_buf.md](../structure/link_buf.md)；`Bgc_ticket_manager` 机制归位 binlog.md。
+
 ## 四、盘点 B：事务锁（事务持、保护数据库对象）
 
 ### B1. MDL 框架（`sql/mdl.h`）—— server 层事务锁的主框架 ✅ [mdl.md](transactional/mdl.md)
@@ -241,10 +275,18 @@ InnoDB 的读写锁是自研的 `rw_lock_t`（不是 server 的 `mysql_rwlock_t`
 
 > **收敛性**：备份锁和用户级锁都不是独立锁系统——`sql_backup_lock.cc` 的 `acquire_exclusive_backup_lock`（底层是 MDL **S** 锁，⚠️ 命名反转，见 B4 下方专节）和 `GET_LOCK` 都只是 MDL 框架的一个 namespace。写类操作（DDL/PURGE BINLOG 等）自动拿的是"S 备份锁"（底层 MDL **IX**；`binlog.cc` 的 `Shared_backup_lock_guard`，拿不到报 `ER_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK`）。
 
-### B2. 表锁体系（`THR_LOCK` 排队锁，`mysys/thr_lock.cc` + `sql/lock.cc`）
+### B2. 表锁体系（`THR_LOCK` 排队锁，`mysys/thr_lock.cc` + `sql/lock.cc`）✅ [thr_lock.md](transactional/thr_lock.md)
 
-- `mysql_lock_tables`（`sql_base.cc`）→ 底层 `THR_LOCK`：通用排队读/写锁（write 优先、锁升级、队列有防饥饿）
+- `mysql_lock_tables` → 底层 `THR_LOCK`：通用排队读/写锁（**写优先**、并发插入的 4 处锁升级、防饥饿靠 `max_write_lock_count`）
 - 承载：**`LOCK TABLES`** 语句（server 语义，InnoDB 表也支持但锁由引擎 `lock_t` 实现）——THR_LOCK 是 MySQL 3.x 就有、沿用至今的锁框架；InnoDB 的表锁不在这里（走 `lock_t` 的 `LOCK_TABLE`，见 B3）
+
+**★ 三个必须记住的点**：
+
+| 点 | 说明 |
+|---|---|
+| **InnoDB 上它是空壳** | `ha_innobase::lock_count()` 返回 **0**，`store_lock()` 不追加任何 `THR_LOCK_DATA` → `thr_multi_lock()` 拿到空数组。排队/冲突检测/优先级对 InnoDB 一行都不起作用；真正互斥由 MDL + InnoDB `lock_t` 分担 |
+| **但 `thr_lock_type` 仍是跨层意图协议** | 被 `store_lock()` 翻译成 InnoDB 的 `select_lock_type`（LOCK_NONE/S/X）与 `select_mode`（SKIP LOCKED / NOWAIT），并派生 MDL 类型（`mdl_type_for_dml`） |
+| **它完全没有死锁检测** | 用 `sort_locks()` 按 `(THR_LOCK* 地址, -type)` 全序 + "必须经 `thr_multi_lock()` 一次性申请"来预防；失败即整体回滚，无 victim 选择 |
 
 ### B3. InnoDB `lock_t` 体系（`storage/innobase/lock/lock0lock.cc`）✅ [innodb_trx_lock.md](transactional/innodb_trx_lock.md)
 
@@ -254,14 +296,14 @@ InnoDB 的读写锁是自研的 `rw_lock_t`（不是 server 的 `mysql_rwlock_t`
 |------|----|------|
 | `LOCK_TABLE` | 意向锁 **IS/IX** | 表级意向锁：行锁的"电梯"，DDL 判断表上是否有行锁 |
 | `LOCK_TABLE` | 表级 **S/X** | `LOCK TABLES`、DDL 的表锁 |
-| `LOCK_TABLE` | **AUTOINC 锁** | 自增列三档模式（跨层特性，详见 [`../feat/auto_increment.md`](../feat/auto_increment.md)） |
+| `LOCK_TABLE` | **AUTOINC 锁** | 自增列三档模式（跨层特性，详见 [`../feat/auto_increment.md`](../../feat/auto_increment.md)） |
 | `LOCK_REC` | **record / gap / next-key / insert intention** | 行级四标志（`LOCK_REC_NOT_GAP`/`LOCK_GAP`/`LOCK_INSERT_INTENTION` 组合） |
 | `PRDT_REC`/`PRDT_PAGE` | **谓词锁** | R-tree 空间索引（`lock0prdt.cc`） |
 | — | 等待与死锁检测 | `lock0wait.cc` + `lock_deadlock_*`（waits-for graph + DFS 回滚受害者） |
 
-### B4. 全局锁二件套（"锁整个实例"的两把锁）
+### B4. 全局锁二件套（"锁整个实例"的两把锁）✅ [global_lock.md](transactional/global_lock.md)
 
-MySQL 语境里的"**全局锁**"通常指这两把（加上只读模式的配合）：
+MySQL 语境里的"**全局锁**"通常指这两把（加上只读模式的配合）。**两把都不是独立锁系统**，而是 MDL 框架的组合用法：FTWRL = `GLOBAL` S + `COMMIT` S，备份锁 = `BACKUP_LOCK` S：
 
 | 全局锁 | SQL | 实现 | 锁什么 |
 |--------|-----|------|--------|
@@ -312,18 +354,21 @@ MDL 与 InnoDB 行锁**独立但配合**：一个 DML 同时持 MDL SW（元数�
 ```
 lock/
 ├── README.md                        ← 本篇：分类 + 类型学 + 全量盘点
-├── primitives/                      ← 同步原语
-│   └── rcu.md                       ✅ RCU
-│   （待补：mysys 封装族；InnoDB mutex 家族 + rw_lock_t + os_event + latch）
+├── primitives/                      ← 同步原语（锁原语，只放锁原语）
+│   ├── innodb_sync.md               ✅ os_event（manual-reset + signal_count 防丢信号）+ sync0arr（event 已嵌入被等对象，只剩诊断/兜底/死锁检测）+ PolicyMutex 模板族（TTAS 自旋 + futex 三态两后端）+ rw_lock_t lock_word 单字三态编码 + LatchDebug/Stateful_latching_rules/LOCK ORDER 三套校验
+│   ├── mysys_primitives.md          ✅ server 侧三层封装（native/my/mysql_mutex）+ PFS 埋点宏链（m_psi 无条件内嵌换 ABI）+ SAFE_MUTEX（CMake Debug 注入，与 PFS 正交）+ prlock（为 MDL 手搓的强读者优先锁）
+│   └── rcu.md                       ✅ RCU 锁模式（读计数等零 + 写者等读者退出）
 └── transactional/                   ← 事务锁
-    ├── mdl.md                       ✅ MDL（全 18 namespace，含 BACKUP_LOCK/USER_LEVEL_LOCK）
-    ├── innodb_trx_lock.md           ✅ lock_t 一统表锁/行锁：四种行锁形态、表锁意向锁、隐含锁、等待唤醒、死锁检测、锁与 MVCC/半一致性读边界
-    └── （待补：表锁 THR_LOCK、FTWRL Global_read_lock；备份锁专节已并入 B4 下方）
+    ├── global_lock.md               ✅ 全局锁二件套：FTWRL（`Global_read_lock` = GLOBAL S + COMMIT S **两段式**，含三线程死锁反例）+ 备份锁（`BACKUP_LOCK` namespace，**语义 X = MDL S 的命名反转**推导）；`SET GLOBAL read_only` 为何复用 GRL；两把锁的阻塞范围对比
+    ├── innodb_trx_lock.md           ✅ lock_t 一统表锁/行锁：表锁机制（意向锁/count_by_mode/AUTOINC）、行锁四形态深入剖析（源码版冲突矩阵）、隐含锁物化、等待与唤醒、死锁检测、锁与 MVCC/半一致性读边界；第四种锁语义**谓词锁**（R-tree）、**AUTOINC** 三档模式与语句级释放；核心函数完整代码剖析（加锁决策主链/冲突判定/授予/入队/挂起）
+    ├── mdl.md                       ✅ MDL：**18 namespace 与两套策略**（scoped/object）、四件套关系图、**fast path 与 obtrusive/unobtrusive 的延迟精算**（`m_fast_path_state` 位布局 + 物化）、双矩阵（granted + **4 张 waiting 优先级矩阵**）、`can_grant_lock` 三级短路、`reschedule_waiters` 公平调度、wait-for graph 死锁检测（BFS+DFS、静态权重 victim、深度 32 即判死锁）、锁升级 SU→SNW→X 与 online/instant DDL、用户级锁 GET_LOCK
+    └── thr_lock.md                  ✅ server 层表锁 THR_LOCK：两级结构（THR_LOCK + THR_LOCK_DATA）、13 种 `thr_lock_type` 优先级编码、**排序代替死锁检测**、写优先与防饥饿（默认关闭）、MyISAM 并发插入 4 处锁升级、InnoDB `lock_count()==0` 空壳与跨层意图协议
 ```
 
 ## 七、归属判据（本目录与相邻目录的边界）
 
-- **锁/同步机制本身** → 本目录（原语进 `primitives/`，事务锁进 `transactional/`）
+- **锁/同步机制本身** → 本目录（同步原语进 `primitives/`，事务锁进 `transactional/`）
+- **无锁容器/数据结构本身** → [`../infra/structure/`](../structure/)（按类型一篇一主题：`hash.md`、`list.md`、`link_buf.md` 等，不分层）——**锁原语目录只放锁原语**（2026-09-20 用户拍板的组织原则）
 - **用锁实现的机制，但不是"锁"本身** → 各模块目录：Buffer Pool 的 latch 协议 → `innodb/buffer_pool.md`；`LOCK_open` 只是 table cache 的一个实现细节 → `server/table.md`
 - **跨层特性里用到锁** → `feat/`（如 AUTOINC 锁），本篇从锁的视角链接过去
 - **锁的实例清单**（A2/A3 的全局 mutex/latch）→ 本篇盘点 + 指向各自模块文档，不复制详细机制

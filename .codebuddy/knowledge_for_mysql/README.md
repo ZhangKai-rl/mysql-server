@@ -42,7 +42,7 @@
 
 ## 目录索引
 
-> **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`lock/` 是**横切主题**（锁横跨 include/mysys/sql/innodb）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
+> **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`infra/` 是**横切基础设施**（数据结构 + 锁，横跨 include/mysys/sql/innodb）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
 
 ### server/ —— Server 层
 
@@ -53,10 +53,11 @@
 | [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
 | [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
-| [replication/](server/replication/) | 复制：binlog（格式/组提交/2PC）、gtid、replication（主从）、prpl（并行复制） |
+| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/事件字节布局/GTID 持久化/读侧 dump/半同步）、gtid、replication（主从）、prpl（并行复制）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
+| [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配
 | [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
 | [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |
-| [infra/](server/infra/) | 通用机制：list（侵入式链表）、dbug、pfs、memory、vio、variables、encoding、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
+| [infra/](server/infra/) | 通用机制：dbug、pfs、memory、vio、variables、encoding、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
 | [plugin/](server/plugin/) | 可扩展框架：plugin（插件体系）、component（组件）、service（服务）、abi（C++ ABI 横切专题） |
 | [logging/](server/logging/) | 服务器日志：error_log、general_log、slow_log |
 
@@ -85,6 +86,7 @@
 | [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`）：B+ 树按子树切分算法；★ 社区版为什么没有 SQL 层并行查询 |
 | [fil.md](innodb/fil.md) | 表空间与文件层（fil）：`Fil_shard`×68 分片、`fil_io` 主链路、★ AIO 模式三选一判定链（含"缺页读为何是同步 `pread`"） |
 | [io.md](innodb/io.md) | **MySQL I/O 全景（从 SQL 到系统调用）**：七层分层、AIO 子系统（三套实现、无 io_uring）、server 层 I/O 全景、★ 云盘上的 MySQL I/O 与隐含假设；详写内容多已归位各专篇（读路径/刷脏/dblwr/redo I/O），本篇保留总览与归位表 |
+| [monitor.md](innodb/monitor.md) | **可观测基础设施**（全局，非锁专属）：InnoDB Monitor 输出体系与三个 monitor 类后台线程、临时文件中转机制、monitor counter / `INNODB_METRICS`（位图开关 + 无锁累加 + `MONITOR_EXISTING` 复用）；与 server 层 status var / PFS 的分工 |
 | [trx.md](innodb/trx.md) | InnoDB 事务（`trx_t`） |
 
 ### [feat/](feat/) —— 跨层端到端特性
@@ -98,15 +100,32 @@
 | [auto_increment.md](feat/auto_increment.md) | **自增列**（全链路单篇）：AUTOINC 锁三模式、handler 区间分配、★ 计数器持久化（8.0 重启不回退） |
 | [generated_columns.md](feat/generated_columns.md) | **生成列**（全链路单篇）：求值链路、虚拟列二级索引、隐藏生成列家族（功能索引/多值索引/GIPK） |
 
-### [lock/](lock/) —— 锁与同步（跨层主题）
+### [infra/](infra/) —— 跨层基础设施（数据结构 + 锁）
 
-> 锁横跨 `include/`、`mysys/`、`sql/`、`innodb/`，按**主题**独立成目录。**先分清两类**：同步原语（线程持、保护内存）vs 事务锁（事务持、保护数据库对象）——见 [`lock/README.md`](lock/README.md)（含全量锁盘点与待补清单）。
+> 横跨 `include/`、`mysys/`、`sql/`、`innodb/` 的基础设施之家，含两大子域。**数据结构**（`structure/`）：按**类型**一篇一主题、**不分层**，跨层同主题在一篇里对比写清（如两个无锁哈希合成 `hash.md`）——它们不是锁，也不属 `lock/`；**锁与同步**（`lock/`）：按主题分**同步原语**（`primitives/`）与**事务锁**（`transactional/`）。导航见 [`infra/README.md`](infra/README.md) 与 [`infra/lock/README.md`](infra/lock/README.md)。
+
+**数据结构（structure/，按类型一篇一主题，全量盘点）**
+
+| 文件 | 类别 | 内容 |
+|------|------|------|
+| [list.md](infra/structure/list.md) | 链表 | **链表全盘点（五实现）**：InnoDB `ut_list_base`（侵入式双向 + **成员指针偏移编译期固化**）、server `SQL_I_List`（侵入式单向 + `T **next` 二级指针）、`base_list`/`List`（非侵入式 + `end_of_list` 哨兵）、`I_List`/`ilink`（侵入式双向 + sentinel 伪装 + unlink 自解链）、C `LIST`——寻址协议是第一分野 |
+| [hash.md](infra/structure/hash.md) | 哈希 | **哈希全盘点（三实现一张光谱）**：无锁 `LF_HASH`（split-ordered list + dummy 哨兵 + 零迁移扩容 + hazard pointer 4 pin + purgatory）、无锁 `ut_lock_free_hash_t`（开放寻址 + 链表数组扩容 + 256 分片引用计数）、**有锁** `hash_table_t`（链地址 + 分片 rw_lock + 无锁 peek/锁后 confirm）——含"通用性越强、理论原型越重"结论与 my_hash 已删除澄清 |
+| [queue.md](infra/structure/queue.md) | 队列 | **有界 MPMC 队列（一个算法两种裁剪）**：server `Integrals_lockfree_queue`（仅整型，虚拟索引 + MSB 占用位 + `Null`/`Erased` 哨兵，全套 API）vs InnoDB `mpmc_bq`（任意类型，槽 seq 判空满，最小 MPMC）——需求半径决定 API 半径 |
+| [counter.md](infra/structure/counter.md) | 计数器 | 分片计数器两代：`ib_counter_t`（RDTSC 散槽 + 非原子 `+=`，读 fuzzy）vs `Counter::Shards`（真原子 + Pad，读精确）；cache 乒乓解法与 fuzzy 误差量级分析 |
+| [link_buf.md](infra/structure/link_buf.md) | 链缓冲 | `Link_buf` 无锁环形"链缓冲"：乱序 `add_link` + tail 沿链推进（槽级锁 + 二次确认）；redo `recent_written`/`recent_closed` 两条串行链的解耦 |
+
+**锁与同步（lock/）**
 
 | 文件 | 锁类别 | 内容 |
 |------|--------|------|
-| [rcu.md](lock/primitives/rcu.md) | 同步原语 | RCU：`MyRcuLock<T>` 逐行剖析、SSL acceptor context 场景、受限之处 |
-| [mdl.md](lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：双兼容性矩阵排队语义、wait-for graph 死锁检测 |
-| [innodb_trx_lock.md](lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁（`lock_t` 一统表锁/行锁）：四种行锁形态、隐含锁、等待唤醒、wait-for graph 死锁检测、锁与 MVCC/半一致性读边界 |
+| [mysys_primitives.md](infra/lock/primitives/mysys_primitives.md) | 同步原语 | server 侧同步原语族：native/my/mysql **三层封装**、PFS 埋点宏链（`m_psi` 无条件内嵌换 ABI 零分支）、SAFE_MUTEX（CMake Debug 注入，**与 PFS 正交可同开**）、**prlock 为 MDL 手搓**（强读者优先 + "unlocked 即可 destroy" 两条硬保证）、instrument 注册全流程 |
+| [innodb_sync.md](infra/lock/primitives/innodb_sync.md) | 同步原语 | InnoDB 自研原语族：`os_event`（manual-reset + signal_count 防丢信号）、sync0arr（event 已嵌入被等对象）、PolicyMutex 模板族（TTAS 自旋 + futex 三态，含 Theorem 1 正确性证明注释）、**`rw_lock_t` lock_word 单字三态编码**（S/SX/X + 递归 + 读者 XOR）、LatchDebug / Stateful_latching_rules / LOCK ORDER 三套锁序校验 |
+| [rcu.md](infra/lock/primitives/rcu.md) | 同步原语 | RCU 锁模式：`MyRcuLock<T>` 逐行剖析（读计数等零 + 写者等读者退出）、SSL acceptor context 场景、受限之处 |
+| [seq_lock.md](infra/lock/primitives/seq_lock.md) | 同步原语 | `Seq_lock` 回调式 seqlock：读者零写（与内核版差异）、引 HPL-2012-68、唯一实例 `mt_fast_modulo_t`（hash 表快速取模） |
+| [global_lock.md](infra/lock/transactional/global_lock.md) | 事务锁 | 全局锁二件套：**FTWRL**（`Global_read_lock` = GLOBAL S + COMMIT S **两段式**，含"为什么必须两段"的三线程死锁反例）、**备份锁**（`BACKUP_LOCK` namespace，**语义 X = MDL S 的命名反转**推导、`Shared_backup_lock_guard` 同会话不免）；`SET GLOBAL read_only` 为何复用 GRL；两把锁阻塞范围对比（**备份锁不挡 DML**） |
+| [mdl.md](infra/lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：**18 namespace 与两套策略**（scoped/object）、**fast path 与 obtrusive/unobtrusive 的延迟精算**（`m_fast_path_state` 单字位布局 + 单向物化）、双兼容矩阵（granted + **4 张 waiting 优先级矩阵**）、`can_grant_lock` 三级短路、`reschedule_waiters` 公平调度、wait-for graph 死锁检测（BFS+DFS、静态权重 victim、**深度 32 即判死锁**）、锁升级 SU→SNW→X 与 online/instant DDL、用户级锁 GET_LOCK |
+| [innodb_trx_lock.md](infra/lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁（`lock_t` 一统表锁/行锁）：**表锁机制**（意向锁、`count_by_mode` 快路径、AUTOINC）、**行锁四形态深入剖析**（源码判定版冲突矩阵、supremum 归一化）、隐含锁物化、等待与唤醒（slot 1:1:1、授予的公平性调度）、wait-for graph 死锁检测（DFS 着色 + victim 权重 + 假阳性双校验）、锁与 MVCC/半一致性读边界；**谓词锁**（R-tree 第四种锁语义：MBR 谓词挂锁尾、三张 hash 表、只有插入意向会等待）、**AUTOINC**（三档模式、语句级释放、持久化与 gap 成因）；含 41 个核心函数完整代码剖析（加锁决策主链 `lock_rec_lock` 三兄弟、冲突判定、授予、入队、挂起） |
+| [thr_lock.md](infra/lock/transactional/thr_lock.md) | 事务锁 | server 层表锁 THR_LOCK：两级结构（`THR_LOCK` + `THR_LOCK_DATA`）、13 种 `thr_lock_type` **优先级编码进枚举值**、**排序代替死锁检测**（`sort_locks` 的 `LOCK_CMP` 全序）、写优先与防饥饿（`max_write_lock_count` 默认关闭）、MyISAM 并发插入 4 处锁升级；**InnoDB `lock_count()==0` 空壳**但 `thr_lock_type` 仍是跨层意图协议 |
 
 ### [cloud/](cloud/) —— 云环境（外部知识）
 
@@ -265,6 +284,8 @@
    ```
 4. **写好本篇的「参考」章节**（论文 / 官方文档 / 内核月报，按相关性取舍）
 
+   > **四类资料源都要查**（2026-09-20 用户拍板）：**① WorkLog**（dev.mysql.com/worklog，演进动机一手来源）、**② bug 论坛**（bugs.mysql.com，坑与已知缺陷的权威出处）、**③ Reference Manual**（官方手册，语义与行为基准）、**④ 内核月报**（腾讯云数据库内核月报等，视角与理论脉络）。动笔前先查这四处有没有相关内容，有就引用核实；bug 号 / WL 号要在正文或参考里给出。
+
 ---
 
 ## 准入标准
@@ -285,7 +306,7 @@
 |---|---|---|
 | **1** | **怎么设计的？为什么这么设计？用了什么思想理论？**（权衡取舍、被否决的方案、论文溯源、他库对比） | 「理论基础」——本章是文档价值的核心 |
 | **2** | **重点难点是什么，怎么讲清？**（反直觉处、隐含假设、复杂状态机） | 「核心实现」——**贴关键代码 + 逐段解释算法**，只给结论等于没写透 |
-| **3** | **怎么演进到今天的？**（各版本变了什么，以及**为什么变**） | 「概述·版本演进」记变化清单；「理论基础」记为什么变 |
+| **3** | **怎么演进到今天的？**（**5.7 → 8.0 → 最新 MySQL 的大演进**，各版本变了什么、为什么变） | 「概述·版本演进」记变化清单；「理论基础」记为什么变 |
 
 **加一条结构要求：模块要闭环。** 读者读完这一篇（或这个子目录），对该模块应形成完整认知，不留"讲了一半"的断口——上游谁调它、下游它调谁、边界在哪，都要交代（哪怕只一句交叉引用）。
 
@@ -309,7 +330,7 @@
 
 **说的东西必须真实存在**——函数名、结构成员、默认值都经本仓库源码核实（见「三、事实核验」）。
 
-**基线版本是本仓库的 MySQL 8.0.39。** 其他版本只在"版本演进"里作为对比出现。
+**基线版本是本仓库的 MySQL 8.0.39。** **版本演进是重点**：5.7 → 8.0 → **最新 MySQL** 的大演进必须讲清——不是贴"版本号 + 一句话"清单，而是讲"为什么在这个版本做这件事、机制怎么变的"；8.0.39 之后的最新变化（8.4 / 9.x，或更高 8.0 小版本）也要跟踪交代。
 
 ### 二、重点难点怎么讲
 
@@ -347,6 +368,8 @@
 判据：有继承体系 / 模板 / 所有权转移 / RAII / C 与 C++ 边界。写法是"为什么用、代价是什么"，
 **不是语法教学**。参考 [`server/infra/io_cache.md`](server/infra/io_cache.md) 与 [`server/dd/dd.md`](server/dd/dd.md) 的同名章。
 （C 结构如何被安全地包进 C++ 类——这条最能体现工程权衡，有就必写。）
+
+> **★ C++ 难点讲透是硬要求**（2026-09-20 用户拍板）：**复杂的 C++ 语法、高级用法、复杂继承结构、内存布局**——凡是对 C++ 功力要求较深、读者难以看懂的地方，都要**讲透搞清楚**（配继承树/内存布局图 + 逐段解释），不能一句带过。判据：一个没读过该模块的读者照着文档能否读懂代码——读不懂就是没讲透。
 
 **③ 面向二次开发：Misc 里给"动手改"需要的信息**
 

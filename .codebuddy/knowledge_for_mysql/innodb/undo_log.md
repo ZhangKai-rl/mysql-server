@@ -25,7 +25,7 @@
     - [DDL 与 Undo](#ddl-与-undo)
     - [GTID 持久化与 Undo](#gtid-持久化与-undo)
     - [Undo 与 Clone / 备份](#undo-与-clone--备份)
-- [Misc](#Misc)
+- [Misc](#misc)
 - [关键源码位置速查](#关键源码位置速查)
 - [参考](#参考)
 
@@ -1292,7 +1292,7 @@ InnoDB 的 GTID 持久化与 undo log 紧密耦合，有三条持久化路径：
 
 **Clone_persist_gtid 双 buffer**：`m_gtids[2]` 奇偶切换，事务写 active list，后台线程读 flush list。
 
-**purge 与 GTID 的协同**：purge 边界会被 GTID 持久化进度压低。`clone_oldest_view` 末尾调用 `view->reduce_low_limit(gtid_persistor.get_oldest_trx_no())`，若还有事务的 GTID 未持久化到 `mysql.gtid_executed` 表，它的 trx_no 不能被 purge 越过——因为 purge 会删 undo log，而 GTID 持久化依赖从 undo log header 读取 GTID。
+**purge 与 GTID 的协同**：purge 边界会被 GTID 持久化进度压低。`clone_oldest_view` 末尾调用 `view->reduce_low_limit(gtid_persistor.get_oldest_trx_no())`，若还有事务的 GTID 未持久化到 `mysql.gtid_executed` 表，它的 trx_no 不能被 purge 越过。**为什么**：运行期落表走内存双 buffer（与 undo 无关），但**崩溃恢复时** GTID 的唯一找回途径是从 undo header 扫出来（见下）——若 purge 把"GTID 尚未落表"的 undo 先删了，那个 GTID 就永久消失（表、binlog、undo 三处都没有），从库 GTID 集合出现空洞 ⇒ 重放/主从不一致。**完整的根因链与后果、水位落盘到 TRX_SYS 页（`TRX_SYS_TRX_NUM_GTID`）的崩溃安全性，见 [`../server/replication/gtid.md`](../server/replication/gtid.md)「purge 的相互牵制」节**。
 
 补充两点：一是**为什么 GTID 可以写进 undo header**——undo log header 里有专门的 XID 区与 GTID 区（`TRX_UNDO_FLAG_GTID` / `TRX_UNDO_FLAG_XA_PREPARE_GTID` 两个标志位区分普通 GTID 与 XA prepare GTID），写入时若空间不够会由 `trx_undo_header_add_space_for_xid` 把 header 往后扩展。二是**崩溃恢复时如何补回**：启动时扫描 rseg 的 undo slot，对每个非 CACHED 的 update undo 调 `trx_undo_gtid_read_and_persist`，从 undo header 里把 GTID 读出来补刷到 `mysql.gtid_executed`。完整链路与 `Gtid_set` 的区间表示见 [`../server/replication/gtid.md`](../server/replication/gtid.md)。
 

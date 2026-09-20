@@ -9,7 +9,6 @@
 | [pfs.md](pfs.md) | **Performance Schema**：内建可观测性框架（event-based tracing、PSI 接口、AOP 编织、零开销探针）+ PFS 设计模式 |
 | [memory.md](memory.md) | **内存分配器矩阵**：mem_heap（Bump）/ MEM_ROOT（Arena）/ buf_buddy（Buddy）/ jemalloc + 与 PFS 的交汇 |
 | [variables.md](variables.md) | 变量体系：系统变量 / 状态变量 / 用户变量 / 配置文件来源链路 |
-| [list.md](list.md) | 侵入式链表 |
 | [encoding.md](encoding.md) | **数据编码**：`mach_read/write_from/to_N` 固定宽度族、★ 两种压缩编码（`compressed` 5..9B / `much_compressed` 1..11B，动态元数据 redo 用它）、★ 端序规则（整数大端=字典序，浮点刻意小端）、★ `read` vs `parse`（后者带边界检查，不可信输入必须用 parse）、应用场景速查 |
 | [dbug.md](dbug.md) | DBUG 调试框架 |
 | [vio.md](vio.md) | VIO 通信抽象 |

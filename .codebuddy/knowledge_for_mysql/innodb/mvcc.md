@@ -1,6 +1,6 @@
 # MVCC / 一致性读 深度解析
 
-> 基于 MySQL 8.0.39 源码。涵盖 ReadView 结构与池化、可见性判定、undo 版本链回溯、半一致性读、purge 水位闭环、隔离级别全景。**边界**：undo 记录格式与 purge 执行流程见 [`undo_log.md`](undo_log.md)；事务对象 `trx_t` 与提交协议见 [`trx.md`](trx.md)；行锁（锁定读的加锁本身）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)；取行主链见 [`row_search.md`](row_search.md)。本篇讲"读到哪个版本"的判定与实现。
+> 基于 MySQL 8.0.39 源码。涵盖 ReadView 结构与池化、可见性判定、undo 版本链回溯、半一致性读、purge 水位闭环、隔离级别全景。**边界**：undo 记录格式与 purge 执行流程见 [`undo_log.md`](undo_log.md)；事务对象 `trx_t` 与提交协议见 [`trx.md`](trx.md)；行锁（锁定读的加锁本身）见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；取行主链见 [`row_search.md`](row_search.md)。本篇讲"读到哪个版本"的判定与实现。
 
 ## 目录
 
@@ -861,6 +861,6 @@ trx_purge → trx_sys->mvcc->clone_oldest_view(&purge_sys->view)
 
 - undo 记录格式与 purge 执行流程见 [`undo_log.md`](undo_log.md)
 - 事务对象 `trx_t`、提交协议（`trx_commit` 全时序）见 [`trx.md`](trx.md)
-- 行锁与隐式锁转换的加锁侧见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)
+- 行锁与隐式锁转换的加锁侧见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)
 - 取行主链（`row_search_mvcc` 全流程、回表、ICP）见 [`row_search.md`](row_search.md)
 - 二级索引记录格式（为什么没有 `DB_TRX_ID`）见 [`physical/record.md`](physical/record.md)

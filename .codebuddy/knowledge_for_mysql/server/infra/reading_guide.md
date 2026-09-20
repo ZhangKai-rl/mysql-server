@@ -5,7 +5,8 @@
 > "读不懂"的自诊断流程、参考资料与学术索引。
 
 > **边界**：本篇是**阅读源码的前置知识与方法论**（通用能力），不是某个机制的实现剖析；
-> 具体机制见 [`pfs.md`](pfs.md)、[`memory.md`](memory.md)、[`list.md`](list.md) 等同目录各篇，
+> 具体机制见 [`pfs.md`](pfs.md)、[`memory.md`](memory.md) 等同目录各篇，
+> 链表（`ut_list_base` / `SQL_I_List`）见 [`infra/structure/list.md`](../../infra/structure/list.md)，
 > 以及 [`variables.md`](variables.md)、[`encoding.md`](encoding.md)。
 > 本目录的文件索引见 [`README.md`](README.md)。
 
