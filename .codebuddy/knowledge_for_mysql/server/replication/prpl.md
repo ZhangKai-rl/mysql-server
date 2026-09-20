@@ -40,6 +40,8 @@
 - [Misc](#misc)
   - 扩展点：加一种依赖追踪模式要改哪几处
   - 容易误解的命名：两个 "logical clock"
+  - 生产实践要点
+  - 生产案例：无主键表引发的同步延迟
   - 常见问题 Q1~Q14
 - [参考](#参考)
 
@@ -183,6 +185,49 @@ static void trx_commit_in_memory(trx_t *trx, const mtr_t *mtr, bool serialised) 
     prepare ──► flush ──► sync ──► commit(释放锁)
                 (step)                        (update_max_committed)
 ```
+
+#### 为什么读 max_committed 而不是 transaction_counter：commit-parent-based 的幽灵
+
+`store_commit_parent` 有两个候选时钟可选——读 `m_transaction_counter`（已 flush 水位 = 处理进度）或读 `m_max_committed_transaction`（已提交水位 = 锁释放进度）。前者是 WL#7165 最初的设计（Commit-Parent-Based Scheme），5.7 早期实现过后改进为后者（Lock-Based Scheme，即现行 COMMIT_ORDER）。8.0.39 源码只有 lock-based——但这个被否决的方案是理解"为什么需要两个时钟"的最佳反例。
+
+**两种方案都安全，区别纯粹在并行度。** 先澄清一个常见误读：commit-parent-based 并不会"误判并行"。T2 能在 T1 还没 commit（仍在持锁）时调 `store_commit_parent`，**本身就证明 T2 没有被 T1 的锁阻塞**——否则 T2 根本执行不完用户 SQL、进不了 commit 流程。所以读哪个时钟都不会把真冲突的事务判成可并行（false negative 始终为零）。
+
+区别出在 group commit 的"**先批量 flush、再批量 commit**"特性上。一组事务的 flush 是 leader 串行的（`m_transaction_counter` 逐个递增），但 commit 被延迟到整组 flush+sync 之后统一执行（`m_max_committed_transaction` 一次性跳到组尾）。同一时间窗口内：
+
+```
+T1 先拿到锁 → store_commit_parent
+   prepared 方案读: m_transaction_counter = 0  → T1.lc = 0
+   lock-based 读:  m_max_committed        = 0  → T1.lc = 0
+T1 flush → m_transaction_counter = 1
+
+T2 后拿到锁（锁与 T1 不冲突，同组）→ store_commit_parent
+   prepared 方案读: m_transaction_counter = 1  → T2.lc = 1  ← 被 T1 "拖住"
+   lock-based 读:  m_max_committed        = 0  → T2.lc = 0  ← 与 T1 并级
+```
+
+prepared 方案把"已 flush 但还没 commit"的**同组伙伴**（T1）误当作依赖——T2.lc=1=T1.sn，从库让 T2 等 T1 完成。但 T1 和 T2 锁区间重叠（无冲突），本可并行。lock-based 读的是"已放锁"水位，同组事务读到的是**组前**的 max_committed，lc 相同 → 从库可全部并行。
+
+结论：`m_max_committed_transaction` 比 `m_transaction_counter` 贵一个时钟的维护成本，换来的是**同组事务不被互相串行化**。这正是「两个时钟不可合并」的另一面——合并成一个（flush 时 step）就退化成 commit-parent-based，损失同组并行度；合并成一个（commit 时 step）则 sequence_number 没值可写进 binlog（发号必须在 flush 时完成，见「核心概念」）。
+
+#### 三个概念不能混：lock interval / sequence_number / last_committed
+
+三个概念是**因果链上的三个环节**，不是同义词：
+
+| 概念 | 层面 | 本质 | 是否写入 binlog |
+|------|------|------|----------------|
+| **lock interval** | 物理事实 | 事务实际持有所有锁的时间区间 [L, C] | 否——从库永远看不到 |
+| **sequence_number** | 逻辑编号 | 事务进入 flush 的全局递增序号 | 是，写入 Gtid_log_event |
+| **last_committed** | 依赖标记 | L 点时刻已 commit 事务的最大 sequence_number | 是，写入 Gtid_log_event |
+
+因果关系：
+
+```
+lock interval（物理事实，主库引擎内）
+  ├─ L 点（获取所有锁）→ 触发 store_commit_parent → 产生 last_committed（依赖标记）
+  └─ C 点（释放锁）   → 触发 update_max_committed → m_max_committed 推进到该事务的 sequence_number
+```
+
+从库拿到的是 last_committed 和 sequence_number 两个**数值**，用它**反推** lock interval 是否重叠——从库看不到真正的 lock interval。这正是两个时钟存在的意义：把主库引擎内的"锁持有区间"信息**编码**进两个整数，让从库只靠比较整数就能安全并行。
 
 | 中文 | 英文 | 说明 |
 |---|---|---|
@@ -2859,6 +2904,13 @@ Trx1和Trx2 并行，Trx4和Trx5 都对 lc=2 满足条件后也可并行（在 T
 
 ### Writeset Hash 生成机制
 
+#### 双用途：不止服务并行复制
+
+`Rpl_transaction_write_set_ctx` 的 writeset 有**两个消费者**，本篇只讲第一个：
+
+1. **并行复制依赖跟踪**（本篇主题）：`Writeset_trx_dependency_tracker` 查 `m_writeset_history` 压低 commit_parent（见「主库侧：依赖追踪」）。
+2. **Group Replication 冲突检测认证**：writeset 写入 `Transaction_context_log_event` 随事务广播给组成员，认证线程（certification）比对 writeset 交集检测跨节点事务冲突。本篇不展开（MGR 体系），但它解释了为什么 writeset 计算被放在"事务级上下文"里而不是依赖追踪器内部——它是**复制体系共享的产物**，谁需要谁消费。
+
 #### 核心函数：add_pke
 
 Writeset 的核心是 **PKE（Primary Key Equivalent）**——主键等价值。定义在 [rpl_write_set_handler.cc](sql/rpl_write_set_handler.cc)。
@@ -3818,6 +3870,49 @@ static bool check_binlog_transaction_dependency_tracking(sys_var *, THD *, set_v
 
 > 相关：binlog 写入与组提交（本篇上游）见 [`binlog.md`](binlog.md)。
 
+### 生产实践要点
+
+- **`replica_parallel_workers=1` 比 0 还慢约 20%**：设 1 时 SQL thread 变成 coordinator，但只有 1 个 worker——事务多一次"coordinator 派发 → worker 执行"的转发与队列开销，性能比纯单线程（0）更差。要么 0，要么 >= 2。
+- **级联复制下并行度逐级衰减**：中间从库回放后**重新写 binlog 时依赖信息重新生成**（按中间库自己的提交顺序与锁情况），与原始 `last_committed` 无关——每一级都保守一点，离 source 越远的 replica 并行性越差。
+- **`replica_preserve_commit_order` 的版本要求**：5.7.18 无法保证提交顺序一致（并发提交乱序 bug），5.7.19 才修复——生产用 MTS + 保序至少 5.7.19+（8.0 默认 ON，无此问题）。
+- **主库低负载时 MTS 退化**：组提交合并程度低时每组可能只有 1 个事务，从库并行度 = 主库并发度；此时 MTS 反而因 coordinator 转发与队列开销比单线程慢。低并发主库 + MTS 从库的组合需要实测验证收益。
+
+### 生产案例：无主键表引发的同步延迟
+
+> 案例来源：腾讯云开发者社区（cloud.tencent.com/developer/article/1688866）
+
+**现象**：ROW 模式 binlog 下，无主键大表执行批量 UPDATE/DELETE，备库/只读实例同步延迟巨大且持续上升（binlog 落后字节不多，但时间差不为零）。
+
+**根因：N 个行事件 × 每行全表扫描定位 = O(N²)**。一条批量 SQL 影响 N 行，ROW 模式生成 N 个独立的行事件，从库必须逐条"定位 + 修改"。定位成本由有无主键决定：
+
+| | 有主键 | 无主键 |
+|---|---|---|
+| 事件数量 | N 个（固定） | N 个（固定） |
+| 每行定位 | 主键索引 `ha_index_read_map`，O(log N) | 全表扫描 `ha_rnd_next`，O(N) |
+| 总成本 | O(N log N) | **O(N²)** |
+
+两个因子缺一不可：只有"N 个事件"（有主键）每个事件 O(log N) 很快；只有"无主键"（单行 UPDATE）一次全表扫描也能忍。**叠加才爆炸**。主库执行时是"一次 SQL + 迭代器扫全表"（扫描是自然的、只有一次），从库回放是"N 次独立定位"，没有迭代器上下文可复用。
+
+**无主键对复制的三重影响**：
+
+1. **行定位慢**（本案例直接原因）：从库定位由 `slave_rows_search_algorithms` 控制（8.0.26 默认 `INDEX_SCAN,HASH_SCAN`），无主键则退到 `TABLE_SCAN` 全表扫描。
+2. **`binlog_row_image` 无法 MINIMAL**：MINIMAL 的 before-image 只记主键列，无主键无法唯一标识行 → 只能 FULL/NOBLOB，binlog 体积增大。
+3. **WRITESET 依赖跟踪降级**：writeset 基于主键哈希（PKE）计算，无主键表 `writeset->size()==0` → 整事务回退 COMMIT_ORDER（见「Writeset Hash 生成机制」的降级表），从库并行度下降。
+
+**处置**：给表加主键/唯一索引（可用自增列）后重建受影响的从库。检查无主键表的 SQL：
+
+```sql
+SELECT table_schema, table_name FROM information_schema.tables t
+ WHERE t.table_type = 'BASE TABLE'
+   AND t.table_schema NOT IN ('sys','mysql','information_schema','performance_schema')
+   AND NOT EXISTS (SELECT 1 FROM information_schema.columns c
+                    WHERE c.table_schema = t.table_schema
+                      AND c.table_name = t.table_name
+                      AND c.column_key = 'PRI');
+```
+
+> 结论：无主键表在复制全链路都是杀手——binlog 大（无法 MINIMAL）、回放慢（N 次全表扫描）、并行度低（WRITESET 回退）。主键不只是查询优化手段，是复制体系的基础设施。
+
 ### 常见问题 Q1~Q14
 
 
@@ -4057,6 +4152,8 @@ void Commit_order_trx_dependency_tracker::rotate() {
 }
 // offset 被设为当前的全局 state 值，比如 10000
 ```
+
+**为什么两个 offset 都用 `m_transaction_counter` 的值？** 因为 rotate 发生在 commit stage 末尾，此刻可能存在"已 flush（`m_transaction_counter` 已 step）但还没 commit（`m_max_committed_transaction` 还没更新）"的事务。用**领先的** `m_transaction_counter` 做 offset，保证这些在途事务的绝对 sequence_number ≥ offset、减出来是正数；若用落后的 `m_max_committed_transaction`，这些事务会减出负数被误记 `SEQ_UNINIT`，丢失依赖信息。
 
 **对比两种方案：**
 

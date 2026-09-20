@@ -53,7 +53,7 @@
 | [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
 | [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
-| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/事件字节布局/GTID 持久化/读侧 dump/半同步）、gtid、replication（主从）、prpl（并行复制）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
+| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/事件字节布局/GTID 持久化/读侧 dump/半同步）、gtid、replication（复制拓扑与故障转移：协议/双定位/拓扑/过滤/延迟复制/GTID_ONLY/failover）、prpl（并行复制）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
 | [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配
 | [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
 | [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |

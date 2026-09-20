@@ -906,6 +906,59 @@ Rpl_info（基类：data_lock/run_lock/sleep_lock/info_thd_lock + start/stop/dat
 | 位点仓库内容 | SQL | `SELECT * FROM mysql.slave_master_info` / `mysql.slave_relay_log_info`（TABLE 仓库） |
 | IO 线程重连历史 | 日志 | error log 的 `ER_RPL_REPLICA_ERROR_RETRYING`、`replica_retried_transactions` |
 
+### 经典错误码速查
+
+> 错误码是复制的"体检报告"——`Last_IO_Errno` / `Last_SQL_Errno` 直接告诉你链路断在哪一段。本节按 IO 侧 / SQL 侧 / GTID 侧 / MTS 侧分类，错误码名称与消息均经 8.0.39 `share/messages_to_clients.txt` 核实；5.7 旧编号在 8.0 的改名/删除情况逐条标注。
+
+#### IO 侧：拉取与落盘失败
+
+| 错误码 | 名称 | 触发场景 | 根因与排查 |
+|--------|------|---------|-----------|
+| **13114** | `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG` | dump 时主库报错"Got fatal error from source when reading data from binary log" | ★ 经典 1236 的 8.0 版。**同一错误的两个形态**：主库 dump 线程发 `ER_SOURCE_FATAL_ERROR_READING_BINLOG`（客户端错误码），从库 IO thread 收到后包装成 `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`=13114 记入 `Last_IO_Errno`（rpl_replica.cc 的 `handle_slave_io` switch 分支）。file+pos 模式：请求的 binlog 已被 purge 或从未存在；GTID 模式：集合校验失败（见 GTID 侧）。排查：主库 `SHOW BINARY LOGS` 对比 `Read_Source_Log_Pos`；处置：file+pos 重建复制或 `CHANGE REPLICATION SOURCE TO AUTO_POSITION=1` |
+| `ER_REPLICA_RELAY_LOG_WRITE_FAILURE` | 同左 | `queue_event` 写 relay log 失败 | 磁盘满/只读/permission；IO thread 终止但 SQL thread 可继续消费存量 relay log |
+| `ER_NETWORK_READ_EVENT_CHECKSUM_FAILURE` | 同左 | 网络传输 checksum 校验失败（`queue_event` 入口） | 网络损坏/半途断包；IO 重连后主库重发（checksum 在入队前校验，脏数据不落 relay log） |
+| `ER_RELAY_LOG_INIT` | 同左 | relay log 位点初始化失败（"Failed initializing relay log position"） | 常与 index 文件损坏、位点仓库内容非法有关；见「坑与已知缺陷」的 Bug #92882 |
+
+#### SQL 侧：回放数据不一致（★ 最高频且最危险的类别）
+
+| 错误码 | 名称 | 触发场景 | 根因与排查 |
+|--------|------|---------|-----------|
+| **1032** | `ER_KEY_NOT_FOUND` | 回放 DELETE/UPDATE 时用 before-image 定位不到行 | 主从数据已分叉（从库少了行、主库修改过该行、或从库手动改过数据）。经典诱因：从库被误写、`SET SQL_LOG_BIN=0` 改主库、主库 binlog 部分丢失 |
+| **1062** | `ER_DUP_ENTRY` | 回放 INSERT 时主键冲突 | 从库多了行（同 1032 的反向分叉）；诱因同上 |
+| **1146** | `ER_NO_SUCH_TABLE` | 回放 DML 时表不存在 | 从库缺 DDL（DDL 被过滤/复制权限不足/手滑 `DROP` 了从库的表） |
+| **1050** | `ER_TABLE_EXISTS_ERROR` | 回放 CREATE 时表已存在 | 与 1146 对称的分叉 |
+| **1205** | `ER_LOCK_WAIT_TIMEOUT` | 回放 DML 行锁等待超时（`innodb_lock_wait_timeout`） | 从库本地负载（读写分离）与回放抢行锁；MTS 下 worker 间也可能互等 |
+| **1213** | `ER_LOCK_DEADLOCK` | 回放 DML 死锁 | 同上，且 MTS 并行回放两个本应串行的事务时可能触发（主库依赖编码的 false negative 或本地写与回放交错） |
+| `ER_REPLICA_CANT_CREATE_CONVERSION` | 同左 | 字符集转换表创建失败 | 从库缺字符集/字符集不一致 |
+
+**1032/1062 的通用处置**：确认分叉后，`SET GLOBAL SQL_REPLICA_SKIP_COUNTER=1`（GTID 模式用 `SET GTID_NEXT` 注入空事务）跳过后用 `pt-table-checksum` / `pt-table-sync` 修复数据，或重建从库。跳过是治标，数据修复是治本。
+
+#### GTID 侧：集合校验失败
+
+| 错误码 | 名称 | 触发场景 | 根因 |
+|--------|------|---------|------|
+| `ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE` | 同左 | 从库 exclude 集合 ⊄ 主库 `executed ∪ owned` | GTID 分叉：从库执行了主库没有的事务（从库曾被提升写数据 / 主库 binlog 截断丢失）。消息明说 "source may have rolled back transactions that were already replicated to the replica" |
+| `ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS` | 同左 | 主库 `lost_gtids` ⊄ 从库 exclude 集合 | 主库 purge 掉了从库还没收到的事务——数据在主库已物理消失，复制无解。处置：从备份重建从库（消息原文 "provision a new replica from backup"）。**预防**：purge binlog 前确认所有从库 `Exec_Source_Log_Pos` 已过 purge 点 |
+
+> 这两个错误码的完整判定逻辑（dump 线程的三道校验）见 [`gtid.md`](gtid.md)「GTID 复制协议：exclude 集合」。
+
+#### MTS 侧：并行调度相关
+
+| 错误码 | 名称 | 触发场景 | 说明 |
+|--------|------|---------|------|
+| `ER_REPLICA_WORKER_STOPPED_PREVIOUS_THD_ERROR` | 同左 | `replica_preserve_commit_order=ON` 时某 worker 报错后，后序 worker 连带停止 | 保序机制的代价：前序事务未提交，后序已执行完的事务也不能提交（消息原文 "the last transaction executed by this thread has not been committed"）。修复主 worker 错误后需一并重启 |
+| `ER_WARN_OPEN_TEMP_TABLES_MUST_BE_ZERO` | 同左 | 需要临时表清零才能安全执行的操作 | 警告级：临时表会保持打开直到重启或被复制的 DROP 删除 |
+
+**8.0 删除/改名的对照（5.7 经验直接迁移会踩坑）**：
+
+| 5.7 名称/编号 | 8.0.39 实际 | 说明 |
+|--------------|------------|------|
+| `ER_MTS_INCONSISTENT_DATA`（1756） | **已删除**（全仓库 0 匹配） | 5.7 MTS gap 恢复的经典错误码；8.0 的 MTS 恢复重写后不再需要（见「relay log recovery」的 `UNTIL SQL_AFTER_MTS_GAPS` 路径） |
+| `ER_MASTER_FATAL_ERROR_READING_BINLOG`（1236） | `ER_SOURCE_FATAL_ERROR_READING_BINLOG`（主库侧）/ `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`（13114，从库侧 `Last_IO_Errno`） | 术语改名（master→source），且拆成主从两侧两个符号 |
+| `ER_SLAVE_RELAY_LOG_READ_FAILURE` / `ER_SLAVE_RELAY_LOG_WRITE_FAILURE` | `OBSOLETE_` 前缀标记 | 消息文件里已标记废弃，实际使用新名 `ER_REPLICA_*` |
+
+**排查顺序总结**：`Last_IO_Errno` ≠ 0 → 看 IO 侧（连接/拉取/purge）；`Last_SQL_Errno` ≠ 0 → 看 SQL 侧（1032/1062 = 数据分叉，1205/1213 = 锁，1146/1050 = DDL 分叉）；GTID 侧两个错误码在任何一侧都可能出现，本质是集合校验失败而非线程故障。
+
 ---
 
 ## Misc

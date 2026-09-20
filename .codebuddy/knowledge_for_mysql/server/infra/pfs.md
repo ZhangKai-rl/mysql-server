@@ -393,6 +393,128 @@ PFS_status_variable_cache（状态变量）
 
 物化后的行对象：`System_variable`/`Status_variable` 各持 `m_value_str[SHOW_VAR_FUNC_BUFF_SIZE+1]`（1025 字节）——这就是 `VARIABLE_VALUE VARCHAR(1024)` 的由来。
 
+#### 物化家族全景：6 个入口函数 × 表
+
+系统变量与状态变量的物化**语义完全不同**——状态变量是"跨线程求和"，系统变量是"选择读哪份存储"（GLOBAL 值 vs 某个 THD 的会话值）。这一差异决定了两个 cache 类的入口函数形态：
+
+| 表 | 入口函数 | 读谁的存储 |
+|---|---|---|
+| `global_variables` | `PFS_system_variable_cache::do_materialize_global()` | `global_system_variables`（用 `m_current_thd` 求值） |
+| `session_variables` | `PFS_system_variable_cache::do_materialize_all(THD*)` | 本会话 `current_thd->variables` |
+| `variables_by_thread` | `do_materialize_session(PFS_thread*)` / `(PFS_thread*, uint index)` | 任意线程（`get_THD` 校验后） |
+| `global_status` | `PFS_status_variable_cache::do_materialize_global()` | 全局基线 + **Σ 全部 THD** |
+| `session_status` | `PFS_status_variable_cache::do_materialize_all(THD*)` | 本会话 `status_var`（快照优先） |
+| `status_by_thread/user/host/account` | `do_materialize_session(PFS_thread*)` / `do_materialize_client(PFS_client*)` | 单线程求和 / client 维度聚合 |
+
+#### INITIALIZE 细节：系统变量的清单构建
+
+系统变量版的 `init_show_var_array` 与状态变量版（遍历 `all_status_vars` 数组）完全不同——它从**双 hash** 枚举：
+
+```cpp
+bool PFS_system_variable_cache::init_show_var_array(enum_var_type scope, bool strict) {
+  assert(!m_initialized);
+  m_query_scope = scope;
+
+  mysql_rwlock_rdlock(&LOCK_system_variables_hash);      // 防插件装卸改 dynamic hash
+
+  /* Record the system variable hash version to detect subsequent changes. */
+  m_version = get_dynamic_system_variable_hash_version();
+
+  /* Build the SHOW_VAR array from the system variable hash. */
+  System_variable_tracker::enumerate_sys_vars(true, m_query_scope, strict,
+                                              &m_sys_var_tracker_array);
+
+  mysql_rwlock_unlock(&LOCK_system_variables_hash);
+
+  /* Increase cache size if necessary. */
+  m_cache.reserve(m_sys_var_tracker_array.size());
+
+  m_initialized = true;
+  return true;
+}
+```
+
+要点：① `enumerate_sys_vars(sort=true, ...)` —— 清单**排序**（状态变量的 `all_status_vars` 是注册期排序，系统变量是每次物化时排序，因为 dynamic hash 是乱序的）；② `m_version = get_dynamic_system_variable_hash_version()` —— 快照版本号，用于检测"查询期间插件被装卸"（与状态变量侧 `get_status_vars_version()` 对应）；③ 输出是 `Prealloced_array<System_variable_tracker, 200>`（预分配 200 槽）。
+
+`external_init=true` 的表（`variables_by_thread`）不走这个函数，而是在 `rnd_init()` 先调 `do_initialize_session()`（`LOCK_plugin_delete` 内建一次 `OPT_SESSION, strict=true` 数组），后续对每个线程**复用**该数组——避免 N 个线程 N 次重建 hash 枚举。
+
+#### 系统变量版的 scope 过滤（`match_scope`）
+
+注意它与状态变量版的 `match_scope` 语义不同——系统变量按 `sys_var::scope()` 三分支：
+
+```cpp
+bool PFS_system_variable_cache::match_scope(int scope) {
+  switch (scope) {
+    case sys_var::GLOBAL:       return m_query_scope == OPT_GLOBAL;
+    case sys_var::SESSION:      return (m_query_scope == OPT_GLOBAL || m_query_scope == OPT_SESSION);
+    case sys_var::ONLY_SESSION: return m_query_scope == OPT_SESSION;
+    default:                    return false;
+  }
+}
+```
+
+含义：`SHOW GLOBAL VARIABLES` 显示 GLOBAL-only + **所有有 GLOBAL 副本的 SESSION 变量**（`SESSION` 分支对 OPT_GLOBAL 也返回 true），但不显示 ONLY_SESSION 变量（如 `gtid_next`、`sql_log_bin`——它们没有全局副本）；`SHOW SESSION VARIABLES` 显示 SESSION + ONLY_SESSION，不显示 GLOBAL-only。
+
+#### 两个入口的实现差异（do_materialize_global vs do_materialize_all）
+
+系统变量版 `do_materialize_global()`（`global_variables` 表）——**没有 get_THD**，用当前线程求值即可：
+
+```cpp
+int PFS_system_variable_cache::do_materialize_global() {
+  mysql_mutex_lock(&LOCK_plugin_delete);
+  m_materialized = false;
+  if (!m_external_init) {
+    init_show_var_array(OPT_GLOBAL, true);          // strict=true
+  }
+  for (const System_variable_tracker &i : m_sys_var_tracker_array) {
+    auto f = [this](const System_variable_tracker &, sys_var *sysvar) -> void {
+      if (match_scope(sysvar->scope())) {
+        const SHOW_VAR show_var{sysvar->name.str, pointer_cast<char *>(sysvar),
+                                SHOW_SYS, SHOW_SCOPE_UNDEF};
+        const System_variable system_var(m_current_thd, &show_var, m_query_scope);
+        m_cache.push_back(system_var);
+      }
+    };
+    (void)i.access_system_variable(m_current_thd, f, Suppress_not_found_error::YES);
+  }
+  m_materialized = true;
+  mysql_mutex_unlock(&LOCK_plugin_delete);
+  return 0;
+}
+```
+
+`do_materialize_all(THD *unsafe_thd)`（`session_variables` 表）——三个与上面不同的关键点：
+
+```cpp
+int PFS_system_variable_cache::do_materialize_all(THD *unsafe_thd) {
+  m_unsafe_thd = unsafe_thd;
+  ...
+  if (!m_external_init) {
+    init_show_var_array(OPT_SESSION, false);        // ① strict=false（非严格）
+  }
+  THD_ptr thd_ptr = get_THD(unsafe_thd);            // ② 校验本会话 THD（unsafe_thd 就是 current_thd）
+  m_safe_thd = thd_ptr.get();
+  if (m_safe_thd != nullptr) {
+    for (const System_variable_tracker &i : m_sys_var_tracker_array) {
+      auto f = [this](const System_variable_tracker &, sys_var *sysvar) {
+        SHOW_VAR show_var;
+        show_var.name = sysvar->name.str;
+        show_var.value = (char *)sysvar;
+        show_var.type = SHOW_SYS;
+        show_var.scope = SHOW_SCOPE_UNDEF;
+        /* Resolve value, convert to text, add to cache. */
+        const System_variable system_var(m_safe_thd, &show_var, m_query_scope);  // ③ 无 match_scope
+        m_cache.push_back(system_var);
+      };
+      (void)i.access_system_variable(m_current_thd, f, Suppress_not_found_error::YES);
+    }
+    ...
+```
+
+解释三点差异：① **`strict=false`** —— 非严格模式下 `enumerate_sys_vars` 的 scope 过滤放宽，GLOBAL-only 变量（如 `gtid_mode` 的全局值）也会出现在 session 视图里（与 `SHOW SESSION STATUS` 出现 `Uptime` 同理——"本会话能看到的都给你"）；② 求值循环里**没有 `match_scope` 二次过滤**（过滤已在 INITIALIZE 阶段完成，这点与 `do_materialize_global` 的"边枚举边过滤"不同）；③ `System_variable(m_safe_thd, ...)` 用 `m_safe_thd` 求值——读的是**该 THD 的 `variables`**，而 `do_materialize_global` 用 `m_current_thd` 读全局值（`sys_var::value_ptr` 里 `type==OPT_GLOBAL` 走 `global_value_ptr`）。
+
+**配套的内存管理**：物化可能产生大量文本值（几百个变量的字符串），`do_materialize_session(PFS_thread*)` 在 `m_use_mem_root` 时调 `set_mem_root()`——把 `THR_MALLOC`（`thd->mem_root` 的宏）临时切换到专用 `m_mem_sysvar`（`SYSVAR_MEMROOT_BLOCK_SIZE` 块），物化完 `clear_mem_root()` 一次性释放并恢复，**避免耗尽被观察线程的 THD mem_root**（你正在读的那个线程的内存池不属于你）。
+
 #### 线程间读：如何安全地读"别的线程"的会话变量
 
 `variables_by_thread`/`session_variables` 需要读**任意 THD**（含后台线程）的会话变量，这是整个机制最需要小心的部分。`do_materialize_session` 的三重防护：
@@ -426,6 +548,8 @@ int PFS_system_variable_cache::do_materialize_session(PFS_thread *pfs_thread) {
 要点：① `LOCK_plugin_delete` 防插件装卸（静态变量免锁直取，动态变量持 `LOCK_system_variables_hash` 读锁——由 `access_system_variable` 按 Lifetime 分派）；② `get_THD` 经 thread manager 校验"该 PFS_thread 对应的 THD 还活着"，拿到引用计数保护的 `THD_ptr`——线程可能在物化中途结束，这是 8.0 修过的悬垂指针坑；③ 真正求值（`System_variable` 构造 → `sys_var::value_ptr(running_thd, target_thd, ...)`）时对 target_thd 拿 `LOCK_thd_sysvar`，区分 running_thd（执行查询的线程）与 target_thd（被读的线程）。
 
 注意系统变量与状态变量在这点的差异：状态变量走 `manifest()` 直接用 `get_one_variable`，无 SHOW_SYS 类型；系统变量物化时才构造 `SHOW_SYS` 的 SHOW_VAR（value 是 `sys_var*`），复用同一条求值链。
+
+还有第三个重载 `do_materialize_session(PFS_thread*, uint index)`：**按索引只物化单个变量**——`variables_by_thread` 的 `rnd_pos()`（点查 `WHERE THREAD_ID=x AND VARIABLE_NAME='y'` 走索引定位）用它避免物化整个线程的全部变量，`index` 是 `m_sys_var_tracker_array` 中的槽位。
 
 #### 状态变量的聚合（do_materialize_global）
 

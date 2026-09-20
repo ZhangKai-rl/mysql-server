@@ -48,6 +48,8 @@
 
 ### 一张总图
 
+**写路径**（谁在改变量值）：
+
 ```
                     ┌────────────── 来源（写入路径） ──────────────┐
                     │ 命令行 --max-connections=100                 │
@@ -69,7 +71,26 @@
        语句执行 ++counters ──► System_status_var（连续 ulonglong 块，per-THD）
                               ├─ 会话结束 ──► global_status_var（add_to_status）
                               └─ PFS 聚合 ──► status_by_thread/user/host/account
-       查询：SHOW STATUS ──(语法重写)──► SELECT ... FROM performance_schema.global_status
+```
+
+**读路径**（谁在读变量值）——8.0 的"汇聚点"是 PFS 表：
+
+```
+读变量值
+├─ SHOW [GLOBAL|SESSION] VARIABLES ──(语法重写)──► pfs.global_variables / session_variables
+├─ SHOW [GLOBAL|SESSION] STATUS   ──(语法重写)──► pfs.global_status / session_status
+├─ SELECT FROM pfs.variables_by_thread / status_by_thread / status_by_user/host/account
+├─ SELECT FROM pfs.variables_info / persisted_variables / user_variables_by_thread
+└─ SHOW ENGINE INNODB STATUS/MUTEX ──(唯一不经过 PFS 的例外)──► handlerton::show_status
+                                                                 └─► protocol 直出长文本（1 MiB 截断）
+```
+
+**元数据卫星**（变量相关的周边对象）：
+
+```
+mysql.component      ← 组件注册的系统变量（卸载即摘除）
+mysql.gtid_executed  ← GTID 变量的持久化落点（见 replication/gtid.md）
+sys.metrics          ← 基于 pfs.global_status 等表的视图
 ```
 
 ---
@@ -409,6 +430,54 @@ static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
 
 `innodb_buffer_pool_size_update` 是"update 钩子不能做重活"的反例：它**不直接 resize**，只做状态机检查（`buf_pool_resize_status_code` 必须 COMPLETE/FAILED）→ 校验对齐 → `os_event_set(srv_buf_resize_event)` 唤醒**后台线程** → 写回对齐值。InnoDB 还消费来源追踪：`innodb_dedicated_server` 生效前判断 `innodb_buffer_pool_size` 的 source 是否 `COMPILED`（用户没显式设才允许自动调优）。
 
+#### 锁全景与锁序（防死锁契约）
+
+变量体系横跨"插件管理、会话、全局、状态"四类数据结构，锁有六把以上。防死锁的办法不是逐对分析，而是**一条全局锁序链**——所有路径按同一顺序拿锁。PFS 源码里留了正式契约（`pfs_variable.h` 的 LOCK PRIORITIES 注释）：
+
+```
+System Variables:
+  LOCK_plugin_delete              (block plugin delete)
+   LOCK_system_variables_hash
+   LOCK_thd_data                  (block THD delete)
+   LOCK_thd_sysvar                (block system variable updates,
+                                   alloc_and_copy_thd_dynamic_variables)
+     LOCK_global_system_variables (very briefly held)
+
+Status Variables:
+  LOCK_status
+    LOCK_thd_data                 (block THD delete)
+```
+
+补上插件侧的两个既有顺序（`sql_plugin.cc` 多处一致：装载/卸载三件套 `LOCK_plugin_delete → LOCK_system_variables_hash(wr) → LOCK_plugin`；新连接 `plugin_thdvar_init` 里 `LOCK_global_system_variables → LOCK_plugin`），可以串成一条**总序**：
+
+```
+LOCK_plugin_delete → LOCK_system_variables_hash → LOCK_thd_data
+  → LOCK_thd_sysvar → LOCK_global_system_variables → LOCK_plugin
+```
+
+（`LOCK_status → LOCK_thd_data` 是状态变量侧的另一条短链；`LOCK_persist_file` 独立；gtid_mode 的 `Gtid_mode::lock → channel_map → log_lock → global_sid_lock` 是业务侧独立链，见 [`../replication/gtid.md`](../replication/gtid.md)。）
+
+各路径按序核对：
+
+| 路径 | 拿锁顺序 | 依据 |
+|---|---|---|
+| `SET GLOBAL`（`sys_var::update` 全局分支） | `PLock_global_system_variables` → 变量 `guard` | set_var.cc：两把顺序拿，读路径 `value_ptr` 对称 |
+| `SET SESSION` | `thd->LOCK_thd_sysvar` | 保护 `thd->variables` 与跨线程读 |
+| PFS 物化会话变量 | `LOCK_plugin_delete` → `LOCK_system_variables_hash(rd)` → `get_THD`（`LOCK_thd_data`）→ `LOCK_thd_sysvar` → `LOCK_global_system_variables` | pfs_variable.h 注释 + do_materialize_* |
+| 插件装载/卸载 | `LOCK_plugin_delete` → `LOCK_system_variables_hash(wr)` → `LOCK_plugin` | sql_plugin.cc 1197/1475/2049/2144/2325 |
+| 新连接拷贝变量 | `LOCK_global_system_variables` → `LOCK_plugin` | `plugin_thdvar_init` |
+| 插件变量增量 COW | `LOCK_system_variables_hash(rd)` → `LOCK_global_system_variables` | `alloc_and_copy_thd_dynamic_variables` |
+| 状态变量聚合 | `LOCK_status` → `LOCK_thd_data` | pfs_variable.h + `do_materialize_global` |
+| 用户变量读写 | `LOCK_thd_data` | `THD::user_vars` |
+| PERSIST 落盘 | cache 内部 mutex → `m_LOCK_persist_file` | `flush_to_file`（独立于上链，文件锁） |
+
+四个防死锁设计点：
+
+1. **`pre_update` 提前到加锁前**：`sys_var::update` 开头注释明说——"Invoke preparatory step ... before we have acquired any locks allows to invoke code which acquires other locks without introducing deadlocks"。`on_update` 钩子（可能拿别的业务锁）被延迟到锁内执行是危险的，所以拆出一个加锁前的阶段。
+2. **GLOBAL 写必须拿两把锁**：`PLock_global_system_variables` + `guard`。代码注释给出理由——"If we'll take only 'guard' here, then value_ptr() for strings won't be safe in SHOW VARIABLES anymore"（字符串变量的值指针在多线程下需要双锁保护，否则 SHOW 可能读到半截）。
+3. **`LOCK_status` 非递归 + 手工引用计数**：`SHOW STATUS` 内部可能再次触发 PFS 物化（嵌套查询），`THD::fill_status_recursion_level` 手工计数"第一次才拿锁"（字段名是历史遗留，注释里提到的 `fill_status()` 函数早已不存在）。
+4. **版本号作乐观快照**：`dynamic_system_variable_hash_version` / `status_var_array_version` 不是锁——物化前记录版本、期间检测变化，避免长事务持锁（读写锁只保护"枚举 hash"那一小段）。
+
 ### D. SET 语句与 `SET PERSIST`
 
 #### 主链路：`SET GLOBAL max_connections = 1000`
@@ -712,6 +781,75 @@ Query_block *build_show_global_variables(...) {
 
 `SHOW [GLOBAL|SESSION] VARIABLES` ⇒ `SELECT ... FROM performance_schema.global_variables / session_variables`。**系统变量与状态变量在 8.0 走了同一条"SHOW → PFS 表"的通道**，这就是为什么 PFS 的实现注释说它们"implemented differently in the server, but the steps to process them are essentially the same"。
 
+#### 端到端主链路：`SHOW VARIABLES` 的完整旅程
+
+把上面的重写 + pfs.md 1.9 的 cache 实现串起来，一次 `SHOW VARIABLES` 从敲命令到出结果的完整调用栈是：
+
+```
+客户端发 "SHOW VARIABLES"
+  dispatch_command → mysql_parse → parse_sql
+    → yyparse: show_variables → PT_show_variables
+      → PT_show_variables::make_cmd()
+          → build_show_global_variables()          （或 build_show_session_variables）
+              → build_query()：构造
+                  SELECT * FROM (SELECT VARIABLE_NAME AS Variable_name,
+                                         VARIABLE_VALUE AS Value
+                                 FROM performance_schema.global_variables) global_variables
+                  末尾 lex->sql_command = SQLCOM_SHOW_VARIABLES   ★ 恢复命令类型
+  → mysql_execute_command case SQLCOM_SHOW_VARIABLES
+      → Sql_cmd_show_variables::execute()
+          → Sql_cmd_show::execute() → Sql_cmd_select::execute()   ★ 它真的是条 SELECT
+              → 优化器/执行器 → ha_perfschema::rnd_init
+                  → table_global_variables::rnd_init()            storage/perfschema/table_global_variables.cc
+                      → m_sysvar_cache.materialize_global()
+                          → PFS_system_variable_cache::do_materialize_global()
+                              ├─ mysql_mutex_lock(&LOCK_plugin_delete)
+                              ├─ init_show_var_array(OPT_GLOBAL, /*strict=*/true)
+                              │    └─ System_variable_tracker::enumerate_sys_vars(sort=true, ...)
+                              │        ├─ 遍历 static_system_variable_hash
+                              │        ├─ 遍历 dynamic_system_variable_hash   （strict 过滤 + 敏感变量过滤）
+                              │        └─ std::sort 按名字排序
+                              └─ 对每个 System_variable_tracker:
+                                  access_system_variable() 找到 sys_var
+                                  → 构造 System_variable(target_thd, &show_var, OPT_GLOBAL)
+                                      → System_variable::init()
+                                          ├─ [跨线程才拿] target_thd->LOCK_thd_sysvar
+                                          ├─ mysql_mutex_lock(&LOCK_global_system_variables)
+                                          └─ get_one_variable_ext(current, target, show_var,
+                                                                  OPT_GLOBAL, SHOW_SYS, ...)
+                                              ├─ ★ SHOW_SYS 特判：
+                                              │    show_type = sys_var->show_type()   // 换成真实类型
+                                              │    value = sys_var->value_ptr(running, target, OPT_GLOBAL)
+                                              │        └─ global_value_ptr() 读 global_system_variables
+                                              └─ switch(真实 show_type)：数值/字符串 → 文本
+              → table_global_variables::rnd_next()
+                  → make_row() → read_row_values()   → 逐行发给客户端
+```
+
+**最容易误解的一处：`get_one_variable_ext` 里的 `case SHOW_SYS: /* Cannot happen */`**。这个 case 确实是 `assert(0)` 死分支——但**不是**因为 SHOW_SYS 不被处理，而是因为函数**开头就把 SHOW_SYS 换掉了**：
+
+```cpp
+const char *get_one_variable_ext(THD *running_thd, THD *target_thd, ...) {
+  if (show_type == SHOW_SYS) {                     // 开头特判
+    sys_var *var = ((sys_var *)variable->value);   // show_var->value 就是 sys_var 指针
+    show_type = var->show_type();                  // SHOW_SYS → 实际类型（SHOW_LONG/CHAR...）
+    value = pointer_cast<const char *>(
+        var->value_ptr(running_thd, target_thd, value_type, {}));  // ★ 真正求值点
+    value_charset = var->charset(target_thd);
+  } else { ... }
+  switch (show_type) { ... case SHOW_SYS: /* Cannot happen */ ... }  // 兜底，永远进不来
+}
+```
+
+所以系统变量的求值**唯一入口是 `sys_var::value_ptr(running_thd, target_thd, value_type)`**——它按 `value_type`（OPT_GLOBAL/OPT_SESSION）决定走 `global_value_ptr()`（读全局实例）还是 `session_value_ptr()`（读 target THD），拿到**原始值指针**后，再由 `switch(show_type)` 按类型格式化（`SHOW_LONG` 用 `longlong10_to_str`、`SHOW_CHAR` 直接取串、`SHOW_BOOL` 转 `ON/OFF`…）。这就是"描述符与值分离"的最后一步：`sys_var` 提供值指针 + 类型，格式化器统一转文本。
+
+**`SELECT * FROM performance_schema.global_variables`（直接查表）的差异**：它**不经过** `build_query` 重写（那是 SHOW 语法专用），作为普通 SELECT 进优化器 → `ha_perfschema` → 同一个 `rnd_init → materialize_global`。`rnd_init` 之后两条路径完全一致。唯一实质差异在**头部**：
+
+- SHOW 语法：`build_query` 包了一层子查询 + 列别名 `Variable_name/Variable_value` + 末尾恢复 `SQLCOM_SHOW_VARIABLES`
+- 直接 SELECT：无重写、无列别名（列名就是 `VARIABLE_NAME/VARIABLE_VALUE`）、`sql_command` 保持 `SQLCOM_SELECT`
+
+另外两个值得注意的旁路：`table_global_variables::get_row_count()`——经 handler 标准接口 `ha_perfschema::info(HA_STATUS_VARIABLE)` 的 `stats.records = m_table_share->get_row_count()` 被 SQL 层用作该表的行数估计（EXPLAIN/join 优化用），它同样持 `LOCK_plugin_delete + LOCK_system_variables_hash(rd)` 数 static+dynamic 双 hash 的变量总数（`get_system_variable_count`）；`make_row()` 里 `mysql_audit_notify(MYSQL_AUDIT_GLOBAL_VARIABLE_GET, ...)` —— **读全局变量会触发审计事件**（审计插件能感知"谁读了哪个全局变量"）。
+
 #### 2. PFS 里的变量表全集（12 张）
 
 | 表 | 类别 | 数据源 | ACL |
@@ -731,7 +869,7 @@ Query_block *build_show_global_variables(...) {
 
 #### 3. 统一的 PFS 处理管线
 
-PFS 侧两个平行的 cache 类（`storage/perfschema/pfs_variable.h/.cc`）：
+PFS 侧两个平行的 cache 类把三类变量统一成 `SHOW_VAR` 中间格式，走"INITIALIZE（构建排序清单）→ MATERIALIZE（求值转文本）→ OUTPUT"同一条管线——系统变量从双 hash 枚举（`enumerate_sys_vars`），状态变量遍历 `all_status_vars` 展开 `SHOW_ARRAY`。**完整实现（`do_materialize_*` 家族、线程间读三重防护、mem_root 管理）见 [`pfs.md` 的 1.9 节](pfs.md#19-pfs-的变量与状态表实现show-variablesstatus-的幕后)**。
 
 ```
 PFS_system_variable_cache（系统变量）
