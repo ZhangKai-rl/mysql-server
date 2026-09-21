@@ -336,26 +336,79 @@ optimize_semijoin_nests_for_materialization  预优化可物化的 sj-nest 内�
 
 **原理**：外表行与内表 JOIN 得到一条输出后，**直接跳过所有剩余内表行**，读下一行外表。
 
-**适用条件**：相关外层表（`sj_depends_on`）都在前缀；内表连续；当前表是最后一个内表；`dups_producing_tables == 0`。
+**进入条件**（源码注释明确列了 3 条）：
+
+```
+1. 下一张 join tab 属于这个 semi-join nest
+2. 还没进入 duplicate producer range（dups_producing_tables == 0）
+3. 所有相关外表（sj_depends_on / 被 outer_expr 引用的表）都在 join 前缀
+```
 
 ```cpp
-if (pos->dups_producing_tables == 0 && !(remaining_tables & outer_corr_tables)) {
-  pos->first_firstmatch_table = idx;   // 开始跟踪 FM 范围
+if (pos->dups_producing_tables == 0 &&        // (2)
+    !(remaining_tables & outer_corr_tables))  // (3)
+{
+  pos->first_firstmatch_table = idx;   // 开始跟踪 FirstMatch range
+  pos->firstmatch_need_tables = 0;
+  pos->first_firstmatch_rtbl = remaining_tables;
 }
 ```
+
+**两条"中途放弃"的检查**（不是进入时判定，而是**追踪过程中**发现不行就置 `MAX_TABLES`）：
+
+- **交织检查**：FirstMatch 不能处理"它正在处理的 semi-join 的表"与"其它 nest 的表"交织。源码注释给了两种形态的对照：
+
+```
+Intertwined tables: ot - FM(it11 - it21 - it12 - it22)   ← 交织，不允许
+Grouped tables:     ot - FM(it11 - it12) - FM(it21 - it22) ← 分组，允许
+```
+
+- **非层次 join 检查**（`cur_embedding_map`）：不能跳出一个"还开着的 nest"。注释给的例子是 `B LEFT JOIN (C SEMIJOIN D ON B.X=D.Y)`，表序 `B-D-C` 时，从 D 跳回 B 会穿过还没闭合的 outer join nest，导致非层次 join——所以检查 `cur_embedding_map` 是否包含在跳转目标的 `cur_embedding_map` 里。
 
 #### LooseScan（松散扫描）
 
 **原理**：内表驱动表用索引做"松散扫描"（只扫描索引键不同的记录，一个 group 只取首行），天然去重。
 
-**适用条件**（与 FirstMatch **相反**）：相关外层表**不在**前缀；内表驱动表有索引（`keyuse() != nullptr`）；`sj_inner_exprs ≤ 64`。
+**进入条件**（源码注释列了完整的 8 条，比 FirstMatch 严得多）：
+
+```
+1a. 下一张表是 SJ 内表
+1b. LooseScan 对该 nest 启用（OPTIMIZER_SWITCH_LOOSE_SCAN）
+2.  IN 表达式数 ≤ 64   ★ 因为要"fit in bitmap"（位图大小限制）
+3.  是该 semi-join 的第一张表
+4.  不在另一个 semi-join range 内（dups_producing_tables == 0）
+5.  所有非 IN 等值的相关引用都已绑定
+6.  但还有些 IN 等值没绑定  ← 否则就该走 FirstMatch 了
+7.  有能被这张表索引处理的等值（keyuse() != nullptr）
+8.  不是派生表/视图（临时限制）
+```
 
 ```cpp
-if (remaining_tables_incl & emb_sj_nest->nested_join->sj_depends_on &&  // 还有相关外表在后面
-    new_join_tab->keyuse() != nullptr) {                                // 有索引
+if (emb_sj_nest &&                                                  // (1a)
+    emb_sj_nest->nested_join->sj_enabled_strategies &
+        OPTIMIZER_SWITCH_LOOSE_SCAN &&                              // (1b)
+    emb_sj_nest->nested_join->sj_inner_exprs.size() <= 64 &&        // (2) 位图限制
+    ((remaining_tables_incl & emb_sj_nest->sj_inner_tables) ==
+     emb_sj_nest->sj_inner_tables) &&                               // (3)
+    pos->dups_producing_tables == 0 &&                              // (4)
+    !(remaining_tables_incl & emb_sj_nest->nested_join->sj_corr_tables) &&  // (5)
+    (remaining_tables_incl & emb_sj_nest->nested_join->sj_depends_on) &&    // (6)
+    new_join_tab->keyuse() != nullptr &&                            // (7)
+    !new_join_tab->table_ref->uses_materialization())               // (8)
+{
   pos->first_loosescan_table = idx;
+  pos->loosescan_need_tables =
+      emb_sj_nest->sj_inner_tables | emb_sj_nest->nested_join->sj_depends_on;
 }
 ```
+
+★ **为什么 FirstMatch 与 LooseScan "相反"**：看条件 (6)——LooseScan 要求"还有相关外表没进前缀"，而 FirstMatch 要求"相关外表都在前缀"。所以两者是对同一类输入的**互斥分流**：相关外表在前缀 → FirstMatch；相关外表还在后面 → LooseScan（用索引跳扫，把相关外表留到后面）。
+
+**两条额外的放弃检查**：
+
+- **LooseScan 的 outer join 限制**：LooseScan 要求驱动表与其它内表是 **inner join**。注释给了反例 `A SEMI JOIN (B LEFT JOIN C)`——B 做 LooseScan 时，B 与 C 是 outer join，LooseScan 不可能。判定是"第二张内表时，若两表的 `outer_join_nest` 不同、或第二表直接是 `outer_join`，则置 `MAX_TABLES`"。
+
+- **stage 机制**：LooseScan 的追踪分三个阶段（Stage 1 只有驱动表、Stage 2 加同 nest 的内表、Stage 3 加相关外表），进入 Stage 3 时若又碰到别的 nest 的内表，也置 `MAX_TABLES`（因为 LooseScan 不能处理与其它 nest 交织，与 FirstMatch 的交织检查同理）。
 
 #### MaterializeLookup / MaterializeScan（物化）
 
@@ -376,6 +429,22 @@ return SJ_OPT_MATERIALIZE_LOOKUP;                      // 否则索引查找
 
 **适用条件**：最通用，几乎任意 join order。选择条件里 `pos->dups_producing_tables`（还有未消除重复）时**无条件采纳**（因为"未去重成本"和"已去重成本"不是同量纲）。
 
+#### 代价计算与"先选后重算"
+
+五个策略的**代价估算**收敛在少数几个函数上：
+
+| 策略 | 代价函数 |
+|---|---|
+| FirstMatch / LooseScan | `semijoin_firstmatch_loosescan_access_paths(first, idx, remaining, is_loosescan, &rowcount, &cost)`——**同一个函数服务两个策略**，靠 `is_loosescan` 参数区分（FM 估算"匹配行数"，LS 估算"松散扫描行数"） |
+| MaterializeLookup / Scan | `calculate_materialization_costs()`——算"物化 vs 不物化"两条路，选便宜的那条 |
+| DuplicateWeedout | 兜底，几乎不比价（见上） |
+
+**两个关键设计妥协**：
+
+1. **先选后重算**：`advance_sj_state` 在搜索中只保留"当前最优策略"，不保存各策略的备选 `POSITION`（源码注释：*"we need to save POSITIONs somewhere but reserving space for all cases would require too much space. We will re-calculate POSITION structures later on."*）。等 join order 定下来后，由 `fix_semijoin_strategies` 重新算一遍。**代价**：搜索期与最终期的计算必须严格一致，否则计划自相矛盾（该函数历史上出过 bug）。
+
+2. **"无条件选中" LooseScan**：当 LooseScan 的 range 完整时，源码注释明说"unconditionally pick the LooseScan"——理由是其它策略（Weedout/Materialize）需要**至少同样多的表**进前缀才被考虑，此刻 LooseScan 已经是最优候选，无需比价。
+
 ### 4.4 fix_semijoin_strategies：确定最终策略
 
 贪心搜索每加一张表判定一次，前后可能选不同策略。`fix_semijoin_strategies` 从后往前遍历（靠后的记录更大前缀的最优策略），把最终策略记到第一个内表上（`n_sj_tables` + `sj_strategy`）。
@@ -387,6 +456,38 @@ return SJ_OPT_MATERIALIZE_LOOKUP;                      // 否则索引查找
 > 本篇从**优化器视角**讲"选定策略后如何落到 QEP/迭代器"。**运行期的执行机制**（物化引擎 `subselect_hash_sj_engine`、IN2EXISTS 的 `Item_in_optimizer`、子查询缓存）详见 [`../../runtime/02_subquery_runtime.md`](../../runtime/02_subquery_runtime.md)。
 
 `setup_semijoin_dups_elimination`（`sql/sql_select.cc`）创建具体执行结构。每种策略产生特定的 QEP_TAB 序列（内核月报 2021/06 的图）：
+
+### 5.0 五种策略的 AccessPath 形态总览（8.0 迭代器化之后）
+
+迭代器化之后，"策略 → QEP_TAB 序列"只是中间态，最终每种策略落成**特定的 AccessPath 树形状**。这是 `ConnectJoins()` 里完成的，与第八章讲的连接树翻译同源。对照表：
+
+| 策略 | AccessPath 形态 | 关键构造函数 | 去重靠什么 |
+|---|---|---|---|
+| **FirstMatch** | `NestedLoop(JoinType::SEMI)` | `CreateNestedLoopAccessPath(..., JoinType::SEMI)` | SEMI join type：内层"找到第一个匹配就停"（`NestedLoopIterator` 状态机切回 `NEEDS_OUTER_ROW`） |
+| **LooseScan（单表）** | 表访问 + `REMOVE_DUPLICATES_ON_INDEX` | `NewRemoveDuplicatesOnIndexAccessPath` | 索引去重节点（见 [`../../08_access_path/README.md`](../../08_access_path/README.md)） |
+| **LooseScan（多表）** | `NestedLoopSemiJoinWithDuplicateRemoval` | `NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` | semijoin NestedLoop 与索引去重**合一** |
+| **Duplicate Weedout** | 子树 + `WEEDOUT` 节点 | `CreateWeedoutOrLimitAccessPath`（带 `flush_weedout_table`） | 独立 WEEDOUT 节点（内部是 rowid 临时表） |
+| **MaterializeLookup** | `MATERIALIZE` + ref 访问 | `NewMaterializeAccessPath`（`MATERIALIZE_SEMIJOIN` 分支递归建 virtual join） | 物化临时表的唯一键 |
+| **MaterializeScan** | `MATERIALIZE` + 全扫 | 同上，但物化表上无索引查找 | 物化临时表 |
+
+几个要点：
+
+**① FirstMatch 没有专门的 AccessPath 类型。** 源码里 `join_type = (substructure == SEMIJOIN) ? JoinType::SEMI : JoinType::OUTER`——它退化成"`JoinType::SEMI` 的 NestedLoop"，靠 join type 这个标志让迭代器短路。这是"策略用标志表达、不新增节点类型"的典型。
+
+**② `add_limit_1`：没有左臂的 semijoin 用 LIMIT 1 兜底。** 当整个切片都是 semijoin（例如对 const 表 semijoin，或 outer join 内部的 semijoin）时，`path == nullptr`（没有左臂可接），于是给子树包 `NewLimitOffsetAccessPath(limit=1)`——用 LIMIT 1 实现"找到即停"。源码注释明说：*"If the entire slice is a semijoin ... solve it by using LIMIT 1."*
+
+**③ 多表 LooseScan 只有首表是 LooseScan，其余退化为 FirstMatch。** 关键注释：
+
+```
+LooseScan against multiple tables always puts the non-first tables in
+FirstMatch.
+```
+
+也就是说 `FindSubstructure()` 返回 `SEMIJOIN` 时，`NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` 只对首表做索引去重，其余表靠 FirstMatch 语义（`firstmatch_return` 标记）。若这个 semijoin 恰好被 outer join 覆盖，则去重要**放到 join 之后**（`remove_duplicates_loose_scan = true`），注释说这是"安全选项，且不更慢，因为反正会插 LIMIT 1"。
+
+**④ Weedout 的代价是"瞎抄的"。** `Substructure::WEEDOUT` 分支里，`CreateWeedoutOrLimitAccessPath` 之后有一句 *"Copy costs (even though it makes no sense for the LIMIT 1 case)"*——即 WEEDOUT 节点的代价直接从子树复制，作者自己都知道这不精确。
+
+**⑤ Materialize 在"另一个世界"里递归建树。** `MATERIALIZE_SEMIJOIN` 分支（在 `GetTableAccessPath` 里）递归调用 `ConnectJoins()` 把 semi-join 内层当成一个**独立的 virtual join** 建树，再包 `NewMaterializeAccessPath`（详见 [`../../08_access_path/README.md`](../../08_access_path/README.md) 的"GetTableAccessPath 五分支"）。物化之后，外层用 ref 访问物化临时表（Lookup）或全扫（Scan），这就是两种 Materialize 策略的分野。
 
 ### 5.1 FirstMatch：split jump
 

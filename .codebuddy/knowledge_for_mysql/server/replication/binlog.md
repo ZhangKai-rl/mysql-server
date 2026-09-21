@@ -18,6 +18,7 @@
 - [BGC Ticket 系统](#bgc-ticket-系统)
 - [内部 2PC（两阶段提交）](#内部-2pc两阶段提交)
 - [binlog 与崩溃恢复：2PC 裁决](#binlog-与崩溃恢复2pc-裁决)
+- [原子 DDL 与 binlog 的交互](#原子-ddl-与-binlog-的交互)
 - [binlog_order_commits 参数](#binlog_order_commits-参数)
 - [Commit 阶段与 trx_no](#commit-阶段与-trx_no)
 - [Anonymous_Gtid](#anonymous_gtid)
@@ -25,6 +26,7 @@
 - [Event 格式与 mysqlbinlog 解读](#event-格式与-mysqlbinlog-解读)
 - [事件二进制布局（字节级）](#事件二进制布局字节级)
 - [Row Image 记录过程](#row-image-记录过程)
+- [binlog 事务压缩（binlog_transaction_compression）](#binlog-事务压缩binlog_transaction_compression)
 - [binlog 读侧：dump 线程（Binlog_sender）](#binlog-读侧dump-线程binlog_sender)
 - [半同步复制与 binlog 的衔接](#半同步复制与-binlog-的衔接)
 - [参考](#参考)
@@ -848,6 +850,304 @@ void recover_one_internal_trx(xarecover_st const &info, handlerton &ht,
 | index 损坏 | 忽略 `binlog_error_action`，强制 abort | 会导致 purge 误删 |
 | `sync_binlog` 默认 1 | 双 1 | `N>1` 会产生永久主从分歧，不可接受 |
 
+## 原子 DDL 与 binlog 的交互
+
+> 上一节讲的是普通 DML 事务的 2PC 裁决（Xid_log_event）。本节讲 **8.0 的原子 DDL**：它同样需要 binlog 充当 2PC 协调者，但它的"提交点"不是 Xid_log_event，而是**藏在 Query_log_event 里的一个 XID——`ddl_xid`**。这是 binlog 崩溃恢复里最容易被忽略的一条暗线。
+
+### 背景：DDL 为什么需要 binlog 做协调者
+
+5.7 的 DDL 不是原子的：`CREATE/ALTER/DROP` 失败或中途 crash 会留下 `#sql-xxxx.ibd` / `.frm` 中间文件，且元数据（`.frm` 文件）与 SE 物理数据可能不一致。8.0 的原子 DDL（WL#9175、WL#7743 等一组 worklog）要解决的核心问题是：
+
+> DDL 同时改动**两个系统**——数据字典（Data Dictionary，DD）中的元数据，和存储引擎（SE，主要是 InnoDB）中的物理对象。二者必须**要么都提交、要么都回滚**。
+
+但 DD 和 SE 是两个独立的、各自有持久化日志的子系统，谁都无法单方面保证跨系统的原子性。于是和普通 DML 一样，**binlog 被推举为协调者（Coordinator）**：
+
+- DDL 执行时，引擎先把物理变更做成一个 **prepared 事务**（InnoDB 侧走 DDL log，见 [`../../innodb/ddl.md`](../../innodb/ddl.md)），并把该事务的 XID 记录下来；
+- DDL 语句本体作为一个 **Query_log_event** 写入 binlog；
+- 崩溃后，binlog 用这个 XID 判断：binlog 里有完整的 DDL 事件 → 该 prepared 事务应 commit；否则 rollback。
+
+这正是 `log_event.h:4368` 注释点明的设计动机：
+
+```cpp
+/**
+  The function lists all DDL instances that are supported
+  for crash-recovery (WL9175).
+  todo: the supported feature list is supposed to grow. Once
+        a feature has been readied for 2pc through WL7743,9536(7141/7016) etc
+        it needs registering in the function.
+*/
+```
+
+### ddl_xid：藏在 Query_log_event 里的 XID
+
+普通事务的结构是「一堆 DML 事件 + 收尾的 `Xid_log_event`」，恢复时扫到 `XID_EVENT` 就知道这是个完整的已提交事务。
+
+原子 DDL 的事件主体是 `Query_log_event`（DDL 语句本身），它**没有独立的 Xid_log_event 收尾**，而是把 XID 直接塞进 Query_log_event 的 `ddl_xid` 字段。因此：
+
+- `Query_log_event::ddl_xid`（声明于 `libbinlogevents/include/statement_events.h`）——DDL 的"事务结束点"标记；
+- 默认值 `INVALID_XID = 0xFFFFFFFFFFFFFFFF`（全 1），表示"这不是原子 DDL"。
+
+判定的核心函数在 `log_event.h:4360`：
+
+```cpp
+inline bool is_atomic_ddl_event(Log_event const *evt) {
+  return evt != nullptr && evt->get_type_code() == binary_log::QUERY_EVENT &&
+         static_cast<Query_log_event const *>(evt)->ddl_xid !=
+             binary_log::INVALID_XID;
+}
+```
+
+即：**一个 Query_event 且 `ddl_xid != INVALID_XID`，就是原子 DDL 事件**。这个判定贯穿了 binlog 的写侧（cache 标记）与崩溃恢复（XID 收集）两侧。
+
+### ddl_xid 的生成：复用普通事务的 XID 分配
+
+DDL 的 XID 不是另起一套，而是**和普通事务完全同源**。看 Query_log_event 的构造器（`sql/log_event.cc:4031-4059`）：
+
+```cpp
+} else if (is_atomic_ddl(thd, using_trans)) {
+    assert(stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END));
+    ...
+    Transaction_ctx *trn_ctx = thd->get_transaction();
+    /* Transaction needs to be active for xid to be assigned, */
+    assert(trn_ctx->is_active(Transaction_ctx::SESSION));
+    /* and the transaction's xid has been already computed. */
+    assert(!trn_ctx->xid_state()->get_xid()->is_null());
+
+    my_xid xid = trn_ctx->xid_state()->get_xid()->get_my_xid();
+    ...
+    ddl_xid = xid;
+    ...
+    event_logging_type = Log_event::EVENT_NORMAL_LOGGING;
+    event_cache_type  = Log_event::EVENT_TRANSACTIONAL_CACHE;
+}
+```
+
+要点：
+
+1. `ddl_xid = trn_ctx->xid_state()->get_xid()->get_my_xid()`——就是 `MySQLXid(server_id, query_id)`，和上一节"XID 的分配"里普通事务的 XID 是**同一个分配器**（`thd->query_id`）；
+2. 原子 DDL 事件被放进 **EVENT_TRANSACTIONAL_CACHE**（事务缓存），而不是语句缓存——这决定了它走事务提交路径、参与 2PC；
+3. 序列化时，`ddl_xid` 放在 Query_event 的 **status_vars（状态变量区）**，用 `Q_DDL_LOGGED_WITH_XID` 状态变量标记其存在（`sql/log_event.cc:3590` 附近反序列化对应读取）。反序列化（从库/恢复端）读到该标记才会去解析 `ddl_xid`。
+
+### is_atomic_ddl 判定链：哪些语句算原子 DDL
+
+两层判定：
+
+**第一层 `is_sql_command_atomic_ddl(const LEX *)`**（`sql/log_event.cc:3676`）：
+
+```cpp
+inline bool is_sql_command_atomic_ddl(const LEX *lex) {
+  return ((sql_command_flags[lex->sql_command] & CF_POTENTIAL_ATOMIC_DDL) &&
+          lex->sql_command != SQLCOM_OPTIMIZE &&
+          lex->sql_command != SQLCOM_REPAIR &&
+          lex->sql_command != SQLCOM_ANALYZE) ||
+         (lex->sql_command == SQLCOM_CREATE_TABLE &&
+          !(lex->create_info->options & HA_LEX_CREATE_TMP_TABLE) &&
+          !lex->create_info->m_transactional_ddl) ||
+         (lex->sql_command == SQLCOM_DROP_TABLE && !lex->drop_temporary);
+}
+```
+
+三个来源：带 `CF_POTENTIAL_ATOMIC_DDL` 标志的命令（排除 `OPTIMIZE/REPAIR/ANALYZE` 这三个不走原子路径的维护命令）、`CREATE TABLE`（排除临时表、排除事务性 DDL）、`DROP TABLE`（排除临时表）。
+
+**第二层 `is_atomic_ddl(THD *, bool using_trans)`**（`sql/log_event.cc:3733`）：
+
+```cpp
+bool is_atomic_ddl(THD *thd, bool using_trans_arg) {
+  ...
+  return using_trans_arg && is_sql_command_atomic_ddl(lex);
+}
+```
+
+`using_trans` 表示"存在事务性变更"（即 DDL 真的落进了事务缓存），二者同时成立才判为原子 DDL。这一层还夹带了大量 `NDEBUG` 下的 `assert`，用来约束哪些命令允许/不允许 `using_trans`。
+
+而 SE 侧是否支持原子 DDL，由 `ddl_is_atomic(hton)`（`sql/handler.h:2957`）判断 `HTON_SUPPORTS_ATOMIC_DDL` 标志位：
+
+```cpp
+inline bool ddl_is_atomic(const handlerton *hton) {
+  return (hton->flags & HTON_SUPPORTS_ATOMIC_DDL) != 0;
+}
+```
+
+### 提交路径：原子 DDL 不写 Xid_log_event
+
+这是原子 DDL 与普通事务最本质的区别。普通事务在 `write_transaction` 里走"写 Xid_log_event 收尾"分支，原子 DDL 走**另一条分支**（`sql/binlog.cc:8225-8229`）：
+
+```cpp
+    /*
+      If is atomic DDL, finalize cache for DDL and no further logging is needed.
+    */
+    else if ((is_atomic_ddl = cache_mngr->trx_cache.has_xid())) {
+      if (cache_mngr->trx_cache.finalize(thd, nullptr)) return RESULT_ABORTED;
+    }
+```
+
+注意两个关键点：
+
+1. **`finalize(thd, nullptr)` 的第二参是 `nullptr`**——不追加结束事件。因为 DDL 的"事务结束标记"已经内嵌在 Query_log_event 的 `ddl_xid` 里，无需再写一个 `Xid_log_event`；
+2. `has_xid()` 之所以为真，是因为 **cache 在写入事件时就把原子 DDL 标记成了 xid-requiring**。看 `binlog_cache_data::write_event`（`sql/binlog.cc:1579-1584`）：
+
+```cpp
+    if (ev->get_type_code() == binary_log::XID_EVENT ||
+        ev->get_type_code() == binary_log::XA_PREPARE_LOG_EVENT)
+      flags.with_xid = true;
+    if (ev->is_using_immediate_logging()) flags.immediate = true;
+    /* DDL gets marked as xid-requiring at its caching. */
+    if (is_atomic_ddl_event(ev)) flags.with_xid = true;
+```
+
+而 `has_xid()`（`sql/binlog.cc:760`）就是读 `flags.with_xid`：
+
+```cpp
+  bool has_xid() const {
+    // There should only be an XID event if we are transactional
+    assert((flags.transactional && flags.with_xid) || !flags.with_xid);
+    return flags.with_xid;
+  }
+```
+
+所以整条链是：**Query_log_event 携带 ddl_xid → write_event 时 `is_atomic_ddl_event()` 命中 → `flags.with_xid=true` → 提交时 `has_xid()` 为真 → 走"原子 DDL 专属分支"只 finalize 不写 Xid**。
+
+对比普通 2PC 事务的分支（`sql/binlog.cc:8241-8244`）：
+
+```cpp
+    else if (real_trans && xid && trn_ctx->rw_ha_count(trx_scope) > 1 &&
+             !trn_ctx->no_2pc(trx_scope)) {
+      Xid_log_event end_evt(thd, xid);
+      if (cache_mngr->trx_cache.finalize(thd, &end_evt)) return RESULT_ABORTED;
+    }
+```
+
+普通事务要 `rw_ha_count > 1`（真正跨 binlog + 引擎两个参与者）才写 `Xid_log_event`；原子 DDL 不判断 `rw_ha_count`，只要有 `with_xid` 就 finalize。
+
+### Transactional_ddl_context 与 post_ddl
+
+引擎侧的 DDL 提交完成后，需要一个**收尾钩子**做清理（例如删除 DDL log 里对应的记录、释放 SE 侧为原子 DDL 维护的资源）。server 侧通过 `Transactional_ddl_context` + `handlerton::post_ddl` 完成。
+
+`Transactional_ddl_context`（`sql/sql_class.h`）声明了三个方法，实现在 `sql/sql_class.cc:3262-3320`：
+
+- `init(db, tablename, hton)`（`:3262`）——记录 DDL 涉及的库表与引擎，`assert(sql_command == SQLCOM_CREATE_TABLE)`（当前仅 CREATE TABLE 使用该上下文）；
+- `rollback()`（`:3280`）——事务回滚时清理：`mysql_unlock_tables`、`close_thread_table`、`tdc_remove_table` 移除 table share；
+- `post_ddl()`（`:3312`）——commit/rollback **之后**调用引擎的 `post_ddl`：
+
+```cpp
+void Transactional_ddl_context::post_ddl() {
+  if (!inited()) return;
+  if (m_hton && m_hton->post_ddl) {
+    m_hton->post_ddl(m_thd);
+  }
+  m_hton = nullptr;
+  m_db = "";
+  m_tablename = "";
+}
+```
+
+`handlerton::post_ddl_t` 的语义注释（`sql/handler.h:2278-2281`）明确它是提交后的、不可失败的收尾：
+
+```cpp
+  called after successful commit of the statement we can't fail
+  statement with error.
+*/
+typedef void (*post_ddl_t)(THD *thd);
+```
+
+此外还有 `post_recover_t`（`sql/handler.h:2283-2290`）：崩溃恢复阶段对已 commit/rollback 的 DDL 做 SE 侧清理（`ha_post_recover` → `ht->post_recover()`），与 `post_ddl` 是一对"正常路径/恢复路径"的镜像钩子。
+
+调用时序（以 tablespace 类 DDL 为例，`sql/sql_tablespace.cc:173-193` 的 `complete_stmt`）：
+
+```cpp
+  if (!dont_write_to_binlog)
+    if (write_bin_log(thd, false, thd->query().str, thd->query().length,
+                      using_trans && ddl_is_atomic(hton))) {
+      return true;
+    }
+  /* Commit the statement and call storage engine's post-DDL hook. */
+  if (trans_commit_stmt(thd) || trans_commit(thd)) {
+    return true;
+  }
+  dr();
+  if (hton && ddl_is_atomic(hton) && hton->post_ddl) {
+    hton->post_ddl(thd);
+  }
+```
+
+顺序是：**先 `write_bin_log` 写 binlog → 再 `trans_commit` 提交引擎事务 → 最后 `post_ddl` 收尾**。binlog 提交在前、post_ddl 收尾在后，符合"binlog 是协调者、提交点"的定位。
+
+### 崩溃恢复裁决：ddl_xid 汇入 m_internal_xids
+
+上一节提到，恢复扫描最后一个 binlog 文件时，会把 `XID_EVENT` 的 xid 收集进 `m_internal_xids`（"binlog 侧已提交"的集合）。原子 DDL 的 `ddl_xid` 走**同一条集合**，只是入口不同（`sql/binlog/recovery.cc:217-230`）：
+
+```cpp
+void binlog::Binlog_recovery::process_atomic_ddl(Query_log_event const &ev) {
+  this->m_is_malformed = this->m_in_transaction;
+  if (this->m_is_malformed) {
+    this->m_failure_message.assign(
+        "Query_log event containing a DDL inside the boundary of a sequence of "
+        "events representing an active transaction");
+    return;
+  }
+  if (!this->m_internal_xids.insert(ev.ddl_xid).second) {
+    this->m_is_malformed = true;
+    this->m_failure_message.assign(
+        "Query_log_event containing a DDL holds an invalid XID");
+  }
+}
+```
+
+关键点：
+
+1. **原子 DDL 不能出现在一个显式事务的中间**——`m_in_transaction` 必须为 false（DDL 会隐式提交，天然如此，这里只是防御性校验）；
+2. `ev.ddl_xid` 被插入 `m_internal_xids`，与普通 `XID_EVENT` 的 xid **汇入同一个集合**。扫描完成后，InnoDB 恢复（`innobase_recover_tc` → `ha_recover`）时对每个 prepared 事务问 binlog：xid 在 `m_internal_xids` 里就 `commit_by_xid`，否则 `rollback_by_xid`。
+
+    也就是说，**原子 DDL 的崩溃裁决和普通 DML 完全共用一套 2PC 判决逻辑**，唯一区别只是"XID 从哪里扫到"：普通事务从 `Xid_log_event`，原子 DDL 从 `Query_log_event` 的 `ddl_xid`。这正是 WL#9175 设计的巧妙之处——不新增一套恢复协议，而是把 DDL 伪装成"带 XID 的事务"塞进现有 2PC 框架。
+
+### 与普通 DML 2PC 的异同对照
+
+| 维度 | 普通 DML 事务 | 原子 DDL |
+|---|---|---|
+| 事件主体 | Table_map + Rows | Query_log_event（DDL 语句） |
+| 事务结束标记 | 独立的 `Xid_log_event` | Query_log_event 内嵌 `ddl_xid` |
+| XID 来源 | `thd->query_id`（`MySQLXid`） | **同一分配器**，复用 `get_my_xid()` |
+| 提交分支 | `rw_ha_count>1` 才写 Xid（binlog.cc:8241） | `has_xid()` 即 finalize，不写 Xid（binlog.cc:8227） |
+| cache 标记 | `XID_EVENT` 置 `with_xid` | `is_atomic_ddl_event()` 置 `with_xid`（binlog.cc:1584） |
+| 恢复收集 | `process_xid` 读 Xid_log_event | `process_atomic_ddl` 读 `ddl_xid`（recovery.cc:217） |
+| 恢复判决 | 同一 `m_internal_xids` → commit_by_xid | **同一集合、同一判决** |
+| 收尾钩子 | 无 | `post_ddl` / `post_recover` |
+
+### 关键调用栈
+
+**写侧（CREATE TABLE 为例）：**
+
+```
+Sql_cmd_create_table::execute()
+  └─ mysql_create_table()
+       └─ write_bin_log(...)                          // 写 DDL 事件
+            └─ Query_log_event::Query_log_event(thd, query, ..., using_trans)
+                 ├─ is_atomic_ddl(thd, using_trans)   // log_event.cc:4031
+                 │    └─ is_sql_command_atomic_ddl(lex)  // log_event.cc:3676
+                 └─ ddl_xid = xid_state()->get_xid()->get_my_xid()  // :4046-4054
+  └─ MYSQL_BIN_LOG::commit → ordered_commit → flush_stage
+       └─ write_transaction(...)                       // binlog.cc:8166+
+            └─ trx_cache.finalize(thd, nullptr)        // :8228（原子 DDL 分支）
+                 ├─ flush_pending_event()
+                 ├─ write_event(end_event=nullptr)
+                 └─ (无 Xid_log_event)
+  └─ Transactional_ddl_context::post_ddl()             // sql_class.cc:3312
+       └─ m_hton->post_ddl(thd)
+```
+
+**恢复侧：**
+
+```
+init_server_components()
+  └─ MYSQL_BIN_LOG::open_binlog() → binlog 扫描
+       └─ Binlog_recovery::process_event()
+            └─ 遇到 Query_event 且 is_atomic_ddl_event(ev)  // log_event.h:4360
+                 └─ process_atomic_ddl(ev)                   // recovery.cc:217
+                      └─ m_internal_xids.insert(ev.ddl_xid)  // :225
+  └─ ha_recover()（InnoDB 恢复）
+       └─ 对每个 prepared trx：xid ∈ m_internal_xids ? commit : rollback
+```
+
 ## binlog_order_commits 参数
 
 ### 参数定义
@@ -1502,6 +1802,196 @@ Body:
 
 ---
 
+## binlog 事务压缩（binlog_transaction_compression）
+
+> 8.0.20 引入。以**事务为单位**做 zstd 压缩：一个事务的所有事件被打包成一个 `Transaction_payload_log_event`（type 40）写盘。压缩发生在本章"内部 2PC"里提到的 **finalize cache** 阶段——在 binlog cache 已经写完、即将进入 BGC 流水线之前。读侧（dump / mysqlbinlog / 恢复）通过一层"解压事件对象流"透明还原。
+
+### 设计动机与粒度选择
+
+binlog 是顺序追加日志，天然不适合做块级/文件级压缩（会破坏"按位点读取"和"按事务回放"的语义）。8.0.20 选择了**事务粒度**压缩：
+
+- 压缩单元 = 一个事务 = 从 GTID（可选）+ BEGIN 到 COMMIT/XID 的一整段事件流；
+- 一个事务对应一个 `Transaction_payload_log_event`，其 payload 是"该事务原始事件字节流"的 zstd 压缩结果；
+- 事件边界对上层完全透明：dump 线程、从库 IO/SQL 线程、mysqlbinlog、崩溃恢复都通过统一的解压层读取，**无感知**。
+
+这样既保留了 binlog 按事务回放、按 GTID 定位的能力，又能在 RBR 大事务场景拿到可观的压缩比（重复行数据压缩率高）。代价是**每次提交多一次 zstd 压缩/解压的 CPU 开销**，以及单事务 `max_payload_length` 的上限约束（见下文）。
+
+### 事件格式：post-header 为空的 TLV payload
+
+`Transaction_payload_log_event` 是极少数 **post-header 长度为 0** 的事件——它的所有元数据都塞进 body 的 payload data header 里，用 **TLV（type-length-value）三元组**编码。常量定义在 `libbinlogevents/include/codecs/binary.h:62-73`：
+
+```cpp
+enum {
+    OTW_PAYLOAD_HEADER_END_MARK = 0,           // 头结束标记
+    OTW_PAYLOAD_SIZE_FIELD = 1,                // 压缩后 payload 长度
+    OTW_PAYLOAD_COMPRESSION_TYPE_FIELD = 2,    // 压缩算法类型
+    OTW_PAYLOAD_UNCOMPRESSED_SIZE_FIELD = 3,   // 压缩前长度
+};
+```
+
+body 布局（`libbinlogevents/src/codecs/binary.cpp:289-317` 编码 / `:75-110` 解码）：
+
+```
+Transaction_payload_log_event:
+  common-header (19B, type=40) + post-header (0B) + body
+body:
+  payload_data_header:
+    [TYPE=2, LEN, VAL=compression_type]    仅当 type != NONE 才写
+    [TYPE=3, LEN, VAL=uncompressed_size]   仅当 type != NONE 才写
+    [TYPE=1, LEN, VAL=payload_size]
+    [TYPE=0]                                // OTW_PAYLOAD_HEADER_END_MARK
+  payload: 原始事务事件流的 zstd 压缩字节
+```
+
+压缩算法枚举 `binary_log::transaction::compression::type`：`NONE=0`、`ZSTD=1`。只有压缩成功后才会写 `compression_type` 和 `uncompressed_size` 两个字段——`NONE`（未压缩/回退）时 payload 头只写 `payload_size` + `END_MARK`。
+
+### 压缩触发条件：shall_compress
+
+压缩不是无条件进行的。`Binlog_cache_compressor::shall_compress()`（`sql/binlog.cc:2113`）依次检查四道闸门：
+
+```cpp
+  if (!m_thd.variables.binlog_trx_compression) return false;   // 1. 开关
+  if (m_cache.has_incident()) return false;                     // 2. 无 Incident
+  if (m_thd.get_transaction()->has_modified_non_trans_table(...)) return false; // 3. 无非事务表
+  if (m_cache.may_have_sbr_stmts()) return false;               // 4. 无 SBR
+  return true;
+```
+
+- **`binlog_transaction_compression`**（默认 OFF）：主开关；
+- **Incident 事件**：`INCIDENT_EVENT` 表示"从库无法安全复现"，不能压缩（须原样透传）；
+- **非事务表**：MyISAM 等非事务引擎的修改不能进事务压缩单元（它们无法按事务原子回放）；
+- **SBR**：STATEMENT 格式的语句事件不压缩（`may_have_sbr_stmts()`），只压缩 RBR 事务。
+
+### 压缩流程：finalize 阶段的一步
+
+压缩发生在 `binlog_cache_data::finalize` 内部，紧跟在"写结束事件"之后（`sql/binlog.cc:2298-2306`）：
+
+```cpp
+  if (!is_binlog_empty()) {
+    assert(!flags.finalized);
+    if (int error = flush_pending_event(thd)) return error;   // 先把 pending event 写进 cache
+    if (int error = write_event(end_event)) return error;     // 写结束事件(XID/Query/无)
+    if (int error = this->compress(thd)) return error;        // ★ 压缩
+    flags.finalized = true;
+  }
+```
+
+`binlog_cache_data::compress`（`sql/binlog.cc:2276`）只是包一层 `Binlog_cache_compressor` 的 RAII 外壳。真正的执行流在 `Binlog_cache_compressor::compress()`（`sql/binlog.cc:2090`）：
+
+```cpp
+  bool compress() {
+    if (!shall_compress()) return false;              // 四道闸门
+    if (setup_compressor()) return false;             // 取 zstd 压缩器, pledged_input_size
+    if (setup_buffer_sequence()) return false;        // 配 Managed_buffer_sequence
+    if (compress_to_buffer_sequence()) return false;  // 真正压缩
+    Transaction_payload_log_event tple{&m_thd};
+    if (get_payload_event_from_buffer_sequence(tple)) return false;
+    // 以下开始 truncate 原 cache，此后失败不能再回退 → return true 让事务 abort
+    if (overwrite_cache_with_payload_event(tple)) return true;
+    return false;
+  }
+```
+
+各步职责：
+
+1. `setup_compressor()`（`:2153`）——从 session 的 `Transaction_compression_ctx` 取 zstd 压缩器，`set_pledged_input_size(m_uncompressed_size)` 让 zstd 按已知输入大小优化内存；
+2. `setup_buffer_sequence()`（`:2169`）——配置增长策略：`max_size = Transaction_payload_event::max_payload_length`（约 1GB，见下文）、`grow_factor=2`、`grow_increment=8192`，并与压缩器的 `get_grow_constraint_hint()` 合并；
+3. `compress_to_buffer_sequence()`（`:2187`）——`Compressed_ostream` 包着压缩器，`m_cache_storage.copy_to(&stream)` 把 cache 里的原始事件流喂进 zstd，最后 `m_compressor->finish(...)` 收尾；
+4. `get_payload_event_from_buffer_sequence()`（`:2216`）——把压缩结果写回 `tple`：`set_payload` / `set_compression_type` / `set_uncompressed_size` / `set_payload_size`；
+5. `overwrite_cache_with_payload_event(tple)`（`:2103` 之前）——**truncate 掉原始未压缩 cache，把 `Transaction_payload_log_event` 写回去**，从此刻起 cache 里只有一个压缩事件。
+
+关于**失败语义**，代码注释（`:2097-2102`）说得非常清楚，是一条精心设计的"回退 vs 中止"分界线：
+
+> Errors occurring above this point prevent us from compressing the transaction, but allow us to fallback to uncompressed. Hence we return false. After this point, we truncate the uncompressed cache. Therefore, we can no longer fallback to uncompressed. So we return true.
+
+即：`overwrite_cache_with_payload_event` **之前**的失败（压缩器取不到、压缩失败）→ 返回 false，静默回退到未压缩，事务照常提交；**之后**的失败（truncate 已发生但写入 IO 出错）→ 返回 true，事务必须 abort（此时 cache 已损坏，无法回退）。这个"切点"设计保证了压缩是**尽力而为、绝不丢事务**的。
+
+统计信息在析构函数里写回（`sql/binlog.cc:2073-2080`），供 `performance_schema.binary_log_transaction_compression_stats` 表观测：
+
+```cpp
+  ~Binlog_cache_compressor() {
+    m_managed_buffer_sequence.reset();
+    m_cache.set_compression_type(m_compression_type);
+    m_cache.set_compressed_size(m_compressed_size);
+    m_cache.set_decompressed_size(m_uncompressed_size);
+  }
+```
+
+### 读侧：Decompressing_event_object_istream 透明解压
+
+读侧的解压不侵入原有事件循环，而是引入一层 **`Decompressing_event_object_istream`**（`sql/binlog/decompressing_event_object_istream.h/cc`），对上层表现为一个"能依次产出 `Log_event*` 的流"。它有两个构造入口（`:33-55`）：
+
+- 包 `IBasic_binlog_file_reader&`：从 binlog 文件流读，**遇到 `Transaction_payload_log_event` 时自动切入解压流**，逐个吐出 payload 里的事件；
+- 直接包一个 `Transaction_payload_log_event` + FDE：从单个压缩事件解压。
+
+核心读取逻辑分两路（`operator>>` 在 `:258`，内部按状态分派）：
+
+- `read_from_binlog_stream()`（`:222`）：从底层 reader 读下一个事件；若是普通事件直接返回，若是 `Transaction_payload_log_event` 则调用 `begin_payload_event()` 建立解压流，后续切换；
+- `read_from_payload_stream()`（`:186`）：从解压后的 buffer 流逐个读事件，读空后回到 binlog 流继续；
+- `decode_from_buffer()`（`:156`）：把 buffer 里的字节解码成单个事件。这里有个关键点（`:161-162` 注释）：
+
+```cpp
+  // Events contained in a Transaction_payload_log_event never have a
+  // checksum (regardless of configuration). So we have to temporarily ...
+```
+
+**payload 里嵌套的事件不携带 checksum**（checksum 只覆盖整个 Transaction_payload_log_event 的外层），所以解压内层事件时须临时禁用 checksum 校验。
+
+崩溃恢复扫描（`sql/binlog/recovery.cc:91-99`）也复用这层解压流，并对状态做防御性处理：
+
+```cpp
+  if (istream.has_error()) {
+    switch (istream.get_status()) {
+      case Status_t::corrupted:
+      case Status_t::out_of_memory:
+      case Status_t::exceeds_max_size:
+        // @todo Uncomment this to fix BUG#34828252
+        // this->m_is_malformed = true;
+```
+
+### 上限与交互
+
+| 维度 | 说明 |
+|---|---|
+| `max_payload_length` | `max_log_event_size - max_length_of_all_headers`（`libbinlogevents/include/control_events.h:805`），`max_log_event_size` 默认 1GB，即单事务压缩后 payload 上限约 1GB，超限会回退或报错 |
+| checksum | 外层 `Transaction_payload_log_event` 正常参与 CRC32；**内层嵌套事件无 checksum**（`decompressing_event_object_istream.cc:161`） |
+| dump 线程 | dump 直接读 binlog 文件，经解压流后**原样把内层事件转发给从库**，从库无感知 |
+| MTS / last_committed | 压缩不影响 `sequence_number` / `last_committed` 的计算（依赖追踪发生在写侧 cache 层，见 [`prpl.md`](prpl.md)），压缩只是"包装"了事件字节 |
+| 半同步 | 半同步等待的是整个事务（含压缩事件）被从库 ACK，与压缩正交 |
+| 恢复 | 恢复扫描用 `Decompressing_event_object_istream` 透明解压后正常收集 XID/GTID |
+| 观测 | `performance_schema.binary_log_transaction_compression_stats` 记录压缩/解压字节数 |
+
+### 关键调用栈
+
+**写侧（提交时）：**
+
+```
+MYSQL_BIN_LOG::commit → ordered_commit → flush_stage
+  └─ write_transaction(...)                          // binlog.cc:8166+
+       └─ cache_mngr->trx_cache.finalize(thd, ...)   // binlog.cc:8217/8228/8244/8256
+            ├─ flush_pending_event(thd)              // binlog.cc:2301
+            ├─ write_event(end_event)                // binlog.cc:2302
+            └─ binlog_cache_data::compress(thd)      // binlog.cc:2303
+                 └─ Binlog_cache_compressor::compress()      // binlog.cc:2090
+                      ├─ shall_compress()                   // :2113
+                      ├─ setup_compressor()                 // :2153
+                      ├─ setup_buffer_sequence()            // :2169
+                      ├─ compress_to_buffer_sequence()      // :2187  (zstd)
+                      ├─ get_payload_event_from_buffer_sequence() // :2216
+                      └─ overwrite_cache_with_payload_event()     // truncate+写回
+```
+
+**读侧（dump / 恢复 / mysqlbinlog 统一入口）：**
+
+```
+Binlog_file_reader / Binlog_sender 读取循环
+  └─ Decompressing_event_object_istream::operator>>(event)   // decompressing_event_object_istream.cc:258
+       ├─ read_from_binlog_stream(event)                     // :222
+       │    └─ 遇到 Transaction_payload_log_event → begin_payload_event()  // 建立解压流
+       └─ read_from_payload_stream(event)                    // :186
+            └─ decode_from_buffer(buffer, event)             // :156  (内层无 checksum)
+```
+
 ## binlog 读侧：dump 线程（Binlog_sender）
 
 > 前面都是写侧。本节讲 binlog 怎么被读出来发给从库——8.0 已完成 slave→replica 改名，但 dump 线程核心类仍叫 `Binlog_sender`。
@@ -1813,10 +2303,18 @@ static int repl_semi_slave_queue_event(Binlog_relay_IO_param *param, ...) {
 
 - *MySQL 8.0 Reference Manual → Binary Log*
 - *MySQL 8.0 Reference Manual → XA Transactions*
+- *MySQL 8.0 Reference Manual → Binary Log Transaction Compression*（8.0.20+，`binlog_transaction_compression` / `binlog_transaction_compression_level_zstd`）
+- *MySQL 8.0 Reference Manual → Atomic DDL*
+
+**Worklog / 设计背景**
+
+- WL#9175 / WL#7743 / WL#9536：原子 DDL 与 2PC（crash-recovery、`ddl_xid` 机制），见 `sql/log_event.h` `is_sql_command_atomic_ddl` 与 `sql/binlog/recovery.cc` 内注释
+- binlog 事务压缩（8.0.20，zstd，`Transaction_payload_log_event`）见 MySQL 8.0.20 Release Notes
 
 **相关文档**
 
 - 2PC 引擎侧执行（prepare 五层逐行、undo 状态、外部 XA、崩溃恢复三幕）见 [`../../innodb/trx.md`](../../innodb/trx.md)
+- 原子 DDL 的**引擎侧** DDL log / `mysql.innodb_ddl_log` / 提交后 replay 见 [`../../innodb/ddl.md`](../../innodb/ddl.md)（本篇只覆盖 binlog/server 侧的 `ddl_xid` 协调）
 - GTID 的三条持久化路径见 [`gtid.md`](gtid.md)
 - **MTS 依赖追踪**（`sequence_number` / `last_committed` 怎么算、三种模式、从库如何消费）见 [`prpl.md`](prpl.md)（本篇只覆盖"写进 binlog"这一段）
 - 复制拓扑与故障转移见 [`replication.md`](replication.md)；GTID 见 [`gtid.md`](gtid.md)

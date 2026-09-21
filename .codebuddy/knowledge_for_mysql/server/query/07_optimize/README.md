@@ -2,7 +2,7 @@
 
 > 优化器是查询处理中最大的子系统之一，独立成此目录（作为 query 主链第 5 步）。本目录按**逻辑优化 → 物理优化 → 计划改进**三层组织，全部算法级。
 >
-> **上下游**：`../06_resolver_prepare.md`（②→③）→ **本目录**（③→④，产出 AccessPath）→ `../08_access_path.md`（④ AccessPath 树）→ `../09_executor_iterator.md`（⑤ 迭代器）。执行期专题见 `../runtime/`。
+> **上下游**：`../06_resolver_prepare.md`（②→③）→ **本目录**（③→④，产出 AccessPath）→ `../08_access_path/README.md`（④ AccessPath 树）→ `../09_executor_iterator.md`（⑤ 迭代器）。执行期专题见 `../runtime/`。
 
 ## 目录结构
 
@@ -24,10 +24,22 @@ optimizer/
 ├── 10_plan_refinement.md  ④ 计划改进（单篇，留在根）
 ├── 11_optimizer_hints.md  横切：`/*+ */` 干预优化器
 ├── 12_partition_pruning.md  横切：分区裁剪（归约到 range 分析）
-└── 13_functional_mv_index.md  横切：函数索引 + 多值索引
+├── 13_functional_mv_index.md  横切：函数索引 + 多值索引
+├── 14_plan_stability.md   横切：计划稳定性与优化器能力横向对照
+├── 15_groupby_distinct_order.md  专项：聚合/分组/排序的优化期决策（①前后）
+├── 16_join_object_model.md       专项：优化器对象模型与生命周期（对象视角）
+├── 17_optimizer_decisions.md     横切：优化器决策全景（36 个决策点索引）
+├── physical/18_hypergraph_advanced.md  ② 续：CSE / 谓词归位 / 计划最终化 / 新代价模型 / 二级引擎
+├── 19_set_operation.md          专项：set operation 的优化侧（UNION/INTERSECT/EXCEPT）
+├── 20_view_resolution.md        专项：VIEW 的解析与优化（merge vs materialize）
+├── 21_collation_index_usability.md  横切：collation/类型聚合与索引可用性
+├── 22_optimizer_worklog_timeline.md  横切：优化器 worklog 与版本演进时间线
+└── 23_optimizer_trace_internals.md   横切：optimizer_trace 的实现原理
 ```
 
-> 编号**全局连续**（02-13），不因分目录而重置——这样各篇之间"见 03 篇"这类交叉引用始终有效。
+> 编号**全局连续**（02-23），不因分目录而重置——这样各篇之间"见 03 篇"这类交叉引用始终有效。
+>
+> 15 之后的分组：**专项**（针对某一个具体机制深挖）、**横切**（跨阶段，用于索引与排查）、**② 续**（hypergraph 高阶，是 09 的延续故留在 physical/）。
 
 ## 为什么独立成子目录
 
@@ -77,12 +89,21 @@ SQL 逻辑查询树（prepare 之后）
 | [07_access_method.md](physical/07_access_method.md) | **访问方法选择**：const 表检测（不动点循环+唯一键）、Key_use 数组（笛卡尔展开+多等值 O(n²)）、find_best_ref（fanout 三级来源）、ref/range/scan 四条启发式短路 + 代价决斗、二次 range 重估 |
 | [08_range_optimizer.md](physical/08_range_optimizer.md) | **range 优化独立成篇**：SEL_TREE/SEL_ARG 区间森林（红黑树+链表+next_key_part 三重结构）、key_and/key_or、六种 range 访问（range/skip scan/MIN-MAX/ROR-intersection/union/index merge）、**index merge 代价估算**（选择率乘数 `n_k/n_{k-1}` 连乘、贪心搜索、去重率、非相关性假设的 bad case 根因）、index dive vs 统计、**长 IN list 字面量专题**（DNF 展开 O(N log N)、`in_vector` 排序不显式去重、dive limit 边界、无 inlist2join、8MB 内存闸降级）、QUICK_RANGE→执行 |
 | [09_hypergraph.md](physical/09_hypergraph.md) | **hypergraph**：JoinHypergraph 构建（**CD-C 算法 + TES 膨胀**）、DPhyp 五函数（Solve/EmitCsg/EnumerateCsgRec/EnumerateCmpRec/TryConnecting）、CostingReceiver 的 Pareto 前沿、图简化重跑（打破左深树，支持 bushy tree） |
+| [18_hypergraph_advanced.md](physical/18_hypergraph_advanced.md) | **hypergraph 高阶模块**：**CSE 公共子表达式消除**（`(a AND b) OR (a AND c)` → `a AND (b OR c)`，★动机是"让谓词可独立下推"而非提速；`AlwaysPresent` 三条规则、`OrGroupWithSomeRemoved` 的恒真传播、无代价阈值、只在 hypergraph 生效）、**谓词位图→Item 树的归位**（`ApplyPredicatesForBaseTable` / `ApplyDelayedPredicatesAfterJoin` 多等值只应用一次 / `ExpandFilterAccessPaths`）、`FinalizePlanForQueryBlock`（**只能调一次**）、**新代价模型**（`constexpr` 全是 0.1 vs 旧的可配置 `server_cost` 表）、`replace_item`、★ **二级引擎**（`SecondaryEngineFlag` bitmask 免遍历、`IteratorsAreNeeded` 三条规则、社区无可用引擎） |
 
 ### ④ 计划改进
 
 | 文件 | 核心内容 |
 |------|----------|
 | [10_plan_refinement.md](10_plan_refinement.md) | Ordering index 选择（**test_if_order_by_key 返回方向非 keypart 数**、select_limit 三重缩放、多表反向保护）、finalize_table_conditions 删冗余谓词、make_join_readinfo 分派、**两层下推的区别**、join buffering、临时表七阶段 |
+| [21_collation_index_usability.md](21_collation_index_usability.md) | **collation / 类型聚合与索引可用性**：★ **两条独立链**（字符集聚合 vs 类型聚合，后者才是索引失效元凶）、`DTCollation` 七档 derivation 强度体系（低枚举值=高强度）、`agg_item_charsets` 两步（aggregate + **就地永久替换**）、★ **`only_consts` 使字段永不被包转换器**（故字符集不同通常不毁索引）、`agg_cmp_type` 提升到 REAL 域才毁索引、**NO PAD vs PAD SPACE**（CHAR 去尾空格导致"索引返回假候选行"，优化器必须保守）、前缀索引与索引长度限制 |
+| [23_optimizer_trace_internals.md](23_optimizer_trace_internals.md) | **optimizer_trace 实现原理**：★ 为什么 context 持"当前结构"指针（深栈埋点 vs 层层传参的 backtrace 例子）、`Opt_trace_struct` 的 **RAII 栈**（构造入栈/析构出栈）、★ **`unlikely(is_started())` 零成本开关**、`add()` 系列重载 + **feature 位掩码过滤**（`MISC` 不可禁用）、`start/end` 生命周期与 OFFSET/LIMIT、★ **I_S 填充里的 SUID 安全洞**（`fill_optimizer_trace_info`）、`end_marker`/`one_line` 的 JSON 序列化 |
+| [22_optimizer_worklog_timeline.md](22_optimizer_worklog_timeline.md) | **Worklog 与版本演进**：5.6→8.0.39 优化器/解析器时间线（**两条并行主线**：物理计划表达方式、优化器算法）、**WL 清单按主题分类**（WL#5257 trace / WL#2489 only_full_group_by / WL#5561 semijoin / WL#1110 物化 / WL#4389 EXISTS→SJ / WL#5800 / WL#12108 / WL#7384 / WL#6059，★ 全部编号来自本仓库源码注释）、**源码"活化石"清单**（WL#6570 在 6 个文件的散落位置与含义）、**四组经典 bad case → 源码根因 → 深入哪篇** |
+| [19_set_operation.md](19_set_operation.md) | **set operation 的优化侧**：`Query_term` 四类型、`Query_expression::optimize()` 逐段（代价简单相加、**递归 CTE 靠 `query_result()` 跨 block 传行数**、相关子查询行数保护）、★ **`create_access_paths()` 的 `streaming_allowed` 三条件**（顶层 ORDER BY 是"遗留决定"、INSERT-SELECT 的 **Halloween Problem** 防护）、**混合 UNION ALL/DISTINCT 的两种策略**（`m_last_distinct` 切分点）、`setup_materialize_set_op` 的 `activate_deduplication`、★ **INTERSECT/EXCEPT 的临时表计数器算法**（EXCEPT 递减 / INTERSECT DISTINCT 的 N-1 / INTERSECT ALL 的 `HalfCounter` 与 2^32 上限） |
+| [20_view_resolution.md](20_view_resolution.md) | **VIEW 的解析与优化**：`open_and_read_view` + `parse_view_definition`（★ 每个 view 有自己的 LEX、`OPEN_FOR_CREATE` 的 dummy LEX）、★ **`merge_derived` 的三级优先级**（ALGORITHM > hint > switch+heuristic，源码注释原文）、★ **view 不受 `allow_merge_derived` 限制**（比等价派生表更容易合并）、`is_mergeable` 的 CTE+RAND 规则、`MAX_TABLES` 限制、可更新视图与 **CHECK OPTION 的三态返回值**（OK/SKIP/ERROR） |
+| [17_optimizer_decisions.md](17_optimizer_decisions.md) | **优化器决策全景（横向索引）**：**36 个决策点三张总表**（prepare 期 11 / optimize 规划期 13 / 收尾与代码生成 12），每个标性质（规则 / 代价 / 硬编码）、判据函数、产出、**可覆盖性**；深挖三个决策——**semi-join 执行策略**（`SJ_OPT_*` 六态、`advance_sj_state` 的"先选后重算"省内存妥协）、访问方法、join 算法；**决策的三种失败模式**（代价失真 / 规则边界 / 开关误配）与诊断入口；**`optimizer_switch` 完整 26 项清单** + 倒排速查 |
+| [16_join_object_model.md](16_join_object_model.md) | **优化器对象模型与生命周期（对象视角）**：`JOIN` 字段分组剖析（表序/条件/分组排序/计划产物）、**`JOIN_TAB` / `QEP_TAB` / `QEP_shared` 的继承与分工**（`QEP_shared_owner` 半公开封装）、**六个指针数组的生命周期**（`join_tab`/`best_ref`/`map2table`/`positions`/`best_positions`/`qep_tab` 谁分配、谁重排、**谁被主动置空**）、`Temp_table_param` 母版+拷贝、`ORDER_with_src` 溯源、★ **`ref_items` 切片机制**（`REF_SLICE_*` 与 RAII 切换）、`TABLE` 上的优化器成员（含 `reginfo.qep_tab` **双向绑定**）、从 `lex_start` 到 `JOIN::destroy` 的完整生命周期与内存归属、`cleanup` vs `destroy` |
+| [15_groupby_distinct_order.md](15_groupby_distinct_order.md) | **GROUP BY / DISTINCT / ORDER BY 的优化期决策**：`optimize_aggregated_query`（聚合常量化三态、`HA_STATS_RECORDS_IS_EXACT` vs `HA_COUNT_ROWS_INSTANT` 双路径）、`optimize_distinct_group_order` 逐段（消序 / 唯一索引消组 / **DISTINCT→GROUP BY 改写** / 子序列删 ORDER BY）、`test_skip_sort`（GROUP BY 优先于 ORDER BY、**`SQL_BIG_RESULT` 的反向逻辑**、LooseScan 冲突保护）、**四种 GROUP BY 实现的判定链**、`make_tmp_tables_info` 的 `need_tmp_before_win` / `allow_group_via_temp_table` / `is_agg_loose_index_scan` |
 
 ### 横切（不属四阶段任何单一阶段）
 

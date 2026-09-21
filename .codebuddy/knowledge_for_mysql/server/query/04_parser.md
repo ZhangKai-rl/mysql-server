@@ -106,14 +106,84 @@ PT_select_stmt
 
 ### `%expect 63` 说明什么
 
-63 个移进/归约冲突，说明 MySQL 的语法**不是纯 LALR(1) 可解析的**。典型例子是 `WITH ROLLUP` —— 需要 LALR(2)，MySQL 在词法层特判绕过：
+63 个移进/归约（shift/reduce）冲突，说明 MySQL 的语法**不是纯 LALR(1) 可解析的**。`%expect 63` 的含义是"**我们已知、且接受这 63 个 SR 冲突**"——bison 会在生成时核对实际冲突数，**多了或少了都报错**，所以这个数字是"锁死的契约"。
 
-```cpp
-// sql/sql_lex.cc:1336-1350（MYSQLlex 内）
-// WITH + ROLLUP 的 LALR(2) → LALR(1) 特判
+#### 两条 MAINTAINER 铁律
+
+`%expect 63` 上方就是两条维护者铁律（原文注释）：
+
+```
+1. We do not accept any reduce/reduce conflicts
+2. We should not introduce new shift/reduce conflicts any more.
 ```
 
-另一类冲突来自 SQL 语法本身的二义性（`CONDITIONLESS_JOIN` 用于 `STRAIGHT_JOIN` 之类），靠优先级声明解决。
+| 铁律 | 含义 | 为什么 |
+|---|---|---|
+| **不接受任何 RR 冲突** | reduce/reduce 冲突是**语法真正的歧义**（同一个输入能归约成两个不同的非终结符），必须逐个消除 | RR 冲突意味着语义不定，几乎总是 bug |
+| **不再引入新 SR 冲突** | shift/reduce 冲突数锁死在 63，新增语法规则不能让这个数变大 | SR 冲突通常能被优先级声明消解，是可管理的历史包袱 |
+
+★ 这两条是"改语法"时的红线：**你加一条规则，如果让冲突数从 63 变成 64，bison 会直接报错**，你必须在不改动 `%expect` 的前提下消解它。
+
+#### 冲突的两个来源
+
+1. **LALR(2) 而非 LALR(1)**：典型是 `WITH ROLLUP`——`WITH` 后面到底是 CTE 还是 ROLLUP 修饰符，需要多看一个 token。MySQL 在词法层特判绕过（`sql/sql_lex.cc` 的 `MYSQLlex` 内做 `WITH + ROLLUP` 的 LALR(2)→LALR(1) 归约）。
+
+2. **SQL 语法本身的二义性**：`STRAIGHT_JOIN`、表达式优先级（`a + b * c`、`NOT a IS NULL`）等，靠**优先级声明**解决。
+
+#### 优先级声明体系：一整条"优先级阶梯"
+
+`sql_yacc.yy` 的 `%left`/`%right`/`%nonassoc` 声明构成一条**从低到高的优先级阶梯**（先声明的低，后声明的高）：
+
+```
+%left  KEYWORD_USED_AS_IDENT        ← 关键字被当作标识符用（最低）
+%nonassoc TEXT_STRING
+%left  KEYWORD_USED_AS_KEYWORD      ← 关键字作为关键字
+%right UNIQUE_SYM KEY_SYM
+%left  UNION_SYM EXCEPT_SYM
+%left  INTERSECT_SYM
+%left  CONDITIONLESS_JOIN           ← STRAIGHT_JOIN 这类无条件 join
+%left  JOIN_SYM INNER_SYM CROSS ... USING
+%left  SET_VAR
+%left  OR_SYM XOR AND_SYM
+%left  BETWEEN_SYM CASE_SYM WHEN THEN ELSE
+%left  EQ GE GT LE LT NE IS LIKE REGEXP IN_SYM   ← 比较运算
+%left  '|' '&' SHIFT_LEFT SHIFT_RIGHT
+%left  '-' '+'
+%left  '*' '/' '%' DIV_SYM MOD_SYM
+%left  '^' OR_OR_SYM
+%left  NEG '~'                       ← 一元负号/取反
+%right NOT_SYM BINARY_SYM COLLATE_SYM
+%left  INTERVAL_SYM SUBQUERY_AS_EXPR
+%left  '(' ')' EMPTY_FROM_CLAUSE
+%right INTO                          ← 最高
+```
+
+★ 这条阶梯的**顺序就是 SQL 表达式的优先级语义**：`OR` 低于 `AND`、`AND` 低于比较、比较低于算术、算术低于一元负号、`NOT` 高于 `AND`（`%right`）……MySQL 的表达式优先级不是散落在语义层，而是**由这段 `%left`/`%right` 声明一次性定义**的。
+
+#### `%prec`：给单条产生式"临时改优先级"
+
+53 处 `%prec` 是消解冲突的**具体手段**——当某条产生式不能简单继承它最后一个 token 的优先级时，显式指定：
+
+| `%prec` token | 场景 | 说明 |
+|---|---|---|
+| `SUBQUERY_AS_EXPR` | `query_expression_parens` | 括号里的查询当表达式用 |
+| `EMPTY_FROM_CLAUSE` | 空 `%empty` 的 FROM 子句 | 空产生式没有 token，必须显式给优先级 |
+| `KEYWORD_USED_AS_KEYWORD` | `BIT_SYM` 等在特定上下文 | 同名字符在不同上下文当关键字/标识符 |
+| `KEYWORD_USED_AS_IDENT` | `DATE_SYM`/`TIME_SYM`/`TIMESTAMP_SYM` 等 | 这些词在多数上下文是标识符（所以优先级最低） |
+| `NEG` | 一元 `-` / `~` / `not2` | 一元运算符的优先级与二元 `-` 区分 |
+| `SET_VAR` | `bool_pri` / `predicate` / `bit_expr` / `simple_expr` 的纯提升产生式 | `@@var` 赋值表达式的优先级 |
+| `CONDITIONLESS_JOIN` | 无条件 join | `STRAIGHT_JOIN` 等 |
+
+★ 理解 `%prec` 是读 `sql_yacc.yy` 的关键：**产生式末尾的 `%prec X` 意思是"这条产生式的优先级按 token X 算"**。为什么 `bit_expr '-' bit_expr %prec '-'` 要显式写 `%prec '-'`？因为该产生式右部以 `bit_expr` 结尾，bison 默认取**最后一个终结符** `bit_expr` 的优先级，那是错的——所以显式指定 `'-'`。
+
+#### 冲突排查方法（新增语法规则时）
+
+1. 加规则后直接 `bison` 编译，看 `%expect 63` 是否被破坏（冲突数≠63 会报错）；
+2. 用 `bison --report=all` 生成 `.output` 文件，定位冲突在哪两个状态、哪两条产生式；
+3. 看冲突是 SR 还是 RR：**RR 必须消**（改文法），SR 可以用 `%prec` 或调整优先级阶梯消解；
+4. 实在无法用优先级消解、且确认语义无害的，才考虑改 `%expect`——但这是最后手段，且要更新注释说明新增冲突的来龙去脉。
+
+★ 顺带：`cmake/bison.cmake` 里 `--warnings=all,no-yacc,no-precedence` 意味着 bison 会**警告"无用优先级声明"**，但 MySQL 显式关掉了 `no-precedence` 告警（历史遗留的 `--yacc` 兼容），所以代码里那些"看起来多余的 `%prec`"可能不会触发告警。
 
 ---
 

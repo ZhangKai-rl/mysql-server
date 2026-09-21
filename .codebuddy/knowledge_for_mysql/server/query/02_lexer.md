@@ -244,7 +244,40 @@ if ((tokval = find_keyword(lip, length, c == '('))) {
 - **非保留关键字**：如 `MASTER`/`LOCK`，可当标识符
 - **函数名关键字**：`LEFT`/`RIGHT` 等，特殊处理
 
-关键字列表在 `sql/lex.h`（Bison 生成 `sql_yacc.h` 里的 `%token`）。
+#### 关键字登记表 `symbols[]`：SYM 四宏与 SG 四分类
+
+`find_keyword` 查的是**运行时哈希表**，但那张哈希表不是手写的，而是由 `sql/lex.h` 里的**登记表 `symbols[]`** 经 `gen_lex_hash` 离线生成的。理解 lexer 必须分清这两层：
+
+```cpp
+// sql/lex.h —— 手写的登记表（声明式，不是运行时结构）
+#define SYM(T, A)    STRING_WITH_LEN(T), SYM_OR_NULL(A), SG_KEYWORDS
+#define SYM_FN(T, A) STRING_WITH_LEN(T), SYM_OR_NULL(A), SG_FUNCTIONS
+#define SYM_HK(T, A) STRING_WITH_LEN(T), SYM_OR_NULL(A), SG_HINTABLE_KEYWORDS
+#define SYM_H(T, A)  STRING_WITH_LEN(T), SYM_OR_NULL(A), SG_HINTS
+
+static const SYMBOL symbols[] = {
+  { SYM("SELECT", SELECT_SYM) },
+  { SYM("FROM", FROM_SYM) },
+  { SYM_FN("LEFT", LEFT_SYM) },
+  { SYM_HK("SELECT", SELECT_SYM) },   // hintable 关键字重复登记
+  ...
+};
+```
+
+★ 四个宏对应四种 **`SG_*` 分组**（`SYMBOL::group` 字段），这是"一个 token 可能被登记多次"的原因：
+
+| 宏 | 分组 | 含义 |
+|---|---|---|
+| `SYM` | `SG_KEYWORDS` | 普通关键字 |
+| `SYM_FN` | `SG_FUNCTIONS` | 函数名（`LEFT` 等，可与关键字冲突，靠 `c=='('` 区分） |
+| `SYM_HK` | `SG_HINTABLE_KEYWORDS` | **hintable 关键字**：SELECT/INSERT/UPDATE/DELETE/REPLACE —— 后面紧跟 `/*+` 时唤醒 hint 语法器（见 [`07_optimize/11_optimizer_hints.md`](07_optimize/11_optimizer_hints.md)） |
+| `SYM_H` | `SG_HINTS` | hint **注释内部**的关键字（`JOIN_ORDER`、`INDEX` 等 hint 名） |
+
+`gen_lex_hash`（`sql/gen_lex_hash.cc`）在**构建期**读取 `symbols[]`，按 `group` 与字符串生成一个**完美哈希表** `lex_hash.h`，运行时 `find_keyword` 靠它做 O(1) 查找。
+
+★ 由此理解一个关键点：**`SYM_HK` 的登记是 hint 机制在 lexer 侧的入口**——它把"SELECT/INSERT/UPDATE/DELETE/REPLACE"标成 hintable，这样 lexer 才能在这些关键字之后检测 `/*+` 并切入 hint 语法器。而 `SYM_H` 让 hint 注释内部能用与主语法器不同的关键字集合。这两组宏的登记位置，就是"hint 如何接入词法层"的答案。
+
+关键字列表的**权威来源是 `sql/lex.h` 的 `symbols[]`**；Bison 生成的 `sql_yacc.h` 里的 `%token` 只是另一份与它**保持同步**的声明（`SYM_OR_NULL(A)` 里的 `A` 就是那个 token 常量）。
 
 ---
 

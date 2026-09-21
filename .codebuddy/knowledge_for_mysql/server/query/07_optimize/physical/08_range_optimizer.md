@@ -1,6 +1,8 @@
 # 08 Range 优化：SEL_TREE / SEL_ARG 区间森林与 range 访问方法
 
 > Range 优化是**访问方法选择**里最复杂的一块（属于物理优化③），独立成篇。本篇覆盖：WHERE 如何变成区间森林、森林如何合并、如何变成多种 range 访问方法、代价怎么算、执行期怎么用。
+>
+> ★ 相邻主题：`GROUP_INDEX_SKIP_SCAN` 在**优化期如何被识别与被否决**（LIS 与分组实现的关系）见 [15 篇第五章](../15_groupby_distinct_order.md)；"这个条件为什么建不出 range"（类型聚合提升到 REAL 域）见 [21 篇](../21_collation_index_usability.md)第三章。
 
 ## 目录
 

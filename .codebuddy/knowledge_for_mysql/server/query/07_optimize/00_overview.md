@@ -254,17 +254,17 @@ join 枚举经历三代算法。全景如下——**各代的详细源码落点�
 | 404-420 | 优化派生表/视图/表函数 | ①（递归） | [04 篇](logical/04_logical_join.md) |
 | **473-486** | WHERE `optimize_cond`（等值传播→常量传播→去恒真恒假） | **①** | [05 篇](logical/05_logical_predicate.md) |
 | 487-500 | HAVING `optimize_cond` | ① | 同上 |
-| 502-506 | `prune_table_partitions` 分区裁剪 | ① | |
-| 514-571 | `optimize_aggregated_query` | ① | |
-| 600-606 | `substitute_gc`（生成列替换） | ① | |
-| **610-679** | **hypergraph 分支**（若开启则到此 return） | ③ | [09 篇](physical/09_hypergraph.md) |
-| **696** | **`make_join_plan()`** | **②③** | [06](physical/06_join_order.md) [07](physical/07_access_method.md) |
+| 502-506 | `prune_table_partitions` 分区裁剪 | ① | [12 篇](12_partition_pruning.md) |
+| 514-571 | `optimize_aggregated_query`（聚合常量化三态） | ① | [15 篇 2 章](15_groupby_distinct_order.md) |
+| 600-606 | `substitute_gc`（生成列替换） | ① | [17 篇 决策 11](17_optimizer_decisions.md) |
+| **610-679** | **hypergraph 分支**（若开启则到此 return） | ③ | [09 篇](physical/09_hypergraph.md) [18 篇](physical/18_hypergraph_advanced.md) |
+| **696** | **`make_join_plan()`** | **②③** | [06](physical/06_join_order.md) [07](physical/07_access_method.md) [17 篇](17_optimizer_decisions.md) |
 | 736-748 | `substitute_for_best_equal_field`（等价类展开成星形等值） | ①（需 join 顺序先定） | [05 篇 1.5](logical/05_logical_predicate.md) |
 | 770-781 | `init_ref_access` / `make_join_query_block` | ③ 收尾 | [05 篇 3 节](logical/05_logical_predicate.md) |
-| 796 | `optimize_distinct_group_order` | ① | |
-| 894-916 | `setup_join_buffering`（BNL/BKA/HashJoin） | ③ | [10 篇](10_plan_refinement.md) |
-| **1011-1023** | `alloc_qep` / `test_skip_sort` / `finalize_table_conditions` / `make_join_readinfo` / `make_tmp_tables_info` | **④ 计划改进** | [10 篇](10_plan_refinement.md) |
-| **1037** | **`create_access_paths()`** | 代码生成 | [`../08_access_path.md`](../08_access_path.md) |
+| 796 | `optimize_distinct_group_order` | ① | [15 篇 3 章](15_groupby_distinct_order.md) |
+| 894-916 | `setup_join_buffering`（BNL/BKA/HashJoin） | ③ | [10 篇](10_plan_refinement.md) [17 篇 决策 25](17_optimizer_decisions.md) |
+| **1011-1023** | `alloc_qep` / `test_skip_sort` / `finalize_table_conditions` / `make_join_readinfo` / `make_tmp_tables_info` | **④ 计划改进** | [10 篇](10_plan_refinement.md) [15 篇 4/6 章](15_groupby_distinct_order.md) |
+| **1037** | **`create_access_paths()`** | 代码生成 | [`../08_access_path/README.md`](../08_access_path/README.md) |
 | 1064 | `push_to_engines`（引擎条件下推） | ④ | [10 篇](10_plan_refinement.md) |
 
 > **注意**：逻辑优化（①）不是一次性完成的。它分布在 `JOIN::optimize` 前段（`optimize_cond`）+ prepare 阶段（semi-join/derived merge/连接简化）+ 部分在 join 顺序之后（`substitute_for_best_equal_field`，因为"最优字段"依赖 join 顺序）。
@@ -324,7 +324,7 @@ SELECT t1.a FROM t1 WHERE t1.a IN (SELECT t2.b FROM t2 WHERE t2.c > 5);
 | 4 | **② 初始分析** | `extract_const_tables` 检测 const 表；`update_ref_and_keys` 生成 Key_use；`estimate_rowcount` 首次 range 分析 | [07 篇](physical/07_access_method.md) |
 | 5 | **③ 物理优化** | `make_join_plan`：greedy search 定 join 顺序、`best_access_path` 选访问方法（`t2.c>5` → range）、semi-join 策略选择 | [06](physical/06_join_order.md) [07](physical/07_access_method.md) [08](physical/08_range_optimizer.md) |
 | 6 | **④ 计划改进** | `test_if_skip_sort` 看能否用索引顺序；`make_join_readinfo` → `push_index_cond` 把条件下推为 ICP | [10 篇](10_plan_refinement.md) |
-| 7 | **代码生成** | `create_access_paths` 产出 AccessPath 树 → `CreateIteratorFromAccessPath` 生成迭代器 | [`../08_access_path.md`](../08_access_path.md)、[`../09_executor_iterator.md`](../09_executor_iterator.md) |
+| 7 | **代码生成** | `create_access_paths` 产出 AccessPath 树 → `CreateIteratorFromAccessPath` 生成迭代器 | [`../08_access_path/README.md`](../08_access_path/README.md)、[`../09_executor_iterator.md`](../09_executor_iterator.md) |
 
 ---
 

@@ -22,7 +22,7 @@
   │
   ▼
 ┌──────────────────────────────────────────────────┐
-│ server/query/    协议 → 解析 → 优化 → 迭代器执行  │  ← 主链，35 篇
+│ server/query/    协议 → 解析 → 优化 → 迭代器执行  │  ← 主链，52 篇
 └──────────────────┬───────────────────────────────┘
                    │ ha_rnd_next / ha_index_next
 ┌──────────────────▼───────────────────────────────┐
@@ -46,7 +46,7 @@
 
 ### server/ —— Server 层
 
-**SQL 处理主链**：见 **[query/README.md](server/query/README.md)**（35 篇 = 主链 12 篇 + [`07_optimize/`](server/query/07_optimize/) 优化器 15 篇 + [`runtime/`](server/query/runtime/) 执行期专题 8 篇；主链：协议分发 → 解析 → contextualize → prepare → 优化 → AccessPath → 迭代器执行 → DML）
+**SQL 处理主链**：见 **[query/README.md](server/query/README.md)**（52 篇 = 主链 20 篇（其中 [`08_access_path/`](server/query/08_access_path/) 拆成 9 篇）+ [`07_optimize/`](server/query/07_optimize/) 优化器 24 篇 + [`runtime/`](server/query/runtime/) 执行期专题 8 篇；主链：协议分发 → 解析 → contextualize → prepare → 优化 → AccessPath → 迭代器执行 → DML）
 
 | 文件 / 目录 | 内容 |
 |---|---|
@@ -259,7 +259,7 @@
 ### 编号规则
 
 - 主链用数字前缀表示**时间顺序**（`01_` → `09_`）
-- 子目录内**编号全局连续、不重置**：`07_optimize/logical/02_` 一直排到 `physical/09_`
+- 子目录内**编号全局连续、不重置**：`07_optimize/logical/02_` 一直排到 `physical/09_`，再往后是 `15_`~`22_`（15 之后分「专项 / 横切 / ②续」三组，见 `07_optimize/README.md`）
   - 这样跨篇引用"见 03 篇"**永远有效**，移动文件不必改引用
   - 用**路径**区分命名空间（写 `07_optimize/01_cost_model`），不靠"移出去平级"来避免编号冲突
 - 横切内容（`runtime/`、EXPLAIN）不参与主链编号语义，README 里单独分组

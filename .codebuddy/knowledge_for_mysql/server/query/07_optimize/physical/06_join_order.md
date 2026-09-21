@@ -1,6 +1,8 @@
 # 06 Join Order 搜索：贪心 + 限深 DFS
 
 > 物理优化③的另一半：**决定表的连接顺序**。访问方法的代价计算见 07 篇，semi-join 策略嵌入见 03 篇。
+>
+> ★ 本篇按**算法**讲。`POSITION` / `best_ref` 这些结构在对象模型中的位置与完整生命周期见 [16 篇](../16_join_object_model.md)第四章；"join order"作为一个**决策点**的性质、判据与可覆盖性见 [17 篇](../17_optimizer_decisions.md)第二章。
 
 ## 目录
 

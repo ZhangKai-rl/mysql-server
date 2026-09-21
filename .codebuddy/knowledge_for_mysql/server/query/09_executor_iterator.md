@@ -729,6 +729,8 @@ range->end_key.flag   = HA_READ_AFTER_KEY;      // 单 key 的闭开区间
 
 **NestedLoopSemiJoinWithDuplicateRemovalIterator**（`.cc:2145`）—— loose scan 的"跳过"语义：取一个外层行 → 取**恰好一条**内层行 → 命中后设 `m_deduplicate_against_previous_row`，之后**不扫内层**地跳过所有同 key 外层行；未命中则不设标志。
 
+> ★ 这些迭代器对应的 **AccessPath 形态**（`NewRemoveDuplicatesOnIndexAccessPath` / `NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` 等在 `ConnectJoins` 里如何组装）见 [`08_access_path/README.md`](08_access_path/README.md)；五种 semi-join 策略分别落成哪个节点/迭代器的对照表见 [`07_optimize/logical/03_semijoin.md`](07_optimize/logical/03_semijoin.md) 5.0 节。
+
 ### 2.6 去重
 
 | 迭代器 | 算法 |

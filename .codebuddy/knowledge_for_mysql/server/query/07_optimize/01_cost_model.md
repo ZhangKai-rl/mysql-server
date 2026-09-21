@@ -1,6 +1,8 @@
 # 01 代价模型与统计信息
 
 > 代价模型（物理优化的判据）+ 统计信息（代价模型的输入）。两者是 ②③ 物理优化的前提。
+>
+> ★ 本篇讲的是**经典优化器**的代价模型（`Cost_model_table` / `Cost_model_server`，可从 `mysql.server_cost` / `mysql.engine_cost` 配置）。hypergraph 优化器用的是**另一套**（编译期 `constexpr` 常量，全部为 0.1），见 [18 篇第四章](physical/18_hypergraph_advanced.md)——两者的量纲不可直接比较。
 
 ## 目录
 

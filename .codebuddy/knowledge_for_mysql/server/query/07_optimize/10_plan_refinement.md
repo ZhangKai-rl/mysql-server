@@ -3,6 +3,8 @@
 > 物理优化**之后**的收尾：Ordering index 选择（避免排序）、条件最终化、访问方法 setup、引擎下推、临时表与排序。
 >
 > 分工：**ICP 的 SQL 层决策**在本篇，**ICP 的 handler 接口与 InnoDB 实现**在 [05 篇 4 节](logical/05_logical_predicate.md)。
+>
+> ★ 相邻主题：GROUP BY / DISTINCT 在优化期被改写的**判定过程**（本篇只讲"排序怎么选"）见 [15 篇](15_groupby_distinct_order.md)；`QEP_TAB` / `POSITION` 等结构的字段级剖析与生命周期见 [16 篇](16_join_object_model.md)。
 
 ## 目录
 
