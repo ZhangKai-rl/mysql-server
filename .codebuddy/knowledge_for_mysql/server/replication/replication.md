@@ -163,14 +163,87 @@ GTID 把坐标换成了**内容寻址**：每个事务带全局唯一 ID（`SERV
 
 ### 复制协议与握手
 
-#### 三个 COM 命令
+> 分工：本篇讲**交互契约**——每一步双方交换什么；从库侧各步骤的代码实现见 [`replica.md`](replica.md)「IO thread 接收管线」，主库侧发送细节见 [`binlog.md`](binlog.md)「读侧 dump 线程」。
 
-从库侧请求入口 `request_dump`（rpl_replica.cc）按定位模式选命令：
+#### 完整握手时序
 
-```cpp
-enum_server_command command =
-    mi->is_auto_position() ? COM_BINLOG_DUMP_GTID : COM_BINLOG_DUMP;
+从库 IO thread 连上主库后，在发出第一个 dump 请求之前要走完一串准备动作（顺序即 `handle_slave_io` 主循环的前几步）：
+
 ```
+从库 IO thread                                     主库
+────────────────────────────────────────────────────────────
+① connect_to_master
+   TCP + 认证 + SSL(可选) + 设 net timeout
+   ─────────────────────────────────────────────►
+                                    （认证、版本握手由连接层完成）
+② get_master_version_and_clock
+   · 读 mysql->server_version  ← 版本<5 或不识别则拒绝
+   · 建本地 FD event（relay log 格式基线）
+   · SELECT @@GLOBAL.binlog_checksum  ─────────►  返回 checksum 算法
+     （存入 mi->checksum_alg_before_fd，用于 FD 到达前的"预热校验"）
+   · SELECT UNIX_TIMESTAMP()  ─────────────────►  返回主库时钟
+     （算 clock_diff，供 Seconds_Behind_Source 使用）
+③ get_master_uuid
+   SELECT @@GLOBAL.SERVER_UUID  ───────────────►  返回主库 UUID
+   ★ 与本机 UUID 相同 → 报错停止复制
+④ io_thread_init_commands
+   SET @slave_uuid/@replica_uuid = '<从库 UUID>'  ──►  主库记住本连接属于谁
+⑤ register_slave_on_master（COM_REGISTER_SLAVE）
+   上报 server_id + report_host/user/password/port ──►  主库 slave_list
+                                                      （供 SHOW REPLICAS）
+⑥ request_dump（COM_BINLOG_DUMP_GTID 或 COM_BINLOG_DUMP）
+   ─────────────────────────────────────────────►
+                                    主库：kill_zombie_dump_threads
+                                          （按 ④ 的 UUID + ⑤ 的 server_id）
+                                          三道校验 → 定位起点
+   ◄───────────────────────────────  fake Rotate + FD + 事件流 + 心跳
+⑦ read_event / queue_event 循环（收包 → 写 relay log → 推进位点）
+```
+
+#### 双方各需要对方什么信息
+
+**从库需要从主库获取**（② ③）：
+
+| 信息 | 获取方式 | 用途 |
+|------|---------|------|
+| 版本 | 连接层 `server_version` | 兼容性检查（<5 直接拒绝） |
+| `binlog_checksum` 算法 | `SELECT @@GLOBAL.binlog_checksum` | FD event 到达前的校验"预热"；之后改用 FD 里带的算法 |
+| 主库时钟 | `SELECT UNIX_TIMESTAMP()` | 算 `clock_diff`，`Seconds_Behind_Source` 依赖它（拿不到也不致命） |
+| **主库 `server_uuid`** | `SELECT @@GLOBAL.SERVER_UUID` | ① 与本机 UUID 相同则停止复制（GTID 命名空间必须不同）；② 记入 `SHOW REPLICA STATUS` 的 `Source_UUID` |
+| FD event / 事件格式 | 主库主动下发 | relay log 的格式基线 |
+
+★ 注意：**GTID 模式下从库不需要知道主库的任何 binlog 文件名或位点**——这正是 auto position 的意义（主库自己算起点）。只有 file+pos 模式才需要维护 `Source_Log_File/Pos`。
+
+**主库需要从库提供**（④ ⑤ ⑥）：
+
+| 信息 | 提供方式 | 用途 |
+|------|---------|------|
+| 从库 `server_uuid` | `SET @slave_uuid/@replica_uuid`（用户变量，非 COM 命令） | **僵尸连接管理**：同 UUID 的旧 dump 线程被踢除（`kill_zombie_dump_threads` 用 `get_replica_uuid`） |
+| 从库 `server_id` | COM_REGISTER_SLAVE / dump 报文 | 同上（server_id 维度）；也用于从库端"跳过自己发出的事件"（见 `replicate_same_server_id`） |
+| exclude 集合（GTID 模式） | COM_BINLOG_DUMP_GTID 报文 | 决定跳过哪些、从哪里开始（见 gtid.md） |
+| 文件名 + 偏移（file+pos） | COM_BINLOG_DUMP 报文 | 直接作起点 |
+| report_host/user/password/port | COM_REGISTER_SLAVE | 仅用于 `SHOW REPLICAS` 展示（不参与协议逻辑） |
+
+**系统层结论**：整个握手里主库真正"记住"的从库状态只有 ④ ⑤ 的注册信息（且只用于防僵尸和展示）——**没有任何与复制进度有关的状态**。这是拉模型的核心收益：主库挂掉后从库连到新主库，新主库不需要任何"旧主库留下的关于这个从库的信息"，仅凭从库自己带来的 exclude 集合就能继续。
+
+#### file+pos 模式的握手一样吗
+
+**前五步完全相同**——源码里 `get_master_version_and_clock` → `get_master_uuid` → `io_thread_init_commands` → `register_slave_on_master` 是**无条件顺序调用**的，与定位模式无关（版本检查、UUID 唯一性校验、`@slave_uuid` 上报、注册这些在 file+pos 下一样要做）。事件流、心跳、`queue_event` 写 relay log 也完全一样。
+
+**差异全部集中在第 ⑥ 步 `request_dump` 之后**：
+
+| 维度 | file+pos（`COM_BINLOG_DUMP`） | GTID（`COM_BINLOG_DUMP_GTID`） |
+|------|------------------------------|-------------------------------|
+| 报文 | 文件名 + `pos(4)` | 空文件名 + `pos(8)`=4 + exclude 集合 |
+| 起点谁定 | **从库指定**，主库直接用（`check_start_file` 分支①） | **主库算**（`find_first_log_not_in_gtid_set`） |
+| 主库校验 | 只校验文件存在 + `pos` 合法（≥4、≤文件长度） | 三道集合校验（子集/purge/定位） |
+| 事件级跳过 | **无**——`m_exclude_gtid == nullptr`，从 pos 起全发 | **有**——`skip_event` 逐事务 `contains_gtid` 过滤 |
+| 从库要维护 | io 位点（文件名 + 偏移） | 只需 `gtid_executed` |
+| 重连粒度 | 从持久化的 io 位点续；**若断在事务中间**，靠 `Transaction_boundary_parser` 丢弃半截事务 | 靠集合语义，天然不含半截事务（GTID 只在事务完整 flush 后入 retrieved） |
+
+> 一句话：**握手骨架共用，差异只在"怎么表达起点"** ——file+pos 传物理坐标、主库照做；GTID 传集合、主库推导。这也解释了为什么 file+pos 必须做 io 位点的 crash-safe 持久化而 GTID 不必。
+
+#### 三个 COM 命令
 
 | 命令 | 载荷 | 语义 |
 |------|------|------|
@@ -178,15 +251,9 @@ enum_server_command command =
 | `COM_BINLOG_DUMP`（0x12） | binlog 文件名 + 偏移 + server_id | file+pos 定位：从指定字节开始发事件 |
 | `COM_BINLOG_DUMP_GTID` | 编码后的 GTID 集合 + server_id | GTID 定位：发"集合之外"的事务 |
 
-GTID 模式的载荷构造（`request_dump` 内）：从库把 `rli->get_gtid_set()`（retrieved）与 `gtid_state->get_executed_gtids()`（已执行）**并集**编码发出——这就是从库的 exclude 集合（"我全都有，别发这些"）。`file_name` 置空、`start_position = 4`（跳过 magic），主库侧用 `find_first_log_not_in_gtid_set` 决定真正的起点。
+请求的构造（`request_dump` 按 `is_auto_position` 选命令、GTID 模式发 retrieved ∪ executed 并集作为 exclude 集合）见 [`replica.md`](replica.md)「IO thread 接收管线」；主库侧三件事的代码细节见 [`binlog.md`](binlog.md)「读侧 dump 线程」——僵尸连接踢除（`kill_zombie_dump_threads`）、心跳（HEARTBEAT_EVENT v2，空闲超时后主动发，从库据此刷新 `Read_Source_Log_Pos` 探测存活）、事件流主循环。
 
-#### 僵尸连接管理
-
-主库侧 `kill_zombie_dump_threads`：dump 线程注册时，若发现已有同 `server_id` 或同 `server_uuid` 的 dump 线程存在，**杀死旧连接**。这是拉模型下主库仅有的"从库状态"——防半死连接（网络分区导致旧连接还挂着）与新连接并存造成重复发送。mysqlbinlog 连上来时 server_id=0，不受此管理。
-
-#### 心跳
-
-拉模型下从库收不到事件时无法区分"主库没事只是没事务"与"主库挂了"。HEARTBEAT_EVENT（v2）让 dump 线程在空闲超时后主动发心跳事件（含当前 binlog 位点），从库据此刷新 `Read_Source_Log_Pos` 并探测存活。`request_dump` 里 `binlog_flags |= USE_HEARTBEAT_EVENT_V2` 声明支持。发送细节见 binlog.md「等待新事件与心跳」。
+**系统层视角只需记住两点**：其一，拉模型下主库对从库仅有的状态就是"注册信息 + 防僵尸"，这使 failover 切换主库零负担；其二，心跳解决了拉模型"收不到事件无法区分主库安静 vs 主库挂了"的固有问题。
 
 ### 位点定位：file+pos vs GTID auto position
 
@@ -196,7 +263,7 @@ GTID 模式的载荷构造（`request_dump` 内）：从库把 `rli->get_gtid_se
 
 #### GTID auto position：差集定位
 
-主库侧核心算法 `find_first_log_not_in_gtid_set`（binlog.cc）——逆序扫描 + 单调包含：
+主库侧核心算法 `find_first_log_not_in_gtid_set`——**逆序扫描 binlog index，只读每个文件的 `Previous_gtids_log_event`，找第一个 `Previous_gtids ⊆ exclude 集合` 的文件**（该文件之前的事务从库全有，从它开始 dump）。算法代码、逐事件 `skip_event` 过滤与三道集合校验的完整剖析见 [`gtid.md`](gtid.md)「发送起点的选择」与「GTID 复制协议：exclude 集合」；本篇只讲它对 failover 的意义。
 
 ```cpp
 bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,

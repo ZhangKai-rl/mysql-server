@@ -344,14 +344,30 @@ if (rli->log_space_limit && exceeds_relay_log_limit(rli, queued_size) &&
 }
 ```
 
-`wait_for_relay_log_space`（rpl_replica.cc:3103 附近）的协议是"先 rotate 挤出旧文件、再睡在 `log_space_cond` 上等 SQL 侧 purge"：
+空间判定 `exceeds_relay_log_limit` 精确到字节：`log_space_limit != 0 && log_space_limit < log_space_total + queued_size`——`log_space_total` 由"写事件加、purge 文件减"持续维护。GTID 事件之所以用 `trx_length`（整个事务长度）估算而不是 `event_len`（单个事件字节）：反压一旦在事务中间触发就无解（不能在事务中间 purge 文件），所以要在**事务开始前**用全事务长度预判。
+
+`wait_for_relay_log_space`（rpl_replica.cc）的协议是"置标记 → 主动 rotate → 睡在 `log_space_cond` 等 SQL 侧 purge"：
 
 ```cpp
 static bool wait_for_relay_log_space(Relay_log_info *rli, size_t queued_size) {
-  // 标记：此后 coordinator 在事务外 rotate 时，会 purge 掉旧文件
+  // from now on, until the time is_receiver_waiting_for_rl_space is
+  // cleared, every rotation made by coordinator and executed
+  // outside of a transaction, will purge the currently rotated log
   rli->is_receiver_waiting_for_rl_space.store(true);
-  ...
-  rotate_relay_log(mi, true, true, true);   // 先主动 rotate 一次，让旧文件可被 purge
+
+  // rotate now to avoid deadlock with FLUSH RELAY LOGS, which calls
+  // rotate_relay_log with a default locking order ...
+  // Before rotation, is_receiver_waiting_for_rl_space is already set, so
+  // after exiting the rotate_relay_log, coordinator executing rotation
+  // requested here will see the correct value and will purge applied
+  // logs with force option
+  rotate_relay_log(mi, true, true, true);
+
+  // capture the log name to which we rotated:
+  mysql_mutex_lock(rli->relay_log.get_log_lock());
+  std::string receiver_log = rli->relay_log.get_log_fname();
+  mysql_mutex_unlock(rli->relay_log.get_log_lock());
+
   ...
   mysql_mutex_lock(&rli->log_space_lock);
   thd->ENTER_COND(&rli->log_space_cond, &rli->log_space_lock, ...);
@@ -361,11 +377,20 @@ static bool wait_for_relay_log_space(Relay_log_info *rli, size_t queued_size) {
     mysql_cond_wait(&rli->log_space_cond, &rli->log_space_lock);
   }
   mysql_mutex_unlock(&rli->log_space_lock);
-  ...
+  thd->EXIT_COND(&old_stage);
+
+  rli->is_receiver_waiting_for_rl_space.store(false);
+  return slave_killed;
 }
 ```
 
-唤醒条件有三条：空间够了 / 被 kill / `coordinator_log_after_purge` 前进了（SQL 侧 purge 了文件并在 `log_space_lock` 下更新了该标记后广播）。第三条是防止"SQL 侧 purge 完成但空间依然不够"时的死等。
+三个动作各有其不得已的理由，合起来是一个**双死锁避免协议**：
+
+1. **`is_receiver_waiting_for_rl_space` 置位**：给 SQL 侧的声明——"IO 正在等空间，凡事务外的 relay log rotate 都给我 force purge 掉已回放文件"。SQL 侧 coordinator 在 rotate 时检查这个标志，决定是否用 force 选项 purge（`purge_applied_logs` 的 force 分支），否则正常 rotate 不会主动释放已回放空间，IO 可能永远等不到空间。
+2. **先主动 `rotate_relay_log` 一次**：动机不是"挤出旧文件"这么简单——源码注释明说 **"rotate now to avoid deadlock with FLUSH RELAY LOGS"**。`FLUSH RELAY LOGS` 会以默认锁序调 `rotate_relay_log`，若 IO 先睡在 `log_space_cond` 上等空间、而空间又需要一次 rotate 才能释放，就与 FLUSH 命令形成锁序死锁。先自己 rotate 一次（此时 `is_receiver_waiting_for_rl_space` 已置位，coordinator 执行这次 rotate 时会 force purge），把"需要 rotate 才能释放的空间"提前释放掉，之后等待期间就不再需要 rotate。
+3. **while 第三条 `coordinator_log_after_purge != receiver_log`**：`receiver_log` 是 rotate 后 IO 当前写入的文件名，`coordinator_log_after_purge` 是 SQL 侧"已 force purge 到哪个文件"的推进标记（每次 purge 后更新为当前 group 文件并广播 `log_space_cond`）。当两者相等时，SQL 已把 receiver 当前文件之前的所有文件都 purge 完了——**不可能再有 purge 释放空间**，继续睡就是无限等待。官方字段注释（rpl_rli.h）点出最极端的触发场景：**单事务 + relay log 元数据本身比 `relay_log_space_limit` 还大**时，这个事务永远装不进限额。此时必须 break 出去、允许暂时超限继续入队——这是 IO/SQL 互等死锁的解法：空间反压的最终出路不是"等到空间"，而是"等不到就放行，让 SQL 追上"。
+
+唤醒条件对应三条：空间够了 / 被 kill / `coordinator_log_after_purge` 前进了（SQL 侧 purge 后广播 `log_space_cond`）。
 
 ### relay log：读写生命周期
 
@@ -468,6 +493,56 @@ relay log rotate 的独特之处在 `new_file_impl`：开新文件时把**主库
 - `purge_applied_logs()`：SQL 回放推进后，purge 掉已回放完的旧 relay log 文件，更新 `log_space_total`，广播 `log_space_cond` 唤醒等待空间的 IO thread
 
 purge 的判定是**文件粒度**（不能 purge 当前正在读的文件），且更新 `coordinator_log_after_purge` 标记——这正是「空间反压」节中 IO thread 的唤醒条件之一。
+
+#### purge：SQL 侧的清理（完整机制）
+
+**触发点**：`move_to_next_log()`——SQL thread 读到文件尾、切到下一个 relay log 时，且 `!is_in_group()`（**事务外**）。事务内绝不 purge（与 rotate 同理）。
+
+`purge_applied_logs`（rpl_applier_reader.cc）的完整流程：
+
+```cpp
+if (!relay_log_purge) return false;                    // ① 开关
+
+Shared_backup_lock_guard backup_lock{current_thd};     // ② 备份锁
+switch (backup_lock) {
+  case locked: break;
+  case not_locked:
+    LogErr(WARNING_LEVEL, ER_LOG_CANNOT_PURGE_BINLOG_WITH_BACKUP_LOCK);
+    return false;                                      //    备份中：放弃本次 purge
+  case oom: m_errmsg = ER_OUT_OF_RESOURCES_MSG; return true;
+}
+
+if (m_rli->flush_info(RLI_FLUSH_IGNORE_SYNC_OPT)) {    // ③ 先把 SQL 位点落盘
+  m_errmsg = "Error purging processed logs"; return true;
+}
+
+m_rli->relay_log.lock_index();
+mysql_mutex_lock(&m_rli->log_space_lock);
+auto current_log_space = m_rli->log_space_total.load();
+m_rli->relay_log.purge_logs(
+    m_rli->get_group_relay_log_name(),
+    false /* include */,                               // ④ 不含当前文件
+    false, false, &current_log_space, true);
+m_rli->log_space_total.store(current_log_space);       // ⑤ 扣减空间
+m_rli->coordinator_log_after_purge = m_rli->get_group_relay_log_name();
+mysql_cond_broadcast(&m_rli->log_space_cond);          //    唤醒等空间的 IO
+mysql_mutex_unlock(&m_rli->log_space_lock);
+
+m_rli->relay_log.find_log_pos(&m_linfo,                // ⑥ 文件被删，重定位读游标
+                              m_rli->get_event_relay_log_name(), false);
+m_rli->relay_log.unlock_index();
+```
+
+六个设计点各有其理由：
+
+1. **① 开关 `relay_log_purge`（默认 ON）**：关闭后 relay log **只增不删**——磁盘持续增长，且必须靠 `relay_log_recovery` 或手工清理；官方不建议关（手册明确"relay log 只能由 MySQL 自己 purge"）。
+2. **② 备份锁**：purge 会删文件，而物理备份可能正在读它们。拿不到备份锁就**放弃本次 purge 并告警**（不阻塞、不报错），下次机会再试——这是"宁可晚删也不破坏备份"的取舍。
+3. **③ 顺序：先 flush_info 再 purge**——这是"位点不能领先于数据"的**反向保证**：必须先把 SQL 位点（已回放到哪）持久化，才能删除对应的 relay log。若顺序反过来，删完文件后崩溃 → 位点说"还没回放完"但文件已经没了 → 事务永久丢失。
+4. **④ `include = false`**：purge 掉 group 位点所在文件**之前**的所有文件，**当前正在回放的文件不能删**（SQL thread 正在读它）。
+5. **⑤ 空间记账与唤醒在同一把 `log_space_lock` 下完成**：先扣 `log_space_total`、更新 `coordinator_log_after_purge`、再广播 `log_space_cond`——源码注释明说要在 signal 之前改完变量。这正是「空间反压」节 IO thread 的唤醒源。
+6. **⑥ 重定位**：文件被删后 `linfo` 缓存失效，必须 `find_log_pos` 重新定位读游标。
+
+**与空间反压的联动**：`should_purge_current_relay_log` 标志由 IO 侧的 `is_receiver_waiting_for_rl_space` 触发（见「空间反压」节）。IO 等空间时，SQL 侧切文件时会把 group 位点**推进到下一个文件**（`set_group_relay_log_name(next_file)`），使**当前文件也进入可 purge 范围**——这是反压能真正释放空间的最后一环：正常情况下当前文件不删，等空间时破例让它也能被删。
 
 ### SQL thread：应用管线
 
@@ -594,6 +669,25 @@ mysql_mutex_unlock(&rli->run_lock);
 这是复制线程退出的经典竞态：STOP REPLICA 的等待者在 `stop_cond` 上，被唤醒后会检查 `slave_running==0` 然后可能释放 `mi`/`rli`。若先 unlock 后 broadcast，等待者在 broadcast 前拿到锁、看到旧状态、提前释放结构——因此**广播必须发生在锁内**（等待者醒来时锁还在，结构必然存活）。
 
 ### 位点持久化：两套仓库与 MTS checkpoint
+
+#### 为什么必须 crash-safe 持久化（file+pos 的根本原因）
+
+**因为 file+pos 模式下"起点"是从库自己的责任**：主库只是照着从库给的 (文件名, 偏移) 发数据，不参与计算、也不做去重（见 `check_start_file` 分支① 与"file+pos 没有事件级跳过"）。于是从库持久化的 io 位点就是**重连时唯一的依据**，它的准确性直接决定数据正确性：
+
+| 位点出错方向 | 后果 |
+|---|---|
+| **落后**（位点 < relay log 实际内容） | 重连重复拉取已收过的事务 → 重复执行 → `1062` 主键冲突 / `1032` 找不到行。**file+pos 没有幂等机制**（不像 GTID 有集合去重） |
+| **超前**（位点 > 实际已落盘的事件） | 那些事件再也不会被请求 → **永久丢事务**，且不报错 |
+
+第二个方向最危险，所以真正的约束是**"位点绝不能领先于数据"**——这决定了 `queue_event` 的写入顺序：先 `write_buffer` 把事件写进 relay log、再推进 `master_log_pos`、最后才 `flush_info`。
+
+**对比 GTID 模式为什么没这么苛刻**：GTID 重连时发 exclude 集合由主库重新定位，位点稍落后只会"多拉一点"，而多拉的事务因在集合里被 `skip_event` 跳过（整事务粒度），天然幂等。所以 GTID 模式下 io 位点仍要维护（用于显示、`relay_log_recovery`），但**不需要精确到事件级的 crash-safe**。这也是 GTID_ONLY 模式敢把文件名从仓库里删掉的底气。
+
+**落地三要素**：
+
+1. **仓库必须是 TABLE**（`mysql.slave_master_info` / `slave_relay_log_info` 是 InnoDB 表）——位点的更新与业务数据在同一崩溃恢复体系内，要么一起提交要么一起回滚，不存在"数据提交了位点没提交"。8.0 已强制这一点：两个 repository 变量默认值就是 `TABLE` 且**已标记为 DEPRECATED**（不再支持 FILE）。这也是 5.7+ "crash-safe replication"的标准配置。
+2. **节流与强制**：周期性同步由 `sync_source_info`（默认 10000 个事件）/ `sync_relay_log_info` 控制；关键节点用 `force` 强制落盘（见下节 `do_flush_info` 的 `force ||` 判据）。
+3. **`relay_log_recovery=ON` 兜底**：启动时若 relay log 与位点信息不一致（崩溃残留），丢弃不可信的 relay log、按 SQL 位点重新从主库拉取（详见「relay log recovery」章）。
 
 #### flush_info 与节流
 
@@ -914,7 +1008,7 @@ Rpl_info（基类：data_lock/run_lock/sleep_lock/info_thd_lock + start/stop/dat
 
 | 错误码 | 名称 | 触发场景 | 根因与排查 |
 |--------|------|---------|-----------|
-| **13114** | `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG` | dump 时主库报错"Got fatal error from source when reading data from binary log" | ★ 经典 1236 的 8.0 版。**同一错误的两个形态**：主库 dump 线程发 `ER_SOURCE_FATAL_ERROR_READING_BINLOG`（客户端错误码），从库 IO thread 收到后包装成 `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`=13114 记入 `Last_IO_Errno`（rpl_replica.cc 的 `handle_slave_io` switch 分支）。file+pos 模式：请求的 binlog 已被 purge 或从未存在；GTID 模式：集合校验失败（见 GTID 侧）。排查：主库 `SHOW BINARY LOGS` 对比 `Read_Source_Log_Pos`；处置：file+pos 重建复制或 `CHANGE REPLICATION SOURCE TO AUTO_POSITION=1` |
+| **13114** | `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG` | dump 时主库报错"Got fatal error from source when reading data from binary log" | ★ 经典 1236 的 8.0 版。**同一错误的两个形态**：主库 dump 线程发 `ER_SOURCE_FATAL_ERROR_READING_BINLOG`（客户端错误码），从库 IO thread 收到后包装成 `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`=13114 记入 `Last_IO_Errno`（rpl_replica.cc 的 `handle_slave_io` switch 分支）。file+pos 模式：请求的 binlog 已被 purge 或从未存在；GTID 模式：集合校验失败（★ 三道校验任一失败主库都统一发这个错误码，靠 `Last_IO_Error` 文本区分具体原因，机制见 [`gtid.md`](gtid.md)「三道校验」）。排查：主库 `SHOW BINARY LOGS` 对比 `Read_Source_Log_Pos`；处置：file+pos 重建复制或 `CHANGE REPLICATION SOURCE TO AUTO_POSITION=1` |
 | `ER_REPLICA_RELAY_LOG_WRITE_FAILURE` | 同左 | `queue_event` 写 relay log 失败 | 磁盘满/只读/permission；IO thread 终止但 SQL thread 可继续消费存量 relay log |
 | `ER_NETWORK_READ_EVENT_CHECKSUM_FAILURE` | 同左 | 网络传输 checksum 校验失败（`queue_event` 入口） | 网络损坏/半途断包；IO 重连后主库重发（checksum 在入队前校验，脏数据不落 relay log） |
 | `ER_RELAY_LOG_INIT` | 同左 | relay log 位点初始化失败（"Failed initializing relay log position"） | 常与 index 文件损坏、位点仓库内容非法有关；见「坑与已知缺陷」的 Bug #92882 |

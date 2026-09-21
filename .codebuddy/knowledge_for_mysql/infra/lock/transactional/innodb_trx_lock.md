@@ -26,6 +26,7 @@
     - [挂起：入睡的完整编排](#挂起入睡的完整编排)
     - [授予：lock_rec_grant_by_heap_no 逐行](#授予lock_rec_grant_by_heap_no-逐行)
     - [唤醒：最多一次的结构性保证](#唤醒最多一次的结构性保证)
+    - [超时：innodb_lock_wait_timeout 的完整链路](#超时innodb_lock_wait_timeout-的完整链路)
   - 死锁检测
     - [后台线程主循环](#后台线程主循环1-秒轮询--事件提前唤醒)
     - [wait-for graph 的构建](#wait-for-graph-的构建)
@@ -1617,6 +1618,146 @@ static const lock_t *lock_rec_has_to_wait_for_granted(
 **另外两条唤醒路径**与授予同终点：死锁 victim（检测线程置标志后 `lock_cancel_waiting_and_release`，同样摘锁 + 唤醒）；超时/中断（`lock_wait_check_slots_for_timeouts` 每秒扫槽位，到期者置 `error_state = DB_LOCK_WAIT_TIMEOUT` 再取消；HP 事务对非 HP 阻塞者不让超时）。
 
 **醒来后怎么办**：`que_run_threads` 状态机里 `QUE_THR_LOCK_WAIT` 分支调 `lock_wait_suspend_thread` 返回后检查 `error_state`——`DB_SUCCESS` 则 `goto loop` 重跑同一条 SQL（"锁被授予"= 从挂起点返回重试，冲突已消）；非 SUCCESS 则进入错误处理（DB_DEADLOCK 回滚整个事务、DB_LOCK_WAIT_TIMEOUT 回滚当前语句）。
+
+#### 超时：innodb_lock_wait_timeout 的完整链路
+
+挂起、唤醒、线程主循环已见上文三小节，本节把「超时」这条线单独串起来——它是**等待机制唯一"事后取消"的路径**（挂起侧不带闹钟，见下）。
+
+##### sysvar 与语义
+
+```cpp
+static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
+                          "Timeout in seconds an InnoDB transaction may wait "
+                          "for a lock before being rolled back. Values above "
+                          "100000000 disable the timeout.",
+                          nullptr, nullptr, 50, 1, 1024 * 1024 * 1024, 0);
+```
+
+- **默认 50 秒**，min 1，max 2^30（约 34 年）；`PLUGIN_VAR_RQCMDARG` = **动态 session 级**（每个连接可不同值，SET 即生效）
+- **"禁用超时"没有独立开关**：注释原文 "Values above 100000000 disable the timeout"——值 > 1 亿秒（约 3.17 年）即视为禁用，检测侧以 `wait_timeout < 100000000` 为门槛呼应（见「检测侧」）
+- 配套 `innodb_rollback_on_timeout`（默认 OFF，`PLUGIN_VAR_READONLY` 只读）：注释原文 "Roll back the complete transaction on lock wait timeout, **for 4.x compatibility**"——OFF 只回滚当前语句，ON 回滚整个事务。流转：静态 `innobase_rollback_on_timeout` → 启动时赋值 `row_rollback_on_timeout`（row0mysql.cc 全局）
+
+##### 超时值的流转：用时即查，`trx_t` 上无缓存
+
+```cpp
+// trx0trx.h
+static inline std::chrono::seconds trx_lock_wait_timeout_get(const trx_t *t) {
+  return thd_lock_wait_timeout(t->mysql_thd);
+}
+// ha_innodb.cc
+std::chrono::seconds thd_lock_wait_timeout(THD *thd) {
+  /* According to <mysql/plugin.h>, passing thd == NULL
+  returns the global value of the session variable. */
+  return std::chrono::seconds{THDVAR(thd, lock_wait_timeout)};
+}
+```
+
+三个要点：
+
+1. **8.0.39 的 `lock_wait_suspend_thread` 只有 `que_thr_t *thr` 一个参数**（旧资料常见"wait_timeout 实参"说法已过时）——超时值在函数内部 `trx_lock_wait_timeout_get(trx)` 现查，不靠调用方传参。
+2. **后台事务落全局值**：`mysql_thd == NULL` 时 `THDVAR(NULL, ...)` 返回全局默认 50 秒——挂起函数内注释原文："InnoDB system transactions (such as the purge, and incomplete transactions that are being rolled back after crash recovery) will use the global value of innodb_lock_wait_timeout, because trx->mysql_thd == NULL"。⚠️ `trx0trx.h` 注释里"set the lock wait timeout to 0"是**历史残留**（旧实现置 0 表无限等），8.0.39 实际返回全局值——后台事务**不是无限等待**，真"无限"只有用户显式设 > 1 亿秒。
+3. **"用时即查"让 `WAIT N` 语法零成本生效**：`SELECT ... FOR UPDATE WAIT 5`（8.0.30+）在 SQL 层临时覆盖 `thd->variables.lock_wait_timeout`，InnoDB 侧读 `THDVAR(thd, ...)` 拿到就是这个临时值——**WAIT N 本质是临时改写会话变量**，与 `innodb_lock_wait_timeout` 走同一机制。（对照：`NOWAIT`/`SKIP LOCKED` 在 `lock_rec_lock_slow` 直接返回 `DB_LOCK_NOWAIT`/`DB_SKIP_LOCKED`，**根本不入等待队列**，与超时无关。）
+
+##### 挂起侧：不带闹钟的睡眠
+
+`lock_wait_table_reserve_slot` 里存两样东西：
+
+```cpp
+slot->suspend_time = std::chrono::steady_clock::now();   // 单调时钟：超时判定的基准
+slot->wait_timeout = wait_timeout;                        // 存完整超时值
+```
+
+而挂起本身是 `os_event_wait(slot->event)`——**无限等、不设闹钟**。真正计时在检测线程，超时是"事后取消"。由此引出本机制最重要的**双时钟域分离**：
+
+| 时钟 | 字段 | 用途 | 为什么 |
+|---|---|---|---|
+| `steady_clock`（单调） | `slot->suspend_time` | **超时判定** | 免受系统改时间影响（改表时间不会让等待"永不超时"或"立即超时"） |
+| `system_clock`（wall clock） | `trx->lock.wait_started`（`RecLock::set_wait_state`/`lock_table` 里 `from_time_t(time(nullptr))`） | **只展示**：SHOW ENGINE / I_S.innodb_trx | 给人看的字段，语义就该是墙上时间 |
+
+（`thd_set_lock_wait_time`/`thd_storage_lock_wait` 也是易误解点：它们**不是设置超时**，而是把本次等待耗时上报给 PFS 累计 `inc_lock_usec`。）
+
+##### 检测侧：每秒扫描 + 事后取消
+
+```cpp
+static void lock_wait_check_slots_for_timeouts() {
+  lock_wait_mutex_enter();
+  for (auto slot = lock_sys->waiting_threads; slot < lock_sys->last_slot; ++slot) {
+    if (slot->in_use) lock_wait_check_and_cancel(slot);
+  }
+  lock_wait_mutex_exit();
+}
+
+static void lock_wait_check_and_cancel(const srv_slot_t *slot) {
+  const auto wait_time = std::chrono::steady_clock::now() - slot->suspend_time;
+  /* Timeout exceeded or a wrap-around in system time counter */
+  const auto timeout = slot->wait_timeout < std::chrono::seconds{100000000} &&
+                       wait_time > slot->wait_timeout;
+  trx_t *trx = thr_get_trx(slot->thr);
+  if (!trx_is_interrupted(trx) && !timeout) return;
+  locksys::run_if_waiting({trx}, [&]() { lock_wait_try_cancel(trx, timeout); });
+}
+```
+
+- 判据：`wait_time > slot->wait_timeout` 且 `< 100000000`（禁用门槛）；**KILL（`trx_is_interrupted`）走同一条 cancel 路径**（此时 `timeout=false`，只是中断）
+- `lock_wait_try_cancel` 里三个保护：① **HP 豁免**——高优先级事务若阻塞者非 HP 则 `return` 不让超时（"An HP trx should not give up if the blocker is not HP"）；② `ut_ad(trx->error_state != DB_DEADLOCK)`——注释 "Make sure we are not overwriting the DB_DEADLOCK which would be more important to report as it rolls back whole transaction"；③ 置 `error_state = DB_LOCK_WAIT_TIMEOUT` 后 `lock_cancel_waiting_and_release` → `os_event_set` 唤醒
+- `lock_set_timeout_event()` 的真实语义（纠正一个流传说法）：它 **set `lock_sys->timeout_event`**，是检测线程主循环 `os_event_wait_time_low(event, 1s)` 的**唤醒信号**——新等待者入槽（`lock_wait_request_check_for_cycles`）或 shutdown 时踢检测线程立刻跑一轮，不是"长等待辅助路径"
+
+##### 超时后的收尾：回滚语句还是事务
+
+`row_mysql_handle_errors` 的 `handle_new_error` 标签（完整分支）：
+
+```cpp
+err = trx->error_state;
+ut_a(err != DB_SUCCESS);
+trx->error_state = DB_SUCCESS;
+switch (err) {
+  case DB_LOCK_WAIT_TIMEOUT:
+    if (row_rollback_on_timeout) {
+      trx_rollback_to_savepoint(trx, nullptr);   // ON：回滚整个事务（4.x 兼容语义）
+      break;
+    }
+    [[fallthrough]];                             // OFF：落入 default 只回滚当前语句
+  case DB_DUPLICATE_KEY:
+  ...
+  default:
+    if (trx->error_state == DB_SUCCESS) {
+      err = trx_rollback_last_sql_stat_for_mysql(trx);   // 只回滚最后一条 SQL
+    }
+    ...
+}
+```
+
+SQL 层转换（`convert_error_code_to_mysql`）：
+
+```cpp
+case DB_LOCK_WAIT_TIMEOUT:
+  /* Starting from 5.0.13, we let MySQL just roll back the
+  latest SQL statement in a lock wait timeout. Previously, we
+  rolled back the whole transaction. */
+  if (thd) thd_mark_transaction_to_rollback(thd, (int)row_rollback_on_timeout);
+  return (HA_ERR_LOCK_WAIT_TIMEOUT);
+```
+
+`HA_ERR_LOCK_WAIT_TIMEOUT` → `ER_LOCK_WAIT_TIMEOUT`(1205) "Lock wait timeout exceeded"。注意**两层回滚标记是一致的**：InnoDB 侧已按 `row_rollback_on_timeout` 回滚了语句或事务，`thd_mark_transaction_to_rollback(thd, 0/1)` 把同样的决定告诉 server 层（0=只语句、1=整个事务）。
+
+##### 特殊场景
+
+| 场景 | 行为 | 证据 |
+|---|---|---|
+| **后台事务**（purge/恢复回滚） | 用**全局默认值 50s**，不是无限等 | `mysql_thd==NULL` → `THDVAR(NULL)` 全局值（挂起函数注释原文） |
+| **DD 的 `DB_LOCK_WAIT_TIMEOUT`** | 是 **MDL 等待**超时，不是行锁超时——InnoDB 内部访问 SDI 表时给 MDL 等设"用户超时 **+27 小时**"高水位，防短超时打断内部 DDL（注释 "Submit a higher than default lock wait timeout"） | dict0dict.cc 的 SDI MDL 获取路径 |
+| **死锁 vs 超时** | **谁先到谁生效**：同一线程每轮先超时检查后死锁检测；`ut_ad(error_state != DB_DEADLOCK)` + "至多唤醒一次"保证互不覆盖；死锁一旦选中 victim（整事务回滚）超时不再碰它 | `lock_wait_try_cancel` + 唤醒小节四条规则 |
+| **AUTOINC 锁等待** | 同样走 `lock_wait_suspend_thread`，**受超时约束**（AI 锁的"语句级释放"是正常路径，与超时无关） | que0que 状态机统一挂起 |
+| **`WAIT N` / `NOWAIT` / `SKIP LOCKED`** | `WAIT N` = 临时覆盖会话变量；`NOWAIT`/`SKIP LOCKED` 不入队不受影响 | 见「超时值的流转」 |
+
+##### 超时的可观测性
+
+| 观测面 | 怎么看到 | 时钟域 |
+|---|---|---|
+| SHOW ENGINE INNODB STATUS | `------- TRX HAS BEEN WAITING N SEC FOR THIS LOCK TO BE GRANTED:`（`lock_trx_print_wait_and_mvcc_state`） | wall clock（`wait_started`） |
+| I_S.innodb_trx | `trx_wait_started` 列 | wall clock |
+| INNODB_METRICS | 计数器名 **`lock_timeouts`**（枚举 `MONITOR_TIMEOUT`），递增点在挂起函数尾部 `if (error_state == DB_LOCK_WAIT_TIMEOUT) MONITOR_INC(MONITOR_TIMEOUT)` | — |
+| PFS data_lock_waits | `WAIT_STARTED` 时间戳是 **server 层**在 `thd_wait_begin` 时记录的（PFS 自身 timing），**不是** `trx->lock.wait_started` | — |
 
 ### 死锁检测
 

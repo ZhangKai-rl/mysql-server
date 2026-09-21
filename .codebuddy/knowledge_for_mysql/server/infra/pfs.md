@@ -393,6 +393,169 @@ PFS_status_variable_cache（状态变量）
 
 物化后的行对象：`System_variable`/`Status_variable` 各持 `m_value_str[SHOW_VAR_FUNC_BUFF_SIZE+1]`（1025 字节）——这就是 `VARIABLE_VALUE VARCHAR(1024)` 的由来。
 
+#### 优化器/执行器如何驱动 PFS 表
+
+**全表扫描**（`SELECT * FROM pfs.global_variables`，无谓词 → AccessPath 是 `TABLE_SCAN`）：
+
+```
+TableScanIterator::Init                     sql/iterators/basic_row_iterators.cc
+  → table()->file->ha_rnd_init(true)        ← handler 包装
+    → ha_perfschema::rnd_init               ha_perfschema.cc:1684
+        ├─ m_table == nullptr 时 m_open_table() = table_global_variables::create() new 表游标
+        └─ m_table->rnd_init(scan)
+            └─ m_sysvar_cache.materialize_global()   ← ★ 全量物化发生在 Init
+TableScanIterator::Read（逐行）
+  → ha_rnd_next → ha_perfschema::rnd_next   ha_perfschema.cc:1714
+      ├─ m_table->rnd_next()                ← cache 下标游标 + make_row（含审计事件）
+      └─ m_table->read_row(...)             ← read_row_values 把 System_variable 翻译成 Field 值
+扫描结束
+  → ha_rnd_end → ha_perfschema::rnd_end     ha_perfschema.cc:1706
+      └─ delete m_table                     ← 销毁游标与 m_sysvar_cache
+```
+
+**点查**（`WHERE VARIABLE_NAME='x'`）：优化器生成 `REF`/`EQ_REF` 或 `INDEX_RANGE_SCAN`（取决于成本判定），但无论哪条路径，落到的 handler 序列都一样——**PFS 的"索引"是线性过滤，没有 hash 查找**：
+
+```
+REF 路径:   RefIterator::Init → ha_index_init → ha_perfschema::index_init
+              → table_global_variables::index_init
+                  └─ m_sysvar_cache.materialize_global()          ← ★ 点查也全量物化！
+                     + PFS_NEW(PFS_index_global_variables) 建索引对象
+            RefIterator::Read → ha_index_read_map → ha_perfschema::index_read
+              → PFS_engine_table::index_read
+                  └─ m_index->read_key() 解析 key → reset_position() → index_next()
+                      → 线性扫描 m_cache，m_opened_index->match() 逐行比对变量名字符串
+INDEX_RANGE_SCAN 路径: IndexRangeScanIterator → ha_multi_range_read_next（handler 默认 MRR）
+              → read_range_first（ha_index_read_map → index_read）
+              → read_range_next（ha_index_next_same → index_next_same → 退化为 index_next）
+```
+
+关键证据——`PFS_engine_table::index_read` 解析 key 后直接从头线性扫：
+
+```cpp
+int PFS_engine_table::index_read(KEY *key_infos, uint index, const uchar *key,
+                                 uint key_len, enum ha_rkey_function find_flag) {
+  if (m_index == nullptr) return HA_ERR_END_OF_FILE;
+  KEY *key_info = key_infos + index;
+  m_index->set_key_info(key_info);
+  m_index->read_key(key, key_len, find_flag);   // 只把 key 存进 PFS_engine_index
+  reset_position();
+  return index_next();                           // 从头线性扫描 + match 过滤
+}
+int PFS_engine_table::index_next_same(const uchar *, uint) { return index_next(); }
+```
+
+所以 `PRIMARY KEY (VARIABLE_NAME) USING HASH` 的 `USING HASH` **只是 DDL 声明**（`get_default_index_algorithm()` 返回 `HA_KEY_ALG_HASH`），运行时没有任何 hash 表。
+
+**`ha_perfschema` 的 handler 特性声明**（决定优化器行为的几个关键 flags）：
+
+```cpp
+ulonglong table_flags() const override {
+  /*
+    About HA_FAST_KEY_READ:
+    The storage engine ::rnd_pos() method is fast to locate records by key,
+    so HA_FAST_KEY_READ is technically true, but the record content can be
+    overwritten between ::rnd_next() and ::rnd_pos(), because all the P_S
+    data is volatile.  The HA_FAST_KEY_READ flag is not advertised, to force
+    the optimizer to cache records instead, to provide more consistent records.
+  */
+  return HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT |
+         HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_NULL_IN_KEY | HA_NULL_PART_KEY;
+}
+```
+
+- **故意不声明 `HA_FAST_KEY_READ`**：注释原话——PFS 数据易变，`rnd_next` 与 `rnd_pos` 之间内容可能被改写；不声明该 flag 迫使优化器**缓存整行**（`set_record_buffer`）而不是"拿 rowid 再回表"，保证"WHERE THREAD_ID=n"的过滤结果自洽。
+- `index_flags()` 返回 `HA_KEY_SCAN_NOT_ROR`：禁止 Rowid Ordered Retrieval。
+- `HA_NO_TRANSACTIONS`：无事务语义，锁模型最简。
+
+#### cache 的本质与生命周期
+
+**有 cache，但它的生命周期是"单条语句的一次表扫描"，不是跨语句的全局缓存。** 这是最容易误解的一点——同一连接连续两次查询，第二次照样从零物化，**cache 不跨语句复用**。
+
+**为什么这么设计：cache 的目的不是"跨查询加速"，而是"单次扫描内的快照 + 免锁迭代"。** 三个理由：
+
+1. **一致性快照语义**。变量随时可能被其他线程 `SET`、被插件装卸改集合。物化在锁内（`LOCK_plugin_delete` + 求值锁）一次性把"当前的变量集合 + 当前的值"定格成文本快照，之后 `rnd_next` 迭代读的是定格结果——**保证同一次扫描内行与行自洽**（不会扫到一半集合变了、值变了）。如果没有 cache、逐行求值，就要么每行持锁（锁持有时间放大 N 倍），要么不持锁（行间不一致）。
+2. **锁的持有范围被限制在一个物化周期内**。`LOCK_plugin_delete`、`LOCK_global_system_variables` 等都只在物化循环内持有，出循环即释放；后续迭代无锁。若 cache 跨语句存活，要么跨语句持锁（灾难），要么引入失效协议（谁改了变量通知谁的缓存——复杂且易错）。
+3. **PFS 的语义是"查询即当前状态"**。它的价值就在于反映实时状态；跨语句缓存必然返回陈旧值，直接违背产品语义。这与其他"为读性能而生"的 cache（table_definition_cache 等）目的根本不同。
+
+代价就是：高频轮询 PFS 变量表 = 每次全量"枚举 hash + 排序 + N 次求值 + 格式化"，且 `get_row_count`（表打开时统计行数）还要持锁读 hash——高频 `SHOW VARIABLES` 的锁竞争是真实的性能风险点。
+
+**PFS 表也不在磁盘上**——它是纯内存"引擎表"（PERFORMANCE_SCHEMA 引擎：无数据文件、无 page、无 buffer pool）。PFS 引擎的一切都在内存：表定义（`Plugin_table`）在代码静态区、表 share 在 PFS 的 share 注册表、表游标对象每次扫描 `new` 在堆上、cache 就住在游标对象里。
+
+**两个 hash 不是 PFS 的**——`static/dynamic_system_variable_hash` 是 **SQL 层 `sys_var` 体系**的全局结构（`sql/set_var.cc`），值存储 `global_system_variables`/`THD::variables` 也归 SQL 层。PFS 只是"借用"它们来物化。精确的数据流时序：
+
+```
+【rnd_init —— 物化阶段，只发生一次，访问 hash 和值存储就在此刻】
+  enumerate_sys_vars 遍历两个 hash      ← 这里碰 hash
+    → sys_var* 列表（tracker 数组）
+  → 每个 sys_var: value_ptr(OPT_GLOBAL/SESSION)
+    → 读 global_system_variables / THD::variables   ← 这里碰值存储
+    → 格式化文本
+  → 存进 m_cache（PFS 表游标对象的文本快照数组）
+
+【rnd_next —— 迭代阶段，每行一次，只读 cache】
+  m_cache[i] → make_row → 输出
+  —— 不碰 hash、不碰 global_system_variables、不再求值
+```
+
+**所以不是"rnd_next 进 hash 再索引到 global"**——那是 `rnd_init` 干的事，且只干一次。`rnd_next` 读的是物化时定格的**文本快照**（这就是快照一致性的来源：迭代期间值被别的线程 SET 也影响不到本次扫描）。
+
+PFS 表更像一个**每次查询现场计算的视图**：`rnd_init` 时从 SQL 层的内存变量存储读值、格式化、定格进 cache；`rnd_next` 只是把定格结果搬给 SQL 层。值**从不在 PFS 引擎上长期存在**——PFS 只有游标级的快照。
+
+cache 是**表打开对象**的成员：每次 `SELECT ... FROM pfs.global_variables` 打开表时，`table_global_variables::create()` **new 一个新的 `table_global_variables` 对象**，其成员 `m_sysvar_cache`（`PFS_system_variable_cache` 实例）是全新的。所以：
+
+- **每条语句都从零重新物化**：重新枚举双 hash、重新求值几百个变量的值、重新格式化文本。没有"上次查询的结果缓存"。
+- **短路只在同一次扫描内生效**：入口包装函数先查 `is_materialized()`：
+
+```cpp
+template <class Var_type>
+int PFS_variable_cache<Var_type>::materialize_global() {
+  if (is_materialized()) {
+    return 0;                    // 同一次扫描内二次调用（如 index_init 又调一次）直接返回
+  }
+  return do_materialize_global();
+}
+```
+
+  这个短路服务于：① `rnd_init` 之后 `index_init` 再调不重复物化；② `status_by_thread` 的 `rnd_next` 对每个线程循环物化时，`is_materialized(pfs_thread)` 防止同一线程重复物化（`rnd_pos` 点查后又 `rnd_next` 的场景）。
+
+cache 是**两层结构**：
+
+| 层 | 成员 | 内容 | 标志 |
+|---|---|---|---|
+| 清单层 | `m_sys_var_tracker_array`（`Prealloced_array<System_variable_tracker, 200>`） | INITIALIZE 阶段枚举出来的变量描述符（tracker）数组，预分配 200 槽 | `m_initialized` |
+| 值层 | `m_cache`（`Prealloced_array<System_variable, 200>`） | MATERIALIZE 阶段物化出的**文本行**（名字 + 已格式化的字符串值 + charset + source） | `m_materialized` |
+
+求值（`sys_var::value_ptr` + 类型格式化）**在物化时一次性完成**，`rnd_next`/`rnd_pos` 只是从 `m_cache` 按索引取行——所以表扫描期间不会二次求值。
+
+**`external_init=true` 的表（`variables_by_thread`）有微妙的生命周期差异**：`rnd_init` 时只建清单层（`initialize_session()`，`m_initialized=true` 后**不再重建**，跨语句的表对象里清单可以复用）；值层 `m_cache` 在 `rnd_next` 对每个线程物化时**先 `clear()` 再重建**（`do_materialize_session(PFS_thread*)` 开头）。`global_variables`/`session_variables`（`external_init=false`）则两层都是每条语句新建。
+
+**"SHOW VARIABLES 与直查都走 cache 吗"**——是，**都走同一个 `PFS_system_variable_cache`、同一条物化管线**（SHOW 被重写成 SELECT 后，内层 PFS 表查询与直查在 `ha_perfschema::rnd_init` 之后完全一致）。唯一区别在**外层**：SHOW 重写的查询是 `SELECT * FROM (内层 SELECT) 派生表`，SQL 层还会把派生表**物化到内部临时表**（这就是官方文档说 "Each invocation of the SHOW STATUS statement ... increments the global Created_tmp_tables value" 的根源——SHOW 路径 = PFS cache + 临时表物化**两层**；直查只有 PFS cache 一层）。
+
+#### cache 的级别：游标级（rnd_init → rnd_end）
+
+精确的层级是**"表扫描游标"级，比单条语句还短命**。挂在 handler 实例的 `m_table` 成员上：
+
+```
+ha_perfschema handler（每次 SQL 打开表 new 一个，属于语句的 TABLE 对象）
+  └── m_table（PFS_engine_table 实例）
+        ├─ ha_perfschema::rnd_init():   m_table == nullptr 时 m_open_table() new
+        │                               → rnd_init(scan) 里 materialize_*
+        └─ ha_perfschema::rnd_end():    delete m_table; m_table = nullptr
+```
+
+`ha_perfschema::rnd_init()` 在 `m_table == nullptr` 时 `m_table = m_table_share->m_open_table(...)`（即 `table_global_variables::create()` new 一个），`rnd_end()` 里 `delete m_table`。**一条语句内如果执行器对同一表做多趟 rnd 扫描，每趟 `rnd_init`/`rnd_end` 都会 new/delete 一个全新对象和全新 cache。**
+
+对照 MySQL 其他 cache 的级别：
+
+| cache | 级别 | 跨连接共享？ |
+|---|---|---|
+| `table_definition_cache`（表定义） | 全局级 | 是 |
+| `table_open_cache` | 全局池 + THD 级 | 部分 |
+| query cache（8.0 已移除） | 全局级 | 是 |
+| **PFS 变量 cache** | **游标级（rnd_init→rnd_end）** | 否 |
+
+**连带推论：点查也全量物化。** `table_global_variables::index_init`（`WHERE VARIABLE_NAME='x'` 走索引）同样调 `materialize_global()` 物化**全部**变量，只是 `index_next` 里逐个 `match()` 过滤出匹配行——不存在"只求值那一个变量"的优化。唯一的例外是 `variables_by_thread` 的 `rnd_pos`（`materialize_session(pfs_thread, index)` 单变量物化）。
+
 #### 物化家族全景：6 个入口函数 × 表
 
 系统变量与状态变量的物化**语义完全不同**——状态变量是"跨线程求和"，系统变量是"选择读哪份存储"（GLOBAL 值 vs 某个 THD 的会话值）。这一差异决定了两个 cache 类的入口函数形态：
@@ -515,6 +678,21 @@ int PFS_system_variable_cache::do_materialize_all(THD *unsafe_thd) {
 
 **配套的内存管理**：物化可能产生大量文本值（几百个变量的字符串），`do_materialize_session(PFS_thread*)` 在 `m_use_mem_root` 时调 `set_mem_root()`——把 `THR_MALLOC`（`thd->mem_root` 的宏）临时切换到专用 `m_mem_sysvar`（`SYSVAR_MEMROOT_BLOCK_SIZE` 块），物化完 `clear_mem_root()` 一次性释放并恢复，**避免耗尽被观察线程的 THD mem_root**（你正在读的那个线程的内存池不属于你）。
 
+#### `System_variable` 类全貌与 variables_info 的复用
+
+`System_variable` 是物化行的载体（`pfs_variable.h:169-203`），16 个 public 成员分三组：
+
+| 组 | 成员 | 用途 |
+|---|---|---|
+| 值 | `m_name/m_name_length`、`m_value_str[1025]/m_value_length`、`m_type`、`m_scope`、`m_charset` | 变量名 + 物化后的文本值 + 类型/作用域/字符集 |
+| 元数据 | `m_source`、`m_path_str/m_path_length`、`m_min_value_str`、`m_max_value_str`、`m_set_time`、`m_set_user_str`、`m_set_host_str` | variables_info 用：来源/路径/范围/设置时间与者 |
+| 状态 | `m_initialized`（私有） | `is_null()` = `!m_initialized` |
+
+**两个 `init` 重载对应两类表**：
+
+- **求值版**（三参，`global_variables`/`session_variables` 用）：`get_one_variable_ext` 求值 → 文本进 `m_value_str`，元数据成员闲置。
+- **元数据版**（两参，`variables_info` 用）：**不求值**（`m_value_str` 置空），只拷 `sys_var` 的 source/path/min/max/timestamp/user/host；对"只读 persisted 变量"（作为命令行选项处理，`sys_var` 本身不带 who/when），从 `Persisted_variables_cache` 的 `m_persisted_static_variables`/`m_persisted_static_parse_early_variables` 两张 map 里按名字补齐。`table_variables_info` 用的是派生类 `PFS_system_variable_info_cache`（只覆盖 `do_materialize_all`，物化时调元数据版构造），且**表定义无 PK、无 index_init**（`WHERE VARIABLE_NAME=...` 只能全表过滤）。
+
 #### 线程间读：如何安全地读"别的线程"的会话变量
 
 `variables_by_thread`/`session_variables` 需要读**任意 THD**（含后台线程）的会话变量，这是整个机制最需要小心的部分。`do_materialize_session` 的三重防护：
@@ -551,9 +729,88 @@ int PFS_system_variable_cache::do_materialize_session(PFS_thread *pfs_thread) {
 
 还有第三个重载 `do_materialize_session(PFS_thread*, uint index)`：**按索引只物化单个变量**——`variables_by_thread` 的 `rnd_pos()`（点查 `WHERE THREAD_ID=x AND VARIABLE_NAME='y'` 走索引定位）用它避免物化整个线程的全部变量，`index` 是 `m_sys_var_tracker_array` 中的槽位。
 
+#### `get_THD` / `THD_ptr`：安全拿到"别的线程"的 THD
+
+`get_THD` 的完整机制——把裸指针交给 thread manager 校验：
+
+```cpp
+THD_ptr PFS_variable_cache<Var_type>::get_THD(THD *unsafe_thd) {
+  if (unsafe_thd == nullptr) return THD_ptr{nullptr};   // 已断连的直接短路
+  m_thd_finder.set_unsafe_thd(unsafe_thd);
+  return Global_THD_manager::get_instance()->find_thd(&m_thd_finder);
+}
+
+THD_ptr Global_THD_manager::find_thd(Find_THD_Impl *func) {
+  Find_THD find_thd(func);
+  for (int i = 0; i < NUM_PARTITIONS; i++) {            // 9 个分区
+    MUTEX_LOCK(lock, &LOCK_thd_list[i]);
+    auto it = std::find_if(thd_list[i].begin(), thd_list[i].end(), find_thd);
+    if (it != thd_list[i].end()) {
+      THD_ptr thd_ptr(*it);                             // 构造即拿 LOCK_thd_data
+      if (!thd_ptr->is_being_disposed()) return thd_ptr;  // 正在退出视为未找到
+      break;
+    }
+  }
+  return THD_ptr{nullptr};
+}
+```
+
+三层保障：① `find_thd` 在**分区锁**内 `find_if` 线性比对（`Find_THD_variable::operator()` 只是裸指针相等比较 `thd == m_unsafe_thd`）；② 命中后**在仍持有分区锁时**构造 `THD_ptr`——其构造函数立即获取 `THD::LOCK_thd_data`（注释："ensures that THD::LOCK_thd_data mutex is acquired at instantiation"），阻止 THD 数据被并发销毁；③ `is_being_disposed()` 检查——正在退出的 THD 视为未找到。返回的 `THD_ptr` 靠移动语义传递（拷贝构造被 delete），析构时释放锁。
+
+成员分工：`m_unsafe_thd`（调用者传入的裸指针，**只做身份比较**，绝不解引用）vs `m_safe_thd`（`THD_ptr::get()` 校验后的指针，物化循环只解引用它）。
+
+#### 异常与边界路径
+
+- **物化途中 THD 消失**：`get_THD` 返回空 → 所有 `do_materialize_*` 保持 `m_materialized=false`、返回 1 → 表驱动侧 `rnd_next` 的循环条件（`is_materialized()` 或 cache 为空）不满足 → **对外表现为空结果集**，不崩溃、不返回残行。
+- **NULL 行**：PFS 的"NULL" = `m_initialized == false`（`init` 早退时），`make_row` 对 null 行返回 `HA_ERR_RECORD_DELETED`，`rnd_next` 的 for 循环跳过该行继续——null 行被"跳过"而非输出 SQL NULL。`variables_info` 的 `SET_TIME/SET_USER/SET_HOST` 为 0/空时才用 `f->set_null()` 表达真 SQL NULL。
+- **超长值**：`m_value_length = std::min(m_value_length, 1024)` 静默截断（与 `VARIABLE_VALUE VARCHAR(1024)` 对齐），**无截断告警**（grep 确认无相关逻辑）。
+
 #### 状态变量的聚合（do_materialize_global）
 
 `GLOBAL = global_status_var + Σ(所有登记在 Global_THD_manager 的 THD)`，靠 `PFS_connection_status_visitor`：`visit_global()` 把全局基线 `add_to_status` 进局部 totals，`visit_THD()` 对每个 THD 累加。**含后台线程**（源码留 `// TODO: filter bg threads?`）。account/user/host 维度是**平行账本**（`PFS_status_stats` 遗留账本 + `do_materialize_client`），与全局通道隔离——`PFS_account::aggregate_status` 的注释："Never aggregate to global_status_var, because of the parallel THD -> global_status_var flow"（否则双倍计数）。
+
+#### 性能特征：一次查询的真实工作量
+
+一次 `SELECT * FROM pfs.global_variables` 的开销公式：
+
+```
+枚举 static+dynamic 双 hash 全部条目        O(N)，N ≈ 600~700（get_system_variable_count）
+  + std::sort（my_strcasecmp 大小写不敏感）  O(N log N) —— 每次物化都排序
+  + N 次求值：access_system_variable
+              → System_variable 构造 → init
+              → get_one_variable_ext(SHOW_SYS 特判)
+              → sys_var::value_ptr（每个变量各自的求值函数）
+              → 类型格式化转文本
+  + N 次 m_cache.push_back（Prealloced_array 200 起扩容）
+```
+
+- `rnd_init` 与 `index_init` **都触发**这一整套流程（点查不省）；`rnd_end`/`index_end` 后 cache 随游标销毁——每次全新扫描重复全部工作。
+
+#### 锁竞争：`LOCK_plugin_delete` 是真实瓶颈
+
+三把锁的**类型与持有范围**决定了谁会成为瓶颈：
+
+| 锁 | 类型 | 持有范围 | 并发性 |
+|---|---|---|---|
+| `LOCK_plugin_delete` | **`mysql_mutex_t`（排他）** | 物化**全程**（`do_materialize_*` 开头到结尾，含枚举+排序+N 次求值） | ❌ **完全串行** |
+| `LOCK_system_variables_hash` | `mysql_rwlock_t` | 仅"枚举双 hash"期间 | ✅ 读锁可并发 |
+| `LOCK_global_system_variables` | mutex | 仅**单个变量**求值期间（N 次短持） | ❌ 串行但持时极短 |
+
+关键事实（源码核实）：`LOCK_plugin_delete` 声明为 `extern mysql_mutex_t LOCK_plugin_delete`，注释原话"A mutex LOCK_plugin_delete must be acquired before calling plugin_del function."——它是**全局排他 mutex**，不是读写锁。
+
+**所以并发查询 PFS 变量表会全部串行化在这一把锁上。** 竞争强度 = `查询频率 × 单次物化时长`：
+
+- **锁获取频率 = 查询频率**：cache 不跨语句，每次查询都要物化一次 → 每次都要拿这把锁；
+- **单次持有时长 = 完整物化时间**：遍历双 hash + 排序 + N 次求值 + 格式化，随变量数（含插件变量）增长——插件装得越多，持锁越久；
+- **放大效应**：`SHOW VARIABLES` 还多一层派生表物化（临时表），status 全局表还要再遍历所有在线 THD；高并发下等待队列在 `LOCK_plugin_delete` 上堆积。
+
+这就是"大量线程并发 `SHOW VARIABLES` 导致吞吐骤降"这类线上事故的机理：不是 CPU 打满，而是**线程排队在 `LOCK_plugin_delete` 上**。
+
+实践含义：① 高频轮询 PFS 变量表（监控采集）要控制频率或在应用层缓存结果；② 直查 `SELECT` 比 `SHOW` 少一层临时表物化（但 PFS 表访问部分的锁竞争一样）；③ 装很多插件会拉长持锁时间，间接放大竞争。
+
+> 这是设计上的**粗粒度锁换简单性与正确性**：用一把全局 mutex 保证"物化期间插件集合不变"，代价是可伸缩性。PFS 选择了正确性优先——这也和"cache 不跨语句复用"（见上）是同一个设计取向。
+- status 全局表还要**再加一次持锁遍历所有在线 THD** 聚合（`visit_global(..., with_THDs=true)` → `do_for_all_thd` 逐线程 `add_to_status`），开销随活跃连接数增长。
+- EXPLAIN 的 `rows` 估计来自 `get_row_count()`（= 变量总数，随插件加载变化）；`type` 列推断为：无谓词 `ALL`、点查 `range`/`ref`（取决于优化器成本判定，最终都落到线性过滤的 index 序列）。
 
 #### 12 张变量表与 ACL
 

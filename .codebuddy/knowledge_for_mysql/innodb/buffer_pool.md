@@ -1875,6 +1875,41 @@ latch 编号（`get_owned_latches` buf0buf.cc）：
 
 纯 debug（`ut_ad`/`ut_d`/`#ifdef UNIV_DEBUG`），release 编译掉零开销。
 
+#### ★ `buf_block_dbg_add_level`：页锁的"锁序角色"声明
+
+`buf_page_t` 的并发协议除了 state / io_fix / buf_fix_count，还有一个 debug 专属维度：**页锁的锁序角色（latch level）**。实现只有一行（buf0buf.ic）：
+
+```c
+static inline void buf_block_dbg_add_level(
+    buf_block_t *block,  /*!< in: buffer page where we have acquired latch */
+    latch_level_t level) /*!< in: latching order level */
+{
+  sync_check_lock(&block->lock, level);
+}
+```
+
+release 版是空宏（buf0buf.h）：`#define buf_block_dbg_add_level(block, level) /* nothing */`——零成本。
+
+**语义**：声明"刚拿到手的 `block->lock` 在锁序金字塔中处于 `level` 层级"，`sync_check_lock` 把它注册进 LatchDebug 的持锁列表，后续拿新锁时按锁序规则校验（校验机制与锁序金字塔见 [`infra/lock/primitives/innodb_sync.md`](../infra/lock/primitives/innodb_sync.md) 的 LatchDebug 节）。
+
+**锁序方向**：`latch_level_t` 枚举（sync0types.h）**数字越大 = 层级越高**，规则是"后拿的 level ≤ 已持有的 level"（先高后低）。如 `SYNC_TREE_NODE`(296) 高于 `SYNC_IBUF_TREE_NODE`(277)；`SYNC_INDEX_TREE`(299) 更高——但注意它是 **`index->lock`（字典索引对象）** 的级别，**不是页锁**，勿混。
+
+**为什么 level 要"每次声明"而不是固定进 block**：同一个 `buf_block_t`（页帧）在不同场景扮演**不同锁序角色**——页的物理类型（`FIL_PAGE_INDEX`）相同，锁序角色由上下文决定：
+
+| level 值 | 场景 | 典型调用点 |
+|---|---|---|
+| `SYNC_TREE_NODE` | 普通 B-tree 索引页 | btr0cur.cc 拿页时 |
+| `SYNC_IBUF_TREE_NODE` | ibuf 树的页 | btr0cur 对 `dict_index_is_ibuf` 的页 |
+| `SYNC_FSP_PAGE` | 表空间管理页 | fsp 操作（如 row0import 写 SDI root） |
+| `SYNC_TRX_UNDO_PAGE` | undo 页 | purge 拿 undo 页（row0purge.cc） |
+| `SYNC_TREE_NODE_NEW` | 刚分配的新 B-tree 页（未挂树） | btr_page_create |
+| `SYNC_TREE_NODE_FROM_HASH` | AHI 命中路径拿的页 | btr0sea.cc |
+| `SYNC_NO_ORDER_CHECK` | 恢复期等"免检"场景 | recovery 恢复路径 |
+
+所以每次拿锁后必须按**当前用途**重新声明——这是"页锁是通用资源、锁序角色由上下文注入"的设计，与 `buf_page_t` 状态机"身份由 state 决定"同构。
+
+**最极端的用法是"伪装降级"**：ibuf merge 把普通二级索引页声明成 `SYNC_IBUF_TREE_NODE`（低于正常的 `SYNC_TREE_NODE`），使"先 ibuf 树后目标页"的拿锁顺序合法化；安全性靠 io_fix（io-fixed block 禁止其他线程 latch）保证——详见 [`ibuf.md`](ibuf.md) 的 merge 逐行解析。同理恢复期用 `SYNC_NO_ORDER_CHECK` 整体免检（见 [`recovery.md`](recovery.md)）。
+
 ### 观测与调试
 
 #### DBUG 观测与调试
@@ -1934,14 +1969,175 @@ classDiagram
   LRUHp <|-- LRUItr
 ```
 
-| 特性 | 用在哪 | 为什么（收益） | 代价 / 反直觉处 |
-|---|---|---|---|
-| 纯虚 `adjust` + 派生绑定链表 | `FlushHp::adjust`(buf0buf.cc) / `LRUHp::adjust`() | 两个派生类的 `adjust` **逻辑相同**（都前移 prev），只差链表宏（`list` vs `LRU`）和断言（`in_flush_list` vs `in_LRU_list`）；`is_hp/set/move` 在基类共用——基类定协议、派生绑语境 | 多一层虚调用（频率极低，可忽略）；协议只支持反向遍历（源码注释明写 "We only support reverse traversal for now"） |
-| 模板 + `std::bitset` | `ut::Stateful_latching_rules<buf_io_fix, 3>`，`latches_set_t = std::bitset<3>` | 同一套状态机校验复用于任意"状态类型 + 固定 latch 数"（头注释：created for io_fix, but can be configured for other usages）；位运算判断"持有的 latch ⊇ 要求的 latch" | `Node` 必须可比较（放进 `std::set` 需 `operator<`）；latch 数是编译期常量，改结构要换实例化 |
-| **placement new**（两处） | ①`new (&buf_pool->flush_hp) FlushHp(...)`(buf0buf.cc) ②`new (&new_block->page) buf_page_t(block->page)`() | ①`buf_pool_t` 是 `ut::zalloc_withkey` 分配的 C 结构，不跑构造函数；`FlushHp` 有 ctor（初始化 `m_buf_pool`/`m_mutex`）⇒ 必须手工构造。②resize 搬迁控制块时，把拷贝构造跑在新地址 | **生命周期手工管理**。★ 但 BP **从不显式析构**这些对象：`buf_pool_free_instance` 只 free `page_hash`/`zip_hash`，不调 `flush_hp.~FlushHp()`——成员全是裸指针、析构是 default，**无 RAII 资源可泄漏**。这是刻意的：用"平凡成员"规避 placement new 的析构负担 |
-| 虚析构 + 从不调用 | `virtual ~HazardPointer() = default`（buf0buf.h） | 防御性——万一将来有人通过基类指针 delete | 反直觉：虚析构存在但当前用法（成员对象）下**析构从未被调用**，全靠"成员平凡"兜底 |
-| `std::atomic` | `buf_fix_count` 的 `fetch_add`/`fetch_sub`（默认 seq_cst）；`io_fix.load(std::memory_order_relaxed)`(buf0buf.h) | 高并发读路径每次页访问都 fix/unfix，**不能拿锁** | 下溢靠 unsigned 回绕检测（`ut_ad(count != max)`）+ `static_assert(is_unsigned)` 编译期强制；relaxed 是因为 io 完成路径已有 happens-before（io_responsibility 移交） |
-| C 结构包进 C++ 类 | `buf_page_t` 的拷贝构造（buf0buf.h 逐字段）；`buf_block_t::page` 是首成员 | 让 `page_hash` 能统一指向 `buf_page_t`（裸压缩页）或 `buf_block_t`——**把 C 结构的布局兼容性当接口用** | `buf_page_t` 里混着 `std::atomic`，拷贝构造要逐字段复制（resize 搬迁时整个页状态必须原样搬走） |
+纯虚 `adjust` + 派生绑定链表：`FlushHp::adjust`/`LRUHp::adjust` 逻辑相同（都前移 prev），只差链表宏（`list` vs `LRU`）和断言（`in_flush_list` vs `in_LRU_list`）；`is_hp/set/move` 在基类共用——基类定协议、派生绑语境。代价：协议只支持反向遍历（源码注释 "We only support reverse traversal for now"）。
+
+#### ① `ut::Stateful_latching_rules<Node, LATCHES_COUNT>`：把锁协议变成可校验的数据
+
+这是 BP 里 C++ 最重的一段：把"改状态前要持哪些锁"从**散落各处的人肉记忆**变成**一张显式的边表**，debug 期由机器校验。头注释（40-87 行）明说动机："verifying correctness case by case like that is possible to do manually, but seems error prone, subject to code rot, and would benefit from automation."
+
+**数据结构：状态 + 边，两条都是模板参数决定**：
+
+```cpp
+template <typename Node, size_t LATCHES_COUNT>
+class Stateful_latching_rules {
+  using node_t = Node;
+  using nodes_set_t = std::set<node_t>;              // 状态集合（要可比较）
+  using latches_set_t = std::bitset<LATCHES_COUNT>;   // 锁集合 = 位图
+
+  struct edge_t {
+    node_t m_from;          // 起点状态
+    latches_set_t m_latches; // 这条边的"过路费"：要持的锁集合
+    node_t m_to;            // 终点状态
+
+    edge_t(node_t from, std::initializer_list<int> &&idxs, node_t to)
+        : m_from(from), m_latches(), m_to(to) {
+      for (auto id : idxs) m_latches[id] = true;   // {BUF_IO_READ, {0,2}, BUF_IO_NONE} 语法糖
+    }
+  };
+
+  const nodes_set_t m_states;                       // 全集（用于求补集）
+  const std::vector<edge_t> m_edges;                // 所有允许的转换
+};
+```
+
+四个点：
+- **`Node` 必须能放进 `std::set`**（需 `operator<`）——`io_fix` 枚举天然满足；`nodes_set_t` 用 `std::set` 而不是 vector，是因为后面要用 `std::set_difference` 求补集。
+- **`std::bitset<N>` 当"锁集合"**：判断"持有的锁 ⊇ 边要求的锁"就是一次位与运算。
+- **同向多条边 = 或关系**（构造器注释）：`{{x,{0,2},y},{x,{1},y}}` 意为"持 {0,2} 可 x→y，仅持 {1} 也可"。
+- **latch 编号到真实锁的映射不在模板里**，在 `Latching_rules_helpers::get_owned_latches`（模板注释原话 "The mapping is up to the user of this class - just be consistent"）——策略与机制分离。
+
+**校验一：`on_transition`（改状态前查）**：
+
+```cpp
+void on_transition(const node_t &from, const node_t &to,
+                   const latches_set_t &owned_latches) const {
+  if (from == to) return;                    // 自环不用锁
+  const auto missing_latches = ~owned_latches;   // 取反：我没持的锁
+  if (std::any_of(std::begin(m_edges), std::end(m_edges), [&](auto edge) {
+        return (edge.m_from == from && edge.m_to == to) &&
+               (edge.m_latches & missing_latches) == 0;   // 边要求 ⊆ 我持有的
+      }))
+    return;                                  // 存在一条满足的边 → 放行
+  ib::fatal(...) << "Disallowed transition FROM " << from << " TO " << to;
+}
+```
+
+算法：找一条 from→to 的边，其 `m_latches` 与我**没持的锁**相交为空（即边要求全在我手里）。找不到就 fatal。`std::any_of` + lambda + bitset 位与，三行代码完成整个协议校验。
+
+**校验二：`assert_latches_let_distinguish`（读状态前查）**：
+
+```cpp
+bool is_transition_possible(const latches_set_t &forbiden_latches,
+                            const nodes_set_t &source,
+                            const nodes_set_t &destination) const {
+  for (const edge_t &edge : m_edges) {
+    if (source.count(edge.m_from) && destination.count(edge.m_to) &&
+        (edge.m_latches & forbiden_latches) == 0) {  // 不持我持有的锁也能走 → 逃逸可能
+      ib::error(...) << "It is possible to transition from " << edge.m_from ...;
+      return true;
+    }
+  }
+  return false;
+}
+bool can_leave(const latches_set_t &forbiden_latches,
+               const nodes_set_t &source) const {
+  return is_transition_possible(forbiden_latches, source, complement(source));
+}
+void assert_latches_let_distinguish(const latches_set_t &owned_latches,
+                                    const nodes_set_t &A,
+                                    const nodes_set_t &B) const {
+  if (can_leave(owned_latches, A) || can_leave(owned_latches, B))
+    ib::fatal(...) << "We can leave " << ...;   // 读到的值可能在读的瞬间失效
+}
+```
+
+问题"我持有的锁能不能封死 A/B 两个集合不互相逃逸"被化为：**遍历边表，找一条"不持我手里任何一把锁也能走"的出逃边**。注意这里的判定比直觉更松——它只要求"A 和 B 都不能在只持 owned 锁的情况下被离开"，不要求封死一切活动（头注释举例：查 io_fix 是不是 WRITE 时，别的线程做 PIN↔NONE 无关紧要）。这是"恰好够用的锁"的精确刻画。
+
+**与状态机形式化的关系**：头注释 71-86 用 a/b/c 三状态图演示了这个模型——"当前态必在 {a,c} 里，判断到底是哪个，只需持 #2"，因为出 a、出 c 的所有边都要求 #2。这正是 `assert_latches_let_distinguish` 要自动化的手工推理。
+
+#### ② `io_responsibility_t`：`std::thread::id` 当"抽象锁"
+
+latch #2 不是 mutex，而是一个令牌类（buf0buf.h 里 `buf_page_t` 的成员）：
+
+```cpp
+class io_responsibility_t {
+  /* 谁负责该页的 I/O；默认构造的 thread::id 是"不可能值"（≠任何线程）*/
+  std::thread::id responsible_thread{std::thread().get_id()};
+ public:
+  bool someone_is_responsible() const {
+    return responsible_thread != std::thread().get_id();
+  }
+  bool current_thread_is_responsible() const {
+    return responsible_thread == std::this_thread::get_id();
+  }
+  void release() {
+    ut_a(current_thread_is_responsible());       // 只能自己释放自己的责任
+    responsible_thread = std::thread().get_id();
+  }
+  void take() {
+    ut_a(!someone_is_responsible());             // 只能接"空"的责任
+    responsible_thread = std::this_thread::get_id();
+  }
+};
+```
+
+- **为什么能当锁用**：模板头注释（52-59 行）明说抽象概念可以进 latch 集合，但 "puts a burden of proof on you"——你必须证明同一时刻最多一个线程持有它。`take()`/`release()` 里的 `ut_a` 互斥断言就是这份证明的载体。
+- **为什么不用真 mutex**：I/O 完成回调线程在**拿不到 block mutex** 的情况下（io 完成路径不拿、也不该拿——会与发起路径死锁/阻塞），要靠这个令牌证明"这页的 I/O 是我发的"。用 `std::thread::id` 而不是 bool，是为了在 debug 下区分"责任在哪个线程"、让 `release` 断言"只能自己释放"。
+- **获得令牌的两种语境**（`take_io_responsibility` 的 `ut_ad` 前置条件）：①发起 I/O 时**持 block mutex**（合法）；②已是 READ/WRITE 的线程续接责任（合法）——断言写成"持 mutex ∨ io_fix 已是 READ/WRITE"的析取式，精确刻画了合法调用的全集。
+
+#### ③ placement new：C 内存上手工跑构造函数（三处）
+
+三处共同点：目标内存是 `zalloc`/搬迁出来的 C 风格内存，**编译器不会替你调构造函数**，但对象有非平凡成员必须构造：
+
+```cpp
+// ① buf0buf.h（init_io_fix）——调用点不跑构造函数，补偿构造令牌对象
+ut_d(new (&io_responsibility) io_responsibility_t{});
+
+// ② buf0buf.cc（buf_pool_create）——buf_pool_t 是 ut::zalloc_withkey 的 C 结构
+new (&buf_pool->flush_hp) FlushHp(&buf_pool->flush_list_mutex, &buf_pool->flush_list);
+
+// ③ buf0buf.cc（resize 搬迁）——把拷贝构造跑在新地址，而非用 operator=
+new (&new_block->page) buf_page_t(block->page);
+```
+
+反直觉的配套决策：**BP 从不显式析构这些对象**（`buf_pool_free_instance` 只 free `page_hash`/`zip_hash`，不调 `flush_hp.~FlushHp()`）。能这么干的前提是成员全部"平凡"——裸指针、thread::id、无 RAII 资源可泄漏。placement new 的析构负担被"成员平凡"这一设计约束规避了。`HazardPointer` 的 `virtual ~HazardPointer() = default` 是纯防御（万一将来有人经基类指针 delete），当前用法下析构从未被调用。
+
+#### ④ `buf_page_t` 拷贝构造：C 结构搬迁的"手工 Rule of Five"
+
+resize 搬迁要求"整个页状态原样搬走"（含 `atomic` 的**当前值**、链表节点、脏页 LSN），编译器生成不了这种拷贝（`std::atomic` 不可拷贝），所以全手写（buf0buf.h）：
+
+```cpp
+buf_page_t(const buf_page_t &other)
+    : id(other.id),
+      size(other.size),
+      buf_fix_count(other.buf_fix_count),   // atomic → 隐式转换出值，再构造
+      io_fix(other.io_fix),
+      state(other.state),
+      flush_type(other.flush_type),
+      buf_pool_index(other.buf_pool_index),
+      hash(other.hash),
+      list(other.list),
+      newest_modification(other.newest_modification),
+      oldest_modification(other.oldest_modification),
+      LRU(other.LRU),
+      zip(other.zip),
+      m_flush_observer(other.m_flush_observer),
+      m_space(other.m_space),
+      freed_page_clock(other.freed_page_clock),
+      m_version(other.m_version),
+      access_time(other.access_time),
+      m_dblwr_id(other.m_dblwr_id),
+      old(other.old) {
+  m_space->inc_ref();                       // 函数体只此一句：引用计数 +1
+}
+```
+
+三个细节：
+- **`atomic` 成员用 `buf_fix_count(other.buf_fix_count)` 初始化**——依赖 `std::atomic` 的隐式 `operator T()` 先转出底层值、再走值构造函数。搬迁要的是"当前值"，所以不能用 load 语义读也行，隐式转换读的是同一份值。
+- **函数体只有 `m_space->inc_ref()`**——初始化列表已逐字段复制完毕，唯一需要"动作"的是 fil_space 的引用计数（新控制块多了一个引用者）。
+- **Rule of Five 只实现拷贝构造**：析构故意不写（对象从不销毁，见上），赋值/移动不需要（搬迁用 placement new 拷贝构造，不用 `operator=`）——C 结构包进 C++ 类后，这是刻意裁剪的最小拷贝语义。
+
+**`std::atomic` 的两类用法**（呼应上面的搬迁语义）：`buf_fix_count` 用 `fetch_add/fetch_sub`（默认 seq_cst）——每次页访问都 fix/unfix、**不能拿锁**，下溢靠 unsigned 回绕检测 `ut_ad(count != max)` + `static_assert(is_unsigned)` 编译期强制；`io_fix` 用 `load(relaxed)/store(relaxed)`——io 完成路径的 happens-before 由"责任令牌移交 + block mutex"另行建立，不需要原子序（见 io_fix 节）。
 
 ### 二、经典算法的实现落地（不限于并发）
 

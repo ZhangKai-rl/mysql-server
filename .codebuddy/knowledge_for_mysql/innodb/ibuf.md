@@ -18,9 +18,9 @@
   - 协同与生命周期
     - [崩溃恢复](#崩溃恢复)
     - [purge 与 ibuf](#purge-与-ibuf)
-  - 治理
-    - [参数与监控](#参数与监控)
-- [Misc](#Misc)
+- [★ 本机制里的工程实现技法](#本机制里的工程实现技法)
+- [可观测性](#可观测性)
+- [Misc](#misc)
 - [参考](#参考)
 
 ---
@@ -79,7 +79,7 @@ This is called the insert buffer merge. */
 **三个理由**：
 
 1. **语义原因**：聚簇索引是 DML 的**必达路径**——INSERT 必须先写聚簇索引，UPDATE/DELETE 必须先定位聚簇索引记录。所以聚簇索引页**几乎总已在 BP 中**，缓存它没有收益。
-2. **记录格式原因**：ibuf 用**字段数**而不是 `dict_index_t` 元数据来解析记录（见[记录格式](#核心实现二ibuf-记录格式)），而聚簇索引记录含系统列（`DB_TRX_ID`/`DB_ROLL_PTR`），无法脱离真实 index 解析。源码注释（`ibuf0ibuf.cc`）：*"The insert buffer is only used for secondary indexes, whose records never contain any system columns, such as DB_TRX_ID."*
+2. **记录格式原因**：ibuf 用**字段数**而不是 `dict_index_t` 元数据来解析记录（见[记录格式](#ibuf-记录格式)），而聚簇索引记录含系统列（`DB_TRX_ID`/`DB_ROLL_PTR`），无法脱离真实 index 解析。源码注释（`ibuf0ibuf.cc`）：*"The insert buffer is only used for secondary indexes, whose records never contain any system columns, such as DB_TRX_ID."*
 3. **主键也是唯一索引**，同样需要读页做唯一性检查（见下）。
 
 #### 二、★★ 为什么"唯一二级索引的 INSERT"不能被缓存
@@ -449,26 +449,88 @@ const ulint IBUF_CONTRACT_DO_NOT_INSERT = 10;
 | 7 | （若 update_ibuf_bitmap）用真实 page_size 重查 #5 | |
 | 8 | `IBUF_BITMAP_BUFFERED == 0` → 什么都不用做；`space == nullptr`（表空间已删）→ 降级为"只删 ibuf 记录" | |
 
-#### 4.2 合并主流程
+#### 4.2 ★ 逐行解析：`ibuf_merge_or_delete_for_page`
+
+按执行顺序分五阶段（前置守卫见 4.1，bitmap BUFFERED 判据见 4.5）。
+
+**阶段 1：锁所有权移交 + 损坏防御**：
 
 ```c
+if (block != nullptr) {
+  /* Move the ownership of the x-latch on the page to this OS
+  thread, so that we can acquire a second x-latch on it. This
+  is needed for the insert operations to the index page to pass
+  the debug checks. */
+  rw_lock_x_lock_move_ownership(&(block->lock));
+  page_zip = buf_block_get_page_zip(block);
+
+  if (!fil_page_index_page_check(block->frame) ||
+      !page_is_leaf(block->frame)) {
+    corruption_noticed = true;
+    ib::error(ER_IB_MSG_624) << "Corruption in the tablespace. Bitmap"
+        " shows insert buffer records to page " << page_id
+        << " though the page type is "
+        << fil_page_get_type(block->frame)
+        << ", which is not an index leaf page. ...";
+  }
+}
+```
+
+- **x-latch 所有权移交**：目标页的 x-latch 是**发起读的线程**拿的（异步读，latch 挂在 IO 线程上下文），rw-lock 记录"writer 是哪个线程"。merge 要对同一页做插入、debug 检查要求**本线程**持 x-latch → 先把所有权移到当前线程，才合法拿第二把 x-latch。
+- **损坏防御**：bitmap 说该页有 buffered 变更，但页类型**不是** index leaf page（表被 ALTER/DROP 后页被复用等）→ 置 `corruption_noticed`，后续循环把记录**丢弃**（计入 dops）而非应用，提示 `CHECK TABLE`。这是"bitmap 与页实际状态不一致"的唯一兜底。
+
+**阶段 2：定位 search_tuple + 锁序伪装**：
+
+```c
+search_tuple = ibuf_search_tuple_build(page_id.space(), page_id.page_no(), heap);
+
 loop:
   ibuf_mtr_start(&mtr);
   pcur.open_on_user_rec(ibuf->index, search_tuple, PAGE_CUR_GE, BTR_MODIFY_LEAF,
                         &mtr, UT_LOCATION_HERE);
-  ...
-  for (;;) {
-    rec = pcur.get_rec;
 
-    /* 检查这条记录是不是属于本页 */
-    if (ibuf_rec_get_page_no(&mtr, rec) != page_id.page_no ||
-        ibuf_rec_get_space(&mtr, rec) != page_id.space) {
+  if (block != nullptr) {
+    buf_page_get_known_nowait(RW_X_LATCH, block, Cache_hint::KEEP_OLD, ..., &mtr);
+    /* This is a user page (secondary index leaf page),
+    but we pretend that it is a change buffer page in
+    order to obey the latching order. This should be OK,
+    because buffered changes are applied immediately while
+    the block is io-fixed. Other threads must not try to
+    latch an io-fixed block. */
+    buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE);
+  }
+```
+
+- **search_tuple = (space, page_no, counter=0xFFFF)**：ibuf 记录的排序键是 `(space, page_no, counter)`，counter 取最大值让 `PAGE_CUR_GE` 定位到**该页的第一条记录**（counter 0 才是最小键的下界）。
+- **★ 锁序伪装（本函数最精巧的并发设计）**：同一 mtr 里先 latch ibuf 树节点（锁序 `SYNC_IBUF_TREE_NODE`），又 latch 二级索引目标页（正常锁序 `SYNC_TREE_NODE`，**更高**）——latch level 数字越大层级越高、规则是"后拿的 ≤ 已持有的"（先高后低），拿 296（`SYNC_TREE_NODE`）时已持有 277（`SYNC_IBUF_TREE_NODE`）即违规。解法是把目标页**伪装成 ibuf 树节点**（`buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE)` 把它的 debug 锁级别降为 ibuf 树级，277 ≤ 277 合法；函数机制见 [buffer_pool.md](buffer_pool.md) 的「`buf_block_dbg_add_level`」节）。**合法性来自 io_fix**：block 处于 `io_fix_read`（异步读进行中），`buf_page_get` 对 io-fixed block 一律不许 latch（其他线程会等待或放弃），伪装期间不可能真的发生乱序并发。注释原话 "This should be OK, because buffered changes are applied immediately while the block is io-fixed"——**用"I/O 固定"的互斥性换锁序合法性**。
+
+**阶段 3：主循环——逐条应用**：
+
+```c
+  for (;;) {
+    rec = pcur.get_rec();
+
+    /* 这条记录还属于本页吗？不属于 → 本页的变更已全部处理 */
+    if (ibuf_rec_get_page_no(&mtr, rec) != page_id.page_no() ||
+        ibuf_rec_get_space(&mtr, rec) != page_id.space()) {
+      page_header_reset_last_insert(block->frame, page_zip, &mtr);
       goto reset_bit;
     }
 
     if (!rec_get_deleted_flag(rec, 0)) {
+      dtuple_t *entry;
+      trx_id_t max_trx_id;
+      dict_index_t *dummy_index;
       ibuf_op_t op = ibuf_rec_get_op_type(&mtr, rec);
+
+      /* 同步 trx_id 到目标页头 */
+      max_trx_id = page_get_max_trx_id(page_align(rec));
       page_update_max_trx_id(block, page_zip, max_trx_id, &mtr);
+
+      /* 把 ibuf 记录还原成二级索引 entry。
+       ★ entry 是指向 rec 字段的指针拷贝——插入完成前不能放
+       ibuf 页的 latch！（源码注释：we must keep the latch to
+       the rec page until the insertion is finished） */
       entry = ibuf_build_entry_from_ibuf_rec(&mtr, rec, heap, &dummy_index);
 
       switch (op) {
@@ -480,36 +542,80 @@ loop:
           break;
         case IBUF_OP_DELETE:
           ibuf_delete(entry, block, dummy_index, &mtr);
-          /* ibuf_delete 会 latch bitmap 页，所以先提交 mtr 再重新定位 */
-          ...
+          /* 见阶段 4 */
           goto loop;
       }
       mops[op]++;
+      ibuf_dummy_index_free(dummy_index);
     } else {
-      dops[ibuf_rec_get_op_type(&mtr, rec)]++;
+      dops[ibuf_rec_get_op_type(&mtr, rec)]++;   // 已打删除标记 → 丢弃
     }
 
-    /* 从 ibuf 里删掉这条记录 */
-    if (ibuf_delete_rec(...)) {
-      ut_ad(mtr.has_committed);
-      goto loop;        // 悲观删除导致 mtr 提交 → 从头再来
-    }
-  }
-
-reset_bit:
-  /* 清 BUFFERED 位 + 重算 FREE 位 */
-  ibuf_bitmap_page_set_bits(bitmap_page, page_id, *page_size,
-                            IBUF_BITMAP_BUFFERED, false, &mtr);
-  if (block != nullptr) {
-    ulint new_bits = ibuf_index_page_calc_free(block);
-    if (old_bits != new_bits) {
-      ibuf_bitmap_page_set_bits(bitmap_page, page_id, *page_size,
-                                IBUF_BITMAP_FREE, new_bits, &mtr);
+    /* 把这条记录从 ibuf 树删掉；悲观删除（mtr 已提交）→ goto loop 重来 */
+    if (ibuf_delete_rec(page_id.space(), page_id.page_no(), &pcur, search_tuple,
+                        &mtr)) {
+      ut_ad(mtr.has_committed());
+      goto loop;
     }
   }
 ```
 
-**要点**：
+- **归属检查是"按序"的**：ibuf 树里同一页的记录按 counter 升序**连续排列**，所以"当前记录不属于本页"意味着**本页的所有记录已处理完**，直接跳 reset_bit。顺带 `page_header_reset_last_insert`——merge 插入了记录，页头的 last_insert 位置失效必须重置。
+- **`page_update_max_trx_id`**：ibuf 记录**缓存时**的 trx_id 要同步到目标页头 `PAGE_MAX_TRX_ID`，保证 merge 后该页的 MVCC 可见性判断与"直接插入"完全一致——merge 必须语义等价于原始操作。
+- **★ entry 是 rec 字段的指针拷贝**：dummy entry 的字段直接指向 ibuf 记录里的字节，**插入完成前不能放掉 ibuf 页的 latch**，否则其他线程可能改/删这条记录。这决定了整个 merge 循环必须持续持有 ibuf 树游标。
+- **三 op 落到 `ibuf_insert_to_index_page` / `ibuf_set_del_mark` / `ibuf_delete`**：都是真正的 btr 操作（乐观失败退化悲观 → **页分裂**）。merge 的原子性由外层 mtr 保证——要么全部应用、要么崩溃恢复重做。
+- **删记录的悲观路径**：`ibuf_delete_rec` 乐观删除失败 → 悲观删除（内部 commit mtr）→ 返回 true → `goto loop`（游标已失效，从头再来）。
+
+**阶段 4：DELETE 的两段式 mtr（崩溃安全核心）**：
+
+```c
+case IBUF_OP_DELETE:
+  ibuf_delete(entry, block, dummy_index, &mtr);
+  /* Because ibuf_delete() will latch an insert buffer bitmap
+  page, commit mtr before latching any further pages.
+  Store and restore the cursor position. */
+
+  /* Mark the change buffer record processed, so that it will
+  not be merged again in case the server crashes between the
+  following mtr_commit() and the subsequent mtr_commit() of
+  deleting the change buffer record. */
+  btr_cur_set_deleted_flag_for_ibuf(pcur.get_rec(), nullptr, true, &mtr);
+
+  pcur.store_position(&mtr);
+  ibuf_btr_pcur_commit_specify_mtr(&pcur, &mtr);   // ★ 第一段 mtr 提交
+
+  ibuf_mtr_start(&mtr);                             // ★ 第二段 mtr
+  buf_page_get_known_nowait(RW_X_LATCH, block, ...);
+  buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE);
+
+  if (!ibuf_restore_pos(page_id.space(), page_id.page_no(), search_tuple,
+                        BTR_MODIFY_LEAF, &pcur, &mtr)) {
+    mops[op]++;
+    goto loop;                     // 恢复游标失败（悲观操作）→ 从头再来
+  }
+  break;
+```
+
+- **为什么必须两段 mtr**：`ibuf_delete`（真正的物理删除，可能触发页合并/分裂）内部要 latch **另一张 bitmap 页**——锁序要求"commit 当前 mtr 后才能拿别的页"。所以"应用 DELETE"和"从 ibuf 树删除记录"必须在两个 mtr 里。
+- **★ 先打删除标记再提交（防重复 merge）**：两个 mtr 之间存在崩溃窗口——第一段提交后、第二段删除 ibuf 记录前崩溃，重启后这条 DELETE 记录**还在 ibuf 树里**。没有删除标记，它会被再次 merge → **同一条 DELETE 被应用两次**（幂等性破坏）。打了标记后，阶段 3 的 `!rec_get_deleted_flag` 检查会跳过它、计入 dops。
+- **游标恢复**：`ibuf_restore_pos` 重新定位到该页第一条记录；失败（期间发生悲观操作导致游标失效）→ `goto loop`。
+
+**阶段 5：reset_bit 收尾**：
+
+```c
+reset_bit:
+  ibuf_bitmap_page_set_bits(bitmap_page, page_id, *page_size,
+                            IBUF_BITMAP_BUFFERED, false, &mtr);   // 清 BUFFERED
+  if (block != nullptr) {
+    ulint new_bits = ibuf_index_page_calc_free(block);
+    if (old_bits != new_bits) {
+      ibuf_bitmap_page_set_bits(bitmap_page, page_id, *page_size,
+                                IBUF_BITMAP_FREE, new_bits, &mtr);  // 重算 FREE
+    }
+  }
+```
+
+merge 后页的空闲空间变了：清 `BUFFERED` 位（不再有缓存变更），并**重算** `FREE` 档位（升档！）——这正是「工程技法 → bitmap 单向阀」讲的升档侧：**必须与 merge 同 mtr**（merge 释放了空间，FREE 升档与事实同原子），单独提交会在崩溃时造成高估。
 
 1. **整个 merge 在 `buf_page_io_complete` 的读完成回调里做**——这就是"页被读到时合并"的实现位置。
 2. **`IBUF_OP_DELETE` 特殊**：`ibuf_delete` 内部要 latch 另一个 bitmap 页，所以先 `btr_cur_set_deleted_flag_for_ibuf` 打删除标记 → 提交 mtr → 重新定位（`ibuf_restore_pos`）。
@@ -537,7 +643,7 @@ reset_bit:
 
 > **边界**：本节省掉 buffer pool 侧（压缩页驱逐竞态窗口、`HASH_DELETE`/`HASH_INSERT`、`access_time` 继承）的完整分析见 [`buffer_pool.md`](buffer_pool.md)「压缩页驱逐与 change buffer 竞态」。本节只写 change buffer 侧的判据问题。
 
-**缺陷**：压缩页解压路径 `Buf_fetch::zip_page_handler`（buf0buf.cc:3962-3970）用 `access_time != 0` 作为"跳过 merge"的判据：
+**缺陷**：压缩页解压路径 `Buf_fetch::zip_page_handler`（buf0buf.cc）用 `access_time != 0` 作为"跳过 merge"的判据：
 
 ```c
 if (!recv_no_ibuf_operations) {
@@ -551,7 +657,7 @@ if (!recv_no_ibuf_operations) {
 
 该假定在压缩页驱逐解压帧后被打破——描述符被 `HASH_INSERT` 插回 `page_hash` 时带着**继承来的非零 `access_time`**（stale），但它已是新 incarnation，窗口期缓冲的 ibuf entry 尚未应用 ⇒ merge 被永久跳过 ⇒ 页分裂后记录落错页 ⇒ B+tree 页间顺序违反（`btr_check_sibling_boundary` 报错）。
 
-**change buffer 侧的正确判据在函数内部**。`ibuf_merge_or_delete_for_page`（ibuf0ibuf.cc:4030-4040）自己读 bitmap 的 `IBUF_BITMAP_BUFFERED` 位，无缓冲变更即返回：
+**change buffer 侧的正确判据在函数内部**。`ibuf_merge_or_delete_for_page`（ibuf0ibuf.cc）自己读 bitmap 的 `IBUF_BITMAP_BUFFERED` 位，无缓冲变更即返回：
 
 ```c
 bitmap_bits = ibuf_bitmap_page_get_bits(bitmap_page, page_id, *page_size,
@@ -646,15 +752,110 @@ ibuf 的修改**全部记 redo**（见 [3.5](#35-ibuf-自身的-redo-常见误�
 
 ---
 
-### 参数与监控
+## ★ 本机制里的工程实现技法
 
-#### 8.1 参数
+> 判据见自检 ⑬。ibuf 以 C 风格为主（无复杂模板/继承体系），本章**只写算法落地与体系结构，不硬凑 C++ 段落**。重点是"这份代码与教科书/常规写法的差异"。
 
-| 变量 | 默认 | 范围 | 定义位置 |
-|------|------|------|---------|
-| `innodb_change_buffering` | **`all`** | none/inserts/deletes/changes/purges/all | `ha_innodb.cc` |
-| `innodb_change_buffer_max_size` | **25** | 0–50（BP 百分比） | `ibuf0ibuf.h` `CHANGE_BUFFER_DEFAULT_SIZE` |
-| `innodb_ibuf_disable_background_merge` | false | 仅 DEBUG 构建可见 | — |
+### 一、经典算法的实现落地
+
+#### ① bitmap 空间管理：一条"只能悲观低估"的单向阀
+
+教科书里的 bitmap（文件系统空闲块位图、内存分配位图）是**精确反映 + 读写对称**：空间变多少，位图就如实改多少。ibuf 的 `FREE` 位**故意违反**这个直觉——它是粗粒度档位（2 bit 只有 4 档），而且**只允许低估、不允许高估**。设计契约写在头注释里：
+
+```c
+/* The insert buffer merge must always succeed.  To guarantee this,
+the insert buffer subsystem keeps track of the free space in pages for
+which it can buffer operations.  Two bits per page in the insert
+buffer bitmap indicate the available space in coarse increments.  The
+free bits in the insert buffer bitmap must never exceed the free space
+on a page.  It is safe to decrement or reset the bits in the bitmap in
+a mini-transaction that is committed before the mini-transaction that
+affects the free space.  It is unsafe to increment the bits in a
+separately committed mini-transaction, because in crash recovery, the
+free bits could momentarily be set too high. */
+```
+
+逐句拆这四条工程决策：
+
+1. **"must never exceed"**：FREE 位是**页剩余空间的悲观上界估计**，不是精确值。缓存时按 FREE 位判断"这个页还能不能装下"，所以高估 = 缓存进去装不下 = merge 失败。
+2. **"coarse increments"（粗粒度）**：2 bit 只有 4 档（<512B / ≥512B / ≥1024B / ≥2048B）。粗粒度本身就是悲观化手段——把真实空闲空间**向下取整**到档位。`ibuf_index_page_calc_free_bits` 里的 `if (n == 3) { n = 2; }`（3 档被压进 2 档）是同一个方向的刻意保守：宁可低估 1KB，不可高估 1 字节。
+3. **"safe to decrement or reset ... committed before"**：**先减（缓存时）后算（真实空间变化时）**——缓存一条 INSERT 时把 FREE 位减档，这个 mtr 可以**先提交**；真正写入该页（消耗空间）的操作在其后的 mtr 里。减是"提前悲观"，方向安全。
+4. **"unsafe to increment in a separately committed mtr"**：**加档必须与"实际释放空间的操作"同 mtr**。因为崩溃恢复只重放已提交 mtr——如果"加 FREE 档"单独提交、而"释放空间"的 mtr 还没提交就崩溃，恢复后 FREE 位高估了真实空间。加是"滞后乐观"，必须与原子上锁绑定。
+
+一句话：**FREE 位是一个方向不对称的状态机——降档可以超前，升档必须滞后到与事实同原子。** 这比教科书 bitmap 多了一个"崩溃安全方向性"维度。
+
+#### ② B-tree 的"伪索引"复用：脱离 `dict_index_t` 的 KV 存储
+
+InnoDB 的 B-tree 代码（插入/删除/分裂/游标）本来是为"受字典管理的索引"写的——记录解析靠 `dict_index_t` 提供字段数和类型。ibuf 树却把它当**应用层自定义格式的 KV 存储**用：键是 `(space_id, page_no, counter)`，值是"二级索引 entry + 操作类型"，**记录自带类型描述**（METADATA 字段里内嵌每用户字段 6 字节的类型信息），解析完全不依赖任何 `dict_index_t`。
+
+代码证据——解析函数把 index 参数传 `nullptr`、用**位置号硬编码**读字段：
+
+```c
+/* ibuf_rec_get_page_no_func（ibuf0ibuf.cc）——注意 index 传 nullptr */
+field = rec_get_nth_field_old(nullptr, rec, IBUF_REC_FIELD_MARKER, &len);
+ut_a(len == 1);
+field = rec_get_nth_field_old(nullptr, rec, IBUF_REC_FIELD_PAGE, &len);
+ut_a(len == 4);
+return (mach_read_from_4(field));
+```
+
+字段位置是 `constexpr` 常量（`IBUF_REC_FIELD_SPACE=0` / `MARKER=1` / `PAGE=2` / `METADATA=3` / `USER=4`），格式版本靠 MARKER 字节长度区分（`len>1` → 老格式）。这是"把通用代码复用到脱离通用假设的场景"：B-tree 的键序、分裂、游标逻辑全盘复用，只有"记录怎么解析"被替换成应用层约定。
+
+merge 时怎么把这条"裸记录"还原成真实二级索引 entry？构造一个**用完即弃的 dummy index**：
+
+```c
+/* ibuf0ibuf.cc——dummy index 是元数据替身 */
+entry = ibuf_build_entry_from_ibuf_rec_func(IF_DEBUG(mtr, ) ibuf_rec, heap, &dummy_index);
+volume = rec_get_converted_size(dummy_index, entry);   // 估算 merge 后体积
+ibuf_dummy_index_free(dummy_index);
+```
+
+`ibuf_build_entry_from_ibuf_rec` 从记录**内嵌的类型信息**造出 dtuple + 临时 `dict_index_t`（`ibuf_dummy_index_create`），用它的 `rec_get_converted_size` 算体积（供 volume 校验），用完即释放。**常规用法是"先有字典再有记录"，这里反过来了："记录自带字典，字典用完即弃"。**
+
+**代价**（与教科书 B-tree 的差异）：
+- 记录格式**永久锁定**——枚举注释明写 "DO NOT CHANGE THE VALUES OF THESE, THEY ARE STORED ON DISK."；
+- 版本迁移靠格式探测（`len % 6` 判 REDUNDANT/COMPACT/5.5+ 三种格式）而非在线升级；
+- 类型信息冗余存储（每条记录重复一遍字段类型），用空间换"解析零依赖"。
+
+### 二、复杂体系与设计模式的代码结构
+
+#### ① "merge 必须永远成功"的契约链：一个约束牵出四层设计
+
+这是 ibuf 子系统的**体系级主线**——不是单个算法，而是"一个约束 → 层层落实"的设计链：
+
+```
+约束：merge 在 buf_page_io_complete 的读完成回调里做，没有失败回退路径
+  ├─ 缓存侧：bitmap FREE 悲观低估（"装得下才缓存"）——技法①
+  ├─ 判据侧：IBUF_BITMAP_BUFFERED 位是"有无缓存"的唯一权威（Bug#120698 教训：别用外部代理变量）
+  ├─ 执行侧：整个 merge 在一个 mtr 里原子完成——要么全合并、要么崩溃恢复重做（merge 的 redo 也是 mtr 的一部分）
+  └─ 兜底侧：discarded operations——页/索引已被删除时，缓存操作被**丢弃**而非失败（SHOW ENGINE 的 discarded 计数）
+```
+
+每层都是"无回退"约束的直接推论：缓存前悲观估算（预防）、判据用权威位（正确性）、mtr 原子（崩溃安全）、丢弃兜底（无法预防的终态）。对照 [buffer_pool.md](buffer_pool.md) 的"汇聚点模式"，这是另一种体系组织方式——**契约链**：从一条不可违反的约束倒推每个环节的设计。
+
+#### ② 并发体系：资源分域切断死锁环
+
+普通读和 ibuf merge 读如果共用同一批 AIO 槽位：merge 发起的读占满全部槽位 → 这些读等待完成 → 完成回调才做 merge → 但 merge 又需要发新读 → **等待的读永远不完成**（机制详见「合并路径 → 为什么用 `AIO_mode::IBUF`」）。切断手段是**给 ibuf 单独一组 AIO 数组 + 独立线程**（`s_ibuf`）。
+
+这与 [buffer_pool.md](buffer_pool.md) 的"8 把 mutex 分工"、`flush_rbt` 的"恢复期专用结构"同属一种技法：**按使用场景给共享资源划独立的分域**，而不是无脑共用。代价是内存与线程的冗余，收益是彻底消除跨场景的相互阻塞。
+
+#### ③ 生命周期寄生：无专用 merge 线程
+
+merge 没有自己的后台线程，寄生在 **master 线程**（`ibuf_merge_in_background`，周期性检查 ibuf 大小超限时收缩）。对照 buffer pool 的 page cleaner 专用 coordinator/worker 线程组——为什么 ibuf 不配专用线程？因为 merge 的触发点是**页被读**（读完成回调，被动触发），后台 merge 只是"ibuf 太大"时的兜底收缩，频率低、优先级低。专用线程的调度/唤醒开销不值得。这是**"按触发频率选生命周期归属"**的设计：高频主动 → 专用线程；低频被动 → 寄生。
+
+---
+
+## 可观测性
+
+> 按「我想看什么」倒排的速查索引。观测点跟着机制走——各值的含义已在「核心实现」对应机制处交代，此处汇总备查。
+
+### 系统变量
+
+| 变量 | 默认 | 范围 | 说明 |
+|------|------|------|------|
+| `innodb_change_buffering` | **`all`** | none/inserts/deletes/changes/purges/all | 缓存哪些操作类型 |
+| `innodb_change_buffer_max_size` | **25** | 0–50（BP 百分比） | ibuf 树占用 BP 上限（`ibuf0ibuf.h` `CHANGE_BUFFER_DEFAULT_SIZE`） |
+| `innodb_ibuf_disable_background_merge` | false | 仅 DEBUG 构建 | 禁用后台 merge（调试用） |
 
 `max_size` 动态更新（`ibuf_max_size_update`）：
 
@@ -668,11 +869,16 @@ void ibuf_max_size_update(ulint new_val) {
 }
 ```
 
-#### 8.2 监控
+### 观测对象 → 手段 速查
 
-`SHOW ENGINE INNODB STATUS` 的 INSERT BUFFER 部分：
+| 我想看 | 手段 | 入口 |
+|--------|------|------|
+| ibuf 树大小 / 合并统计 | SQL | `SHOW ENGINE INNODB STATUS` 的 **INSERT BUFFER** 段 |
+| 缓存 / 丢弃的操作数 | SQL | 同段的 merged / discarded operations |
 
-```
+`SHOW ENGINE INNODB STATUS` 的 INSERT BUFFER 段：
+
+```text
 Ibuf: size 1, free list len 0, seg size 2, 0 merges
 merged operations:
  insert 0, delete mark 0, delete 0

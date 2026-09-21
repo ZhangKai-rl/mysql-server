@@ -1,6 +1,8 @@
 # MySQL GTID 机制深度解析
 
 > 基于 MySQL 8.0.39 源码，涵盖 SID/SIDNO/GNO 定义、Gtid_set 结构、GNO 分配算法、GTID 生命周期完整流程、三条持久化路径、Clone 双 buffer 机制。
+>
+> **边界**：本篇讲 **GTID 本身**——标识体系（SID/SIDNO/GNO）、集合数据结构、分配与生命周期、三条持久化路径与 InnoDB 侧落表。**GTID 与 binlog 文件的交互**（三处持久化中 binlog 侧、Gtid_log_event 写入、PREVIOUS_GTIDS 生成）见 [`binlog.md`](binlog.md)「GTID 与 binlog 的持久化交互」；**GTID 如何支撑复制定位**（auto position 的 failover 语义）见 [`replication.md`](replication.md)「位点定位」；外部 XA 的 GTID 语义见 [`../xa.md`](../xa.md)。
 
 ## 目录
 
@@ -33,6 +35,7 @@
   - [Rollback 时的 GTID 处理](#rollback-时的-gtid-处理)
 - [GTID 持久化：三条路径（概览）](#gtid-持久化三条路径概览)
 - [Clone_persist_gtid：InnoDB 侧 GTID 持久化（源码逐段）](#clone_persist_gtidinnodb-侧-gtid-持久化源码逐段)
+- [参考](#参考)
 
 ---
 
@@ -673,6 +676,137 @@ void Owned_gtids::remove_gtid(const Gtid &gtid, const my_thread_id owner) {
 
 `THD::OWNED_SIDNO_ANONYMOUS == -2`、`OWNED_SIDNO_GTID_SET == -1` 是 `thd->owned_gtid.sidno` 的**保留哨兵值**（真实 sidno ≥1）：`-2` 表示线程正"拥有"一个匿名事务（只递增原子计数，**不进** Owned_gtids）；`-1` 为 `gtid_next_list` 多 GTID 预留（8.0.39 中对应代码被 `#ifdef HAVE_GTID_NEXT_LIST` 摘除，实际不使用）。`sidno==0` 表示不拥有任何事务。
 
+#### Owned_gtids 与事务提交：完整生命周期
+
+**为什么要有 owned 这个中间态**：GTID 的**分配点**（FLUSH 阶段，写 `Gtid_log_event`）与**外部化点**（COMMIT 阶段，入 `executed_gtids`）在时间上是分离的。这中间存在一个"GTID 已诞生、事务还没提交"的窗口——这个窗口里的 GTID 必须被追踪：否则并发事务可能抢到同一个 GNO、崩溃时无法判断有没有半截事务、`@@GLOBAL.gtid_owned` 也无从观测。Owned_gtids 就是这段窗口的**登记表**。
+
+三步生命周期：
+
+**① 分配 = 登记所有权**（事务提交流程的 FLUSH 阶段）：`generate_automatic_gtid()` 选出空闲 GNO → `Gtid_state::acquire_ownership(thd, gtid)`：
+
+```cpp
+// 断言：已执行的 GTID 不可再被拥有；本线程当前不能持有别的 GTID
+assert(!executed_gtids.contains_gtid(gtid));
+assert(thd->owned_gtid.sidno == 0);
+if (owned_gtids.add_gtid_owner(gtid, thd->thread_id()) != RETURN_STATUS_OK) goto err;
+thd->owned_gtid = gtid;   // 本线程记住"我拥有这个号"
+```
+
+GNO 的空闲性由 `get_automatic_gno` 保证——**owned 参与冲突检查**，所以并发事务绝不会拿到同一个 GNO：
+
+```cpp
+rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const {
+  Gtid_set::Const_interval_iterator ivit(&executed_gtids, sidno);   // 遍历已执行区间
+  // 从 next_free_gno（上次分配+1）开始，而不是从 1
+  Gtid next_candidate = {sidno, sidno == get_server_sidno() ? next_free_gno : 1};
+  while (true) {
+    const Gtid_set::Interval *iv = ivit.get();
+    rpl_gno next_interval_start = iv != nullptr ? iv->start : GNO_END;
+    while (next_candidate.gno < next_interval_start) {      // 在区间之前的空隙里扫描
+      if (owned_gtids.is_owned_by(next_candidate, 0)) return next_candidate.gno;
+      next_candidate.gno++;
+    }
+    if (iv == nullptr) { my_error(ER_GNO_EXHAUSTED, MYF(0)); return -1; }
+    if (next_candidate.gno < iv->end) next_candidate.gno = iv->end;  // 跳过已执行区间
+  }
+}
+```
+
+三个设计点：
+
+1. **★ `is_owned_by(gtid, 0)` 的语义是反的**——同一函数名两种含义（rpl_gtid_owned.cc）：`owner` 参数非 0 时返回"是否被该线程拥有"；**`owner == 0` 时返回 `equal_range` 是否为空，即"是否无人拥有（空闲）"**：
+
+   ```cpp
+   if (thd_id == 0) return it_range.first == it_range.second;   // 没有 owner → true = 空闲
+   for (auto it = ...; ...) if (it->second->owner == thd_id) return true;
+   return false;
+   ```
+
+   所以上面那行读起来是"如果没人占这个号，就返回它"。这是全库最容易读错的一处命名——`is_owned_by(x, 0)` 实际问的是 **"is it free?"**。
+
+2. **`next_free_gno` 起点优化**（注释 418-441 详述动机）：若每次都从 1 开始找，组提交场景下会连续撞上"已被 FLUSH 阶段其他事务 owned、但还没 COMMIT 释放"的号，要重试 N 次（N = FLUSH 阶段事务数 + COMMIT 阶段未释放所有权的事务数）。从"上次分配 +1"起找，绝大多数情况一次命中。代价是**回滚会留下空隙**，所以 `update_gtids_impl_own_gtid` 在回滚分支里把 `next_free_gno` 回退到被释放的那个 GNO 来填补。
+
+3. **边界**：GNO 耗尽报 `ER_GNO_EXHAUSTED`；GNO 超过 `GNO_WARNING_THRESHOLD` 时提交路径写 `ER_WARN_GTID_THRESHOLD_BREACH` 告警（`update_commit_group` / `update_gtids_impl` 里的 `gtid_threshold_breach`）。
+
+**② 提交 = 外部化**（COMMIT 阶段）：`update_commit_group()`（组提交批量）或 `update_on_commit()`（单事务）→ `update_gtids_impl_own_gtid(thd, is_commit=true)`：
+
+```cpp
+// 无论提交还是回滚，都先释放所有权
+owned_gtids.remove_gtid(thd->owned_gtid, thd->thread_id());
+
+if (is_commit) {
+  executed_gtids._add_gtid(thd->owned_gtid);        // ★ 进入 gtid_executed
+  if (thd->slave_thread && opt_bin_log && !opt_log_replica_updates) {
+    lost_gtids._add_gtid(thd->owned_gtid);          // 从库不写 binlog：GTID 只存在于表
+    gtids_only_in_table._add_gtid(thd->owned_gtid);
+  }
+} else {
+  // 回滚：把 GNO 分配游标回退，该号可被后续事务复用
+  if (thd->owned_gtid.sidno == server_sidno && next_free_gno > thd->owned_gtid.gno)
+    next_free_gno = thd->owned_gtid.gno;
+}
+thd->clear_owned_gtids();
+```
+
+三个必须注意的点：
+
+- **提交路径上 GTID 才真正"算数"**：`executed_gtids._add_gtid` 这一行就是"外部化"——在此之前该 GTID 只在 binlog 文件里（已 flush）而不在 `gtid_executed` 里。这正是 `SHOW MASTER STATUS` 的 `Executed_Gtid_Set` 不含"已写 binlog 未提交"事务的原因，也是崩溃恢复要扫 binlog 补表的根因。
+- **回滚会把 GNO 还回去**（`next_free_gno` 回退）——没提交的事务不该白占一个号。注意只在 `next_free_gno > 该 gno` 时回退，不会覆盖已分配出去的更大 GNO。
+- **从库不写 binlog 时走特殊分支**：`slave_thread && opt_bin_log && !opt_log_replica_updates` 时 GTID 同时进 `lost_gtids` 与 `gtids_only_in_table`（本机 binlog 里没有它，只能靠表持久化）——这是 `gtids_only_in_table` 集合的来源。
+
+**③ 三个让 owned 变复杂的交叉场景**：
+
+1. **XA 的错位**（最容易误解）：`commit_owned_gtids()` 在 **XA PREPARE 阶段就被调用**（`sql_xa_prepare.cc`），而不是等 `XA COMMIT`。结果是 **XA 事务在 PREPARE 后其 GTID 已进入 `gtid_executed`，但事务本身尚未提交**。`@@GLOBAL.gtid_executed` 里有某个 XA 的 GTID ≠ 该 XA 已提交——用 gtid_executed 判断"事务是否提交"在 XA 场景是错的。
+2. **组提交批量外部化**：`update_commit_group(THD *first_thd)` 沿 `next_to_commit` 链表遍历整组，一次性持 `global_sid_lock` 读锁完成全组外部化——注释明说动机是"避免每个会话都加解锁一次"。
+3. **MGR 的多 owner**：源码注释（858-861）指出 Group Replication 下同一 GTID 可能**额外**被另一个线程拥有，本线程提交时只移除自己的那条 owner 记录（"it will be rolled back later"）——这就是 multimap 存在的理由。
+
+#### 外部化的五个分支（`update_gtids_impl` 全貌）
+
+`update_gtids_impl(thd, is_commit)` 先做 `do_nothing` 前置判断，再按 `thd->owned_gtid.sidno` 分派到五个分支（`update_commit_group` 对组内每个 THD 都走同一套）：
+
+| `owned_gtid.sidno` | 分支 | 行为 |
+|---|---|---|
+| （前置）不拥有任何 + 无 GTID 一致性违规 | `update_gtids_impl_do_nothing` | 直接返回（顺带把 `gtid_next=ASSIGNED` 清成 UNDEFINED） |
+| `-1`（`OWNED_SIDNO_GTID_SET`） | `own_gtid_set` | 多 GTID 预留路径（8.0.39 被 `#ifdef HAVE_GTID_NEXT_LIST` 摘除） |
+| `> 0`（真实 sidno） | **`own_gtid`** | 主路径：移除 owned → commit 则入 executed / rollback 则回退 `next_free_gno` |
+| `-2`（`OWNED_SIDNO_ANONYMOUS`） | `own_anonymous` | 匿名事务：见下节 |
+| `0`（不拥有） | `own_nothing` | 只有断言（`commit_error` 或一致性违规场景，无状态可改） |
+
+`more_trx_with_same_gtid_next`（由 `update_gtids_impl_begin` 得出）控制 `update_gtids_impl_end` 是否结束"GTID 违规事务"计数——**一条语句里包含多个事务时（如 `binlog cache` 里还有内容），同一个 `gtid_next` 会被后续事务继续沿用**，此时不能提前结束违规计数。
+
+#### 匿名事务的所有权：计数而非登记
+
+`thd->owned_gtid.sidno == -2` 的匿名事务**没有 GTID 可登记**，所以它的"所有权"退化为一个原子计数：
+
+```cpp
+void acquire_anonymous_ownership() {
+  assert(global_gtid_mode.get() != Gtid_mode::ON);   // ON 模式下不允许匿名
+  ++atomic_anonymous_gtid_count;
+}
+void release_anonymous_ownership() {
+  assert(global_gtid_mode.get() != Gtid_mode::ON);
+  --atomic_anonymous_gtid_count;
+}
+```
+
+**它的存在意义是给 `SET @@GLOBAL.GTID_MODE` 把关**：切到 `ON` 时若 `get_anonymous_ownership_count() > 0` 直接报错拒绝（sys_vars.cc 的错误消息要求先等 `SHOW STATUS LIKE 'ANONYMOUS_TRANSACTION_COUNT'` 归零，并等已有匿名事务复制到所有从库）。`own_anonymous` 分支里还有一个易错点：**binlog cache 非空（语句内还有后续事务）时不释放所有权**、置 `more_trx = true`，否则并发的 `SET GTID_MODE=ON` 会让这条语句的剩余部分无法记录——`THD::is_commit_in_middle_of_statement` 标志就是为这个场景存在的（sql_class.h 注释）。
+
+#### wait_for_gtid：当目标 GTID 已被别人拥有
+
+`SET GTID_NEXT = 'uuid:N'` 显式指定一个 GTID 时，若该 GTID 正被另一个线程 owned（它即将提交或回滚），本线程必须**等待**而不是直接抢（rpl_gtid_execution.cc）：
+
+```cpp
+gtid_state->wait_for_gtid(thd, spec.gtid);   // 睡在 sidno 的条件变量上，等对方外部化/回滚后广播
+```
+
+`wait_for_gtid` 只是 `wait_for_sidno` 的带断言简写——它睡在该 sidno 对应的条件变量上，由 `broadcast_sidno`（在 `update_gtids_impl_broadcast_and_unlock_sidno` 里，即每次外部化之后）唤醒。等待协议是"发生过一次等待就整轮重验"，防止 `RESET MASTER` 之类操作造成的 TOCTOU。
+
+相关的禁令：`WAIT_FOR_EXECUTED_GTID_SET()` 函数与 `WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS` **不允许调用者自己持有 owned**（否则报 `ER_CANT_WAIT_FOR_EXECUTED_GTID_SET_WHILE_OWNING_A_GTID`）——自己占着号又等别人提交，可能自锁。
+
+**与复制的关系**：主库 dump 的第一道校验用的是 `executed_gtids ∪ owned_gtids`（见「三道校验」）——因为 owned 里的事务马上就要提交，若从库声称已拥有它，说明从库超前于主库（数据分叉）。反过来，`SHOW MASTER STATUS` / `@@GLOBAL.gtid_executed` **不含** owned。
+
+**观测**：`@@GLOBAL.gtid_owned` 的格式是 `uuid:gno#:thread_id`（多个 owner 时为 `uuid:gno#t1:t2`）。正常空闲实例应为空；长期非空说明有事务卡在"已分配未提交"窗口（大事务或 XA prepared）。
+
 ### Gtid_state 锁体系
 
 ```cpp
@@ -859,6 +993,109 @@ m_check_previous_gtid_event(exclude_gtids != nullptr),
 - 常规重连：`Executed_Gtid_Set`（从库已执行的）
 - IO thread 接收中断后恢复：`Retrieved_Gtid_Set`（已收到但可能还没执行完的）∪ executed——防止"已收到未执行"的事务被主库重发
 
+#### 从库怎么算出这个并集（计算时机与编码）
+
+`request_dump`（rpl_replica.cc）只在 `COM_BINLOG_DUMP_GTID` 分支计算，两段 `add_gtid_set` 各持自己的锁：
+
+```cpp
+Gtid_set gtid_executed(&sid_map);          // ★ 必须声明在与 mysql_binlog_open() 同层
+if (command == COM_BINLOG_DUMP_GTID) {
+  mi->rli->get_sid_lock()->wrlock();
+  gtid_executed.add_gtid_set(mi->rli->get_gtid_set());   // ① Retrieved_Gtid_Set
+  mi->rli->get_sid_lock()->unlock();
+
+  global_sid_lock->wrlock();
+  gtid_executed.add_gtid_set(gtid_state->get_executed_gtids());  // ② 本地 executed
+  global_sid_lock->unlock();
+
+  rpl->file_name = nullptr;
+  rpl->start_position = 4;
+  rpl->flags |= MYSQL_RPL_GTID;
+  rpl->gtid_set_encoded_size = gtid_executed.get_encoded_length();  // ③ 只算长度
+  rpl->fix_gtid_set = fix_gtid_set;      // ④ 真正的编码推迟到组包时
+  rpl->gtid_set_arg = (void *)&gtid_executed;
+}
+```
+
+四个细节：
+
+1. **`mi->rli->get_gtid_set()` 就是 `Retrieved_Gtid_Set`**（`Relay_log_info::gtid_set`，`rpl_channel_service_interface.cc` 里变量直接叫 `retrieved_gtid_set`）。它的入集时机是**事务最后一个事件 flush 之后**，所以集合里永远不含半截事务（见 replica.md）。
+2. **为什么必须是并集**：只发 executed 的话，relay log 里"已收到但 SQL 线程还没执行"的事务会被主库重发一遍（重复执行）。用 retrieved ∪ executed 才能保证"凡是本地已经拿到的都不再要"。
+3. **★ 编码是延迟的**：③ 只算出编码后长度用于组包占位，真正的 `encode()` 由 `fix_gtid_set` 回调在 `mysql_binlog_open()` 组包那一刻执行（client.cc：`if (rpl->fix_gtid_set) rpl->fix_gtid_set(rpl, ptr); else memcpy(...)`）。这样"算长度"与"填内容"之间即便有 SQL 线程又执行了新事务，也是在同一次 `encode` 里完成的；`gtid_executed` 对象因此必须声明在与 `mysql_binlog_open()` 相同的层级（源码注释明说）。
+4. **relay log recovery 的影响**：`recover_relay_log` 在 GTID 模式下会 `clear_set_and_sid_map()` 清空 Retrieved_Gtid_Set，此时 exclude 退化成"仅 executed"——配合 io 位点被重置为 SQL 位点，靠主库重发补齐（见 replica.md「relay log recovery」）。
+
+#### 主库侧：拿 exclude 集合与哪些 set 对比（四个对比点）
+
+主库把收到的集合存进 `Binlog_sender::m_exclude_gtid` 后，**在四个不同阶段与四个不同的集合做比较**——这是理解"主库怎么决定从哪发"的关键：
+
+| 阶段 | 比较 | 对比对象 | 失败/结果 |
+|------|------|---------|----------|
+| 校验 1 | `m_exclude_gtid->is_subset_for_sid(executed ∪ owned, server_sidno, subset_sidno)` | 主库 **executed_gtids ∪ owned_gtids**，且**只比主库自己 UUID 的那一段** | 不满足 → `ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE` |
+| 校验 2 | `lost_gtids->is_subset(m_exclude_gtid)` | 主库 **lost_gtids（= gtid_purged）** | 不满足 → `ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS` |
+| 定位 | `find_first_log_not_in_gtid_set` 内 `previous_gtid_set.is_subset(m_exclude_gtid)` | 每个 binlog 文件头的 **Previous_gtids_log_event** | 逆序第一个满足的文件 = **起点文件** |
+| 发送 | `skip_event` 内 `m_exclude_gtid->contains_gtid(gtid)` | 每个 **Gtid_log_event 携带的 GTID** | 命中 → 整事务跳过 |
+
+两点精确化：
+
+- **主库算的是"起点文件"，不是"起点 GTID"**。它定位到从哪个 binlog 文件开始读（该文件 `Previous_gtids ⊆ exclude`，即它之前的都被跳过），然后从 `start_position=4` 顺序读，靠事件级 `contains_gtid` 过滤。**第一个不被过滤掉的事务**才是"实际开始发送的事务"——`find_first_log_not_in_gtid_set` 输出参数 `first_gtid` 就是它，用于判断要不要清 FD 的 `created` 字段（`m_gtid_clear_fd_created_flag`）。协议里自始至终没有"起点 GTID"这个输入。
+- **`is_subset_for_sid` 限定 sidno 的理由**：`subset_sidno == 0`（从库集合里根本没有主库 UUID 对应的条目）时直接返回 true——从库一个本主库的事务都没执行过是合法的。而只比主库自己 UUID 那段，是为了忽略从库集合里**其他来源**的 GTID（多源复制、级联上游的其他主库），那些与本通道无关，不该用来判定"从库是否超前于本主库"。
+
+#### 报文里有什么：name / pos 字段的真实角色
+
+`COM_BINLOG_DUMP_GTID` 的报文（`com_binlog_dump_gtid`）并不只有 GTID 集合：
+
+```
+flags(2) | server_id(4) | name_size(4) + name | pos(8) | data_size(4) + encoded_gtid_set
+```
+
+MySQL 从库在 GTID 模式下恒传**空文件名 + pos=4**（`request_dump` 里 `rpl->file_name = nullptr; rpl->start_position = 4`）。主库侧 `check_start_file` 的分派是：
+
+```cpp
+if (m_start_file[0] != '\0') {
+  mysql_bin_log.make_log_name(index_entry_name, m_start_file);
+  name_ptr = index_entry_name;      // ① 带了文件名 → 就用它作起点
+} else if (m_using_gtid_protocol) {
+  ...三道校验 + find_first_log_not_in_gtid_set...
+  name_ptr = index_entry_name;      // ② 文件名空 → 由 exclude 集合算出起点文件
+}
+// 之后 pos 只做合法性校验（< 4 或 > 文件长度才报错），不参与起点决策
+```
+
+#### 为什么是"排除"而不是"起点 GTID"
+
+协议里**不存在**任何"从 GTID `uuid:N` 开始发"的字段——GTID 语义只有"排除"这一种表达方式。这不是疏漏，而是由 GTID 的本质决定的：
+
+1. **从库的状态是集合，不是位点**。从库执行过的 GTID 可能是**非连续**的（MTS gap、复制过滤跳过的、手工跳过的事务都会留下空洞）。一个"起点 GTID"无法表达"我执行了 1,2,5,7 但 3,4,6 没有"——而 exclude 集合能完整表达任意集合状态。
+2. **主库的文件布局是主库的私事**。GTID 模式的初衷就是去掉 file+pos 的跨机耦合：从库不该知道、更不该指定主库的 binlog 文件名。让主库根据自己的 index 决定从哪个文件开始。
+3. **"排除"天然支持两级跳过**：主库拿到集合后可以先**整文件跳过**（`Previous_gtids ⊆ exclude`）再**事件级过滤**（`skip_event`）；若只有"起点 GTID"，主库只能线性扫到那个 GTID 再开始发，无法跳过中间已执行的事务。
+4. **重连自愈**：每次重连重发一次集合即可，从库不需要维护"上次读到哪个文件的哪个字节"——这正是 GTID_ONLY 模式能把文件名从位点仓库删掉的基础（见 replication.md「GTID_ONLY 模式」）。
+
+**最根本的一条**："起点"隐含了**线性全序假设**——假定从库执行的是连续前缀 [1..N]，那么"从 N+1 开始发"就够了。现实不成立：MTS gap、复制过滤、跳过事务、多源复制都会留下**空洞**。"从 N+1 开始"会漏掉空洞里的 3、4、6。exclude 集合不假设任何顺序或连续性，能表达任意状态。
+
+> 一句话对比：**file+pos 的"起点"是部分状态假设，GTID 的"排除集合"是完整状态声明。** 完整声明天然幂等、可重连、可自愈。
+
+#### 对照：file+pos 模式确实有显式起点
+
+`COM_BINLOG_DUMP`（file+pos 模式）的起点是**从库指定、主库直接采用**的物理坐标：
+
+| | file+pos（`COM_BINLOG_DUMP`） | GTID（`COM_BINLOG_DUMP_GTID`） |
+|---|---|---|
+| 报文起点字段 | `pos(4)` + `filename` | `name`(从库恒传空) + `pos(8)`(从库恒传 4) + `gtid_set` |
+| 起点语义 | (文件名, 字节偏移) 显式物理坐标 | 无显式起点，主库由 exclude 集合推导 |
+| 状态表达 | 单个位点（隐含连续前缀假设） | 完整集合（可含空洞） |
+| **谁决定起点** | **从库指定**（`mi->get_master_log_name/pos`） | **主库计算**（`find_first_log_not_in_gtid_set`） |
+| 从库要持久化什么 | io 位点（文件名 + 偏移） | 只需 `gtid_executed`（执行过什么） |
+| failover | 手工换算坐标 | 自动收敛 |
+
+★ 一个易忽略的字段差异：`COM_BINLOG_DUMP` 的 pos 是 **4 字节**，GTID 版是 **8 字节**——源码注释自承 "4 bytes is too little ... fixed in the new protocol"。
+
+**由此产生的最深架构差异是"起点维护责任的转移"**：
+
+- **file+pos**：起点由从库维护并指定 ⇒ 从库**必须**持久化 io 位点。这就是 crash-safe 复制需要 `slave_master_info` / `relay_log_info` 表的原因——**位点是从库的责任，丢了就不知道从哪继续**。
+- **GTID**：起点由主库每次重连时重算 ⇒ 从库只需记住"我执行过什么"，**完全不需要知道"读到哪"**。这正是 GTID_ONLY 能删掉文件名、以及切主零换算的根源。
+
+> 所以准确表述是：**协议不支持"起点 GTID"这一语义**（GTID 只有排除表达），但**报文格式上保留了 name/pos 字段**——MySQL 从库在 GTID 模式下不使用它们（恒传空名 + 4），该分支主要供 `mysqlbinlog` 等第三方客户端或兼容路径使用。
+
 #### 主库侧：skip_event 跳过已执行事务
 
 `Binlog_sender::send_events` 主循环（rpl_binlog_sender.cc:618）对每个事件：
@@ -899,17 +1136,95 @@ if (mysql_bin_log.find_first_log_not_in_gtid_set(
         index_entry_name, m_exclude_gtid, &first_gtid, errmsg)) { ... }
 ```
 
-逻辑：binlog 文件的 `Previous_gtids_log_event` 记录"本文件之前所有事务的 GTID"。若某文件的 Previous_gtids ⊆ exclude（从库全都有），则该文件里所有事务从库都已执行，**整个文件跳过**；找到第一个 Previous_gtids ⊄ exclude 的文件，从那里开始逐事件 skip。这样主库只需读 index 文件 + 各文件头部，不必扫描全部 binlog 内容。
+算法本体（binlog.cc）——**逆序扫描 + 单调包含，第一次命中即停**：
 
-#### 三道校验（check_sender_capabilities 路径）
+```cpp
+bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
+                                                   const Gtid_set *gtid_set,
+                                                   Gtid *first_gtid,
+                                                   std::string &errmsg) {
+  LOG_INFO linfo;
+  auto log_index = this->get_log_index();
+  std::list<std::string> filename_list = log_index.second;
+  int error = log_index.first;
+  list<string>::reverse_iterator rit;
+  Gtid_set binlog_previous_gtid_set{gtid_set->get_sid_map()};
 
-连接建立后（rpl_binlog_sender.cc:877-937）：
+  if (error != LOG_INFO_EOF) {           // ① index 文件读不出来
+    errmsg.assign("Failed to read the binary log index file ...");
+    error = -1; goto end;
+  }
+  if (filename_list.empty()) {           // ② index 里一个文件都没有
+    errmsg.assign("Could not find first log file name in binary log index file ...");
+    error = -2; goto end;
+  }
 
-1. **从库 ⊆ 主库 executed ∪ owned**：`m_exclude_gtid->is_subset_for_sid(executed_and_owned)` 不满足 → `ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE`。从库执行了主库没有的 GTID = 数据分叉（可能从库曾被提升过或手动注入过事务）
+  // ③ 从最新文件逆序扫描，只读每个文件的 Previous_gtids_log_event
+  rit = filename_list.rbegin();
+  error = 0;
+  while (rit != filename_list.rend()) {
+    binlog_previous_gtid_set.clear();
+    const char *filename = rit->c_str();
+    switch (read_gtids_from_binlog(filename, nullptr, &binlog_previous_gtid_set,
+                                   first_gtid,
+                                   binlog_previous_gtid_set.get_sid_map(),
+                                   opt_source_verify_checksum, is_relay_log)) {
+      case ERROR:
+        errmsg.assign("Error reading header of binary log ...");
+        error = -3; goto end;            // ④ 文件头损坏
+      case NO_GTIDS:
+        errmsg.assign("Found old binary log without GTIDs ...");
+        error = -4; goto end;            // ⑤ 混入无 GTID 老文件（GTID 模式不允许）
+      case GOT_GTIDS:
+      case GOT_PREVIOUS_GTIDS:
+        if (binlog_previous_gtid_set.is_subset(gtid_set)) {   // ⑥ 判据
+          strcpy(binlog_file_name, filename);
+          goto end;                      // ⑦ 第一次命中即停
+        }
+      case TRUNCATED:
+        break;                           // ⑧ 半截文件（崩溃残留）跳过，看更旧的
+    }
+    rit++;
+  }
 
-2. **主库 purged ⊆ 从库 exclude**：见上节。不满足 → "master purged required binary logs" 错误。从库缺的事务主库已经物理删除，复制无解
+  if (rit == filename_list.rend()) {     // ⑨ 扫完整个 index 都不命中
+    report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
+    error = -5;
+  }
 
-3. **发送起点确定**：`find_first_log_not_in_gtid_set` 定位起点文件后 `m_check_previous_gtid_event = false`（该文件必有 Previous_gtids，不必再检查）
+end:
+  filename_list.clear();
+  return error != 0 ? true : false;
+}
+```
+
+逐段解释：
+
+1. **① ②**：先做 index 文件的基本校验（读失败 / 空 index 分别返回 -1 / -2）。
+2. **③ 逆序扫描**：从最新 binlog 往回。每读一个文件的 `Previous_gtids_log_event`——它是"该文件之前所有事务"的并集快照，随文件顺序**单调增长**。
+3. **⑥ 判据** `is_subset(gtid_set)`：该文件之前的所有 GTID 都在从库 exclude 集合里 = 从库已执行过它之前的一切 = **整文件可跳过**。
+4. **⑦ 第一次命中即停**：单调性保证命中点之后（更旧）的文件也满足子集关系，但我们找的是"最老的那个满足文件"的下一份内容——逆序扫描第一个命中的文件，正是"从库还没执行的最老事务"所在文件。dump 从这里开始，后续靠 `skip_event` 逐事件过滤该文件内的已执行事务。
+5. **⑧ TRUNCATED**：半截文件（崩溃残留）不报错，跳过看更旧的——这类文件不会出现在正常序列中，但恢复场景要能容忍。
+6. **⑨ 扫完都不命中**：所有文件的 Previous_gtids 都 ⊄ exclude = 主库已 purge 掉从库需要的 binlog。函数**自己**调 `report_missing_gtids` 生成错误信息、返回 -5，调用方把它包装成 `ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS`（"Cannot replicate because the source purged required binary logs"）。④ ⑤ 则对应 binlog 损坏 / 老文件混用，报 `ER_SOURCE_FATAL_ERROR_READING_BINLOG`。
+
+这样主库只需读 index 文件 + 各文件头部，不必扫描全部 binlog 内容。
+
+#### 三道校验：能不能开始 dump（`check_start_file` 的 GTID 分支）
+
+**时序交代**：exclude 集合章节的协议流程是 ①握手（发集合）→ ②**校验（本节）**→ ③定位起点 → ④逐事件 skip。本节发生在收到 `COM_BINLOG_DUMP_GTID` 之后、**发出第一个事件之前**（`Binlog_sender::run()` 里 `check_start_file()` 的 GTID 分支），是"能不能开始 dump"的前置防线。三道按顺序执行，任一失败即 `set_fatal_error` 并终止：
+
+1. **从库 ⊆ 主库 executed ∪ owned**：`m_exclude_gtid->is_subset_for_sid(executed_and_owned)` 不满足 → 从库执行了主库没有的 GTID = 数据分叉（从库曾被提升写过数据、或主库 binlog 被截断丢失）。
+2. **主库 lost_gtids ⊆ 从库 exclude**：不满足 → 从库缺的事务主库已物理删除，复制无解。**它存在的理由是补第 3 步的一个盲区**（源码注释明说）：`SET GTID_PURGED` 会触发 binlog rotate，第一个 binlog 的 `previous_gtids` 为空集，而空集是任何集合的子集——`find_first_log_not_in_gtid_set` 会"命中"第一个文件、误判找到了起点，抓不到"从库要的事务已被 purge"。所以必须在定位之前显式检查。
+3. **起点定位**：`find_first_log_not_in_gtid_set`（见上节）成功定位后 `m_check_previous_gtid_event = false`（该文件必有 Previous_gtids，不必再检查）。
+
+**失败时主从两侧的表现**：
+
+| 侧 | 表现 |
+|----|------|
+| 主库 | `set_fatal_error()` 记录错误 → `run()` 结束时 `my_message()` 发 **ERR 包**回从库 → 连接关闭。error log **无额外记录**（这些路径没有 `LogErr` 调用） |
+| 从库 | `read_event` 收到 ERR 包（`packet_error`）→ `handle_slave_io` 命中 `ER_SOURCE_FATAL_ERROR_READING_BINLOG` case → `Last_IO_Errno = 13114`（`ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`）、`Last_IO_Error = 主库发来的具体文本` → IO thread 停止（fatal 不重试） |
+
+★ **关键点：`set_fatal_error` 统一发 `ER_SOURCE_FATAL_ERROR_READING_BINLOG` 错误码**，三道校验只是消息文本不同（分别为 "Replica has more GTIDs than the source has..." / "Cannot replicate because the source purged required binary logs..." / `find` 的 errmsg）。所以从库 `Last_IO_Errno` 对三种失败**统一显示 13114**，靠 `Last_IO_Error` 文本区分具体原因——`SHOW REPLICA STATUS` 时别只盯错误码。
 
 若跳过的第一个事务正好是某 binlog 文件的第一个事务，FD event 的 `created` 字段要清 0（rpl_binlog_sender.cc:946-953）——避免从库误以为新连接而清理临时表。
 
@@ -935,6 +1250,17 @@ if (mysql_bin_log.find_first_log_not_in_gtid_set(
 
 **澄清：`gtid_current_pos` 在 MySQL 8.0.39 中不存在**（全仓库 grep 0 匹配）——它是 MariaDB 的变量，别当 MySQL 特性。
 
+**`SHOW MASTER STATUS` 的 `Executed_Gtid_Set` 就是 `gtid_executed`**（`show_master_status`，rpl_source.cc）：5 列依次是 File / Position / Binlog_Do_DB / Binlog_Ignore_DB / Executed_Gtid_Set，其中 GTID 列在 `global_sid_lock->wrlock()` 下取 `gtid_state->get_executed_gtids()` 并 `to_string()` 序列化。因此它**包含一切已提交事务的 GTID，含 binlog 已被 purge 的那些**（`gtid_purged ⊆ gtid_executed`）。
+
+两个容易误解之处：
+
+1. **它不包含"已写进 binlog 但尚未 commit"的事务**——GTID 在 FLUSH 阶段分配并写进 binlog，但要到 COMMIT 阶段 `update_commit_group` 才入 `executed_gtids`。所以存在"binlog 文件里有这个 GTID、Executed_Gtid_Set 里没有"的窗口（这正是崩溃恢复必须扫 binlog 补表的原因）。`owned_gtids`（正在执行未提交）同样不在其中。
+2. **GTID 与 File/Position 不是同一时刻的快照**——GTID 在函数开头取完即释放 `global_sid_lock`，File/Position 是之后 `get_current_log()` 读的；并发提交下 Executed_Gtid_Set 可能略滞后于 Position。
+
+另外：**binlog 未开启时该语句返回空结果集**（源码只在 `mysql_bin_log.is_open()` 为真时才发一行，否则只发元数据 0 行）。
+
+> 版本演进：8.4 起官方提供 `SHOW BINARY LOG STATUS` 作为新语法（`SHOW MASTER STATUS` 在 8.4 已不再支持），语义不变。
+
 ### binlog_gtid_simple_recovery / session_track_gtids / gtid_executed_compression_period
 
 - **`binlog_gtid_simple_recovery` 默认是 true（ON），不是 false**；READ_ONLY（只能命令行/配置文件）。控制 `MYSQL_BIN_LOG::init_gtid_sets` 两处提前终止：反向扫描若最新 binlog 无任何 GTID 事件（`NO_GTIDS`）直接断定 executed/purged 为空；正向扫描只读第一个 binlog 的 `Previous_gtids_log_event` 就确定 purged。代价（注释明说）：旧 5.7.5 前 binlog + 混用 gtid_mode 的场景可能算出错误集合且不会自愈。
@@ -957,6 +1283,8 @@ GNO 的自动分配由 `get_automatic_gno`（rpl_gtid_state.cc:413）完成。�
 ---
 
 ## GTID 生命周期
+
+> **分工**：本章从 **GTID 自身视角**串完整生命周期（启动初始化 → 分配 → 外部化 → 持久化 → 崩溃恢复）。其中"GTID 在提交路径上与 binlog 文件的交互"（Gtid_log_event 写入、Previous_gtids 生成、purge 约束）的 binlog 侧细节见 [`binlog.md`](binlog.md)「GTID 与 binlog 的持久化交互」，此处只交代 GTID 侧的结论并互指。
 
 ### 服务器启动与初始化
 
@@ -1761,4 +2089,18 @@ void Clone_persist_gtid::periodic_write() {
 | 压缩时机 | 由 GTID 线程代管，`save(..., compress=false)` | 避免 server 侧压缩线程与 InnoDB 落表竞争 |
 | XA 处理 | clone 期 `XA_Block` 挡住全部外部 XA | XA 的 GTID 先入全局集合再落 SE，不挡会克隆出"超前"的 GTID |
 | 非 InnoDB GTID | 压缩前 `write_other_gtids()` 补一次 | 压缩不可逆，漏掉的区间再也无法从 undo 找回 |
+
+---
+
+## 参考
+
+**官方文档**
+- *MySQL 8.0 Reference Manual → Chapter 19.1.3 Replication with Global Transaction Identifiers*
+
+**相关文档**
+- GTID 与 binlog 文件的交互（三处持久化的 binlog 侧、`Previous_gtids_log_event` 生成、崩溃后的 GTID 收敛）见 [`binlog.md`](binlog.md)「GTID 与 binlog 的持久化交互」
+- GTID 支撑复制定位与 failover（auto position、exclude 集合校验的运维后果）见 [`replication.md`](replication.md)
+- MTS 消费 GTID 事件的 `sequence_number` / `last_committed` 见 [`prpl.md`](prpl.md)
+- 外部 XA 的 GTID 在 PREPARE 即分配、`gtid_executed` 含未提交 XA 的语义见 [`../xa.md`](../xa.md)
+- GTID 落表与 purge 相互牵制（水位铰接）的引擎侧见 [`../../innodb/trx.md`](../../innodb/trx.md)
 

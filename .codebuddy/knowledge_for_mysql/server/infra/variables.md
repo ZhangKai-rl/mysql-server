@@ -202,6 +202,65 @@ sys_var
 └── Sys_var_gtid_next / _list / _purged ...          GTID 系列（读写语义归 replication/gtid.md，此处只列描述符类型）
 ```
 
+#### `sys_var` 基类解剖：成员与虚函数契约
+
+基类成员分四组（`sql/set_var.h`，构造时初始化）：
+
+| 组 | 成员 | 说明 |
+|---|---|---|
+| 身份 | `name`（`LEX_CSTRING`）、`next`（挂链指针） | 名字 + `all_sys_vars` 链 |
+| 元数据 | `flags`、`m_parse_flag`、`show_val_type`、`deprecation_substitute`、`binlog_status` | 作用域/只读等 flag、PARSE_EARLY/NORMAL、SHOW 类型、废弃替代名 |
+| 定位与锁 | `offset`、`guard`（`PolyLock*`） | **offset 是灵魂**——指向值存储的偏移；guard 是第二把锁 |
+| 钩子与来源 | `on_check`/`pre_update`/`on_update`、`source`/`user`/`host`/`timestamp` | 校验/更新回调、VARIABLE_SOURCE 追踪 |
+| 桥接 | 内嵌 `my_option option`（值语义） | 与 getopt 共享值地址与来源（`option.value = global_var_ptr()`、`option.arg_source = &source`） |
+
+**虚函数契约**——`sys_var` 定义了"SET 语句如何读写一个变量"的完整协议：
+
+```cpp
+private:                                          // 私有纯虚：每个具体变量类必须实现
+  virtual bool do_check(THD *thd, set_var *var) = 0;              // 值合法性（范围/格式）
+  virtual void session_save_default(THD *thd, set_var *var) = 0;  // SET ... = DEFAULT 的会话默认
+  virtual void global_save_default(THD *thd, set_var *var) = 0;
+  virtual bool session_update(THD *thd, set_var *var) = 0;        // 写会话值
+  virtual bool global_update(THD *thd, set_var *var) = 0;         // 写全局值
+
+protected:
+  virtual const uchar *session_value_ptr(THD *running_thd, THD *target_thd, ...);  // 读会话值
+  virtual const uchar *global_value_ptr(THD *thd, ...);                             // 读全局值
+  uchar *session_var_ptr(THD *thd);   // &thd->variables + offset
+  uchar *global_var_ptr();            // &global_system_variables + offset
+```
+
+模板化的公共骨架（非虚，定义整体流程，内部调上面的虚函数）：
+
+```cpp
+bool sys_var::check(THD *thd, set_var *var) {
+  if ((var->value && do_check(thd, var)) || (on_check && on_check(this, thd, var))) {
+    ... my_error(ER_WRONG_VALUE_FOR_VAR, name.str, ...); return true;
+  }
+  return false;
+}
+
+bool sys_var::update(THD *thd, set_var *var) {
+  if (pre_update && pre_update(this, thd, var)) return true;    // 加锁前
+  if (type == OPT_GLOBAL || type == OPT_PERSIST || scope() == GLOBAL) {
+    AutoWLock lock1(&PLock_global_system_variables);
+    AutoWLock lock2(guard);
+    return global_update(thd, var) || (on_update && on_update(this, thd, OPT_GLOBAL));
+  } else {
+    mysql_mutex_lock(&thd->LOCK_thd_sysvar);
+    bool ret = session_update(thd, var) || (on_update && on_update(this, thd, OPT_SESSION));
+    mysql_mutex_unlock(&thd->LOCK_thd_sysvar);
+    ...  // session tracker 通知
+    return ret;
+  }
+}
+```
+
+这就是模板方法模式的落地：**基类定义"check = 类型钩子 + 业务钩子"、"update = 拿锁 + 写值 + 通知"的骨架，子类只填充 `do_check`/`*_update` 这些原语**。绝大多数子类（如 `Sys_var_integer`）的 `global_update` 只有一行 `global_var(T) = save_result.ulonglong_value`。
+
+辅助方法：`check_scope(type)`（作用域判定，`ONLY_SESSION` 拒绝 SET GLOBAL）、`is_readonly()`/`is_trilevel()`/`is_hint_updateable()`/`is_persist_readonly()`/`is_sensitive()`/`is_non_persistent()`（flag 位查询）、`show_type()`/`charset()`（供 SHOW 格式化）、`value_ptr(running, target, type)`（读值统一入口，按 type 分派 global/session_value_ptr）、`set_default()`（`SET ... = DEFAULT` 路径）。
+
 flag 位（`sys_var::flag_enum`）：`GLOBAL`、`SESSION`、`ONLY_SESSION`、`READONLY`、`INVISIBLE`、`TRI_LEVEL`、`NOTPERSIST`、`HINT_UPDATEABLE`、`PERSIST_AS_READ_ONLY`、`SENSITIVE`。
 
 **集合型变量的双向转换**（`Sys_var_set`，代表 `sql_mode`）：底层存 `ulonglong` 位图，展示时是逗号分隔字符串，两条转换路径：
@@ -237,6 +296,49 @@ ulonglong dynamic_system_variable_hash_version = 0;
 ```
 
 **双 hash 的理由**：静态变量编译进二进制、指针永久有效，查表**免锁**；插件/组件变量会被 UNINSTALL 摘除，查表持 `LOCK_system_variables_hash` 读锁，每次增删 `++dynamic_system_variable_hash_version` 作版本号。`add_dynamic_system_variable_chain` 显式拒绝与静态变量同名（`ER_DUPLICATE_SYS_VAR`）。
+
+#### hash 表本身的实现
+
+两个 hash 都是 `collation_unordered_map<std::string, sys_var *>`——`std::unordered_map` 的定制三件套（`include/map_helpers.h`）：
+
+```cpp
+class collation_unordered_map
+    : public std::unordered_map<Key, Value, Collation_hasher,
+                                Collation_key_equal,
+                                Malloc_allocator<std::pair<const Key, Value>>> {
+ public:
+  collation_unordered_map(const CHARSET_INFO *cs, PSI_memory_key psi_key)
+      : std::unordered_map<...>(/*bucket_count=*/10, Collation_hasher(cs),
+                                Collation_key_equal(cs),
+                                Malloc_allocator<>(psi_key)) {}
+};
+
+class Collation_hasher {
+ public:
+  size_t operator()(const std::string &s) const {
+    uint64 nr1 = 1, nr2 = 4;
+    hash_sort(cs, pointer_cast<const uchar *>(s.data()), s.size(), &nr1, &nr2);
+    return nr1;                          // 用 collation 的 hash_sort 哈希
+  }
+};
+```
+
+三个定制点的含义：
+
+1. **`Collation_hasher` + `Collation_key_equal`**：哈希与相等比较都走 MySQL collation（构造传 `system_charset_info`，`sys_var_init()` 里 `new collation_unordered_map(system_charset_info, PSI_INSTRUMENT_ME)`）。`*_ci` collation 大小写不敏感——这就是 `SET @@max_connections` / `@@MAX_CONNECTIONS` / `@@Max_Connections` 都命中同一个变量的原因。
+2. **`Malloc_allocator` + PSI key**：hash 的节点内存走 `my_malloc` 且可被 `performance_schema.memory/SQL` 追踪（`PSI_INSTRUMENT_ME`），bucket 初始 10。
+3. **key 是 `std::string`**（变量名小写归一后），value 是 `sys_var*` 描述符指针——hash 里**不存值**，值永远在 `global_system_variables`/`THD::variables`（offset 定位），hash 只是"名字 → 描述符"的字典。
+
+#### hash 的消费者全景（谁在什么场景用它）
+
+| 场景 | 代码路径 | 方式 |
+|---|---|---|
+| `SET xxx=...` 解析 | `intern_find_sys_var()`（`sql/set_var.cc`） | 先查 static hash（**免锁**），未命中再持 `LOCK_system_variables_hash(rd)` 查 dynamic——按名字 O(1) 定位 `sys_var` |
+| PFS 物化 | `enumerate_sys_vars` / `init_show_var_array`（`pfs_variable.cc`） | **遍历**两个 hash 构建 tracker 数组（快照 + 版本号 `m_version`） |
+| `get_row_count` 数行 | `get_system_variable_count()`（`set_var.cc`，= 两个 hash 的 `size()` 之和） | 表打开时 `ha_perfschema::info(HA_STATUS_VARIABLE)` 调用，持锁读 size——高频 `SHOW VARIABLES` 场景下这里是锁竞争点 |
+| SET 的 O(1) 定位 vs PFS 的 O(N) 遍历 | — | 同一个 hash，两种用法：按名点查 vs 全量枚举 |
+
+> 流传的旧材料（含部分网络文章）把 `SHOW VARIABLES` 的消费者写成 `mysqld_show_variables`（`sql_show.cc`）——**该函数在 8.0.39 中 0 匹配**，是 5.7 的历史实现。8.0 的 SHOW VARIABLES 走 PFS 表（本篇 H 节），hash 的消费入口是 PFS 的 `enumerate_sys_vars`。
 
 启动时序：
 
@@ -365,7 +467,101 @@ default_paths[""]                   = enum_variable_source::COMMAND_LINE;
 
 写入时机分三处：配置文件选项在 `handle_default_option` 收集时、命令行段在 `my_handle_options2` 开头扫描分隔符后、persisted 段在扫描 persist 分隔符后——都是 `update_variable_source` 预登记进 `variables_hash`。真正回填在解析每命中一个选项时：`setval_source()` → `set_variable_source()` 查 `variables_hash` 把 `{路径, enum}` 拷进 `my_option.arg_source`——它正是 `sys_var::source` 的地址（构造时 `option.arg_source = &source`），于是 `performance_schema.variables_info` 直接读 `sys_var::source` 即可溯源。
 
+#### B.9 `setval`：字符串如何变成值写进内存
+
+命令行/配置文件解析的**终点**是 `setval()`（`mysys/my_getopt.cc`）——它把字符串 `argument` 按 `var_type` 解析成类型化值，**直接写进 `value` 指针指向的内存**（`value = opts->value`，正是 `sys_var` 的 `global_var_ptr()` = `&global_system_variables + offset`）：
+
+```cpp
+static int setval(const struct my_option *opts, void *value,
+                  const char *argument, bool set_maximum_value, ...) {
+  ulong var_type = opts->var_type & GET_TYPE_MASK;
+
+  if (!argument) argument = enabled_my_option;      // 无值布尔默认 "1"
+
+  // 数值类型拒绝空值（--xxx= 是错误），字符串空值是"重置默认"的合法手段
+  if (!*argument && (var_type == GET_INT || ... GET_ENUM)) {
+    my_getopt_error_reporter(ERROR_LEVEL, EE_OPTION_WITH_EMPTY_VALUE, ...);
+    return EXIT_ARGUMENT_REQUIRED;
+  }
+
+  if (value) {
+    if (set_maximum_value && !(value = opts->u_max_value)) return ...;  // --maximum- 写 u_max_value
+    switch (var_type) {
+      case GET_BOOL:
+        *((bool *)value) = boolean_as_int ? get_bool_int_argument(argument, &error)
+                                          : get_bool_argument(argument, &error);
+        break;
+      case GET_INT:
+        *((int *)value) = (int)getopt_ll(argument, set_maximum_value, opts, &err);
+        break;
+      case GET_ULONG:
+        *((long *)value) = (long)getopt_ull(argument, set_maximum_value, opts, &err);
+        break;
+      case GET_STR:
+        *static_cast<const char **>(value) = argument;   // 字符串直接存指针
+        break;
+      case GET_ENUM: {
+        int type = find_type(argument, opts->typelib, FIND_TYPE_BASIC);  // "ON"/"OFF" 找枚举
+        if (type == 0) { /* 接受整数表示 */ *(ulong *)value = strtoul(argument, ...); }
+        else *(ulong *)value = type - 1;
+      } break;
+      case GET_SET:
+        *(static_cast<ulonglong *>(value)) = find_typeset(argument, opts->typelib, &err);
+        break;
+      ...
+    }
+  }
+  ...
+}
+```
+
+逐段解释——这就是"命令行/配置文件选项 = 系统变量"的最后一步：
+
+1. **`value` 就是变量值的内存地址**：`my_handle_options2` 里 `value = optp->value`，而 `sys_var` 构造时 `option.value = global_var_ptr()`（= `&global_system_variables + offset`）。所以 `setval` 的 `*((int*)value) = ...` 就是**直接改写全局变量内存**，与 `SET GLOBAL` 的 `global_update` 写同一地址。
+2. **数值走 `getopt_ll`/`getopt_ull`**：内部做范围校验（`opts->min_value/max_value/block_size`），超出报 `EE_OPTION_OUT_OF_RANGE` 或按 block_size 对齐——这是命令行阶段就完成的"取值合法性"检查，与 `SET` 语句的 `do_check` 对应。
+3. **枚举/集合走 `find_type`/`find_typeset`**：把 `"ON"`、`"OFF,STRICT_TRANS_TABLES"` 这类文本用 typelib 查表转成整数/位图（`sql_mode` 这类 `GET_SET` 在这里完成字符串→位图的转换）。
+4. **`--maximum-x=N` 写 `u_max_value`**（`set_maximum_value` 分支）：改写 `max_system_variables` 的对应偏移，而不是 `global_system_variables`——这是"软上限"的存储位置。
+5. **布尔**：`get_bool_argument` 接受 `1/0/ON/OFF/TRUE/FALSE/Y/N` 等，非法值告警。
+
+对比 `SET` 语句路径：命令行走 `setval`（getopt 的通用解析），`SET` 走 `sys_var::do_check` + `session/global_update`（sys_var 的虚函数链）——**两条路径最终写同一个地址**，这是"命令行选项就是系统变量"的代码级证据。
+
 ### C. GLOBAL / SESSION 双份存储
+
+#### 三层存储模型（hash 与 global_system_variables 的关系）
+
+这是整个变量体系最核心的认知点，回答"到底存了几份"：
+
+```
+【第 0 层 描述符】编译期静态对象，几百个 sys_var，躺在 .data 段
+    每个含：名字/类型/范围/offset/锁/回调 + 内嵌 my_option
+
+【第 1 层 索引】堆上两个 collation_unordered_map（A 节剖析过）
+    static_system_variable_hash   内置变量名 → sys_var*
+    dynamic_system_variable_hash  插件/组件变量名 → sys_var*
+    —— 这是"目录/字典"，存的是【指针】，不是值
+
+【第 2 层 值】内存里真正的"数据"
+    global_system_variables      1 份，全局值（+ dynamic_variables_ptr 插件动态块）
+    max_system_variables         1 份，--maximum- 软上限（与 global 同布局）
+    THD::variables               每连接 1 份，会话值
+```
+
+**不是 2×2=4 份值存储。** hash 是"索引"，值存储是"数据"，二者通过 `sys_var->offset` 这座桥连接：
+
+```
+查 @@max_connections 的值（三步走）：
+  ① hash["max_connections"]         → sys_var*          （名字 → 描述符）
+  ② sys_var->offset                  → 偏移量            （描述符 → 位置）
+  ③ &global_system_variables + offset → 值               （位置 → 值）
+```
+
+**hash 里没有值，值存储里没有名字**——名字只在描述符（`sys_var->name`）里，值只在值存储里，offset 把二者串起来。这就是"描述符与值分离"的落地形态。
+
+为什么拆成三层（重点）：
+
+- **值拆 global/session**：`SET GLOBAL` 只写 1 份 `global_system_variables`，N 个已存在连接各有自己的 `THD::variables` 副本，不受影响；新连接建立时一次性拷贝。
+- **索引拆 static/dynamic**：static 编译期固定 → 查表**免锁**；dynamic 可增删（插件装卸）→ 持 `LOCK_system_variables_hash`。
+- **描述符（offset）作桥**：同一份描述符代码 + 同一个 offset，`value_ptr(OPT_GLOBAL)` 走 `global_value_ptr`（读全局实例）、`value_ptr(OPT_SESSION)` 走 `session_value_ptr`（读某 THD）——一份描述符服务两份值。
 
 ```cpp
 // sys_var::session_var_ptr / global_var_ptr —— offset 是同一份
@@ -682,16 +878,42 @@ class Sys_var_hint {  // sql/opt_hints.h
 
 ### G. 状态变量：`SHOW STATUS` → PFS
 
+> **先厘清：状态变量与前面 A~F 讲的系统变量是两套独立的体系**。它们唯一的共同点是——`SHOW STATUS` 与 `SHOW VARIABLES` **共用** `build_query` 这个重写函数，且状态变量表的列名恰好也叫 `VARIABLE_NAME`/`VARIABLE_VALUE`（所以列投影常量能复用）。除此之外，存储、索引、描述符、聚合语义全都不同。
+
+| 维度 | 状态变量（status） | 系统变量（variables） |
+|---|---|---|
+| 能否改 | **只读**（无 SET 路径） | 可 `SET GLOBAL/SESSION/PERSIST` |
+| 表 | `global_status`/`session_status`/`status_by_*` | `global_variables`/`session_variables`/`variables_by_thread` |
+| 值存储 | `System_status_var`（**连续 ulonglong 块**，per-THD + 全局 1 份） | `global_system_variables` + `THD::variables`（`System_variables` 结构体） |
+| 索引/目录 | **无 hash**——是 `all_status_vars`（`SHOW_VAR[]` 数组） | **两个 hash**（static + dynamic，名字→`sys_var*`） |
+| 描述符 | `SHOW_VAR`（C 结构：name/value/type/scope），`value` 有三重身份（指针/偏移/函数/子数组） | `sys_var`（C++ 类树），靠 `offset` 定位值 |
+| 类型系统 | `enum_mysql_show_type`（SHOW_LONG/LONGLONG/CHAR/FUNC/ARRAY） | `Sys_var_*` 类树（integer/enum/set/charptr/gtid_*） |
+| GLOBAL 语义 | **聚合**：全局基线 + **Σ 所有 THD**（跨线程求和） | **选读**：直接读 `global_system_variables`（不求和） |
+| 物化 cache | `PFS_status_variable_cache` | `PFS_system_variable_cache` |
+| 求值链 | `get_one_variable`→`get_one_variable_ext`（`SHOW_*_STATUS` 型要**加 status_var 基址**解引用） | `get_one_variable_ext` 的 **SHOW_SYS 特判** → `sys_var::value_ptr` |
+| 观测者效应 | **有**：`Sql_cmd_show_status::execute` 做"语句前快照 + 增量转移"（SHOW 本身会污染计数器） | **无**：读变量不污染任何东西，`Sql_cmd_show_variables` 是空子类 |
+| 会话结束 | `add_to_status` 折进 `global_status_var`（有归并） | 会话值随 THD 销毁（无归并） |
+| 名字生成 | 部分前缀**运行时拼接**（`Innodb_*` 由 `show_innodb_vars` 的 SHOW_FUNC→SHOW_ARRAY 拼出，源码 grep 不到） | 名字即注册名（插件变量会带 plugin 前缀） |
+| 特殊过滤 | `filter_by_name`（`Com_*` **只在** SHOW STATUS 里出现） | 无此过滤 |
+| 版本演进 | 8.0 重写为 PFS 查询 | 8.0 重写为 PFS 查询（同一批改造） |
+
+**记住一句话**：系统变量是"**可写的配置项**"（有 hash 索引、offset 定位、双份存储），状态变量是"**只读的计数器**"（无 hash、连续内存块、跨线程求和）。它们只是恰好都在 PFS 里以 `VARIABLE_NAME/VARIABLE_VALUE` 两列的形式暴露出来。
+
 #### 反直觉开场：SHOW STATUS 是 SELECT 的皮
 
-8.0 的 `SHOW GLOBAL STATUS` 在语法分析阶段被重写成：
+8.0 的 `SHOW GLOBAL STATUS` 在语法分析阶段被重写成（`sql_show_status.cc` 文件头注释原文，表名是 `global_status`）：
 
 ```sql
-SELECT * FROM (SELECT VARIABLE_NAME AS Variable_name, VARIABLE_VALUE AS Value
-               FROM performance_schema.global_status) global_status;
+SELECT * FROM
+         (SELECT VARIABLE_NAME as Variable_name, VARIABLE_VALUE as Value
+          FROM performance_schema.global_status) global_status
 ```
 
-（`sql/sql_show_status.cc` 的 `build_query()`，末尾手工恢复 `lex->sql_command = SQLCOM_SHOW_STATUS`）。三个连带结论：① `Com_*` 只在 SHOW STATUS 里出现（`filter_by_name` 按命令类型过滤整棵 `Com` 子树）；② `SHOW SESSION STATUS` 显示语句开始前快照；③ `Innodb_*` 前缀是运行时拼的，源码 grep 不到。
+即：内层做列投影与别名（`VARIABLE_NAME as Variable_name`、`VARIABLE_VALUE as Value`），外层套一个派生表——**派生表别名就是表名本身**（`PT_derived_table(false, sub_query, table_name, ...)` 的第三个参数就是 `table_alias`）。`LIKE 'x%'` 被翻译成外层的 `WHERE Variable_name LIKE 'x%'`（`Item_func_like`），`WHERE <cond>` 则直接挂外层。末尾手工恢复 `lex->sql_command = SQLCOM_SHOW_STATUS`。
+
+> **出处澄清**：这段注释是 `build_query` 的**函数头注释，以 SHOW STATUS 为例**写的。`build_query` 是通用函数，SHOW VARIABLES 走同一个函数、仅表名不同（`build_show_global_variables` 传 `global_variables`、`build_show_session_variables` 传 `session_variables`），代码里的常量（`VARIABLE_NAME`/`Variable_name`/`VARIABLE_VALUE`/`Value`/`performance_schema`）是共用的。所以 VARIABLES 版本的等价形式成立——**但注释原文里没有直接写出 VARIABLES 版本**，这是我按同一个函数的代码推出来的（常量 + 表名参数）。
+
+三个连带结论：① `Com_*` 只在 SHOW STATUS 里出现（`filter_by_name` 按命令类型过滤整棵 `Com` 子树）；② `SHOW SESSION STATUS` 显示语句开始前快照；③ `Innodb_*` 前缀是运行时拼的，源码 grep 不到。
 
 #### `SHOW_VAR` 的"三重身份"
 
@@ -727,6 +949,8 @@ struct SHOW_VAR { const char *name; char *value; enum enum_mysql_show_type type;
 ```
 
 公式：`GLOBAL = global_status_var + Σ(所有登记在 Global_THD_manager 的 THD 的 status_var)`——**含后台线程**（replica IO/SQL thread、event scheduler 等），源码留 `// TODO: filter bg threads?`。`calc_sum_of_all_status()`（旧实现）只剩 `COM_STATISTICS`（`mysqladmin status`）一个调用者。
+
+> **澄清：这不是"聚合到 hash"，状态变量根本没有 hash。** 状态变量与系统变量是两套存储：系统变量有 `static/dynamic_system_variable_hash`（名字→描述符的字典）；状态变量没有 hash，它的"目录"是 `all_status_vars`（一个 `SHOW_VAR[]` 描述符数组），"值"是 `System_status_var`（连续内存块）。公式里的 `Σ` 是**每次查询现场计算**——`do_materialize_global` 里 `visit_global(..., with_THDs=true)` 持锁遍历所有 THD，用 `add_to_status` 把每个 `thd->status_var` 累加进局部 `status_totals`，不是预先聚合好存在某个地方。
 
 会话生命周期归并：连接结束 `THD::release_resources()` → `add_to_status(&global_status_var, ...)` + PSI `aggregate_thread_status()`（折进 account/user/host）+ `status_var_aggregated = true`；`CHANGE USER`/`RESET CONNECTION` 走 `cleanup_connection()`；顺序协议"先 release 再 remove_thd"保证不重不漏。
 
@@ -783,22 +1007,51 @@ Query_block *build_show_global_variables(...) {
 
 #### 端到端主链路：`SHOW VARIABLES` 的完整旅程
 
-把上面的重写 + pfs.md 1.9 的 cache 实现串起来，一次 `SHOW VARIABLES` 从敲命令到出结果的完整调用栈是：
+把上面的重写 + pfs.md 1.9 的 cache 实现串起来，一次 `SHOW VARIABLES` 从敲命令到出结果的完整调用栈是（**本篇唯一完整版**，前端按 yacc/make_cmd/build_query 三段源码展开）：
 
 ```
 客户端发 "SHOW VARIABLES"
-  dispatch_command → mysql_parse → parse_sql
-    → yyparse: show_variables → PT_show_variables
-      → PT_show_variables::make_cmd()
-          → build_show_global_variables()          （或 build_show_session_variables）
-              → build_query()：构造
-                  SELECT * FROM (SELECT VARIABLE_NAME AS Variable_name,
-                                         VARIABLE_VALUE AS Value
-                                 FROM performance_schema.global_variables) global_variables
-                  末尾 lex->sql_command = SQLCOM_SHOW_VARIABLES   ★ 恢复命令类型
+
+【1】语法解析（sql_yacc.yy: show_variables_stmt）
+    SHOW opt_var_type VARIABLES opt_wild_or_where
+      → NEW_PTN PT_show_variables(pos, var_type, wild, where)
+    opt_var_type: 空 → OPT_SESSION            ★ 裸 SHOW 默认是 SESSION 视图！
+                  GLOBAL → OPT_GLOBAL
+                  SESSION/LOCAL → OPT_SESSION
+
+【2】make_cmd（parse_tree_nodes.cc）—— 分派器，只决定"用哪张表"
+    lex->sql_command = SQLCOM_SHOW_VARIABLES           ① 先标命令类型
+    if (m_wild.str) lex->set_wild(m_wild)              ② LIKE 'x%' 暂存进 lex->wild
+    if (m_var_type == OPT_SESSION)
+        build_show_session_variables(pos, thd, lex->wild, m_where)   → 表名 "session_variables"
+    else if (m_var_type == OPT_GLOBAL)
+        build_show_global_variables(pos, thd, lex->wild, m_where)    → 表名 "global_variables"
+    return &m_sql_cmd                                  ③ Sql_cmd_show_variables
+
+【3】build_query（sql_show_status.cc）—— 手搓器，造出"查 PFS 表"的查询树
+    常量：col_name="VARIABLE_NAME"  as_name="Variable_name"
+          col_value="VARIABLE_VALUE" as_value="Value"
+          pfs="performance_schema"
+    内层：PTI_expr_with_alias(ident(VARIABLE_NAME), Variable_name)
+        + PTI_expr_with_alias(ident(VARIABLE_VALUE), Value)
+        + PT_table_factor_table_ident(performance_schema, <table_name>)
+        → PT_query_specification(内层, where=nullptr)
+    外层：PT_subquery → PT_derived_table(lateral=false, sub_query,
+              table_alias = <table_name>)            ★ 派生表别名就是表名
+        + Item_asterisk（SELECT *）
+        + where_clause = wild ? PTI_where(Item_func_like(Variable_name, wild_string))
+                             : where_cond            ★ LIKE 在这里变成 WHERE
+    关键三步：
+        lex->sql_command = SQLCOM_SELECT              ← 伪装成 SELECT
+        query_expression2->contextualize(&pc)         ← PT 树 → Query_block/Item
+        pc.finalize_query_expression()
+        lex->sql_command = command                    ← 恢复 SQLCOM_SHOW_VARIABLES
+
+【4】执行
   → mysql_execute_command case SQLCOM_SHOW_VARIABLES
-      → Sql_cmd_show_variables::execute()
-          → Sql_cmd_show::execute() → Sql_cmd_select::execute()   ★ 它真的是条 SELECT
+      → Sql_cmd_show_variables::execute()（空子类，无快照回滚——那是 STATUS 特有）
+          → Sql_cmd_show::check_privileges()  ← check_table_access(SELECT_ACL, pfs 表)
+          → Sql_cmd_select::execute()                ★ 它真的是条 SELECT
               → 优化器/执行器 → ha_perfschema::rnd_init
                   → table_global_variables::rnd_init()            storage/perfschema/table_global_variables.cc
                       → m_sysvar_cache.materialize_global()
@@ -849,6 +1102,178 @@ const char *get_one_variable_ext(THD *running_thd, THD *target_thd, ...) {
 - 直接 SELECT：无重写、无列别名（列名就是 `VARIABLE_NAME/VARIABLE_VALUE`）、`sql_command` 保持 `SQLCOM_SELECT`
 
 另外两个值得注意的旁路：`table_global_variables::get_row_count()`——经 handler 标准接口 `ha_perfschema::info(HA_STATUS_VARIABLE)` 的 `stats.records = m_table_share->get_row_count()` 被 SQL 层用作该表的行数估计（EXPLAIN/join 优化用），它同样持 `LOCK_plugin_delete + LOCK_system_variables_hash(rd)` 数 static+dynamic 双 hash 的变量总数（`get_system_variable_count`）；`make_row()` 里 `mysql_audit_notify(MYSQL_AUDIT_GLOBAL_VARIABLE_GET, ...)` —— **读全局变量会触发审计事件**（审计插件能感知"谁读了哪个全局变量"）。
+
+#### SHOW VARIABLES 与直查 PFS 表：是不是一个东西？
+
+**精确回答：数据源上是同一个东西，语法/命令上不是。** 差异全部集中在"进 `ha_perfschema::rnd_init` 之前"的头部；`rnd_init` 之后（物化管线、求值、行输出）逐字节一致。
+
+**差异一：`build_query` 是"手搓语法树"，不是文本拼接**。`PT_show_variables::make_cmd` 用一堆 `PTI_*` 节点直接构造查询树（MAINTAINER 注释明说按 `turn_parser_debug_on()` 反推文法动作）：
+
+```cpp
+// 内层：SELECT VARIABLE_NAME as Variable_name, VARIABLE_VALUE as Value
+//       FROM performance_schema.<table>
+PTI_expr_with_alias *expr_name = new ... PTI_expr_with_alias(pos, ident_name, pos.cpp, as_name);
+// 外层：SELECT * FROM (内层) <table_name> [WHERE ...]
+PT_derived_table *derived_table = new ... PT_derived_table(false, sub_query, table_name, ...);
+// LIKE 'x%' 被翻译成 Item_func_like 挂在外层 WHERE 上
+Item_func_like *func_like = new ... Item_func_like(pos, ident_name_where, wild_string);
+...
+// 关键：contextualize 期间命令类型是 SELECT，结束后恢复
+lex->sql_command = SQLCOM_SELECT;
+if (query_expression2->contextualize(&pc)) return nullptr;
+if (pc.finalize_query_expression()) return nullptr;
+lex->sql_command = command;      // 恢复成 SQLCOM_SHOW_VARIABLES
+```
+
+**差异二：`Sql_cmd_show_variables` 没有重写 `execute`**——它是 `Sql_cmd_show` 的**空子类**（构造传 `SQLCOM_SHOW_VARIABLES` 而已）。对比 `Sql_cmd_show_status::execute` 那套"语句前快照 + 增量转移回滚"是 STATUS 特有的观测者效应控制，**VARIABLES 侧没有**（读变量不会污染计数器，无需快照）。
+
+**差异三：默认作用域是 SESSION**——最容易踩的坑。yacc 的 `opt_var_type: %empty { $$=OPT_SESSION; }`，所以**裸 `SHOW VARIABLES` 等价于 `SHOW SESSION VARIABLES`**（查 `session_variables` 表），不是 GLOBAL！要全局值必须显式 `SHOW GLOBAL VARIABLES`。
+
+**全维度对比表**：
+
+| 维度 | `SHOW [GLOBAL\|SESSION] VARIABLES` | `SELECT * FROM pfs.global_variables / session_variables` |
+|---|---|---|
+| 语法树来源 | `PT_show_variables` 手搓的查询树（`build_query`） | 用户 SQL 正常解析 |
+| 默认作用域 | **SESSION**（裸 SHOW = session_variables） | 显式指定哪张表 |
+| 结果列名 | `Variable_name` / `Value`（内层投影的别名） | `VARIABLE_NAME` / `VARIABLE_VALUE` |
+| `sql_command` | `SQLCOM_SHOW_VARIABLES`（contextualize 后恢复） | `SQLCOM_SELECT` |
+| `Com_*` 计数 | `Com_show_variables` +1 | `Com_select` +1 |
+| LIKE 语法糖 | `LIKE 'x%'` → 外层 `WHERE Variable_name LIKE 'x%'` | 无，自己写 WHERE |
+| 命令执行类 | `Sql_cmd_show_variables`（空子类，无快照回滚） | `Sql_cmd_select` |
+| 权限 | `check_table_access(SELECT_ACL)`（Sql_cmd_show 的 check_privileges） | 普通 SELECT 授权 |
+| `rnd_init` 之后 | **完全一致**（`materialize_global()`/`materialize_all(current_thd)`） | **完全一致** |
+| 读全局变量的审计事件 | 有（make_row 里 `MYSQL_AUDIT_GLOBAL_VARIABLE_GET`） | 有（同一条 make_row） |
+
+**驱动入口也对应成对**：`table_global_variables::rnd_init` → `m_sysvar_cache.materialize_global()`；`table_session_variables::rnd_init` → `m_sysvar_cache.materialize_all(current_thd)`（本会话专用入口，无跨线程防护需求）。
+
+#### 流程对比图：语法分叉 → 物化/输出一致（含锁标注）
+
+下面这张图完全按源码调用链绘制（不标文件行号），分四段：语法分叉 → 行数估计 → 物化（两层子阶段）→ 迭代销毁。
+
+**【A 段】语法与命令：两者分叉（还没打开 PFS 表）**
+
+```
+                    SHOW VARIABLES              │  SELECT * FROM pfs.global_variables
+  ──────────────────────────────────────────────┼──────────────────────────────────────
+  ① 语法解析                                     │  ① 语法解析（普通 SELECT）
+     yyparse → PT_show_variables                 │     → Query_block（用户的查询树）
+     （裸 SHOW 默认 OPT_SESSION！）                │
+                                                 │
+  ② make_cmd 阶段（直查没有这步）                  │  ② ——（无此阶段）
+     PT_show_variables::make_cmd                  │
+     ├─ OPT_SESSION → build_show_session_         │
+     │                 variables("session_        │
+     │                 variables")                │
+     ├─ OPT_GLOBAL  → build_show_global_          │
+     │                 variables("global_         │
+     │                 variables")                │
+     └─ build_query() 手搓查询树（PTI_* 节点）：    │
+         内层: SELECT VARIABLE_NAME               │
+                      AS Variable_name,           │
+                      VARIABLE_VALUE AS Value     │
+               FROM pfs.<table>                   │
+         外层: SELECT * FROM (内层)                │
+               AS <table_name>                    │
+               ★ 别名=表名本身（PT_derived_table    │
+                 第 3 参就是 table_alias），        │
+                 不是 "t"                         │
+               [LIKE 'x%' → 外层 WHERE 的          │
+                Item_func_like]                   │
+     contextualize 期间伪装成 SELECT，              │
+     结束后恢复 SQLCOM_SHOW_VARIABLES             │  sql_command = SQLCOM_SELECT
+                                                 │
+  ③ 命令对象：execute() 入口                       │  ③ 命令对象：execute() 入口
+     Sql_cmd_show_variables（空子类，              │     Sql_cmd_select
+     无快照回滚——那是 STATUS 特有）                │
+     → Sql_cmd_show::execute()                    │     → execute()
+       → Sql_cmd_select::execute()                │
+     此时 lex 里已是②替换好的 SELECT 查询树        │
+     ★ 下面的④优化器、⑤执行器都发生在这个          │
+       execute() 内部（不是 execute 之后的步骤）    │
+                                                 │
+  ④ 优化器（SHOW 唯一的额外层）                    │  ④ 优化器
+     外层 SELECT * FROM (派生表)                   │     TABLE_SCAN（无谓词）
+       → 物化到内部临时表                          │     [点查: REF / INDEX_RANGE_SCAN]
+         （Created_tmp_tables +1 的根源）          │
+     ★ LIKE 不下推：SHOW ... LIKE 的过滤在外层派生表 │
+       上，内层 PFS 表仍是全表扫描（无谓词）        │
+       而直查的 WHERE 在内层，可能走索引            │
+     内层: TABLE_SCAN                             │
+                                                 │
+  ★ 两条路径接下来都会打开同一个 PFS 表，
+    打开时的行数估计见【B 段】（含 LOCK_plugin_delete 卡点）
+  ──────────────────────────────────────────────┴──────────────────────────────────────
+```
+
+> **"公有"确认**：`info(HA_STATUS_VARIABLE) → get_row_count()` 这条**两条路径都有**——因为 SHOW 被重写后打开的也是同一张 PFS 表，打开表时 SQL 层都要统计行数。它是"打开表时"的动作，不是分叉点，所以只在【B 段】详写一次（避免与 A 段重复）。
+
+**【B 段】打开 PFS 表：行数估计（两条路径共有）**
+
+```
+  handler::info(HA_STATUS_VARIABLE)              ← SQL 层要表统计信息时调用
+     → stats.records = m_table_share->get_row_count()
+         └─ [锁] LOCK_plugin_delete + LOCK_system_variables_hash(rd)
+            数值 = static hash size + dynamic hash size（get_system_variable_count）
+            → 供优化器估算 rows（EXPLAIN 的 rows 列来源）
+```
+
+**【C 段】物化：rnd_init（或 index_init）里发生，两条路径一致**
+
+```
+  ⑤ TableScanIterator::Init → handler::ha_rnd_init(true)
+     [点查: RefIterator::Init → ha_index_init → ha_perfschema::index_init]
+
+  ⑥ ha_perfschema::rnd_init / index_init
+     → m_open_table()  new 表游标对象（含全新空 cache）
+     → materialize_global()   ★ 点查也全量物化，不省
+
+        ├─ [锁] LOCK_plugin_delete ── 物化【全程】持有
+        │        保护：防插件装卸把 dynamic hash 改掉
+        │
+        ├─ C1 清单层（INITIALIZE）：init_show_var_array
+        │    [锁] LOCK_system_variables_hash(rd) ── 仅枚举期间，枚举完即放
+        │    enumerate_sys_vars 遍历 static + dynamic 双 hash：
+        │       · 敏感变量过滤（无 SENSITIVE_VARIABLES_OBSERVER 则跳过）
+        │       · scope 过滤（global 表 strict=true；session 表 strict=false）
+        │       · std::sort（my_strcasecmp，大小写不敏感）
+        │    → m_sys_var_tracker_array（清单层，m_initialized = true）
+        │
+        └─ C2 值层（MATERIALIZE）：对清单里每个 tracker 求值（循环 N 次）
+             ├─ access_system_variable() 找到 sys_var（插件变量按 Lifetime 加相应锁）
+             └─ System_variable::init()
+                  ├─ [锁] target->LOCK_thd_sysvar（跨线程读会话变量时才拿，先）
+                  ├─ [锁] LOCK_global_system_variables（后；求值完即放，非全程）
+                  ├─ get_one_variable_ext(SHOW_SYS 特判)：
+                  │    show_var.value 就是 sys_var* →
+                  │    sys_var::value_ptr(running, target, OPT_GLOBAL)
+                  │      → global_value_ptr() = &global_system_variables + offset
+                  └─ switch(真实 show_type) 格式化 → 写进 m_value_str
+             → push_back 进 m_cache（值层，m_materialized = true）
+
+        ↑ 物化结束：所有锁释放。m_cache = 锁内定格的【文本快照】
+```
+
+**【D 段】迭代与销毁：两条路径一致**
+
+```
+  ⑦ 逐行 Read → ha_rnd_next → m_table->rnd_next ──【无锁】
+       [点查: index_next 线性扫 m_cache + m_index->match(name) 过滤]
+     → m_cache[i] 取行
+     → make_row()：填 row 结构
+           + mysql_audit_notify(MYSQL_AUDIT_GLOBAL_VARIABLE_GET)（审计事件）
+           + 若 is_null()（未初始化）→ HA_ERR_RECORD_DELETED，跳过该行
+     → read_row_values()：把 row 翻译成 Field 值 → 发给客户端
+
+  ⑧ 结束 → ha_rnd_end（或 index_end）──【无锁】
+     → delete m_table   ★ cache 随游标销毁（游标级生命周期）
+```
+
+**读图要点**：
+
+- **差异只在 A 段**（语法树来源、make_cmd 手搓、命令类/sql_command、SHOW 多一层派生表物化）。从 B 段开始两条路径**合并为同一条**——因为 SHOW 在语法阶段就被重写成了对 PFS 表的 SELECT，B/C/D 段（打开表 → 物化 → 迭代输出）**逐字节一致**。严谨地说：SHOW 相比直查的**全部额外开销**就是 A 段④那层"外层派生表物化到临时表"（`Created_tmp_tables` +1 的根源）；PFS 表本身的访问完全等价。
+- **所有锁都集中在 C 段物化阶段**，且各自只持有最短时间（`LOCK_plugin_delete` 全程、`LOCK_system_variables_hash` 只在枚举期间、`LOCK_global_system_variables` 只在单个变量求值期间）；**D 段迭代与销毁全程无锁**——这就是"快照 + 免锁迭代"的代码形态：迭代期间别的线程 `SET` 变量也影响不到本次扫描。
+- **点查不省**：`index_init` 与 `rnd_init` 做同样全量物化，点查只在 `index_next` 里线性 `match` 过滤（PFS 的"索引"没有 hash 结构）。
+- 裸 `SHOW VARIABLES` 走 `session_variables` 表（`build_show_session_variables` + `materialize_all(current_thd)`），其余同理。
 
 #### 2. PFS 里的变量表全集（12 张）
 

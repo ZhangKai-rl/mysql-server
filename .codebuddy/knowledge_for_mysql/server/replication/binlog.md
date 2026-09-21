@@ -624,6 +624,62 @@ MGR 完全开源（GPLv2），代码位于 `plugin/group_replication/`。上层 
     → commit: ha_commit_low → InnoDB 引擎层真正 commit
 ```
 
+### Transaction_ctx：提交路径的每事务状态包
+
+`ha_commit_trans` 主链上的每个决策点（是否走 prepare、是否 2PC、real_commit 还是 commit_low、要不要跑 after_commit hook）读写的状态，都装在一个对象里——`Transaction_ctx`（transaction_info.h），挂在 `THD::m_transaction`（每线程一个）。它是标准的 context 模式：提交流程横跨 `ha_commit_trans` → `tc_log` → `ordered_commit` → `process_commit_stage_queue` → `finish_transaction_in_engines` 多层函数链，没有集中上下文就得把十几个状态参数层层传递。
+
+#### 完整成员清单（按功能域分组）
+
+| 功能域 | 成员 | 说明 |
+|--------|------|------|
+| 双作用域引擎状态 | `THD_TRANS m_scope_info[2]`（STMT / SESSION） | 语句级与事务级两套引擎参与记录（见下） |
+| 2PC 判定 | `m_no_2pc` / `m_rw_ha_count` / `m_ha_list` | 是否有引擎不支持 prepare、读写参与者数、注册的引擎链表 |
+| 回滚安全性 | `m_unsafe_rollback_flags` | 不能安全回滚的语句位图（见下） |
+| binlog 提交标志 | `m_flags` | enabled / xid_written / real_commit / commit_low / run_hooks / ready_preempt |
+| MTS 逻辑时间戳 | `last_committed` / `sequence_number` + `store_commit_parent()` | 绝对值，写入 binlog 时转相对值（详析见 prpl.md） |
+| XA 状态 | `m_xid_state`（`XID_STATE`） | 外部 XA 的 XID 与状态（见 xa.md） |
+| savepoint | `SAVEPOINT *m_savepoints` | 链表：prev / name / length / ha_list / **mdl_savepoint**——savepoint 快照的不只是名字，还有引擎事务状态和 MDL 状态，供 `ROLLBACK TO SAVEPOINT` 还原 |
+| 事务内存池 | `MEM_ROOT m_mem_root` | 事务生命周期的分配池：`allocate_memory()` / `strmake()` / `claim_memory_ownership()` / `free_memory()`；结束 `ClearForReuse()` 复用 |
+| 复制上下文 | `m_rpl_transaction_ctx` / `m_transaction_write_set_ctx` | `Rpl_transaction_ctx` + `Rpl_transaction_write_set_ctx`（writeset 载体，见 prpl.md「Writeset Hash 生成机制」） |
+| hook 去重 | `trans_begin_hook_invoked` | begin hook 只调一次 |
+
+**★ 死代码勘误（8.0.39）**：`add_changed_table()` 与 `invalidate_changed_tables_in_cache()` 在 transaction_info.h **只有声明**——全仓库搜不到实现与调用点。它们是 query cache 时代（已删除）的遗留接口，写文档不要引用。
+
+#### 双作用域 m_scope_info[2]：STMT vs SESSION
+
+每个作用域是一份 `THD_TRANS`（引擎参与记录 + 2PC 判定 + 回滚安全标志）。为什么要两套：**非事务引擎（MyISAM）与临时表的语句**是语句级提交的（每条语句即事务），它们不能进 SESSION 作用域污染真正的事务；而 InnoDB 的多语句事务状态要跨语句保持。语句结束时 `merge_unsafe_rollback_flags()` 把 STMT 级的"不能安全回滚"标志合并进 SESSION 级——一条语句改了非事务表，整个事务就标记为不能安全回滚。**子语句**没有独立上下文，复用时把 STMT 标志在栈上保存、执行完合并（transaction_info.h 的长注释完整描述了这个生命周期）。
+
+#### 2PC 判定三件套（ha_commit_trans 的分岔依据）
+
+- **`m_ha_list`**（`Ha_trx_info` 侵入式链表）：本事务注册了哪些引擎。`Ha_trx_info::register_ha` 头插进链表，初始 `TRX_READ_ONLY`，写操作时 `set_trx_read_write()` 翻转；语句级读写通过 `coalesce_trx_with` 合并进会话级。`Ha_trx_info_list` 是它的**包装器 + 迭代器**（范围 for 友好）。
+- **`m_rw_ha_count`**：读写参与者计数。`rw_ha_count > 1`（InnoDB + binlog 这个"参与者"也算一个）才走 prepare，否则 1PC。
+- **`m_no_2pc`**：有引擎没实现 `prepare` 回调 → 整个事务降级 1PC。
+
+#### m_unsafe_rollback_flags：三标志
+
+`MODIFIED_NON_TRANS_TABLE`（改了非事务表）/ `CREATED_TEMP_TABLE` / `DROPPED_TEMP_TABLE`——这三类语句不能安全回滚（非事务表改动回滚不了、临时表 DDL 隐式提交），所以整个事务被标记 `cannot_safely_rollback()`。意义：**不能安全回滚的事务不允许走 2PC 的 rollback 路径**，binlog 侧据此决定事件处理（回滚时不写 binlog 而是写 rollback 事件）。
+
+#### m_flags：六个提交标志 + 为什么不用 bitfield
+
+```cpp
+struct {
+  bool enabled{false};      // see ha_enable_transaction()
+  bool xid_written{false};  // The session wrote an XID
+  bool real_commit{false};  // Is this a "real" commit?
+  bool commit_low{false};   // see MYSQL_BIN_LOG::ordered_commit
+  bool run_hooks{false};    // Call the after_commit hook
+  bool ready_preempt{false};// internal in ordered_commit (debug only)
+} m_flags;
+```
+
+注释点破了一个**工程事实**：这里曾经用 bitfield，后来改成独立 bool——"Modification will be lost when concurrently updating multiple bit fields"，并注明真实抓过一次 `xid_written` 与 `ready_preempt` 在 `ordered_commit` 并发更新中的竞态。bitfield 的不同位是同一个字节，多线程各自写自己的位是 read-modify-write，会互相覆盖；独立 bool 是独立字节，各写各的。`real_commit` / `commit_low` / `run_hooks` 三者组合决定 ordered_commit 之后走哪条收尾路径（引擎提交 + after_commit hook 还是跳过）。
+
+#### 生命周期：cleanup() 清什么
+
+`cleanup()`（事务结束统一调用）：`m_savepoints = nullptr` → `m_xid_state.cleanup()` → `m_rpl_transaction_ctx.cleanup()` → `m_transaction_write_set_ctx.reset_state()` → `trans_begin_hook_invoked = false` → `m_mem_root.ClearForReuse()`。注意 memroot 是**复用不清空**（ClearForReuse 保留已分配块），这是每事务分配器的标准姿势——事务内高频小分配（savepoint 名、writeset 等）在下个事务直接复用内存块。
+
+> MTS 的 `sequence_number` / `last_committed` 两个字段的分配、消费与语义见 [`prpl.md`](prpl.md)「核心概念：两个逻辑时间戳」；`m_xid_state` 的 XA 语义见 [`../xa.md`](../xa.md)。
+
 ### binlog 侧的核心环节：finalize cache 与结束事件
 
 > 2PC 的引擎侧剖析（prepare 五层逐行、undo 状态、`HA_IGNORE_DURABILITY` 的协同、触发条件 `rw_ha_count > 1`、外部 XA 的 detach / by_xid）见 [`../../innodb/trx.md`](../../innodb/trx.md)「事务与 binlog：2PC」。本篇只讲 binlog 自己的环节。
@@ -1234,6 +1290,8 @@ log_event.cc:2935 的注释直接点明了这个必要性。
 
 ## GTID 与 binlog 的持久化交互
 
+> **分工**：GTID 标识体系、集合算法、生命周期全貌与 InnoDB 侧落表（Clone_persist_gtid）见 [`gtid.md`](gtid.md)；本篇只讲 **binlog 侧视角**——GTID 在提交路径上与 binlog 文件的交互（Gtid_log_event 写入、Previous_gtids 生成、purge 约束）。
+>
 > ⚠️ **命名勘误（8.0.39）**：`GTID_GROUP` / `ANONYMOUS_GROUP` / `GTID_NOT_YET_DETERMINED_GROUP` **已不存在**，源码注释记录了重命名（`BUG#18089914`）：现行 `enum_gtid_type` 是 `AUTOMATIC_GTID` / `ASSIGNED_GTID`（旧 `GTID_GROUP`）/ `ANONYMOUS_GTID` / `UNDEFINED_GTID` / `NOT_YET_DETERMINED_GTID` / `PRE_GENERATE_GTID`。另外 `fetch_gtids_from_binlog`、`update_gtids_purged` 均不存在（对应物见下文）。
 
 ### 三处持久化：表 + 两类事件

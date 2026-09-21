@@ -1418,6 +1418,45 @@ DD 表的读写用 **attachable transaction**（`transaction_impl.h:130-150`）�
 | `DD_INITIALIZE_SERVER` | **5.7 数据目录就地升级** | 预检 → 建新 DD → 迁移旧元数据 |
 | `DD_RESTART_OR_UPGRADE` | 正常重启（含 8.0.x → 8.0.y） | `create_tables` + `upgrade_tables` |
 
+#### ★★ 8.0 版本间升级：`upgrade_tables()`（DD 的"原子升级"）
+
+8.0.x → 8.0.y 的每次重启都会问：**磁盘上的 DD 版本 ≠ 当前代码的 `DD_VERSION`？**（`is_dd_upgrade()`）是则走 `dd::upgrade::upgrade_tables()`（`sql/dd/impl/upgrade/dd.cc:1074`）——这就是"内核串行执行一批系统表 DDL"的地方，**社区版完全涉及**。
+
+**六大步骤**（源码注释在每步前明说事务边界）：
+
+```
+① create_temporary_schemas()          // 建两个临时 schema：
+                                       //   target_schema（放新版表结构）
+                                       //   actual_schema（放旧版表结构）
+② establish_table_name_sets()         // 算出 remove_set / create_set：
+                                       //   哪些表要新建、哪些表要删
+③ create_tables()                     // 遍历全部 DD 表，target != actual 就建 target 表
+④ update_meta_data()                  // 阶段 1：UPDATE 源表（mysql schema 里的旧表）
+   migrate_meta_data()                // 阶段 2：UPDATE/INSERT 目标表（数据搬家）
+⑤ ★ ATOMIC SWITCH（三步一体，见下）:
+   update_properties()                //   先改 dd_properties
+   update_object_ids()                //   再改 tables / foreign_keys /
+                                      //   foreign_key_column_usage 的
+                                      //   id 和 schema 名（"假装 ALTER 了 schema"）
+   update_versions()                  //   最后写版本号 + COMMIT
+⑥ 升级后清理：FLUSH TABLES → reset Shared_dictionary_cache
+   → reset DDSE dict cache（逐个 CORE 表）→ 从头重新 bootstrap
+```
+
+**★★ 事务结构（用户问题的核心答案）**：
+
+| 阶段 | 事务行为 | 源码注释原文 |
+|---|---|---|
+| ③ 建表 DDL | **每个 DDL 语句 auto commit**（串行执行，各自成事务） | *The table creation is done by executing DDL statements that are auto committed* |
+| ④ 数据迁移 | 修改**攒在事务里不提交** | *the changes done during migration of meta data are committed in next step at the end of 'atomic switch'* |
+| ⑤ Atomic Switch | **三步中间不提交、失败立即回滚、成功到 `update_versions()` 末尾才 commit** | *must be done without intermediate commits. Note that in case of failure, rollback is done immediately. In case of success, no commit is done until at the very end of update_versions()* |
+
+即：**建表阶段是"串行 auto commit DDL"，切换阶段是"一个大事务"**。中间断开的地方（③→④）就算崩溃，重启后 `is_dd_upgrade()` 依然为真（版本号还没改），整套流程重来——**幂等性靠"版本号最后才写"天然保证**。
+
+★ **为什么"先改 dd_properties、后改 object_ids"**（⑤内部的顺序也是刻意设计的）：注释（`:1137-1141`）说——若先改 schema id 再去 acquire 新表，Storage_adapter 会从 core registry 拿到**错误对象**（因为表的 schema id 已被改成 `mysql` 的，acquire 命中 core registry 而不是临时 schema）。所以必须先把手伸进临时 target schema 把对象取出来，再动 id。
+
+★ **升级成功后为什么还要"从头重新 bootstrap"**：⑥ 的 `set_dd_upgrade_done()` + reset 缓存——因为升级期间 DD 缓存里装的是**旧版本对象**，全部作废重来；且 I_S 的元数据若底层表变了需要重生成（`set_dd_upgrade_done` 正是给 I_S 初始化看的标记）。
+
 #### ★ `do_pre_checks_and_initialize_dd`：两个文件决定走哪条路
 
 入口（`upgrade_57/upgrade.cc:837`）第一件事不是查字典，而是**摸文件系统**：

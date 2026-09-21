@@ -66,6 +66,16 @@ MySQL 的锁可以沿三个正交维度切分，任何一把锁都落在下面�
 
 > 注意 **prlock ≠ 普通 rwlock**：`mysql_rwlock_t` 写者排队后读者会被间接阻塞；`mysql_prlock_t`（priority）读者永远不被写者阻塞——MDL 的等待队列（`m_LOCK_waiting_for`）必须用它，否则死锁检测会卡死。InnoDB 的 `rw_lock_t` 则独有 **SX（shared-exclusive）** 态（供 B-tree 热点页分裂：阻止新读、不阻止在途读）。
 
+**锁序校验的两套体系与分层**（这是"锁序"主题的全局地图）：
+
+| 体系 | 归属 | 覆盖范围 | 坐标系 | 详细剖析 |
+|---|---|---|---|---|
+| **LatchDebug**（latch level 金字塔） | **InnoDB 专属**（UNIV_DEBUG） | 仅 InnoDB 自研原语（100+ 全局实例 + 页锁） | `latch_level_t` 枚举（sync0types.h 头部有整幅 ASCII 金字塔图） | [`primitives/innodb_sync.md`](primitives/innodb_sync.md)「LatchDebug 的锁序金字塔」 |
+| **LOCK ORDER 工具**（`sql/debug_lock_order.cc`） | **server 层跨层**（`WITH_LOCK_ORDER` 构建） | server + InnoDB **所有 PFS 锁** | **PFS instrument 名**（`wait/synch/...`） | [`lock_order.md`](lock_order.md) |
+| **PFS 锁 instrument** | 两者共享的**锁命名层** | `wait/synch/mutex\|rwlock\|sxlock\|cond\|prlock` + 事务锁表 `wait/lock/*` | PFS 名 | 观测见各篇「可观测性」章 |
+
+**为什么是两套而不是一套**：LatchDebug 只能管 InnoDB 自己（它不认识 mysys 的 `mysql_mutex_t`）；LOCK ORDER 工具以 PFS 名为通用坐标，才能把 server 与引擎的加锁关系画进**同一张全局有向图**（配 `lock_order_dependencies.txt` 手工声明允许的依赖，运行时判环 = 死锁风险）。演进方向：从"InnoDB 内部金字塔"走向"以 PFS 名为通用坐标的全局图"。
+
 **事务锁侧收敛为四大体系**（这是盘点的主线）：
 
 ```
@@ -354,6 +364,7 @@ MDL 与 InnoDB 行锁**独立但配合**：一个 DML 同时持 MDL SW（元数�
 ```
 lock/
 ├── README.md                        ← 本篇：分类 + 类型学 + 全量盘点
+├── lock_order.md                    ✅ LOCK ORDER 工具（server 层跨层）：PSI 钩子替换 + 有向图 + Tarjan SCC 判环 + 依赖文件语法（ARC/BIND/NODE）+ 官方工作流
 ├── primitives/                      ← 同步原语（锁原语，只放锁原语）
 │   ├── innodb_sync.md               ✅ os_event（manual-reset + signal_count 防丢信号）+ sync0arr（event 已嵌入被等对象，只剩诊断/兜底/死锁检测）+ PolicyMutex 模板族（TTAS 自旋 + futex 三态两后端）+ rw_lock_t lock_word 单字三态编码 + LatchDebug/Stateful_latching_rules/LOCK ORDER 三套校验
 │   ├── mysys_primitives.md          ✅ server 侧三层封装（native/my/mysql_mutex）+ PFS 埋点宏链（m_psi 无条件内嵌换 ABI）+ SAFE_MUTEX（CMake Debug 注入，与 PFS 正交）+ prlock（为 MDL 手搓的强读者优先锁）

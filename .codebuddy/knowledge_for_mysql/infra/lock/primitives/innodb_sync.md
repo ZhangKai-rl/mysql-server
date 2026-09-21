@@ -540,9 +540,397 @@ btr 层注释佐证："an sx-latch on the tree"（悲观修改树结构时对树
 | **`ut::Stateful_latching_rules`** | `ut0stateful_latching_rules.h` | **状态机 × 持锁集合**的声明式校验：把问题建模为"状态图，边标注所需 latch 子集"。唯一用户是 `buf_page_t::io_fix`（`Buf_io_fix_latching_rules`），提供"读状态时持有的锁足以冻结状态"的断言 | UNIV_DEBUG |
 | **LOCK ORDER 工具** | `sql/debug_lock_order.cc`（`WITH_LOCK_ORDER` 构建选项） | 用 PFS 名建全局有向图（`lock_order_dependencies.txt`），运行时校验加锁序列无环 → 保证无死锁；InnoDB sxlock 被建模为三态（注释 "Shared exclusive locks are recursive... SX + X counts as X"） | 独立构建选项 |
 
+**分层归属（三套体系谁管谁）**：
+
+- **LatchDebug** = InnoDB 专属（UNIV_DEBUG，只覆盖 InnoDB 自研原语，锁序金字塔是 InnoDB 内部知识）
+- **LOCK ORDER 工具** = **server 层跨层**（`sql/debug_lock_order.cc`，覆盖 server + InnoDB **所有 PFS 锁**——输入是 PFS instrument 名，不关心锁是 mysys 还是 InnoDB 实现）
+- **PFS** = 两者共享的**锁命名层**：LOCK ORDER 以 PFS 名为图节点；LatchDebug 校验的锁在 PFS 也有对应 instrument（`wait/synch/mutex|rwlock|sxlock/innodb/*`），供运行时观测竞争（见「可观测性」章）。锁序校验的演进方向就是"从 InnoDB 内部金字塔走向以 PFS 名为通用坐标"。
+
+### LatchDebug 的锁序金字塔：机制详解
+
+**官方锁序图**（sync0types.h 头部注释，完整 ASCII 金字塔，从"必须先拿"到"最后拿"，此处精选）：
+
+```
+Dictionary mutex              字典锁 dict_sys（最高）
+  ↓
+Dictionary header
+  ↓
+Secondary index tree latch    index->lock（树锁，SMO 用 SX）
+  ↓
+Secondary index non-leaf / leaf
+  ↓
+Clustered index tree latch / non-leaf / leaf
+  ↓
+  ...（undo / rseg / purge / lock_sys 分片 / trx_sys 等十余层）
+  ↓
+Buffer pool mutexes
+  ↓
+Log mutex
+  ↓
+Any other latch
+  ↓
+Memory pool mutex             内存池锁（最低）
+```
+
+**方向规则**：`latch_level_t` 枚举（sync0types.h）**值越大 = 层级越高 = 必须先拿**（证据：`SYNC_POOL` 排在 `SYNC_DICT` 前、值更小，而图中 Dictionary mutex 在 Buffer pool mutexes 之上）。拿锁时校验"**后拿的 level ≤ 已持有的 level**"（先高后低），违反报 `"latch order violation"` 后 crash。
+
+**注册与校验入口**（sync0debug.cc）：`sync_check_lock_validate`（拿锁时校验）→ `sync_check_lock_granted`（把锁挂进线程的持锁链）→ `sync_check_unlock`（摘除）。策略层在 `enter` 时自动调前两个、`release` 时调最后一个——业务代码透明，只需在 `mutex_create` 时指定 level。
+
+**★ `sync_check_lock` 只为"可变层级锁"存在**：
+
+```cpp
+void sync_check_lock(const latch_t *latch, latch_level_t level) {
+  ut_ad(latch->get_level() == SYNC_LEVEL_VARYING);      // 固定层级锁不适用
+  ut_ad(latch->get_id() == LATCH_ID_BUF_BLOCK_LOCK);    // 全库唯一：buf block 页锁
+  LatchDebug::instance()->lock_validate(latch, level);
+  LatchDebug::instance()->lock_granted(latch, level);
+}
+```
+
+`buf_block_t::lock` 是**全库唯一**可以"每次声明层级"的锁——它的固定层级是 `SYNC_LEVEL_VARYING`，必须每次拿锁后用 `buf_block_dbg_add_level(block, level)` 声明这次扮演的角色（同一页帧在不同场景是 `SYNC_TREE_NODE`/`SYNC_IBUF_TREE_NODE`/`SYNC_FSP_PAGE`/`SYNC_TRX_UNDO_PAGE`…，机制剖析见 [`buffer_pool.md`](../../../innodb/buffer_pool.md) 的「`buf_block_dbg_add_level`」节）。其他锁层级固定，注册时直接读 `get_level()`，无此问题。
+
+**check_order 的三层 case 模式**（sync0debug.cc 的 `lock_validate` 按 level switch）：
+
+```cpp
+switch (level) {
+  case SYNC_NO_ORDER_CHECK:
+  case SYNC_EXTERN_STORAGE:
+  case SYNC_TREE_NODE_FROM_HASH:
+    /* Do no order checking */            // ① 免检组：恢复期/AHI 命中等语境
+    break;
+
+  case SYNC_DICT: ... case SYNC_POOL: ... case SYNC_LOG_*: ...
+    // ② 典型组："requested < held"
+    assert_requested_is_lower_than_held(level, latches);
+    break;
+
+  case SYNC_TREE_NODE:
+    if (find(latches, SYNC_INDEX_TREE) == nullptr &&
+        find(latches, SYNC_DICT_OPERATION) == nullptr)
+      assert_requested_is_lower_or_equal_to_held(level, latches);  // ③ 豁免组
+    break;
+
+  case SYNC_TREE_NODE_NEW:
+    ut_a(find(latches, SYNC_FSP_PAGE) != nullptr);   // 新页分配必须已在 fsp 保护下
+    break;
+
+  case SYNC_IBUF_TREE_NODE:
+    if (find(latches, SYNC_IBUF_INDEX_TREE) == nullptr)
+      assert_requested_is_lower_or_equal_to_held(level, latches);
+    break;
+  ...
+}
+```
+
+**豁免分支的精髓**（case SYNC_TREE_NODE）：规则不是死的"必须按序"，而是"**要么按序，要么持有足够高的保护锁**"——已持 `index->lock`（SYNC_INDEX_TREE）或 `dict_operation_lock`（SYNC_DICT_OPERATION）时，拿树节点免查（树结构已被更高层级锁保护，不存在乱序并发）。**高层级锁的持有是低级乱序的豁免凭证**——这是锁序金字塔与"锁保护伞"思想的结合点。同理 `SYNC_TREE_NODE_NEW` 强制要求已持 `SYNC_FSP_PAGE`（新页分配必在 fsp latch 保护下）。
+
+**为什么值得单独讲**：这套 case 规则是**手工维护**的——枚举注释明说 "If you modify these, you have to also update LatchDebug internals in sync0debug.cc"。每加一种锁层级，人肉在 check_order 加 case、且要保证与金字塔图注释同步。这正是三套体系演进要解决的痛点（见下节「三套锁序校验的演进」）。
+
 **勘误**：`latch_t` **不是**"buf 页 latch 原型"——它是 UNIV_DEBUG 下所有可校验 latch 的调试基类（持 `latch_id_t`、虚 `to_string()`、`get_level()` 查金字塔层级），`rw_lock_t` 在 DEBUG 下继承它。`Stateful_latching_rules` 也**不是**通用机制，目前是 io_fix 状态机的专用校验器。三套体系的演进方向：从"人工维护 level 枚举"走向"声明式/数据驱动校验"。
 
 旧的 `latch_add_to_history` **不存在**（已重构），现行 API 是 `sync_check_lock_validate / sync_check_lock_granted / sync_check_unlock`，由策略层（mutex）与 `rw_lock_add_debug_info`（rwlock）驱动。
+
+### 表空间锁：fil 三级锁体系（fil_space_t::latch 详解）
+
+fil 是 InnoDB "所有表空间文件 I/O 的统一入口与元数据中心"，用**三级锁**协调并发。本节从同步原语视角讲锁本身（保护对象 / 锁序 / 为什么分层）；功能视角的 `Fil_shard` 分片与 `do_io` 链路见 [`fil.md`](../../../innodb/fil.md)。
+
+**两条主链路先看全景**：
+
+```
+读路径（高频，只碰 shard mutex，不碰 space latch）：
+  buf 页读取 → fil_io → Fil_shard::do_io
+    mutex_acquire()                          ← 持 shard mutex 查 space
+    ├─ get_space_by_id(space_id)             ← 查 m_spaces hash
+    ├─ stop_new_ops 检查（删除中 → DB_TABLESPACE_DELETED）
+    ├─ get_file_for_io / prepare_file_for_io
+    └─ mutex_release() → 发起 I/O（不持锁）
+
+DDL truncate（低频，三步持锁）：
+  space_prepare_for_truncate
+    ├─ Step1: stop_new_ops=true → 20ms 轮询等 pending ops/IO 归零（shard mutex 反复拿/放）
+  mutex_acquire()
+    ├─ Step2: bump_version()                ← 旧页惰性失效
+    ├─ Step3: os_file_truncate + size 更新
+    └─ stop_new_ops = false
+  mutex_release()
+
+扩展（fsp 页分配链，space latch X 的唯一入口）：
+  mtr_x_lock_space(space)        [X space latch, SYNC_FSP]
+    → fsp_try_extend_data_file_with_pages
+      → Fil_shard::space_extend → mutex_acquire()   [SYNC_FIL_SHARD]
+```
+
+#### 三级锁的真实结构（先纠正一个流传说法）
+
+```cpp
+// fil0fil.cc Fil_system —— 全局没有独立 mutex，靠"锁全部 shard"实现
+void mutex_acquire_all() const { for (auto shard : m_shards) shard->mutex_acquire(); }
+void mutex_release_all() const { for (auto shard : m_shards) shard->mutex_release(); }
+
+// Fil_shard —— 68 把 shard mutex
+Fil_shard::Fil_shard(size_t shard_id) : m_id(shard_id), ... {
+  mutex_create(LATCH_ID_FIL_SHARD, &m_mutex);   // SYNC_FIL_SHARD；PFS key = fil_system_mutex_key
+}
+
+// fil_space_t —— 每个表空间一把 rw_lock_t
+/** Latch protecting the file space storage allocation */
+rw_lock_t latch;                                // LATCH_ID_FIL_SPACE；SYNC_FSP；PFS key = fil_space_latch_key
+```
+
+**latch 的完整生命周期**（`Fil_shard::space_create` 里的创建段，完整代码）：
+
+```cpp
+space = static_cast<fil_space_t *>(
+    ut::zalloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, sizeof(*space)));
+space->initialize();
+...
+space->magic_n = FIL_SPACE_MAGIC_N;
+...
+rw_lock_create(fil_space_latch_key, &space->latch, LATCH_ID_FIL_SPACE);
+
+#ifndef UNIV_HOTBACKUP
+if (space->purpose == FIL_TYPE_TEMPORARY) {
+  ut_d(space->latch.set_temp_fsp());   // 临时表空间的锁序特殊规则（m_temp_fsp）
+}
+#endif
+space_add(space);                      // 挂进 shard 的 m_spaces hash
+```
+
+销毁在 `space_free_low`（`rw_lock_free(&space->latch)`），**前置引用计数校验**：临时/undo space 必须 `has_no_references()`（所有 buffer pool 页引用清零）才 free，否则复用 space_id 会撞残留页。
+
+**⚠️ 没有独立的 `fil_system_mutex`**——PFS 里那个 `fil_system_mutex_key` 是**分片 mutex 共用的 instrument 名**（历史命名），不是真的有一把全局 mutex。全局操作（建表空间、分配新 space_id）用 `mutex_acquire_all()` 顺序锁全部 68 个 shard——低频，代价可接受。
+
+`fil_space_t::latch` 的创建在 `Fil_shard::space_create`（`zalloc + initialize` 后、`space_add` 挂 hash 前），销毁在 `space_free_low`（`rw_lock_free(&space->latch)`）。临时表空间额外 `latch.set_temp_fsp()`（`m_temp_fsp`，intrinsic 临时表的锁序特殊规则）。
+
+#### 各自保护什么
+
+| 锁 | 保护对象 |
+|---|---|
+| `Fil_shard::m_mutex`（68 把） | `m_spaces`（space 集合）、`m_names`（名字映射）、`m_deleted_spaces`、`m_LRU`（文件句柄 LRU）、`m_unflushed_spaces`、`m_modification_counter`；以及 `fil_space_t` 的 `n_pending_ops`/`size`/`files` 等**元数据** |
+| `fil_space_t::latch`（每 space 一把） | **fsp 存储分配元数据**：free list、extent descriptor、header 页——通过 mtr 在页分配时 X 持锁 |
+| （全局）`mutex_acquire_all` | `m_max_assigned_id`、`m_shards` 构造期、启动扫描的 `m_dirs`/`m_old_paths` |
+
+**纠偏**：`size` 字段**没有**"由 latch 保护"的注释，实际在 shard mutex 下读写（`fil_space_get_size` 持 shard mutex 读）；`compression_type`/`purpose`/`files` 也是 shard mutex 保护的元数据。`space->latch` 只覆盖**存储分配**这一件低频写。
+
+#### 锁序：不是"全局→局部"，是 space → shard 递减
+
+`latch_level_t` 里 `SYNC_FSP`（space latch）的数值**大于** `SYNC_FIL_SHARD`（shard mutex），而 InnoDB 要求**严格递减**获取（`sync0debug.cc` 注释原文 "strictly descending sequence cannot have a loop"）。所以嵌套链是：
+
+```cpp
+// fsp0fsp.cc fsp_try_extend_data_file_with_pages（调用方已 mtr_x_lock_space 持 X）
+bool success = fil_space_extend(space, page_no + 1);
+//   → Fil_shard::space_extend → mutex_acquire()   ← 先 space latch(X, SYNC_FSP) 再 shard mutex(SYNC_FIL_SHARD)
+```
+
+**先拿 space latch、后拿 shard mutex**——与直觉的"先全局后局部"相反。全库**没有**"先持 shard mutex 再嵌套拿 space latch"的反向路径（`fil_set_autoextend_size` 是"先 `space_acquire` 计数 → 释放 shard mutex → 再 X 锁 latch"的**串行两段**，不是嵌套）。
+
+#### 关键函数逐段剖析
+
+##### `Fil_shard::do_io`：读路径的锁检查段
+
+```cpp
+dberr_t Fil_shard::do_io(const IORequest &type, bool sync, ...) {
+  ...
+  /* Reserve the mutex and make sure that we can open at
+  least one file while holding it, if the file is not already open */
+  mutex_acquire();
+
+  auto space = get_space_by_id(page_id.space());
+
+  if (space == nullptr ||
+      (req_type.is_read() && !sync && space->stop_new_ops)) {
+    mutex_release();
+    /* A read request can happen because the reader thread has gone through
+    the ::stop_new_ops check in buf_page_init_for_read() before the flag was
+    set and has not yet incremented ::n_pending when we checked it above. */
+    return DB_TABLESPACE_DELETED;
+  }
+  ...
+  fil_node_t *file;
+  auto err = get_file_for_io(space, &page_no, file);
+  ...
+  if (!prepare_file_for_io(file)) { ... }
+  mutex_release();
+  ...
+}
+```
+
+逐段：① `mutex_acquire` 一次覆盖"查 space → 定位文件 → 打开文件"整段元数据操作（注释：至少保证能打开一个文件再放锁）；② 删除中（`stop_new_ops`）的**异步**读直接拒绝——但**同步**读（`sync==true`，如恢复期）豁免；③ 这是注释明说的竞态防线：读线程可能已在 `buf_page_init_for_read` 穿过 `stop_new_ops` 检查，所以 `do_io` 里再查一次。
+
+##### `Fil_shard::space_extend`：扩展的完整持锁协议
+
+```cpp
+bool Fil_shard::space_extend(fil_space_t *space, page_no_t size) {
+  ut_ad(!srv_read_only_mode || fsp_is_system_temporary(space->id));
+  fil_node_t *file;
+  bool success = true;
+
+  for (;;) {
+    mutex_acquire();
+    space = get_space_by_id(space->id);
+
+    if (size < space->size) {          /* ① 别人已扩到位 */
+      mutex_release();
+      return true;
+    }
+    file = &space->files.back();
+
+    if (!file->is_being_extended) {    /* ② 抢到扩展权 */
+      /* Mark this file as undergoing extension. This flag is used to
+      synchronize threads to execute space extension in order. */
+      file->is_being_extended = true;
+      break;
+    }
+
+    /* ③ 别的线程在扩：释放 mutex 轮询等（注释承认"整个模块到处是轮询，
+       本该用 event 机制"） */
+    mutex_release();
+    if (!tbsp_extend_and_initialize) std::this_thread::sleep_for(20us);
+    else std::this_thread::sleep_for(100ms);
+  }
+
+  if (!prepare_file_for_io(file)) {    /* .ibd 缺失 */
+    ut_a(file->is_being_extended);
+    file->is_being_extended = false;
+    mutex_release();
+    return false;
+  }
+  ut_a(file->is_open);
+  ...
+  /* At this point it is safe to release the shard mutex. No other thread can
+  rename, delete or close the file because we have set the file->in_use flag. */
+  mutex_release();
+
+  /* 真正的扩文件在锁外做：posix_fallocate + 可选写 redo（临时表空间/系统表空间
+     不写 redo——注释：临时表空间启动时重建、系统表空间不 resize） */
+  ...os_file_set_size(...)...
+}
+```
+
+逐段：① 进入即查"是否已被别人扩到位"（size 已在 shard mutex 下更新）；② `is_being_extended` 是**扩展权的互斥旗标**（注意它不是锁，靠 shard mutex 保护检查-置位的原子性）；③ 竞争者释放锁轮询——持锁者只锁"查状态 + 置旗标 + 准备文件"这一段，**真正的 `posix_fallocate`/写 redo 在锁外做**（`file->in_use` 保活，注释原文 "No other thread can rename, delete or close the file"）。
+
+##### `Fil_shard::space_truncate`：三步持锁
+
+```cpp
+bool Fil_shard::space_truncate(space_id_t space_id, page_no_t size_in_pages) {
+  fil_space_t *space{};
+
+  /* Step-1: Prepare tablespace for truncate. This involves stopping all the
+  new operations + IO on that tablespace. Any future attempts to flush will be
+  ignored and pages discarded. */
+  if (space_prepare_for_truncate(space_id, space) != DB_SUCCESS) {
+    return false;
+  }
+
+  mutex_acquire();
+
+  /* Step-2: Mark the tablespace pages in the buffer pool as stale by bumping
+  the version number of the space. Those stale pages will be ignored and freed
+  lazily later. This includes AHI, for which entries will be removed on
+  buf_page_free_stale*() -> buf_LRU_free_page -> btr_search_drop_page_hash_index() */
+  space->bump_version();
+
+  /* Step-3: Truncate the tablespace and accordingly update the fil_space_t
+  handler that is used to access this tablespace. */
+  ut_a(space->files.size() == 1);
+  auto &file = space->files.front();
+  if (!file.is_open) {
+    if (!open_file(&file)) { mutex_release(); return false; }
+  }
+  space->size = file.size = size_in_pages;
+  bool success = os_file_truncate(file.name, file.handle, 0);
+  if (success) {
+    os_offset_t size = size_in_pages * UNIV_PAGE_SIZE;
+    success = os_file_set_size(file.name, file.handle, 0, size, true);
+    if (success) space->stop_new_ops = false;
+  }
+  mutex_release();
+  return success;
+}
+```
+
+三步都在注释里自带说明：Step-1（锁外）先把 `stop_new_ops` 置位并等所有在途操作归零；Step-2（锁内）`bump_version` 让 buffer pool 旧页**惰性失效**（含 AHI 条目，失效链一路到 `btr_search_drop_page_hash_index`）；Step-3（锁内）真截断 + 更新 `size` + 放行新操作。注意 `bump_version` 的前置 `ut_a(stop_new_ops); ut_a(!m_deleted);`——只能在已 stop_new_ops 且未删除时 bump。
+
+##### `Fil_shard::wait_for_pending_operations`：两段 20ms 轮询
+
+```cpp
+dberr_t Fil_shard::wait_for_pending_operations(space_id_t space_id,
+                                               fil_space_t *&space,
+                                               char **path) const {
+  mutex_acquire();
+  fil_space_t *sp = get_space_by_id(space_id);
+  if (sp != nullptr) sp->stop_new_ops = true;   /* ① 关闸：新操作不许进 */
+  mutex_release();
+
+  /* ② Check for pending operations. */
+  ulint count = 0;
+  do {
+    mutex_acquire();
+    sp = get_space_by_id(space_id);
+    count = space_check_pending_operations(sp, count);
+    mutex_release();
+    if (count > 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  } while (count > 0);
+
+  /* ③ Check for pending IO. */
+  *path = nullptr;
+  do {
+    mutex_acquire();
+    sp = get_space_by_id(space_id);
+    if (sp == nullptr) { mutex_release(); return DB_TABLESPACE_NOT_FOUND; }
+    ut_a(sp->files.size() == 1);
+    const fil_node_t &file = sp->files.front();
+    count = check_pending_io(sp, file, count);
+    if (count == 0) *path = mem_strdup(file.name);
+    mutex_release();
+    ...
+  } while (count > 0);
+  ...
+}
+```
+
+逐段：① 关闸后**必须反复拿/放 mutex 轮询**，因为 pending IO 的完成需要 IO 线程推进，持锁死等会死锁；② 先等"操作"（ibuf merge/读页等）归零，③ 再等"IO"（`n_pending_ios`/`n_pending_flushes`/`is_being_extended`）归零。两段分开等是因为两者的归零路径不同。
+
+#### ★ 三个反直觉结论（纠正流传说法）
+
+1. **`fil_space_t::latch` 8.0 几乎只以 X 模式持有**——全库没有 `rw_lock_s_lock(&space->latch)` 调用。所谓"读多写少用 S 锁"**不成立**：真正承担"读多写少"的是 shard mutex（短临界区元数据读），space latch 只覆盖低频存储分配写。它保留 rwlock 形态的原因是历史（经典 "File space management latch" 一直就是 rwlock）+ LatchDebug 集成（`rw_lock_create(..., LATCH_ID_FIL_SPACE)` 进入 `SYNC_FSP` 层级校验 + `set_temp_fsp()` 钩子）。
+2. **没有独立全局 mutex**（见上），全局操作 = `mutex_acquire_all` 锁全部 shard。
+3. **锁序是 space → shard**，不是 shard → space（层级数值 `SYNC_FSP > SYNC_FIL_SHARD`）。
+
+#### 引用计数保活：`n_pending_ops` 代替长期持锁
+
+DDL 删除与后台 IO/读页并发时，不靠长期持 shard mutex 保活对象，而是引用计数：
+
+```cpp
+fil_space_t *Fil_system::space_acquire(space_id_t space_id) {
+  auto shard = shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_space_t *space = shard->get_space_by_id(space_id);
+  if (space && !shard->space_acquire(space)) space = nullptr;  // ++n_pending_ops
+  shard->mutex_release();
+  return space;   // 释放 mutex 后指针仍有效：n_pending_ops>0 阻止 DDL free
+}
+```
+
+`space_release` 在无锁下 `--n_pending_ops`；删除方置 `stop_new_ops=true` 后 `wait_for_pending_operations`（20ms 轮询）等计数归零，才 `set_deleted` → `bump_version()`（旧页惰性失效）。`bump_version` 的前置 `ut_a(stop_new_ops); ut_a(!m_deleted);`——**只能在已 stop_new_ops 且未删除时 bump**。
+
+#### 与 LatchDebug 金字塔
+
+`SYNC_FSP` 在 `sync0types.h` 头部 ASCII 锁序图里对应 "**File space management latch**"（注释："If a mini-transaction must allocate several file pages, it can do that, because it keeps the x-latch to the file space management in its memo"）。`SYNC_FSP_PAGE`（页帧临时层级）是它的下一级，校验强制**必须先持 `SYNC_FSP`**：
+
+```cpp
+case SYNC_FSP_PAGE:
+  ut_a(find(latches, SYNC_FSP) != nullptr);   // 新页分配必在 fsp latch 保护下
+  break;
+```
+
+区分：`SYNC_FSP` = `fil_space_t::latch` 的层级；`SYNC_FSP_PAGE` = 页帧锁（`buf_block_t::lock`）在表空间页分配场景下的**临时调试层级**（`buf_block_dbg_add_level(block, SYNC_FSP_PAGE)`）。
+
+#### 已知坑
+
+1. **`stop_new_ops` 挡不住已穿过检查的读和任意时刻的写**（`space_delete` 注释原文）：读线程可能在 `buf_page_init_for_read` 穿过 `stop_new_ops` 检查后才置位，写请求根本不查这个 flag——所以删除前必须 `buf_LRU_flush_or_remove_pages` + 等 `n_pending_ios`/`n_pending_flushes`/`is_being_extended` 全归零。
+2. **`is_being_extended` 串行化扩展**：`space_extend` 循环里持 shard mutex 查 `is_being_extended`，被占则释放 mutex + sleep 重试（"used to synchronize threads to execute space extension in order"）。
+3. **`space_free_low` 前引用计数校验**：临时/undo space 必须 `has_no_references()`（所有 buf 页引用清零）才 free，否则复用 space_id 撞残留页。
 
 ### 模块闭环：下游靠什么、上游谁在用
 
@@ -559,7 +947,7 @@ btr 层注释佐证："an sx-latch on the tree"（悲观修改树结构时对树
 | **事务系统** | `trx_sys_mutex`、`trx_sys_shard_mutex`、`serialisation_mutex` | read view 生成与事务串行化 | [`../../innodb/trx.md`](../../../innodb/trx.md) |
 | **redo / log** | `log_sys` 相关 latch + os_event（写盘等待） | 8.0 的 log 系统大量用 `os_event_wait_for` 与 `std::condition_variable` | [`../../innodb/redo_log.md`](../../../innodb/redo_log.md) |
 | **自适应哈希** | `btr_search_latch`（`rw_lock_t`，可分区） | 热点等值查询的加速结构 | [`../../innodb/ahi.md`](../../../innodb/ahi.md) |
-| **插入缓冲 / 文件空间** | `ibuf_mutex`、`ibuf_bitmap_mutex`、`fil_system->mutex` | 二级索引延迟写与表空间管理 | — |
+| **插入缓冲 / 文件空间** | `ibuf_mutex`、`ibuf_bitmap_mutex` + fil 三级锁（`Fil_shard::m_mutex`×68、`fil_space_t::latch` rw_lock_t，**无独立全局 mutex**） | 二级索引延迟写；表空间管理三级锁（保护对象/锁序/引用计数保活见上文「表空间锁」节） | 本节上文 |
 
 这条"L0 → 本篇 → 各子系统"的链才是完整的：**本篇不解决任何业务问题，它只是让上面每一层都能回答"谁持锁、等了多久、顺序对不对"**。
 

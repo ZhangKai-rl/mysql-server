@@ -1589,7 +1589,7 @@ WL#7165 是 LOGICAL_CLOCK 的设计工作日志，其经典图解的完整逐事
 | 主库 | [rpl_trx_tracking.cc](sql/rpl_trx_tracking.cc) | 依赖追踪器实现，三种模式的 `get_dependency()` 逻辑 |
 | 主库 | [binlog.cc](sql/binlog.cc) | `write_transaction()` 调用 `get_dependency()`，写入 GTID event；`binlog_cache_data::flush()` 中分配 `sequence_number`；多处 `store_commit_parent()` |
 | 主库 | [log_event.cc](sql/log_event.cc) | `Gtid_log_event::write_post_header_to_memory()` 将 `last_committed` 和 `sequence_number` 序列化到 binlog 的 GTID 事件中 |
-| 主库 | [transaction_info.h](sql/transaction_info.h) | `Transaction_ctx`：`sequence_number`、`last_committed` 字段定义；`store_commit_parent()` 方法 |
+| 主库 | [transaction_info.h](sql/transaction_info.h) | `Transaction_ctx`：`sequence_number`、`last_committed` 字段定义；`store_commit_parent()` 方法（**类的完整成员剖析见 [`binlog.md`](binlog.md)「Transaction_ctx：提交路径的每事务状态包」**） |
 | 从库 | [rpl_mta_submode.h](sql/rpl_mta_submode.h) | MTS 调度子模式接口定义：`Mts_submode`、`Mts_submode_database`、`Mts_submode_logical_clock` |
 | 从库 | [rpl_mta_submode.cc](sql/rpl_mta_submode.cc) | `Mts_submode_database` 和 `Mts_submode_logical_clock` 的完整实现，包含调度、等待、LWM 计算等核心逻辑 |
 
