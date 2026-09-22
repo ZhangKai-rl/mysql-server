@@ -1,6 +1,6 @@
 # IO_CACHE 深度剖析：server 层的通用带缓冲 I/O
 
-> 基于 MySQL 8.0.39 源码。涵盖 `IO_CACHE` 的数据结构与状态机、**"穷人版多态"（函数指针）**、**延迟创建文件**、**把网络流伪装成文件**、以及围绕它建立的 **ostream / istream 类继承体系**（`Basic_ostream` → `Truncatable_ostream` → `IO_CACHE_ostream` / `Binlog_encryption_ostream` / `IO_CACHE_binlog_cache_storage`）。
+> 基于 MySQL 8.0.39 源码。涵盖 `IO_CACHE` 的数据结构与状态机、**"穷人版多态"（函数指针）**、**延迟创建文件**、**把网络流伪装成文件**、以及围绕它建立的 **ostream / istream 类继承体系**（写侧 `Basic_ostream` → `Truncatable_ostream` → `IO_CACHE_ostream` / `Binlog_encryption_ostream` / `IO_CACHE_binlog_cache_storage`；读侧 `Basic_istream` → `Basic_seekable_istream` → `IO_CACHE_istream` / `Binlog_encryption_istream` / `Basic_binlog_ifile`）。
 
 > **边界**：本篇讲 **server 层通用的带缓冲 I/O 抽象**。InnoDB 自己的 I/O 栈（`fil_io` / `os_file` / AIO / doublewrite）见 [`../../innodb/io.md`](../../innodb/io.md)，其中「server 层 I/O 全景」一节是本篇的**上游场景清单**；binlog 的组提交与复制语义见 [`../replication/binlog.md`](../replication/binlog.md)；MyISAM 的 key cache 是另一套独立的引擎私有缓存，见 `../../innodb/io.md` 的相关小节。
 
@@ -433,6 +433,29 @@ enum cache_type {
 | `READ_FIFO` | 命名管道 | `LOAD DATA` 从 FIFO 读（`sql_load.cc:1393`） |
 | `READ_NET` | 网络伪装成文件 | `LOAD DATA LOCAL INFILE`（`sql_load.cc:1393`） |
 | `WRITE_NET` | 写网络 | **无任何使用点**（只在 `init_functions` 的 default 分支与 assert 里出现） |
+
+#### ★ binlog 的 IO_CACHE 全景（反观视角）
+
+上面是从 IO_CACHE 机制出发看类型；这里反过来，**从 binlog 内核开发者的视角**看 binlog 到底用了哪几种 IO_CACHE、各自为什么这么用。binlog 是 IO_CACHE 最重度的用户之一，它的每个存储环节都落在 IO_CACHE 上：
+
+| binlog 存储环节 | IO_CACHE 载体 | type | 关键机制（本篇章节） | 与 binlog.md 衔接 |
+|---|---|---|---|---|
+| binlog 文件写入 | `Binlog_ofile` → `IO_CACHE_ostream` | WRITE_CACHE | 顺序写、`disk_sync` 由 `sync_binlog` 控制 | BGC flush 阶段 |
+| binlog 文件读（dump/mysqlbinlog/恢复） | `Basic_binlog_ifile` → `IO_CACHE_istream` | READ_CACHE | 顺序读 + 随机 seek（8.9/8.11） | dump 线程 |
+| binlog index 文件 | 裸 `IO_CACHE` | READ_CACHE | 顺序读文件名列表（核心实现二） | rotate/purge |
+| **binlog cache（事务缓存）** | `IO_CACHE_binlog_cache_storage` | WRITE_CACHE + `open_cached_file` | 延迟建文件（核心实现五）、`end_of_file` 容量上限、`disk_use` 统计 | `max_binlog_cache_size` / `binlog_cache_disk_use` |
+| binlog cache 溢出 | 同上，内存 → 临时文件 | file==-1 惰性 | `my_b_flush_io_cache` ① spill 分支 | 大事务溢出 |
+| relay log | `Relaylog_ifile` → `IO_CACHE_istream` | READ_CACHE | 同 binlog（8.11） | 从库 IO 线程 |
+| binlog 加密（文件级） | `Binlog_encryption_ostream`/`istream` | WRITE/READ 装饰 | 分块加解密 + 偏移翻译（8.5/8.10） | `binlog_encryption` |
+| binlog cache 加密 | `IO_CACHE_binlog_cache_storage` 的 `m_encryptor` | 临时文件加密 | 8.0 新增（8.7） | 大事务临时文件 |
+
+**最值得记住的三条映射**（binlog 特有的、非通用 IO_CACHE 用法）：
+
+1. **`open_cached_file`（file==-1 延迟建文件）是 binlog cache 的专属机制**：小事务完全走内存，只有溢出 `max_binlog_cache_size` 才 `real_open_cached_file` 建临时文件——这是"binlog cache 为什么快"的根本原因（见核心实现五）。
+2. **`end_of_file` 被 binlog cache 劫持成容量上限**：通用 WRITE_CACHE 的 `end_of_file` 是无符号最大值（EFBIG 检查永不触发），但 binlog cache 把它设成 `max_binlog_cache_size`，于是 `_my_b_write` 的 EFBIG 检查变成了"超上限报 `ER_TRANS_CACHE_FULL`"——**一个通用字段被特定场景重定义为配额**。
+3. **`disk_writes`（每次 flush +1）是 `binlog_cache_disk_use` 的数据源**：它统计的是"落到磁盘的次数"而非"写入字节数"，所以这个状态变量的语义是"cache 刷盘次数"（见 `my_b_flush_io_cache` ⑪）。
+
+这三条就是 io_cache 与 binlog 最深的耦合点，也是本篇把 binlog 当典型案例贯穿始终的原因。
 
 ---
 
@@ -1424,7 +1447,139 @@ class Binlog_cache_storage : public Basic_ostream {
   ```
   存在的唯一理由是**向前兼容**（将来加压缩/加密装饰器时只改 `open()` 一处）。头文件注释明说这个意图。
 
-### 8.9 全套类清单
+### 8.9 `IO_CACHE_istream`：读侧终点
+
+对称于写侧的 `IO_CACHE_ostream`（8.4），它是读侧 pipeline 的**终点**，把 `IO_CACHE` 包装成 `Basic_seekable_istream`（`sql/basic_istream.h:88`）：
+
+```cpp
+class IO_CACHE_istream : public Basic_seekable_istream {
+ public:
+  bool open(PSI_file_key log_file_key, PSI_file_key log_cache_key,
+            const char *file_name, myf flags, size_t cache_size = IO_SIZE * 2);
+  ssize_t read(unsigned char *buffer, size_t length) override;
+  bool seek(my_off_t bytes) override;
+  my_off_t length() override;
+ private:
+  IO_CACHE m_io_cache;   // 与 IO_CACHE_ostream 一样，内联持有 IO_CACHE
+};
+```
+
+实现（`sql/basic_istream.cc:30-81`）：
+
+```cpp
+bool IO_CACHE_istream::open(...) {
+  File file = mysql_file_open(log_file_key, file_name, O_RDONLY, MYF(MY_WME)); // 只读
+  if (file < 0) return true;
+  if (init_io_cache(&m_io_cache, file, cache_size, READ_CACHE, 0, false, ...))  // ★ READ_CACHE
+    return true;
+  return false;
+}
+ssize_t IO_CACHE_istream::read(unsigned char *buffer, size_t length) {
+  if (my_b_read(&m_io_cache, buffer, length)) return m_io_cache.error;
+  return length;
+}
+bool IO_CACHE_istream::seek(my_off_t offset) { my_b_seek(&m_io_cache, offset); return false; }
+my_off_t IO_CACHE_istream::length() { return my_b_filelength(&m_io_cache); }
+```
+
+**关键**：`IO_CACHE_istream` 的 `seek`/`length` 都是**物理文件偏移**——它不理解加密，`seek(offset)` 就是 `my_b_seek(offset)`，`length()` 就是 `my_b_filelength`（物理文件长度）。**偏移翻译由上一层 `Binlog_encryption_istream` 负责**，这一点与写侧的分工完全一致。
+
+### 8.10 `Binlog_encryption_istream`：解密装饰器 + 偏移翻译
+
+对称于 `Binlog_encryption_ostream`（8.5）。`open` 时读加密文件头 → 解密 file password → 建 decryptor（`sql/binlog_istream.cc:78-133`）：
+
+```cpp
+bool Binlog_encryption_istream::open(unique_ptr<Basic_seekable_istream> down_istream,
+                                     Binlog_read_error *error) {
+  m_down_istream = std::move(down_istream);
+  auto header = Rpl_encryption_header::get_header(m_down_istream.get());  // 读 512B 加密头
+  if (!header) return error->set_type(INVALID_ENCRYPTION_HEADER);
+  Key_string password = header->decrypt_file_password();   // 用主密钥解密 file password
+  if (password.empty()) return error->set_type(CANNOT_GET_FILE_PASSWORD);
+  m_decryptor = header->get_decryptor();
+  if (m_decryptor->open(password, header->get_header_size()))
+    return error->set_type(ERROR_DECRYPTING_FILE);
+  return false;
+}
+ssize_t Binlog_encryption_istream::read(unsigned char *buffer, size_t length) {
+  ssize_t ret = m_down_istream->read(buffer, length);               // 读密文
+  if (ret > 0 && m_decryptor->decrypt(buffer, buffer, ret)) ret = -1;  // ★ 原地解密
+  return ret;
+}
+bool Binlog_encryption_istream::seek(my_off_t offset) {
+  bool res = m_decryptor->set_stream_offset(offset);                // 重置 CTR counter
+  if (!res) res = m_down_istream->seek(offset + m_decryptor->get_header_size());  // ★ 偏移翻译
+  return res;
+}
+my_off_t Binlog_encryption_istream::length() {
+  return m_down_istream->length() - m_decryptor->get_header_size(); // 减去加密头
+}
+```
+
+**与写侧的完美对称**：
+
+| 维度 | 写侧 `Binlog_encryption_ostream` | 读侧 `Binlog_encryption_istream` |
+|---|---|---|
+| seek 偏移翻译 | `down->seek(header_size + offset)` | `down->seek(offset + header_size)` |
+| CTR counter 重置 | `encryptor->set_stream_offset(offset)` | `decryptor->set_stream_offset(offset)` |
+| length | 物理 = 逻辑 + header_size | 逻辑 = 物理 - header_size |
+| 数据处理 | 分块加密后转发 | 读后**原地**解密 |
+
+### 8.11 `Basic_binlog_ifile`：读侧门面（Facade）
+
+对称于写侧的 `Binlog_ofile`（8.6）。它隐藏"文件是否加密"的细节，是 binlog 读取的统一入口（`sql/binlog_istream.h:157`）：
+
+```cpp
+class Basic_binlog_ifile : public Basic_seekable_istream {
+  bool open(const char *file_name);              // open_file() + read_binlog_magic()
+  bool read_binlog_magic();                      // ★ 判断加密 + 组装 pipeline
+  my_off_t position() const { return m_position; } // 逻辑位点（不含加密头）
+ private:
+  my_off_t m_position = 0;                       // 逻辑位点
+  unique_ptr<Basic_seekable_istream> m_istream;  // pipeline 头
+};
+```
+
+**`read_binlog_magic()` 是读侧门面的核心**——它做「判断是否加密 + 动态组装 pipeline」两件事（`sql/binlog_istream.cc:135-171`）：
+
+```cpp
+bool Basic_binlog_ifile::read_binlog_magic() {
+  unsigned char magic[BINLOG_MAGIC_SIZE];
+  if (m_istream->read(magic, BINLOG_MAGIC_SIZE) != BINLOG_MAGIC_SIZE)
+    return m_error->set_type(HEADER_IO_FAILURE);
+  if (memcmp(magic, Rpl_encryption_header::ENCRYPTION_MAGIC, ...) == 0) {  // 0xFD62696E
+    // 加密文件 → 套解密层
+    auto encryption_istream = new Binlog_encryption_istream();
+    if (encryption_istream->open(std::move(m_istream), m_error)) return true;
+    m_istream = std::move(encryption_istream);
+    if (m_istream->read(magic, BINLOG_MAGIC_SIZE) != BINLOG_MAGIC_SIZE)  // 再读真 magic
+      return m_error->set_type(BAD_BINLOG_MAGIC);
+  }
+  if (memcmp(magic, BINLOG_MAGIC, BINLOG_MAGIC_SIZE))    // 0xFE62696E
+    return m_error->set_type(BAD_BINLOG_MAGIC);
+  m_position = BINLOG_MAGIC_SIZE;   // ★ 逻辑位点从 4 开始（跳过 magic）
+  return m_error->set_type(SUCCESS);
+}
+```
+
+**门面的四点证据**（与写侧 `Binlog_ofile` 对称）：
+
+1. `open()` 是**工厂 + 组装器**：先 `open_file()` 造 `IO_CACHE_istream`，再按 `read_binlog_magic()` 的结果动态决定是否套 `Binlog_encryption_istream`；
+2. 它维护**门面专属状态** `m_position`（逻辑位点，`read()` 里 `m_position += ret`，**不含加密头**），与写侧 `Binlog_ofile::m_position` 完全对称；
+3. `open_file()` 委托给子类（`Binlog_ifile` 用 `key_file_binlog`、`Relaylog_ifile` 用 `key_file_relaylog`），所以**一个门面同时服务 binlog 和 relay log**；
+4. `length()` 返回的是"逻辑内容长度"（`BINLOG_MAGIC + 全部明文事件`），不是 OS 文件长度——加密时二者差一个 512B 加密头。
+
+**读侧 pipeline 形态**（与写侧 8.6 的图对称）：
+
+```
+不加密:  Basic_binlog_ifile ──> IO_CACHE_istream ──> IO_CACHE ──> binlog 文件
+加密:    Basic_binlog_ifile ──> Binlog_encryption_istream ──> IO_CACHE_istream ──> IO_CACHE ──> 文件
+         (read_binlog_magic 按 magic 动态套解密层)
+```
+
+**读侧还有写侧没有的东西：`Binlog_read_error`**（`sql/binlog_istream.h:37-111`）。它是贯穿整个读侧 pipeline 的错误对象——**不归任何 stream 拥有，由调用方提供**（`m_error` 指针），枚举 17 种错误类型（`CHECKSUM_FAILURE`、`INVALID_ENCRYPTION_HEADER`、`CANNOT_GET_FILE_PASSWORD`、`READ_ENCRYPTED_LOG_FILE_IS_NOT_SUPPORTED`、`ERROR_DECRYPTING_FILE` 等），每个 `open/read/seek` 出错都 `set_type`。这是「错误对象外置、stream 无状态报错」的设计——避免每个 stream 层各自维护错误码，且让多层 stream 共享同一个错误出口。
+
+### 8.12 全套类清单
 
 | 类 | 基类 | 位置 |
 |---|---|---|

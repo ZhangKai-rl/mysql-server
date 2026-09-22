@@ -1000,6 +1000,60 @@ Rpl_info（基类：data_lock/run_lock/sleep_lock/info_thd_lock + start/stop/dat
 | 位点仓库内容 | SQL | `SELECT * FROM mysql.slave_master_info` / `mysql.slave_relay_log_info`（TABLE 仓库） |
 | IO 线程重连历史 | 日志 | error log 的 `ER_RPL_REPLICA_ERROR_RETRYING`、`replica_retried_transactions` |
 
+### Seconds_Behind_Source 的计算公式（★ 最常被误解的指标）
+
+`SHOW REPLICA STATUS` 的 `Seconds_Behind_Source`（旧名 `Seconds_Behind_Master`，8.0 改名）本质是**「SQL 线程现在回放的事件，是主库多久之前产生的」**，不是"从库比主库慢了多少秒"的字面意思。它的计算在 `sql/rpl_replica.cc` 的 `fill_slave_rows`，源码里就有一段伪代码注释把逻辑讲得最清楚：
+
+```
+if (SQL 线程在运行) {
+  if (SQL 线程已处理完所有 relay log) {      // IO 位点 == SQL 位点
+    if (IO 线程在运行)  打印 0;               // 追平
+    else               打印 NULL;             // 位点追平但 IO 断了 → 无法判断
+  } else {
+    compute Seconds_Behind_Source;            // 真落后 → 计算
+  }
+} else {
+  打印 NULL;                                   // SQL 线程没跑
+}
+```
+
+核心公式（`rpl_replica.cc` 的 `fill_slave_rows`）：
+
+```cpp
+long time_diff = ((long)(time(nullptr) - mi->rli->last_master_timestamp) -
+                  mi->clock_diff_with_master);
+protocol->store(
+    (longlong)(mi->rli->last_master_timestamp ? max(0L, time_diff) : 0));
+```
+
+公式里两个量，各自有独立的更新时机和含义：
+
+**① `last_master_timestamp`——SQL 线程正在回放的事件，主库何时产生的**。SQL 线程每执行一个事件，更新为「事件头的时间戳 + 该语句执行耗时」（`rpl_replica.cc` 的 `apply_event_and_update_pos`）：
+
+```cpp
+rli->last_master_timestamp =
+    ev->common_header->when.tv_sec + (time_t)ev->exec_time;
+```
+
+所以它**不是主库当前时间，而是"当前正在回放的那条 binlog 事件"的落盘时间**。MTS 下它只在 coordinator 从 GAQ 取出 job 时更新（并行回放时没有"正在回放哪一条"的单一概念，取的是 GAQ 队头事务的时间戳）。
+
+**② `clock_diff_with_master`——主从时钟差**。IO 线程每次连主库时，通过 `SELECT UNIX_TIMESTAMP()` 在主库会话里读主库时钟，再与从库本地时钟相减得到（`rpl_replica.cc` 的 `get_master_version_and_clock`）：
+
+```cpp
+mi->clock_diff_with_master =
+    (long)(time(nullptr) - strtoul(master_row[0], nullptr, 10));
+```
+
+它的存在是为了**抵消主从系统时钟不同步**——SBM 要算的是"主库视角下的延迟"，所以必须把主从时钟差减掉。若读时钟失败（如权限不足），置 0 并记 warning `ER_RPL_REPLICA_SECONDS_BEHIND_SOURCE_DUBIOUS`。
+
+**三个最容易踩的坑**（源码注释专门解释了每一个）：
+
+1. **负数归零**：`max(0L, time_diff)`。可能出负数的原因包括——主库本身是另一台主库的从库（时间领先）、主库有人 `SET TIMESTAMP`、或时间函数秒级粒度造成的 ±1 误差（注释给了个 `0-(2-1)=-1` 的精确例子）。归零是为了不吓到用户。
+2. **`last_master_timestamp == 0` 是"已追上"的哨兵**：0 对应 1970 这个"不可能"的时间戳，专门用来标记"考虑自己已经追平"。所以公式里 `last_master_timestamp ? ... : 0`——一旦是 0 直接报 0。
+3. **返回 NULL 不是"追平"而是"无法判断"**：SQL 线程没运行、或位点追平但 IO 线程断了，都返回 NULL。很多人把 NULL 当 0 看，其实语义相反——NULL 意味着"这个值此刻没有意义"。
+
+**由此得到的正确解读**：SBM 反映的是**纯 SQL 回放侧**的延迟（IO 拉取侧不直接体现在这个数里）。IO 严重落后但 SQL 追着 IO 跑时，SBM 可能显示 0（因为 SQL 处理的 relay log 都是刚拉到的、时间戳很新），而真实的"数据延迟"要看 IO 位点（`Relay_Log_Pos` vs `Read_Source_Log_Pos`）——这正是上面速查表里"两段延迟"要分开看的原因。
+
 ### 经典错误码速查
 
 > 错误码是复制的"体检报告"——`Last_IO_Errno` / `Last_SQL_Errno` 直接告诉你链路断在哪一段。本节按 IO 侧 / SQL 侧 / GTID 侧 / MTS 侧分类，错误码名称与消息均经 8.0.39 `share/messages_to_clients.txt` 核实；5.7 旧编号在 8.0 的改名/删除情况逐条标注。

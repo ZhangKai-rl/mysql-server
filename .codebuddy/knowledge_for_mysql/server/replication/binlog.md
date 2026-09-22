@@ -23,12 +23,13 @@
 - [Commit 阶段与 trx_no](#commit-阶段与-trx_no)
 - [Anonymous_Gtid](#anonymous_gtid)
 - [GTID 与 binlog 的持久化交互](#gtid-与-binlog-的持久化交互)
-- [Event 格式与 mysqlbinlog 解读](#event-格式与-mysqlbinlog-解读)
-- [事件二进制布局（字节级）](#事件二进制布局字节级)
+- [Event 格式速览](#event-格式速览)
+- [binlog 文件加密（binlog_encryption）](#binlog-文件加密binlog_encryption)
 - [Row Image 记录过程](#row-image-记录过程)
 - [binlog 事务压缩（binlog_transaction_compression）](#binlog-事务压缩binlog_transaction_compression)
 - [binlog 读侧：dump 线程（Binlog_sender）](#binlog-读侧dump-线程binlog_sender)
 - [半同步复制与 binlog 的衔接](#半同步复制与-binlog-的衔接)
+- [业界 binlog 优化方案（大事务 / 提交锁 / 传输）](#业界-binlog-优化方案大事务--提交锁--传输)
 - [参考](#参考)
 
 ---
@@ -191,6 +192,58 @@ class binlog_cache_mngr {
 
 `finalize()` 负责"event → IO_CACHE"（补 pending rows event、写 XID/COMMIT），`flush()` 负责"IO_CACHE → binlog 文件"。`do_write_cache()` 不重新解析事件，而是 `stream_copy()` 把 cache 字节流按页喂给 `Binlog_event_writer`，因此**一个事件跨多个 cache 页也能正确重组**。
 
+#### savepoint 级 / 语句级回退
+
+上面说 trx_cache 支持回退，但"回退"不是重放日志，而是**「字节截断 + 元数据快照恢复」**两个动作的组合。这是 binlog cache 最容易被误解的一层。
+
+**`cache_state_map` 的准确语义**：它是 `std::map<my_off_t, cache_state>`——key 是边界处的字节位置，value 是**元数据快照结构体**（不是"截断后长度"）：
+
+```cpp
+struct cache_state {
+  bool with_sbr, with_rbr, with_start, with_end, with_content;
+  size_t event_counter;
+};
+std::map<my_off_t, cache_state> cache_state_map;
+```
+
+为什么需要它：`truncate(pos)` 只能把底层 `IO_CACHE` 的写指针回拨到 `pos`（字节级截断），但 `flags.with_rbr/with_sbr/with_start/with_end` 和 `event_counter` 是"事务进行到当前位置"的**累积状态**，字节回退了这些标志不会自动回退。所以每次在边界打快照（`cache_state_checkpoint`），回退时按 `pos` 查 map 恢复（`cache_state_rollback`）。
+
+**两个回退粒度**（`binlog_trx_cache_data` 的成员）：
+
+- `m_cannot_rollback`（事务级）：一旦有"不能安全回退"的语句进入 trx_cache，置 true 后整个事务不可回退；
+- `before_stmt_pos`（语句级）：当前语句开始前的 cache 字节位置，用于单语句失败回退。
+
+**打快照与恢复**：
+
+```cpp
+void set_prev_position(my_off_t pos) {
+  before_stmt_pos = pos;
+  cache_state_checkpoint(before_stmt_pos);      // 打快照
+}
+void restore_savepoint(my_off_t pos) {
+  binlog_cache_data::truncate(pos);             // ① 字节截断
+  if (pos <= before_stmt_pos) before_stmt_pos = MY_OFF_T_UNDEF;
+  cache_state_rollback(pos);                    // ② 元标志恢复
+}
+```
+
+**savepoint 回退的核心分岔**（`binlog_savepoint_rollback`）：
+
+```cpp
+if (trans_cannot_safely_rollback(thd)) {
+  // 事务里改过非事务表（MyISAM），引擎侧已提交、无法回滚 → 不能截断 cache
+  // 只能把 "ROLLBACK TO SAVEPOINT `name`" 当一条语句写进 binlog，让从库重放对齐
+  ...写 Query_log_event("ROLLBACK TO SAVEPOINT ...")
+} else {
+  // 只有事务表 → 直接截断 cache + 恢复快照（引擎侧和 binlog 侧一起原子回退）
+  cache_mngr->trx_cache.restore_savepoint(pos);
+}
+```
+
+这就是"事务表可回退、非事务表不可回退"的**代码落点**：非事务表（MyISAM）在引擎侧已经提交了、物理上无法回滚，binlog 不能截断，只能把 `ROLLBACK TO SAVEPOINT` 作为语句重放；只有纯事务表时才能直接 truncate。`truncate(THD*, bool all)` 的 `all` 参数区分两种：`all=true` 滚回 0（整事务回退），`all=false` 滚回 `before_stmt_pos`（单语句回退）。
+
+**语句级回退**走同一条链：单条语句执行失败 → `binlog_stmt_rollback` → 用 `before_stmt_pos` 截断到语句开始前。而 `stmt_cache`（非事务缓存）没有这套回退机制——它只按语句清空，不做字节级 truncate，因为非事务表的 binlog 一经产生就不能丢。
+
 ### 事件序列化：三段式 + 流式 CRC32
 
 ```c
@@ -231,6 +284,49 @@ int MYSQL_BIN_LOG::new_file_impl(...) {
 轮转 = "写 ROTATE 到旧文件尾 → flush → 关旧 → 开新 → 追加 index 行"。两处屏障的意义：**等 `prep_xids==0`** 防止原子 DDL 的 binlog 与引擎状态在文件边界撕裂；**`ha_flush_logs`** 保证轮转时引擎侧已持久化。
 
 **purge 的优先级**：`binlog_expire_logs_seconds` **优先于** `expire_logs_days`——只要前者 > 0 后者被完全忽略（8.0 里设 seconds 时 days 会被置 0）。`purge_logs()` 按文件名边界删，`purge_logs_before_date()` 按 mtime 删；都跳过当前活跃文件与被 dump 线程占用的文件。
+
+#### purge 的触发点（一个常见误解）
+
+**8.0.39 没有独立的 purge 后台线程**（`Purge_controller` / `Binlog_background_thread` 这类符号在官方 8.0 源码里 grep 不到，是早期开发分支或某些 fork 的实现）。自动 purge 只在**两个时机**触发（`sys_vars.cc` 里 `binlog_expire_logs_seconds` 的注释明确写 "Purges happen at startup and at binary log rotation."）：
+
+- **启动时**：`auto_purge_at_server_startup()`；
+- **rotate 时**：`FLUSH LOGS` / 正常轮转里调用 `auto_purge()`。
+
+两次都会先过两道闸门：
+
+```cpp
+check_auto_purge_conditions()   // ① opt_binlog_expire_logs_auto_purge 开关 && retention 已配置
+calculate_auto_purge_lower_time_bound()  // ② 算过期时间下界（seconds 优先于 days）
+```
+
+这意味着 `binlog_expire_logs_seconds` 不是"到点就删"，而是**下次 rotate（或重启）时**才真正执行清理——binlog 文件多、rotate 不频繁时，过期文件会滞留到下一次轮转。
+
+#### 手动 purge 的入口
+
+`PURGE BINARY LOGS TO 'x'` / `BEFORE 'datetime'` 走 `purge_source_logs_to_file` / `purge_source_logs_before_date`，两者都先拿 **Shared Backup Lock**（与在线备份 `LOCK INSTANCE FOR BACKUP` 互斥，防止备份途中 binlog 被删），再调用核心 `purge_logs`。注意本版本 purge **没有** `Purge_statement` 命令类（未做 `Sql_cmd_*` 对象化），直接走 `sql_parse.cc` 的分支执行。
+
+#### purge_logs 的核心逻辑（crash-safe 两阶段）
+
+```cpp
+int MYSQL_BIN_LOG::purge_logs(to_log, included, need_lock_index, ...) {
+  if (need_lock_index) lock_index();                    // LOCK_index
+  find_log_pos(&log_info, to_log);                       // 定位目标文件 → entry_index
+  no_of_log_files_to_purge = log_info.entry_index;       // 该文件之前的所有文件
+  open_purge_index_file(true);                           // ① 先写 .~rec~ 登记文件
+  // 从最旧开始遍历 index，逐个删
+  while (no_of_log_files_to_purge > 0) {
+    // ② 活跃文件(正在写) → break；被 dump 线程占用(log_in_use) → break
+    //    其余 → 从 index 移除 + 删物理文件
+  }
+  // ③ 全部完成后 close + 清 .~rec~ 登记文件
+}
+```
+
+**crash-safe 的关键**：purge 是两阶段事务式的——先在 `purge_index_file`（`.~rec~` 登记文件）记录"待删清单"，再更新 index 文件、最后删物理文件。中途崩溃后，下次启动能从 `.~rec~` 恢复，避免"index 已删但物理文件还在"或相反的不一致。
+
+**与 dump 线程的并发**：删除前检查 `log_in_use()`——若某个文件正被 dump 线程（`Binlog_sender`）读取，就 `break`，只删到它之前。手动 purge 时对活跃文件报 `ER_WARN_PURGE_LOG_IS_ACTIVE`、对被占用文件报 `ER_WARN_PURGE_LOG_IN_USE`（警告而非报错，说明"只 purge 到该文件之前"）。这是"清理不打断复制"的保证。
+
+**GTID 约束**：purge 后 `mysql.gtid_executed` 会重写，`Previous_gtids` 由 `Gtid_set::purge` 重算，见 [`gtid.md`](gtid.md)。
 
 **写失败的两种策略**（`binlog_error_action`）：
 
@@ -1505,265 +1601,53 @@ rotate → `new_file_impl()` → `open_binlog()`；注意**先补表再开新文
 | FLUSH 分配、COMMIT 才入 `executed_gtids` | leader 批量分配 | 少锁竞争；产生"已落 binlog 未入内存"窗口 ⇒ 必须启动扫描补表 |
 | purge 不校验落表 | 依赖"rotate 必先落表"不变式 | purge 路径简单；rotate 失败必须硬失败 |
 
-## Event 格式与 mysqlbinlog 解读
+## Event 格式速览
 
-### Event 边界
+> binlog 的最小数据单元是 event：`19 字节公共头 + post-header + body + 可选 4 字节 CRC32`。公共头里写着 event 类型、总长度、下一个 event 的位置。完整的 event 三层类体系、序列化/反序列化机制、checksum 协商、以及每个事件类型（control / statement / rows / load_data / XA）的字段级字节布局，已独立成篇：**[`binlog_event.md`](binlog_event.md)**。
 
-mysqlbinlog 输出中，每个 event 由三部分组成：
+### mysqlbinlog 解读速查
+
+mysqlbinlog 输出中每个 event 由三行组成，`# at` 是分隔符：
 
 ```
-# at <offset>                    ← event 起始：字节偏移
-#<时间> server id <id>  end_log_pos <pos> CRC32 <crc>  <EventType> <详情>  ← event 头
-<event 内容>                     ← event 体（SQL/SET 语句等）
+# at 157                          ← event 起始字节偏移
+#260703 15:17:04 server id 1  end_log_pos 236  CRC32 0x...  GTID last_committed=0 sequence_number=1
+<event 内容>                       ← 两个 # at 之间属于同一个 event
 ```
-
-`# at` 就是 event 的分隔符。遇到下一个 `# at` 意味着上一个 event 结束。两个 `# at` 之间的所有内容属于同一个 event。
-
-### 关键字段
-
-| 字段 | 含义 |
-|------|------|
-| `# at 157` | event 在 binlog 文件中的起始字节偏移 |
-| `260703 15:17:04` | event 的时间戳 |
-| `server id 1` | 生成该 event 的服务器 id |
-| `end_log_pos 236` | event 结束位置 = 下一个 event 的起始位置（236-157=79 字节是 event 长度） |
-| `CRC32 0x...` | 校验和 |
-| `GTID` / `Query` / `Start` | event 类型 |
-| `last_committed=0 sequence_number=1` | MTS 逻辑时钟依赖信息（仅 GTID event 有） |
-
-### mysqlbinlog 显示名与内部类型对照
 
 | mysqlbinlog 显示 | 内部 event 类型 | type code |
 |---|---|---|
 | `Start:` | `FORMAT_DESCRIPTION_EVENT` | 15 |
 | `Previous-GTIDs` | `PREVIOUS_GTIDS_LOG_EVENT` | 35 |
-| `GTID` | `GTID_LOG_EVENT` | 33 |
-| `Anonymous_GTID` | `ANONYMOUS_GTID_LOG_EVENT` | 34 |
+| `GTID` / `Anonymous_GTID` | `GTID_LOG_EVENT` / `ANONYMOUS_GTID_LOG_EVENT` | 33 / 34 |
 | `Query` | `QUERY_EVENT` | 2 |
 | `Table_map` | `TABLE_MAP_EVENT` | 19 |
-| `Update_rows` / `Write_rows` / `Delete_rows` | `ROWS_EVENT` | 23/24/25 |
+| `Update_rows` / `Write_rows` / `Delete_rows` | `ROWS_EVENT` | 31/30/32 |
 | `Xid` | `XID_EVENT` | 16 |
 | `Rotate` | `ROTATE_EVENT` | 4 |
 
-### 常用参数
+调试常用：
 
 ```bash
-# 解码行事件，显示每个字段的具体值（调试最有用）
-mysqlbinlog --base64-output=DECODE-ROWS -vv binlog_file
-
-# 显示十六进制 dump（调试 event 头部）
-mysqlbinlog --hexdump binlog_file
+mysqlbinlog --base64-output=DECODE-ROWS -vv binlog_file   # 解码行事件字段值
+mysqlbinlog --hexdump binlog_file                          # 十六进制 dump 头部
 ```
 
-### 一个事务的 event 组成
-
-每个事务在 binlog 中由以下 event 序列组成：
-
-```
-Gtid_log_event (或 Anonymous_gtid_log_event)   ← 携带 GTID + sequence_number/last_committed
-Query_log_event ("BEGIN")                       ← 事务开始（可选，autocommit DDL 可能没有）
-... 行事件或语句事件 ...
-Xid_log_event 或 Query_log_event ("COMMIT")    ← 事务结束
-```
+一个事务的 event 序列：`Gtid(33)` → `Query "BEGIN"(2)` → `Table_map(19)` + `Rows(30/31/32)` → `Xid(16)`。每个事件的具体字节布局见 [`binlog_event.md`](binlog_event.md)。
 
 ---
 
-## 事件二进制布局（字节级）
+## binlog 文件加密（binlog_encryption）
 
-> 上面「Event 格式」节讲的是 mysqlbinlog 怎么读、字段叫什么；本节给**字节级布局**——每个字段在事件里的偏移、长度、字节序。所有多字节整数均为**小端**（`int2store/int4store/int8store`）。
-
-### 通用头 19 字节
+> **文件级**加密（8.0.14+，含 relay log），完整机制（两级密钥 / 512B TLV 文件头 / `Aes_ctr_cipher` 流密码 / keyring 轮换 + `reencrypt_logs` / 读侧透明解密）已独立成篇：**[`binlog_encryption.md`](binlog_encryption.md)**。此处只留最简速览：
 
 ```
-偏移(相对事件首字节)  长度  字段                      源码常量
-  0                   4    timestamp (when)         —（4 字节无符号秒）
-  4                   1    event_type               EVENT_TYPE_OFFSET
-  5                   4    server_id                SERVER_ID_OFFSET
-  9                   4    event_size               EVENT_LEN_OFFSET
- 13                   4    end_log_pos (log_pos)    LOG_POS_OFFSET
- 17                   2    flags                    FLAGS_OFFSET
- 19                  ...    post-header + body [+ 4 字节 crc32]
+  0    4   ENCRYPTION_MAGIC = 0xFD62696E   （对比 BINLOG_MAGIC = 0xFE62696E，差 1 字节）
+  4    1   version + TLV 字段（HEADER_SIZE = 512，尾部补 0）
+512   ─  加密数据区（AES-256-CTR）
 ```
 
-- `LOG_EVENT_HEADER_LEN 19U`（`LOG_EVENT_MINIMAL_HEADER_LEN` 同为 19：FD 与 ROTATE 强制只用这 19 字节）
-- ★ `event_size` = 19 + post-header + body **+ checksum**，**包含**尾部 4 字节 crc32
-- `end_log_pos` = 本事件结束后的文件偏移（同样含 checksum）；在 relay log 中保留的是**主库 binlog** 的偏移
-- flags 低位：`LOG_EVENT_BINLOG_IN_USE_F 0x1`、`LOG_EVENT_IGNORABLE_F 0x80`
-- 三段式：通用头（固定 19）→ post-header（**长度不固定，由 FD 的数组给出**）→ body（变长）→ [crc32 4]
-
-### FORMAT_DESCRIPTION_EVENT（type 15）
-
-`FORMAT_DESCRIPTION_HEADER_LEN = (2+50+4) + 1 + 41 = 98`
-
-```
-偏移(相对事件首字节)  长度  字段                       源码常量
- 19                   2    binlog_version (=4)        ST_BINLOG_VER_OFFSET + 19
- 21                  50    server_version[50],0补齐    ST_SERVER_VER_OFFSET(2)
- 71                   4    create_timestamp           ST_CREATED_OFFSET(52)
- 75                   1    header_length (=19)        ST_COMMON_HEADER_LEN_OFFSET(56)
- 76                  41    post_header_len[41]        （下标 i 对应 event_type = i+1）
-117                   1    checksum alg desc (A)
-118                   4    crc32 (V)
----  事件总长 = 19+98+1+4 = 122 字节
-```
-
-**post-header 长度数组**（`post_header_len[event_type - 1]`）：
-
-| event_type | 值 | 常量 |
-|---|---|---|
-| QUERY_EVENT(2) | 13 | `QUERY_HEADER_LEN = 4+4+1+2+2` |
-| ROTATE_EVENT(4) | 8 | `ROTATE_HEADER_LEN` |
-| FORMAT_DESCRIPTION_EVENT(15) | 98 | `FORMAT_DESCRIPTION_HEADER_LEN` |
-| XID_EVENT(16) | 0 | `XID_HEADER_LEN` |
-| TABLE_MAP_EVENT(19) | 8 | `TABLE_MAP_HEADER_LEN` |
-| WRITE/UPDATE/DELETE_ROWS_V1(23/24/25) | 8 | `ROWS_HEADER_LEN_V1` |
-| INCIDENT_EVENT(26) | 2 | `INCIDENT_HEADER_LEN` |
-| ROWS_QUERY_LOG_EVENT(29) | 0 | `IGNORABLE_HEADER_LEN` |
-| WRITE/UPDATE/DELETE_ROWS(30/31/32) | 10 | `ROWS_HEADER_LEN_V2` |
-| **GTID_LOG_EVENT(33) / ANONYMOUS(34)** | **42** | `Gtid_event::POST_HEADER_LENGTH` |
-| PREVIOUS_GTIDS_LOG_EVENT(35) | 0 | `IGNORABLE_HEADER_LEN` |
-| PARTIAL_UPDATE_ROWS_EVENT(39) | 10 | `ROWS_HEADER_LEN_V2` |
-| TRANSACTION_PAYLOAD_EVENT(40) | 声明为 40 | `TRANSACTION_PAYLOAD_HEADER_LEN = 0` |
-
-**为什么 FD 必须是第一个**：解析任何事件都要先知道"post-header 有多长"，而这个长度本身写在 FD 里——鸡生蛋。解法是 FD（及可能先到的 ROTATE）**保证只用 19 字节固定头**，且 `binlog_version` 位于永不变动的偏移；读出 FD 后拿到 `common_header_len` 与 41 项 `post_header_len[]`，后续事件才能定位边界。FD 还给出 `server_version`（决定有无 checksum）与尾部 1 字节校验算法描述符。
-
-### Gtid_log_event(33) / Anonymous_gtid_log_event(34)
-
-post-header **固定 42 字节**：
-
-```
-post-header（偏移相对 19）
-  0   1   GTID flags            FLAG_MAY_HAVE_SBR = 1（是否可能含 SBR）
-  1  16   uuid / SID            Uuid::BYTE_LENGTH
- 17   8   gno (int64)           GTID >=1；Anonymous 必须为 0
- 25   1   lt_type (=2)          LOGICAL_TIMESTAMP_TYPECODE
- 26   8   last_committed        int64
- 34   8   sequence_number       int64
-body（变长，5.7/8.0 逐步追加）
- 42   7   immediate_commit_timestamp（bit55 为标志位，1<<55）
- 49   7   original_commit_timestamp     ← 仅当 bit55 置位时存在
- --  1~9  transaction_length（net_store_length 变长编码）
- --   4   immediate_server_version（bit31 为标志位，1<<31）
- --   4   original_server_version       ← 仅当 bit31 置位时存在
- --   8   commit_group_ticket           ← 可选（BgcTicket）
-```
-
-★ 时间戳是 **7 字节**不是 8 字节——最高位（bit55）兼作"是否跟随 original 时间戳"的标志；`server_version` 同理用 bit31。这是"省字节 + 兼容旧版本"的取舍。
-
-### Query_log_event(2)
-
-post-header 13 字节（5.0 之前为 `QUERY_HEADER_MINIMAL_LEN = 11`，无 status_vars_length）：
-
-```
-  0   4   slave_proxy_id        Q_THREAD_ID_OFFSET（源码字段名仍保留 slave 字样）
-  4   4   execution_time        Q_EXEC_TIME_OFFSET
-  8   1   schema_length         Q_DB_LEN_OFFSET
-  9   2   error_code            Q_ERR_CODE_OFFSET
- 11   2   status_vars_length    Q_STATUS_VARS_LEN_OFFSET
- 13   n   status_vars           Q_DATA_OFFSET = QUERY_HEADER_LEN
- 13+n sl  schema（schema_length 字节 + 1 字节 0x00）
- ...  余  query（到事件尾，不含 crc）
-```
-
-`status_vars` 是 (1 字节 code + 值) 序列，按 code 递增写（`Q_FLAGS2_CODE`、`Q_SQL_MODE_CODE`、`Q_CATALOG_NZ_CODE`、`Q_AUTO_INCREMENT`、`Q_CHARSET_CODE`、`Q_TIME_ZONE_CODE`、`Q_MICROSECONDS`、`Q_XID`…）。
-
-### Table_map_log_event(19)
-
-```
-post-header（8）
-  0   6   table_id              TM_MAPID_OFFSET
-  6   2   flags                 TM_FLAGS_OFFSET
-body
-  var      schema_length（packed） + schema + 0x00
-  var      table_length（packed） + table + 0x00
-  var      column_count（packed）
-  var cc   column_types[column_count]（每列 1 字节）
-  var      metadata_length（packed） + metadata
-  var      null_bits（(cc+7)/8 字节）
-  var  余  optional_metadata（binlog_row_metadata，TLV：(type,length,value) 序列）
-```
-
-optional_metadata 类型含 `SIGNEDNESS=1`、`DEFAULT_CHARSET=2`、`COLUMN_CHARSET=3`、`COLUMN_NAME=4`、`SET_STR_VALUE=5`、`ENUM_STR_VALUE=6`、`GEOMETRY_TYPE=7`、`SIMPLE_PRIMARY_KEY=8`、`PRIMARY_KEY_WITH_PREFIX=9`、`ENUM_AND_SET_DEFAULT_CHARSET=10`、`ENUM_AND_SET_COLUMN_CHARSET=11`、`COLUMN_VISIBILITY=12`。
-
-### Rows_log_event（WRITE 30 / UPDATE 31 / DELETE 32 / PARTIAL_UPDATE 39）
-
-```
-post-header
-  0   6   table_id              ROWS_MAPID_OFFSET
-  6   2   flags                 ROWS_FLAGS_OFFSET
-  8   2   extra_data_len        ROWS_VHLEN_OFFSET   ← 仅 V2（post_header_len==10），含自身 2 字节
- 10   …   extra_data（extra_data_len-2 字节，(typecode,值) 块；NDB=0、PART=1）
-body
-  var      columns_count（packed，m_width）
-  var      columns-present bitmap1（BI，ceil(n/8) 字节）
-  var      columns-present bitmap2（AI）← 仅 UPDATE / UPDATE_V1 / PARTIAL_UPDATE
-  var      行数据（重复到事件尾）
-```
-
-- 每行 = `null bitmap（ceil(该镜像列数/8) 字节）` + 逐列值（**NULL 列不占值空间**）
-- UPDATE：先按 bitmap1 解 BI，再按 bitmap2 解 AI
-- `PARTIAL_UPDATE_ROWS_EVENT` 的 AI 前另有 `value_options（packed）+ partial bits（ceil(json列数/8)）`，用于 `binlog_row_value_options=PARTIAL_JSON`
-
-### 其余几个关键事件
-
-**Xid_log_event(16)**：post-header 为 0，body 就是 **8 字节 xid**（小端），随后 crc32。它是内部 2PC 的"commit 记录"。
-
-**Rotate_log_event(4)**：
-
-```
-post-header（8，已冻结）
-  0   8   first_log_file_position   R_POS_OFFSET
-body
-  8   余   new_log_ident（文件名，无长度前缀）      R_IDENT_OFFSET = 8
-```
-
-不需要长度字段：post-header 之后到 `event_size - checksum` 的**全部剩余字节**即文件名。
-
-**Previous_gtids_log_event(35)**：post-header = 0，body 是 `Gtid_set::encode()` 的输出：
-
-```
-  0   8   n_sids（uint8korr）
-  8   ─   重复 n_sids 次：
-          uuid(16) + n_intervals(8) + 重复 n_intervals 次：start(8) + end(8)
-                                      （int8store 定长，非 packed）
-```
-
-**Incident_log_event(26)**：post-header 2 字节 `incident_number`，body = `message_length(1) + message`（≤255）。
-
-### 校验和
-
-- `BINLOG_CHECKSUM_LEN 4`，位置是事件的**最后 4 字节**，且**在 `event_size` 之内**
-- 覆盖范围：`crc32(event_buf[0 .. event_size-4))` —— **含 19 字节通用头在内**的除自身外全部字节；边写边算，算法固定 zlib crc32
-- **FD 特例**：尾部恒为 `(A) 1 字节算法描述符 + (V) 4 字节 crc`，**即使 `binlog_checksum=OFF` 也占这 5 字节**（A=0 表示本文件其余事件无 checksum）
-
-### 压缩事件：Transaction_payload_event(40)
-
-`binlog_transaction_compression` 开启后，一个事务的所有事件被打成一个 payload：
-
-```
- 19   var   payload data header：(typecode, length, value) 三元组，全部 net_store_length 变长编码
-            typecode: 1 = OTW_PAYLOAD_SIZE_FIELD
-                      2 = OTW_PAYLOAD_COMPRESSION_TYPE_FIELD
-                      3 = OTW_PAYLOAD_UNCOMPRESSED_SIZE_FIELD
-                      0 = OTW_PAYLOAD_HEADER_END_MARK（仅 1 字节）
-  …   var   payload（压缩后的完整事件字节流，zstd frame）
-```
-
-compression type：`ZSTD = 0` / `NONE = 255`；`max_log_event_size = 1GB`。注意 FD 的 post-header 数组里该位填的是常量 40 而非 0，但解码器直接从 `common_header_len` 之后开始读三元组，**不使用** post_header_len，因此不影响编解码。
-
-### 加密：每文件一把数据密钥
-
-```
-  0    4   ENCRYPTION_MAGIC = 0xFD62696E   （对比 BINLOG_MAGIC = 0xFE62696E）
-  4    1   header version (=1)
-  5    ─   TLV 字段（总长 HEADER_SIZE = 512，尾部补 0）
-          type=1 KEY_ID
-          type=2 ENCRYPTED_FILE_PASSWORD（32 字节值）
-          type=3 IV_FOR_FILE_PASSWORD（16 字节值）
-512   ─  加密数据区（含被加密的 BINLOG_MAGIC），整文件要么全加密要么全不加密
-```
-
-**两级密钥**：`file password`（每文件 32 字节随机数）用 keyring 中的 *Replication Encryption Key* 以 **AES-256-CBC** 加密后存文件头；真正加密数据区用的是由 file password 生成的密钥，算法 **AES-256-CTR**。所以**每个 binlog/relay log 文件一把独立数据密钥**，轮换主密钥只需重新加密各文件头里的密码。
+**两级密钥**：`file password`（每文件 32 字节随机数）用 keyring 的 *Replication Encryption Key*（AES-256-CBC）加密后存文件头；数据区用 file password 派生的 file key（AES-256-CTR）加密。
 
 ## Row Image 记录过程
 
@@ -2207,28 +2091,19 @@ int Binlog_sender::wait_new_events(my_off_t log_pos) {
 
 ## 半同步复制与 binlog 的衔接
 
-> ⚠️ **命名勘误（8.0.39）**：类名**仍是旧名** `ReplSemiSyncBase` / `ReplSemiSyncMaster` / `ReplSemiSyncSlave`，**不存在** `ReplSemiSyncSource` 类；改名只发生在文件名/插件名/sysvar 名层面（CMake 同时产出 4 个插件，后两者由 `_old.cc` 在 `USE_OLD_SEMI_SYNC_TERMINOLOGY` 下 include 新文件编译而来，两组 sysvar 互斥）。另外 ★ `waitAfterSync` / `waitAfterCommit` **全仓 grep 0 命中**——两个埋点已合并进同一个 `commitTrx()`。
+> 半同步的**完整机制**（插件架构、`active_tranxs_` 事务等待、`commitTrx` 逐行、从库 ACK、`Ack_receiver` 线程、降级/恢复状态机、参数/状态变量全清单）已独立成篇：**[`semisync.md`](semisync.md)**。本节只保留「半同步如何挂到 binlog 提交流水线上」这一衔接视角。
 
-### 插件架构：四个 Delegate
+### 两种 wait point 在 BGC 流水线的精确埋点
 
-| Delegate | semisync 回调 | 服务器侧触发点 |
-|---|---|---|
-| `Trans_delegate` | `repl_semi_report_commit` / `_rollback` | `process_after_commit_stage_queue`（AFTER_COMMIT 埋点） |
-| `Binlog_storage_delegate` | `repl_semi_report_binlog_update`（after_flush）/ `_binlog_sync`（after_sync） | FLUSH 后；`call_after_sync_hook` |
-| `Binlog_transmit_delegate` | `repl_semi_binlog_dump_start/stop`、`reserve_header`、`before/after_send_event` | `Binlog_sender` 各处 |
-| `Binlog_relay_IO_delegate` | `repl_semi_slave_io_start/io_end/request_dump/read_event/queue_event` | IO 线程 |
-
-### 两种 wait point 的精确埋点
+半同步通过四个 delegate observer 挂到 server 钩子（详见 [`semisync.md`](semisync.md)「插件架构」），其中与提交流水线直接相关的是 `Binlog_storage_delegate`（after_flush/after_sync）和 `Trans_delegate`（after_commit）。两个等待埋点已合并进同一个 `commitTrx()`，由 `rpl_semi_sync_source_wait_point` 分流：
 
 ```cpp
-static int repl_semi_report_binlog_sync(..., const char *log_file, my_off_t log_pos) {
-  if (rpl_semi_sync_source_wait_point == WAIT_AFTER_SYNC)
-    return repl_semisync->commitTrx(log_file, log_pos);
+static int repl_semi_report_binlog_sync(...) {          // after_sync 钩子
+  if (wait_point == WAIT_AFTER_SYNC) return repl_semisync->commitTrx(log_file, log_pos);
   return 0;
 }
-static int repl_semi_report_commit(Trans_param *param) {
-  bool is_real_trans = param->flags & TRANS_IS_REAL_TRANS;
-  if (rpl_semi_sync_source_wait_point == WAIT_AFTER_COMMIT && is_real_trans && param->log_pos)
+static int repl_semi_report_commit(Trans_param *param) {  // after_commit 钩子
+  if (wait_point == WAIT_AFTER_COMMIT && is_real_trans && param->log_pos)
     return repl_semisync->commitTrx(param->log_file, param->log_pos);
   return 0;
 }
@@ -2238,9 +2113,9 @@ static int repl_semi_report_commit(Trans_param *param) {
 FLUSH   process_flush_stage_queue → flush_cache_to_file
         └─ after_flush → writeTranxInBinlog()   ← 登记位点进 active_tranxs_
 SYNC    sync_binlog_file(false)
-        change_stage(COMMIT_STAGE)   ← 拿到 LOCK_commit，尚未做引擎提交
+        change_stage(COMMIT_STAGE)
         ├─ ★ AFTER_SYNC 埋点：call_after_sync_hook → commitTrx()      【默认】
-        ├─ process_commit_stage_queue() → 引擎 ha_commit_low()，事务对其他会话可见
+        ├─ process_commit_stage_queue() → 引擎 ha_commit_low()
         change_stage(AFTER_COMMIT_STAGE)
         └─ ★ AFTER_COMMIT 埋点：process_after_commit_stage_queue → commitTrx()
         → signal_done() → finish_commit() → 客户端收到 OK
@@ -2248,112 +2123,119 @@ SYNC    sync_binlog_file(false)
 
 **崩溃语义差别**：
 
-- **AFTER_SYNC**（默认）：等待在引擎提交**之前**。主库在等待后、引擎提交前崩溃 ⇒ 事务在主库不存在（会被回滚），但 binlog 已落盘、从库已收到 ⇒ 需要人工处理，但**客户端从未收到过成功**
-- **AFTER_COMMIT**：等待在引擎提交**之后**、回 OK **之前**。此时事务已在主库可见、其他会话能读到；此刻崩溃且从库未收到 ⇒ 数据永久丢失，而**并发会话可能已读到这份即将丢失的数据并据此决策**（"幻读式"不一致）
-
-### `commitTrx`：等待与降级
-
-```cpp
-  lock();                                    // LOCK_binlog_
-  TranxNode *entry = nullptr;
-  if (active_tranxs_ != nullptr && trx_wait_binlog_name) {
-    entry = active_tranxs_->find_active_tranx_node(trx_wait_binlog_name, trx_wait_binlog_pos);
-    if (entry) thd_cond = &entry->cond;      // ★ 事务槽位自带的 cond
-  }
-  THD_ENTER_COND(nullptr, thd_cond, &LOCK_binlog_,
-                 &stage_waiting_for_semi_sync_ack_from_replica, &old_stage);
-  if (getMasterEnabled() && trx_wait_binlog_name) {
-    /* 计算绝对超时 wait_timeout_ 毫秒 */
-    while (is_on()) {
-      if (reply_file_name_inited_) {
-        if (ActiveTranx::compare(reply_file_name_, reply_file_pos_,
-                                 trx_wait_binlog_name, trx_wait_binlog_pos) >= 0)
-          break;                             // 从库已追上，无需等待
-      }
-      if (!entry) { is_semi_sync_trans = false; goto l_end; }  // 未开 semi → 视为异步
-      /* 维护 wait_file_* = 所有等待者中最小的位点 */
-      if (connection_events_loop_aborted() && 
-          (rpl_semi_sync_source_clients == rpl_semi_sync_source_wait_for_replica_count - 1) && is_on()) {
-        LogErr(WARNING_LEVEL, ER_SEMISYNC_FORCED_SHUTDOWN);
-        switch_off();                        // 强制降级，避免 shutdown 挂死
-        break;
-      }
-      rpl_semi_sync_source_wait_sessions++;
-      entry->n_waiters++;
-      wait_result = mysql_cond_timedwait(&entry->cond, &LOCK_binlog_, &abstime);
-      entry->n_waiters--;
-      if (wait_result != 0) {                // 真超时
-        rpl_semi_sync_source_wait_timeouts++;
-        switch_off();                        // ★ 降级为异步
-      } else { /* 统计 wait_time */ }
-    }
-  l_end:
-    if (is_on() && is_semi_sync_trans) rpl_semi_sync_source_yes_transactions++;  // yes_tx
-    else                              rpl_semi_sync_source_no_transactions++;    // no_tx
-  }
-  if (trx_wait_binlog_name && active_tranxs_ && entry && entry->n_waiters == 0)
-    active_tranxs_->clear_active_tranx_nodes(...);   // 最后一个等待者清理槽位
-```
-
-要点：
-
-- 等待对象是**事务自己的 `TranxNode::cond`**（不是全局 cond），`active_tranxs_` 是按 (file,pos) 有序的链表+哈希表；唤醒由 `signal_waiting_sessions_up_to(reply_file_pos_)` 沿链表**广播**所有位点 ≤ 已 ACK 位点的 node
-- ★ **超时不回滚**：`commitTrx` 不返回错误，事务照常提交，只是 `switch_off()` 把 `state_ = false` 并 `signal_waiting_sessions_all()`，本次计入 `no_tx`，`Rpl_semi_sync_source_status` 翻 OFF
-- 恢复 ON 靠 `try_switch_on()`：dump 线程发下一事件时若其位点 ≥ `commit_file_*` 说明从库已追上
-
-### 从库何时回 ACK
-
-```cpp
-static int repl_semi_slave_queue_event(Binlog_relay_IO_param *param, ...) {
-  if (rpl_semi_sync_replica_status && semi_sync_need_reply)
-    (void)repl_semisync->slaveReply(param->mysql, param->master_log_name, param->master_log_pos);
-  return 0;
-}
-```
-
-★ ACK 在 **`after_queue_event`** 里发，即**事件已写入 relay log 之后**，而非收到即回。`slaveReadSyncHeader` 剥掉 2 字节头（`kPacketMagicNum = 0xef`，`kPacketFlagSync = 0x01`）判断是否需要回复。
-
-源侧收 ACK 的是 **`Ack_receiver` 后台线程**（不是 dump 线程）：`Socket_listener` 轮询所有 semisync dump 的 vio → `reportReplyPacket` → `handleAck`。`wait_for_replica_count > 1` 时先塞进 `AckContainer`，凑够 N 个不同从库才上报**其中最小的**位点。
-
-```
- 客户端      ordered_commit        dump 线程        副本 IO 线程     Ack_receiver
-   │  COMMIT      │                   │                  │                │
-   ├─────────────►│ FLUSH: after_flush → writeTranxInBinlog()             │
-   │              │ SYNC              │                  │                │
-   │              │ ★ AFTER_SYNC: commitTrx() cond_timedwait ┐            │
-   │              │           send XID（before_send → sync 位置 1）◄┘      │
-   │              │                   ├─────────────────►│ queue_event     │
-   │              │                   │                  │ 写 relay log    │
-   │              │                   │◄─────────────────┤ slaveReply()    │
-   │              │                   │            net_flush ────────────►│
-   │              │      reportReplyBinlog() → signal_waiting_sessions_up_to()
-   │              │ 引擎 commit（AFTER_SYNC 语义）                         │
-   │◄─── OK ──────┤                   │                  │                │
-```
+- **AFTER_SYNC**（默认）：等待在引擎提交**之前**。主库等待后、引擎提交前崩溃 ⇒ 事务在主库被回滚，但 binlog 已落盘、从库已收到 ⇒ 客户端从未收到成功。
+- **AFTER_COMMIT**：等待在引擎提交**之后**、回 OK **之前**。事务已在主库可见，此刻崩溃且从库未收到 ⇒ 数据丢失，且并发会话可能已读到这份将丢的数据。
 
 ### 与 binlog 发送的交互
 
-- `transmit_start` 读会话变量 `rpl_semi_sync_replica` 判断对端是否 semisync，是则 `ack_receiver->add_slave()`、`clients++`、置 `set_observe_flag()`，并**乐观假设**该从库已收到其请求位点之前的所有事件、立即 `handleAck(server_id, log_file, log_pos)`
-- `reserve_header` 预留 2 字节 `{0xef, 0}`；`send_heartbeat_event_v2` 也走它，所以 HB 包同样带 semisync 头（sync 位为 0）
-- ★ `before_send_event` → `updateSyncHeader`：**只有该事件位点确实是一个活跃事务的结束位点**（`is_tranx_end_pos`）才置 sync 位——这就是"只对事务边界要 ACK"
-- `replication_sender_observe_commit_only=ON` 时 `Observe_transmission_guard` 只在 XID / XA_PREPARE / TRANSACTION_PAYLOAD / DDL-QUERY 上打开 observe，中间行事件完全不过 observer
-- `after_send_event` 中被跳过的区间走 `skipSlaveReply` → **源端单方面把跳过的位置算作已 ACK**，防止历史 GTID 拖住 `reply_file_pos_`
+半同步等待的是「从库 IO 线程已写 relay log」的 ACK，由 dump 线程发 binlog 时通过 `reserve_header`（预留 2 字节半同步头 `{0xef,0}`）+ `before_send_event`（`updateSyncHeader` 只对事务结束位点置 sync 位）驱动；ACK 由独立的 `Ack_receiver` 线程读取。`writeTranxInBinlog` 在 **after_flush**（`sync_binlog` 之前）登记位点，因此 **`sync_binlog=1` 是半同步"不丢"的前提之一**。完整细节见 [`semisync.md`](semisync.md)。
 
-### 边界：不保证 apply
+## 业界 binlog 优化方案（大事务 / 提交锁 / 传输）
 
-- 半同步只保证"至少一个从库的 **IO 线程收到并写入 relay log**"，**不保证 applier 已 apply**
-- ★ `writeTranxInBinlog` 在 **after_flush**（`sync_binlog` 之前）就登记位点。若 `sync_binlog != 1`，binlog 可能只在 OS cache，此时从库已 ACK 而主库掉电仍会丢 ⇒ **`sync_binlog=1` 是半同步"不丢"的前提之一**
-- `rpl_semi_sync_source_wait_no_replica` 默认 1：从库不足时**仍等满 timeout** 才降级；置 0 则立即 `switch_off()`
+> **边界说明**：本节讲的是**业界（腾讯云 / PolarDB / AliSQL / MariaDB / 鲲鹏 BoostDB）针对 binlog 性能痛点的自研优化**，**官方 8.0.39 原生代码里没有这些方案**。它们属于"别家分支 / 商业版"，事实来源是公开文档而非本仓库源码，故只记录**设计动机 + 方案原理 + 限制**，作为"他库对比 / 业界演进"的参考。但方案要解决的那三个串行瓶颈，在本仓库源码里都能精确对应到官方实现，已逐条标注官方落点。
 
-| 决策 | 实现 | 代价 / 收益 |
+### 三个串行瓶颈：业界优化的靶子
+
+官方 8.0 的 binlog 链路存在三个与大事务 / 高并发强相关的串行点，它们的共性都是「**一个慢事务 / 一个热锁，拖住所有无辜者**」：
+
+| # | 瓶颈 | 官方原生机制 | 对应本篇章节 | 业界解法 |
+|---|---|---|---|---|
+| 1 | 提交时 copy | cache 溢出到临时文件后，提交时 `stream_copy` 把 cache（含磁盘临时文件）搬回 binlog 文件，耗时 O(事务大小)，且持 `LOCK_log` 串行 | 「binlog cache」「Ordered Commit」 | rename 重定向 |
+| 2 | dump 串行传输 | dump 线程按 binlog 顺序单线程发事件，大事务长期占用，半同步下后续小事务等 ACK 被拖住 | 「读侧 dump 线程」「半同步」 | 执行期实时传输 |
+| 3 | BGC 锁误唤醒 | 三阶段 follower 共享等待，leader 广播唤醒所有等待者，跨阶段误唤醒 | 「Ordered Commit」 | 拆锁 |
+
+### 一、大事务提交优化：rename 代替 copy
+
+#### 痛点：为什么大事务提交会阻塞所有事务
+
+事务提交的标志是「提交成功」，而提交要等 binlog 落盘。官方链路里，一个事务执行期间把 binlog 事件写进自己的 binlog cache，cache 内存满后溢出到临时文件（`open_cached_file` 惰性建 `MLxxxx`）；**提交时**再由 `do_write_cache → stream_copy` 把 cache 字节流（含磁盘临时文件部分）搬进 binlog 文件。这一步有两个致命特征：
+
+1. **拷贝时间与事务 binlog 大小线性相关**：一个 100GB 的事务，提交时要把 100GB 从临时文件再 copy 一遍——数据其实早就写进磁盘了，只是"换个文件身份"，却要再读再写一次；
+2. **拷贝在 `LOCK_log` 串行临界区内**：binlog 文件要求同一时刻只能写一个事务（顺序追加），所以大事务 copy 期间，队列里后续所有事务（哪怕它们只有几十字节）都得排队。
+
+结果就是「**大事务提交 → 整个实例短时间不可写 → 慢 SQL、连接暴涨**」的经典稳定性事故。官方对它的唯一缓解是 `max_binlog_cache_size` 上限（超限直接 `ER_TRANS_CACHE_FULL` 报错），但那是"拒绝"，不是"优化"——合法的大事务照样会阻塞。
+
+#### 方案核心：binlog cache 已经是文件了，直接 rename
+
+优化的洞见非常直接：**binlog cache 溢出时，事件已经落到了磁盘临时文件里；提交时不需要把字节再 copy 一遍，只要把这个文件"改名"成 binlog 文件**。`rename` 是常量时间、与事务大小无关，`LOCK_log` 的持有时间从 O(事务大小) 降到微秒级。
+
+具体要做四件事：
+
+1. **临时文件要放在能 rename 的地方**：官方 cache 用的是系统临时文件（`tmpdir` 下的 `MLxxxx`），不能直接 rename 成数据目录里的正式 binlog 文件。所以方案在 binlog 目录下新建一个 `#binlog_cache_files` 目录，cache 溢出的文件改建成**普通文件**放这里（如 `ML_140413554102520`）。
+2. **文件头预留空间**：binlog 文件开头必须有 magic + `Format_description_event` + `Previous_gtids_event` + 事务的 `Gtid_event` 等头部事件，而 cache 文件里只有事务的 body 事件。所以在 cache 文件头部**预留固定空间**（按 4KB 对齐），提交时把头部事件写进去。
+3. **空洞填充**：头部事件实际占用通常不到 4KB，但 binlog 文件不允许有空洞。剩余空间用 **ignorable log event** 填充（或填充到 `Gtid_log_event` 尾部），保证文件字节连续、偏移自洽。写入 cache 时每个事件的 `log_pos` 要按「预留空间 + 偏移」重算。
+4. **提交时的原子切换**：先持久化 cache 文件（还没到 rename，不阻塞他人）→ 触发 rotate 关闭当前 binlog → 把新文件头部内容 copy 进预留空间 → 生成 `Gtid_event` → 删除刚 rotate 出来的空 binlog → 把 cache 文件 rename 成新 binlog 文件。rename 只在极短窗口内持 binlog 切换锁。
+
+#### 各家实现与触发参数
+
+| 厂商 | 开关 / 参数 | 触发阈值 | 备注 |
+|---|---|---|---|
+| 腾讯云 TXSQL | `txsql_non_blocking_binlog_threshold` | 默认 `UINT64_MAX`（关闭），可设 ≥ 134217728（128MB） | 事务 binlog 量 ≥ 阈值即启用，需工单申请 |
+| PolarDB MySQL | `loose_enable_large_trx_optimization` | — | 官方文档另有专章（`loose_enable_large_trx_optimization` 系列参数） |
+| AliSQL / MariaDB 11.x | 同类 rename 方案 | 参考 MariaDB-11.7 官方说明 | 与 PolarDB 思路同源 |
+
+#### 限制：两个硬约束
+
+优化不是无代价的，公开文档明确给出两条限制：
+
+1. **大事务所在 binlog 文件禁用 checksum**：因为从 cache 开始写到提交期间，`binlog_checksum` 相关参数可能变化，无法确定最终是否开 checksum，所以这个文件干脆不做校验。
+2. **下游不能走 DATABASE 并行复制**：禁止 `slave_parallel_workers > 0 && slave_parallel_type = 'DATABASE'`，只允许 `logical_clock`——因为 rename 生成的 binlog 文件在事件偏移 / GTID 布局上破坏了 DATABASE 模式按库分派的假设。
+
+这两条限制本身就很有信息量：它们暴露了「binlog 文件格式其实有两个隐含不变式——**checksum 全程可确定** 和 **事件偏移可被 DATABASE 模式按库切分**」——而 rename 方案为了换取「大事务不阻塞」，牺牲了这两个不变式。
+
+### 二、大事务传输优化：执行期实时传输
+
+#### 痛点：dump 线程被大事务独占
+
+上一节解决的是「落盘」问题，这一节解决的是「传输」问题。在半同步复制下，主库 dump 线程按 binlog 顺序**单线程**把事件发给从库，从库 IO 线程写 relay log 后回 ACK。如果一个事务的 binlog 是 2GB，dump 线程要连续发 2GB，期间：
+
+- 后续小事务虽然已经在 binlog 文件里了，但排在 2GB 之后，只能等；
+- 半同步下小事务的 `commitTrx` 在等自己的 ACK，而 ACK 要等 dump 线程发到自己——被大事务死死拖住；
+- 结果小事务 COMMIT 异常变长（实测可达秒级），直到半同步超时降级才恢复。
+
+**大事务把「落盘瓶颈」转嫁成了「传输瓶颈」**——rename 只解决了前者。
+
+#### 方案：把传输从"提交阶段"提前到"执行阶段"
+
+AliSQL 的思路与上一节一脉相承：**大事务的事件不要等提交时才发，而是在 DML 执行期间就边产生边发**。
+
+1. DML 执行期间，事务产生的 binlog 事件超过阈值时，把该事务注册为「大事务」；
+2. dump 线程维护一个「大事务列表」，除了正常从 binlog 文件发已提交事件外，**额外从大事务的 cache 临时文件里读事件、提前发往从库**；
+3. 大事务事件与 binlog 文件里的已提交事务事件**交替发送**，并对大事务传输**限流**——优先保证已提交事务的发送，不挤占正常提交的带宽；
+4. 从库 IO 线程收到大事务事件后，先存进临时文件 **Relay Log Cache**（还不是正式 relay log）；
+5. 大事务真正提交时，dump 只需把剩余事件发完、最后发一个 `Gtid_event`；从库收到 `Gtid_event` 确认事务完整后，把 Relay Log Cache 转正为正式 relay log。
+
+**异常处理**：大事务在主库回滚 → dump 发 `rollback`，从库销毁对应 Relay Log Cache；连接断开 / `STOP SLAVE` → 从库销毁所有 Relay Log Cache，重连后重来。支持多个大事务同时实时传输。
+
+#### 意义：RPO=0 不再怕大事务
+
+半同步常被用来做 RPO=0（零丢失）方案，但大事务是这个方案最脆的点——一出现大事务整个集群可能不可写，传统做法是让半同步退化为异步（牺牲一致性）。实时传输让大事务不再阻塞提交，**不需要退化为异步**，为 RPO=0 架构扫清了关键障碍。这也解释了为什么这个优化会出现在 AliSQL 里：RPO=0 是云数据库的高可用卖点，大事务是它的命门。
+
+### 三、提交锁优化：BGC 三阶段的锁拆分
+
+#### 痛点：跨阶段误唤醒
+
+BGC 三阶段（FLUSH / SYNC / COMMIT）里，follower 线程在进入 stage 失败后转入等待，由 leader 完成后广播唤醒。业界的观察是：**三阶段的 follower 共享同一把等待锁和条件变量**，当 COMMIT 阶段的 leader 提交成功做 `pthread_cond_broadcast` 时，FLUSH / SYNC 阶段的 follower 也会被一起唤醒，它们醒来发现"还轮不到我"，又 `pthread_cond_wait` 睡回去——这种**误唤醒**带来额外的系统调用开销和锁竞争，高并发下尤其明显。
+
+官方 8.0 其实已经做了一部分锁分离：`Commit_stage_manager` 用 5 个独立 `Mutex_queue`（FLUSH / SYNC / COMMIT / AFTER_COMMIT / COMMIT_ORDER_FLUSH），且入队用的 `m_queue_lock[]` 与阶段工作用的 `LOCK_log`/`LOCK_sync`/`LOCK_commit` 是**两套锁**（入队是短操作、阶段工作含 I/O，解耦后互不阻塞）。这是 5.6 → 5.7 → 8.0 一路优化的结果。
+
+#### 方案：把共享等待拆成按阶段的细粒度同步
+
+鲲鹏 BoostDB 的拆锁优化针对的是**上一段优化没解决的残留问题**——即 follower 的等待唤醒仍存在跨阶段广播。方案是把 FLUSH / SYNC / COMMIT 各阶段共用的锁和条件变量**拆开**，让不同阶段的 follower 等不同的同步原语，使 COMMIT 阶段的唤醒只影响真正该继续的线程，不再惊扰 FLUSH / SYNC 阶段的等待者。
+
+这属于**典型的"按阶段细化锁粒度"优化**：减少 `pthread_cond_broadcast` 的无效唤醒次数、降低多线程提交时的锁竞争与上下文切换。按鲲鹏公开数据，叠加 binlog 预分配、`writeset_history` 数据结构优化后，8C16G 容器下 Sysbench 只写场景提升约 13%（测试对象为 Percona Server 5.7.44）。
+
+> 需要强调：这个数字和方案是**鲲鹏针对 Percona 5.7 分支**的，不代表官方 8.0 的现状——官方 8.0 的 `Commit_stage_manager` 已经是独立队列 + 双锁分离的设计。把它记在这里的价值在于：它揭示了「BGC 锁演进的下一步方向」——**按阶段拆分等待条件**，是官方未来也可能走的路。
+
+### 小结：三个优化的共性
+
+| 优化 | 本质 | 牺牲的不变式 |
 |---|---|---|
-| 插件 + Delegate observer | 4 个 `*_delegate` + `RUN_HOOK` | 解耦；每事件多一次 observer 遍历，故有 `observe_commit_only` |
-| 两埋点合并进单一 `commitTrx` | 由 `wait_point` 在 hook 入口分流 | 逻辑集中，语义靠调用方保证 |
-| 每事务一个 `TranxNode::cond` | `TranxNodeAllocator` 池化 | 唤醒精确、避免惊群；需 `n_waiters` 引用计数做清理 |
-| ACK 读取独立成 `Ack_receiver` 线程 | dump 线程 `readSlaveReply` 只 flush | dump 线程不被单从库阻塞，支持多从库并发 ACK |
-| 超时只降级不回滚 | `switch_off()` + `signal_waiting_sessions_all()` | 可用性优先；计入 `no_tx`，status 翻 OFF |
-| 恢复 ON 靠"推断从库追上" | `updateSyncHeader` 比对 `commit_file_*` | 无需额外协议；时机是启发式的，可能滞后一个事件 |
-| 跳过区间视为已 ACK | `skipSlaveReply` → `handleAck` | 防止旧 GTID 拖住 `reply_file_pos_` |
+| rename 重定向 | 把「提交时 copy」换成「执行期已落盘 + 常量时间 rename」 | checksum 全程可确定、事件偏移可被 DATABASE 模式切分 |
+| 实时传输 | 把「提交期传输」换成「执行期边产生边发」 | dump 严格按序、事件流与文件字节一一对应 |
+| 拆锁 | 把「全局广播」换成「按阶段定向唤醒」 | （无一致性问题，纯同步原语粒度） |
+
+它们的共同设计哲学是：**把长尾操作从"串行临界区"里挪出去**——落盘挪到执行期（rename）、传输挪到执行期（实时）、唤醒按阶段隔离（拆锁）。这也是理解 binlog 性能优化的主线：瓶颈从来不在"写入本身"，而在"写入被迫与某个长事务/热锁绑在一起"。
 
 ## 参考
 
@@ -2369,10 +2251,20 @@ static int repl_semi_slave_queue_event(Binlog_relay_IO_param *param, ...) {
 - WL#9175 / WL#7743 / WL#9536：原子 DDL 与 2PC（crash-recovery、`ddl_xid` 机制），见 `sql/log_event.h` `is_sql_command_atomic_ddl` 与 `sql/binlog/recovery.cc` 内注释
 - binlog 事务压缩（8.0.20，zstd，`Transaction_payload_log_event`）见 MySQL 8.0.20 Release Notes
 
+**业界优化方案（非官方，见「业界 binlog 优化方案」章）**
+
+- 腾讯云 MySQL「大事务提交 binlog 优化」：`txsql_non_blocking_binlog_threshold` 参数（cloud.tencent.com/document/product/236/127571）
+- PolarDB MySQL「Binlog 大事务优化」：`loose_enable_large_trx_optimization`（墨天轮《PolarDB MySQL版Binlog大事务优化方案》）
+- 宋立兵《MySQL 大事务提交优化》/《MySQL 大事务的 Binlog 传输优化》（AliSQL rename 方案与执行期实时传输）
+- 鲲鹏 BoostDB《MySQL Binlog拆锁优化 特性指南》（BGC 三阶段拆锁）
+
 **相关文档**
 
 - 2PC 引擎侧执行（prepare 五层逐行、undo 状态、外部 XA、崩溃恢复三幕）见 [`../../innodb/trx.md`](../../innodb/trx.md)
 - 原子 DDL 的**引擎侧** DDL log / `mysql.innodb_ddl_log` / 提交后 replay 见 [`../../innodb/ddl.md`](../../innodb/ddl.md)（本篇只覆盖 binlog/server 侧的 `ddl_xid` 协调）
+- **event 的三层类体系 / 序列化 / checksum / 各事件字节格式**见 [`binlog_event.md`](binlog_event.md)（本篇只留「Event 格式速览」）
+- **SBR 语句级复制**（`binlog_format` 三态 / unsafe 判定 / MIXED 降级 / 上下文事件）见 [`binlog_sbr.md`](binlog_sbr.md)
+- **binlog 文件加密**（两级密钥 / keyring 轮换 / `reencrypt_logs`）见 [`binlog_encryption.md`](binlog_encryption.md)
 - GTID 的三条持久化路径见 [`gtid.md`](gtid.md)
 - **MTS 依赖追踪**（`sequence_number` / `last_committed` 怎么算、三种模式、从库如何消费）见 [`prpl.md`](prpl.md)（本篇只覆盖"写进 binlog"这一段）
 - 复制拓扑与故障转移见 [`replication.md`](replication.md)；GTID 见 [`gtid.md`](gtid.md)
