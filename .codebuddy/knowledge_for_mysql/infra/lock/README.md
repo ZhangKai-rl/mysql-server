@@ -208,12 +208,12 @@ InnoDB 旁支（不挂主干的独立原语）：
 | **purge** | `purge_sys_pq_mutex`、`trx_purge_latch`（rwlock） | `innodb/undo_log.md` |
 | **fil / 表空间** | ★ `fil_system_mutex` + 68 个 `Fil_shard::mutex`、per-space `fil_space_latch`（rwlock）、`file_open_mutex` | `innodb/io.md` |
 | **AIO 子系统** | `os_aio_array::m_mutex`（每个 AIO 数组的槽位保护，"the mutex protecting the aio array"，`os0file.cc:715`） | `innodb/io.md` |
-| **★ 索引树锁（"索引锁"）** | `dict_index_t::lock`（`dict0mem.h:1266`，`rw_lock_t`，**每个索引一把**，创建于 `dict0dict.cc:2561` 的 `rw_lock_create(index_tree_rw_lock_key, ..., LATCH_ID_INDEX_TREE)`）——B-tree 搜索持 S、修改（`BTR_MODIFY_LEAF`）持 X、页分裂 SMO 用 SX；保护的是**索引这个内存结构**（树高/分裂/合并），不是记录 | `innodb/btr.md` |
-| **AHI** | `btr_search_latch`（AHI 分片 rwlock）、`ahi_enabled_mutex` | `innodb/ahi.md` |
+| **★ 索引树锁（"索引锁"）** | `dict_index_t::lock`（`dict0mem.h:1266`，`rw_lock_t`，**每个索引一把**，创建于 `dict0dict.cc:2561` 的 `rw_lock_create(index_tree_rw_lock_key, ..., LATCH_ID_INDEX_TREE)`）——B-tree 搜索持 S、修改（`BTR_MODIFY_LEAF`）持 X、页分裂 SMO 用 SX；保护的是**索引这个内存结构**（树高/分裂/合并），不是记录 | `index/btr.md` |
+| **AHI** | `btr_search_latch`（AHI 分片 rwlock）、`ahi_enabled_mutex` | `index/ahi.md` |
 | **dict / DD 引擎侧** | `dict_sys_mutex`、`dict_table_mutex`、`dict_persist_dirty_tables`、`dict_table_stats`（rwlock）、`index_online_log`（online DDL row log） | `innodb/dd.md` |
 | **dblwr** | `dblwr_mutex` | `innodb/dblwr.md` |
 | **FTS** | `fts_bg_threads`/`fts_delete`/`fts_optimize`/`fts_doc_id`/`fts_pll_tokenize` + `fts_cache_rw_lock`/`fts_cache_init_rw_lock` | `innodb/fts.md` |
-| **change buffer** | `ibuf_mutex`、`ibuf_bitmap`、`ibuf_pessimistic_insert` | `innodb/ibuf.md` |
+| **change buffer** | `ibuf_mutex`、`ibuf_bitmap`、`ibuf_pessimistic_insert` | `index/ibuf.md` |
 | **undo/rseg** | `undo_spaces_lock`（rwlock）、`rsegs_lock`（rwlock）、`trx_sys_rseg`、`undo_space_rseg`、`temp_space_rseg` | `innodb/undo_log.md` |
 | **autoinc** | `autoinc_mutex`、`autoinc_persisted_mutex`、`ddl_autoinc_mutex` | `feat/auto_increment.md` |
 | **恢复（recv）** | `recv_sys_mutex`、`recv_writer_mutex` | `innodb/recovery.md` |

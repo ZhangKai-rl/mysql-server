@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。GIS 是**两个独立子系统**的组合：① 几何值的存储（自研 SRID+WKB 二进制）+ R-Tree 空间索引（InnoDB 层）；② GeoJSON 只是几何值的**外部文本交换格式**（复用 JSON 解析器）。
 >
-> **边界**：R-Tree 空间索引使用的**谓词锁**（`LOCK_PREDICATE` / `LOCK_PRDT_PAGE`）第一主语是"锁"，已在 [`../../lock/transactional/innodb_trx_lock.md`](../../lock/transactional/innodb_trx_lock.md)「谓词锁」节完整剖析，本篇不重复。
+> **边界**：R-Tree 空间索引使用的**谓词锁**（`LOCK_PREDICATE` / `LOCK_PRDT_PAGE`）第一主语是"锁"，已在 [`../../infra/lock/transactional/innodb_trx_lock.md`](../../infra/lock/transactional/innodb_trx_lock.md)「谓词锁」节完整剖析，本篇不重复。
 
 ## 目录
 
@@ -381,5 +381,5 @@ EXPLAIN SELECT * FROM t WHERE MBRContains(..., g);
 
 **相关文档**
 
-- [`../../lock/transactional/innodb_trx_lock.md`](../../lock/transactional/innodb_trx_lock.md) —— R-Tree 的谓词锁
+- [`../../infra/lock/transactional/innodb_trx_lock.md`](../../infra/lock/transactional/innodb_trx_lock.md) —— R-Tree 的谓词锁
 - [`json.md`](json.md) —— JSON 子系统（GeoJSON 复用其解析器）

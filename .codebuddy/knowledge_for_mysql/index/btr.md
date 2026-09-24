@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。剖析 InnoDB 索引 B-tree 的全套结构操作：游标搜索（`btr0cur`）、页面分裂/合并/根页管理（`btr0btr`）、持久游标（`btr0pcur`）、自适应哈希索引 AHI（`btr0sea`）、排序批量构建（`btr0load`）。
 >
-> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](physical/record.md)；latch 体系与行锁见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](redo_log.md)；undo 与 purge 见 [`undo_log.md`](undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](ddl.md)。
+> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](../innodb/row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](../innodb/physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](../innodb/physical/record.md)；latch 体系与行锁见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](../innodb/redo_log.md)；undo 与 purge 见 [`undo_log.md`](../innodb/undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](../innodb/physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](../innodb/ddl.md)。
 
 ## 目录
 
@@ -1321,6 +1321,10 @@ do {
 
 ### 索引锁：完整锁语义（intention / 叶子三兄弟 / SMO 预测）
 
+> **本节是"索引树锁"的权威出处**。索引相关的锁有两类，容易混淆：
+> - **索引树锁**（本节）：`dict_index_t::lock`，引擎**内部 latch**，保护树结构（高度/分裂/合并），是 B-tree 结构操作的伴生机制——正因如此它归本篇，不另立专篇；
+> - **索引记录上的事务锁**（record / gap / next-key、隐式锁转换、谓词锁）：保护数据行、由事务持有，见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)。
+
 btr 层的锁分三层：**index->lock**（整棵树的 rw-lock，S/SX/X）、**路径页锁**（非叶页，latch coupling）、**叶子页及兄弟页锁**（X/S）。8.0 的核心不变量是：**加锁顺序永远自顶向下、自左向右**。下面把 6 个锁辅助函数的完整源码逐一贴出。
 
 #### intention 解析：`btr_cur_get_and_clear_intention`
@@ -2558,7 +2562,7 @@ void btr_page_free(dict_index_t *index, buf_block_t *block, mtr_t *mtr) {
 
 - `btr_page_free` 与 `btr_page_free_low` 的分工：前者从页里读 level（普通索引页，level 有效），后者接受 level 参数（BLOB 外存页 level 是 `ULINT_UNDEFINED`，需显式传）——所以 LOB 页释放要直接调 `_low`。
 - **`buf_block_modify_clock_inc`**：页释放前递增修改时钟，让所有基于 `modify_clock` 的乐观机制（AHI 的乐观恢复、pcur 的 `restore_position`）立即失效——它们下次会走悲观重搜，不会用到已释放页的悬空指针。
-- 按 level 选段与分配完全对称；`fseg_free_page` 把碎片页直接还表空间、整 extent 全空则整 extent 归还（详见 [`physical/tablespace.md`](physical/tablespace.md)）。
+- 按 level 选段与分配完全对称；`fseg_free_page` 把碎片页直接还表空间、整 extent 全空则整 extent 归还（详见 [`physical/tablespace.md`](../innodb/physical/tablespace.md)）。
 - 释放后页仍 buffer-fixed 到 mtr_commit：同 mtr 内的其他步骤还可能引用这块 block，提前 unfix 会被并发复用。
 
 #### 整树释放：`btr_free_if_exists` 链
@@ -2700,11 +2704,11 @@ ulint btr_get_size(dict_index_t *index, ulint flag, mtr_t *mtr) {
 }
 ```
 
-逐行解释：页数不逐页遍历，而是读两个 fseg 的**保留页数**（含预留未用的 extent），O(1) 完成。所以 `DATA_FREE` 之类的碎片度量在 fsp 层（见 [`physical/tablespace.md`](physical/tablespace.md)），这里只是"段预留了多少页"。
+逐行解释：页数不逐页遍历，而是读两个 fseg 的**保留页数**（含预留未用的 extent），O(1) 完成。所以 `DATA_FREE` 之类的碎片度量在 fsp 层（见 [`physical/tablespace.md`](../innodb/physical/tablespace.md)），这里只是"段预留了多少页"。
 
 #### 校验族与 redo 解析端
 
-- **校验族**（诊断/`CHECK TABLE`）：`btr_validate_index` → `btr_validate_level`（逐层校验 node pointer 指向正确子页、兄弟链双向一致、记录有序）→ `btr_index_page_validate`/`btr_index_rec_validate`；`btr_check_node_ptr` 单点校验父 node pointer。`btr_sdi_create`/`btr_sdi_create_index` 建 SDI 索引（8.0 新特性，见 [`ddl.md`](ddl.md)）。
+- **校验族**（诊断/`CHECK TABLE`）：`btr_validate_index` → `btr_validate_level`（逐层校验 node pointer 指向正确子页、兄弟链双向一致、记录有序）→ `btr_index_page_validate`/`btr_index_rec_validate`；`btr_check_node_ptr` 单点校验父 node pointer。`btr_sdi_create`/`btr_sdi_create_index` 建 SDI 索引（8.0 新特性，见 [`ddl.md`](../innodb/ddl.md)）。
 - **redo 解析端**（崩溃恢复重放，与写端一一对应）：`btr_parse_page_reorganize`（MLOG_PAGE_REORGANIZE）、`btr_parse_set_min_rec_mark`（MLOG_REC_MIN_MARK）、`btr_cur_parse_update_in_place`（MLOG_REC_UPDATE_IN_PLACE）、`btr_cur_parse_del_mark_set_clust_rec`/`btr_cur_parse_del_mark_set_sec_rec`（delete-mark）。列表级搬移日志的解析在 page 层 `page_parse_delete_rec_list`。
 
 ---
@@ -2789,15 +2793,15 @@ ulint btr_get_size(dict_index_t *index, ulint flag, mtr_t *mtr) {
 > 注意：月报文章基于 8.0.13 及更早版本，其函数名/行号与 8.0.39 有出入（如 `btr_cur_latch_for_insert`、`btr_search_info_t` 已更名），本文所有函数名均以 8.0.39 源码为准。
 
 **相关文档**
-- 上游 SQL 层行读取主链（`row_search_mvcc`、行缓冲转换）见 [`row_search.md`](row_search.md)
-- 下游页结构（页头/目录槽/页内二分 `page_cur_search_with_match` 详情）见 [`physical/page_structure.md`](physical/page_structure.md)
-- 记录格式与 offsets（`rec_get_offsets`、node pointer 字段解析）见 [`physical/record.md`](physical/record.md)
+- 上游 SQL 层行读取主链（`row_search_mvcc`、行缓冲转换）见 [`row_search.md`](../innodb/row_search.md)
+- 下游页结构（页头/目录槽/页内二分 `page_cur_search_with_match` 详情）见 [`physical/page_structure.md`](../innodb/physical/page_structure.md)
+- 记录格式与 offsets（`rec_get_offsets`、node pointer 字段解析）见 [`physical/record.md`](../innodb/physical/record.md)
 - 行锁/间隙锁/latch 体系（`index->lock`、`lock_update_split_*` 的锁继承）见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)
-- mtr 与 redo 日志（`MLOG_LIST_*` 重放、`mtr_set_log_mode`）见 [`redo_log.md`](redo_log.md)
-- undo 与 purge（物理删除入口、delete-mark）见 [`undo_log.md`](undo_log.md)
-- LOB 外存字段（`lob::BtrContext`、extern 引用前缀）见 [`physical/lob.md`](physical/lob.md)
-- online DDL 与并行构建（`ddl::Loader`/`Builder` 驱动 `Btree_load` 的上下文）见 [`ddl.md`](ddl.md)
-- 可见性判断（`up_match/low_match` 供重复键检测、PAGE_MAX_TRX_ID）见 [`mvcc.md`](mvcc.md)
+- mtr 与 redo 日志（`MLOG_LIST_*` 重放、`mtr_set_log_mode`）见 [`redo_log.md`](../innodb/redo_log.md)
+- undo 与 purge（物理删除入口、delete-mark）见 [`undo_log.md`](../innodb/undo_log.md)
+- LOB 外存字段（`lob::BtrContext`、extern 引用前缀）见 [`physical/lob.md`](../innodb/physical/lob.md)
+- online DDL 与并行构建（`ddl::Loader`/`Builder` 驱动 `Btree_load` 的上下文）见 [`ddl.md`](../innodb/ddl.md)
+- 可见性判断（`up_match/low_match` 供重复键检测、PAGE_MAX_TRX_ID）见 [`mvcc.md`](../innodb/mvcc.md)
 
 
 

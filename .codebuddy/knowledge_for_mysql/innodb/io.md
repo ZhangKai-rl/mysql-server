@@ -1296,8 +1296,8 @@ fallocate(fh, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, len);
 | **`buf_wait_for_read` 没有任何 os_event** | 同上 | **"能拿到 S 锁"本身就是唤醒** |
 | **`buf_page_io_complete` 十步后处理 + 两层解压** | 同上 | os 层解密 / 解透明页压缩；buf 层解表压缩 / checksum / ibuf merge |
 | **读失败：重试 100 次才 fatal** | 同上 | `BUF_PAGE_READ_MAX_RETRIES = 100`；`srv_force_recovery >= 1` 会吞掉坏页 |
-| **change buffer（ibuf）** | [`ibuf.md`](ibuf.md) | 用延迟写换随机读；**云盘上收益更大**；"写完立刻读"的负载该关 |
-| **AHI（自适应哈希索引）** | [`ahi.md`](ahi.md) | 纯内存、零 I/O；只在叶子页；**每组只存一条**；分片按 (space_id, index_id) 路由故单索引热点仍争用 |
+| **change buffer（ibuf）** | [`ibuf.md`](../index/ibuf.md) | 用延迟写换随机读；**云盘上收益更大**；"写完立刻读"的负载该关 |
+| **AHI（自适应哈希索引）** | [`ahi.md`](../index/ahi.md) | 纯内存、零 I/O；只在叶子页；**每组只存一条**；分片按 (space_id, index_id) 路由故单索引热点仍争用 |
 | **两种预读（线性 / 随机）** | [`buffer_pool.md`](buffer_pool.md) | 另有 ibuf merge 批量读与恢复期区域预读；**SSD 上收益可变负** |
 | **并行扫描 `Parallel_reader`** | [`parallel_scan.md`](parallel_scan.md) | 只服务 DDL / 分区 / 直方图；**社区版无 SQL 层并行查询** |
 

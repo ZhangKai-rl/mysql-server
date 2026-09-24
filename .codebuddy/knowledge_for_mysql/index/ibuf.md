@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，核心文件 `storage/innobase/ibuf/ibuf0ibuf.cc` / `include/ibuf0ibuf.h`。涵盖：**为什么只缓存非唯一二级索引**（唯一性检查与"页不在 BP"的互斥）、**ibuf 树与 bitmap 的物理布局**、**插入路径的 14 条否决条件**、**合并路径的 8 条触发条件**、**redo 的真相**（ibuf 树走的是普通 B-tree redo）、**三级自我保护 contract**、**★ 为什么 purge/delete-mark 反而能缓存唯一索引**。
 
-> **边界**：本篇讲 **change buffer 本身**。Buffer Pool 的读页与预读见 [`buffer_pool.md`](buffer_pool.md)；二级索引的 B-tree 操作见 [`btr.md`](btr.md)；purge 与 undo 见 [`undo_log.md`](undo_log.md)；崩溃恢复见 [`recovery.md`](recovery.md)。
+> **边界**：本篇讲 **change buffer 本身**。Buffer Pool 的读页与预读见 [`buffer_pool.md`](../innodb/buffer_pool.md)；二级索引的 B-tree 操作见 [`btr.md`](btr.md)；purge 与 undo 见 [`undo_log.md`](../innodb/undo_log.md)；崩溃恢复见 [`recovery.md`](../innodb/recovery.md)。
 
 - [概述](#概述)
 - [理论基础](#理论基础)
@@ -502,7 +502,7 @@ loop:
 ```
 
 - **search_tuple = (space, page_no, counter=0xFFFF)**：ibuf 记录的排序键是 `(space, page_no, counter)`，counter 取最大值让 `PAGE_CUR_GE` 定位到**该页的第一条记录**（counter 0 才是最小键的下界）。
-- **★ 锁序伪装（本函数最精巧的并发设计）**：同一 mtr 里先 latch ibuf 树节点（锁序 `SYNC_IBUF_TREE_NODE`），又 latch 二级索引目标页（正常锁序 `SYNC_TREE_NODE`，**更高**）——latch level 数字越大层级越高、规则是"后拿的 ≤ 已持有的"（先高后低），拿 296（`SYNC_TREE_NODE`）时已持有 277（`SYNC_IBUF_TREE_NODE`）即违规。解法是把目标页**伪装成 ibuf 树节点**（`buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE)` 把它的 debug 锁级别降为 ibuf 树级，277 ≤ 277 合法；函数机制见 [buffer_pool.md](buffer_pool.md) 的「`buf_block_dbg_add_level`」节）。**合法性来自 io_fix**：block 处于 `io_fix_read`（异步读进行中），`buf_page_get` 对 io-fixed block 一律不许 latch（其他线程会等待或放弃），伪装期间不可能真的发生乱序并发。注释原话 "This should be OK, because buffered changes are applied immediately while the block is io-fixed"——**用"I/O 固定"的互斥性换锁序合法性**。
+- **★ 锁序伪装（本函数最精巧的并发设计）**：同一 mtr 里先 latch ibuf 树节点（锁序 `SYNC_IBUF_TREE_NODE`），又 latch 二级索引目标页（正常锁序 `SYNC_TREE_NODE`，**更高**）——latch level 数字越大层级越高、规则是"后拿的 ≤ 已持有的"（先高后低），拿 296（`SYNC_TREE_NODE`）时已持有 277（`SYNC_IBUF_TREE_NODE`）即违规。解法是把目标页**伪装成 ibuf 树节点**（`buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE)` 把它的 debug 锁级别降为 ibuf 树级，277 ≤ 277 合法；函数机制见 [buffer_pool.md](../innodb/buffer_pool.md) 的「`buf_block_dbg_add_level`」节）。**合法性来自 io_fix**：block 处于 `io_fix_read`（异步读进行中），`buf_page_get` 对 io-fixed block 一律不许 latch（其他线程会等待或放弃），伪装期间不可能真的发生乱序并发。注释原话 "This should be OK, because buffered changes are applied immediately while the block is io-fixed"——**用"I/O 固定"的互斥性换锁序合法性**。
 
 **阶段 3：主循环——逐条应用**：
 
@@ -637,11 +637,11 @@ merge 后页的空闲空间变了：清 `BUFFERED` 位（不再有缓存变更�
 
 `buf_read_ibuf_merge_pages` 用 `AIO_mode::IBUF`，**单独的 AIO 数组 + 单独的线程**。
 
-原因：ibuf merge 时要读入二级索引页。如果它和普通读抢同一批 AIO 槽位，可能出现**"所有槽位都被 ibuf merge 的读占满，而 ibuf merge 又在等这些读完成"的死锁**。单独一个 `s_ibuf` 数组把这个环切断（详见 [`io.md`](io.md) / [`fil.md`](fil.md)）。
+原因：ibuf merge 时要读入二级索引页。如果它和普通读抢同一批 AIO 槽位，可能出现**"所有槽位都被 ibuf merge 的读占满，而 ibuf merge 又在等这些读完成"的死锁**。单独一个 `s_ibuf` 数组把这个环切断（详见 [`io.md`](../innodb/io.md) / [`fil.md`](../innodb/fil.md)）。
 
 #### 4.5 ★ Bug#120698：`access_time` 不是可靠的 merge 门控
 
-> **边界**：本节省掉 buffer pool 侧（压缩页驱逐竞态窗口、`HASH_DELETE`/`HASH_INSERT`、`access_time` 继承）的完整分析见 [`buffer_pool.md`](buffer_pool.md)「压缩页驱逐与 change buffer 竞态」。本节只写 change buffer 侧的判据问题。
+> **边界**：本节省掉 buffer pool 侧（压缩页驱逐竞态窗口、`HASH_DELETE`/`HASH_INSERT`、`access_time` 继承）的完整分析见 [`buffer_pool.md`](../innodb/buffer_pool.md)「压缩页驱逐与 change buffer 竞态」。本节只写 change buffer 侧的判据问题。
 
 **缺陷**：压缩页解压路径 `Buf_fetch::zip_page_handler`（buf0buf.cc）用 `access_time != 0` 作为"跳过 merge"的判据：
 
@@ -831,13 +831,13 @@ ibuf_dummy_index_free(dummy_index);
   └─ 兜底侧：discarded operations——页/索引已被删除时，缓存操作被**丢弃**而非失败（SHOW ENGINE 的 discarded 计数）
 ```
 
-每层都是"无回退"约束的直接推论：缓存前悲观估算（预防）、判据用权威位（正确性）、mtr 原子（崩溃安全）、丢弃兜底（无法预防的终态）。对照 [buffer_pool.md](buffer_pool.md) 的"汇聚点模式"，这是另一种体系组织方式——**契约链**：从一条不可违反的约束倒推每个环节的设计。
+每层都是"无回退"约束的直接推论：缓存前悲观估算（预防）、判据用权威位（正确性）、mtr 原子（崩溃安全）、丢弃兜底（无法预防的终态）。对照 [buffer_pool.md](../innodb/buffer_pool.md) 的"汇聚点模式"，这是另一种体系组织方式——**契约链**：从一条不可违反的约束倒推每个环节的设计。
 
 #### ② 并发体系：资源分域切断死锁环
 
 普通读和 ibuf merge 读如果共用同一批 AIO 槽位：merge 发起的读占满全部槽位 → 这些读等待完成 → 完成回调才做 merge → 但 merge 又需要发新读 → **等待的读永远不完成**（机制详见「合并路径 → 为什么用 `AIO_mode::IBUF`」）。切断手段是**给 ibuf 单独一组 AIO 数组 + 独立线程**（`s_ibuf`）。
 
-这与 [buffer_pool.md](buffer_pool.md) 的"8 把 mutex 分工"、`flush_rbt` 的"恢复期专用结构"同属一种技法：**按使用场景给共享资源划独立的分域**，而不是无脑共用。代价是内存与线程的冗余，收益是彻底消除跨场景的相互阻塞。
+这与 [buffer_pool.md](../innodb/buffer_pool.md) 的"8 把 mutex 分工"、`flush_rbt` 的"恢复期专用结构"同属一种技法：**按使用场景给共享资源划独立的分域**，而不是无脑共用。代价是内存与线程的冗余，收益是彻底消除跨场景的相互阻塞。
 
 #### ③ 生命周期寄生：无专用 merge 线程
 
@@ -942,8 +942,8 @@ discarded operations:
 
 **相关文档**
 
-- Buffer Pool 读页与 `buf_page_io_complete`（merge 的调用点）：[`buffer_pool.md`](buffer_pool.md)
+- Buffer Pool 读页与 `buf_page_io_complete`（merge 的调用点）：[`buffer_pool.md`](../innodb/buffer_pool.md)
 - B-tree 与二级索引操作：[`btr.md`](btr.md)
-- purge 与 undo：[`undo_log.md`](undo_log.md)
-- 崩溃恢复：[`recovery.md`](recovery.md)
+- purge 与 undo：[`undo_log.md`](../innodb/undo_log.md)
+- 崩溃恢复：[`recovery.md`](../innodb/recovery.md)
 - 云盘为何放大 change buffer 的收益：[`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)

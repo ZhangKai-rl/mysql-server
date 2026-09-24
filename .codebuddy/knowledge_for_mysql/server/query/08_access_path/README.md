@@ -35,7 +35,7 @@ AccessPath 是**物理 IR**——它不再表达"用户要什么"，而是表达
 | **物理计划** | physical plan / 查询计划 / query plan / 执行计划 | AccessPath 树（④ 层） | "**怎么做**" |
 | **EXPLAIN 输出** | 执行计划的可视化 | AccessPath 树的可读呈现 | 上面的"怎么做"用树/表格画出来 |
 
-> 日常说的"看查询计划"、"EXPLAIN 看执行计划"，看的都是 **AccessPath 树**——它是优化器的最终产物，也是执行器的唯一输入。`06_postprocessing_explain.md` 讲"EXPLAIN 如何把这棵树打印出来"。
+> 日常说的"看查询计划"、"EXPLAIN 看执行计划"，看的都是 **AccessPath 树**——它是优化器的最终产物，也是执行器的唯一输入。`07_postprocessing_explain.md` 讲"EXPLAIN 如何把这棵树打印出来"。
 
 ### 为什么 AccessPath 是"纯数据结构"
 
@@ -76,7 +76,7 @@ AccessPath 是 8.0.20 起逐步引入、8.0.22 稳定的。深层动机是 **hyp
 | [03_set_operation.md](03_set_operation.md) | 构建（集合操作层）：`create_access_paths` 完整控制流、两种策略、`setup_materialize_set_op` | ✅ |
 | [04_factory_cost.md](04_factory_cost.md) | 工厂函数 + **cost/init_cost/init_once_cost 三字段语义** + `rescan_cost` 设计 | ✅ |
 | [05_parameterization.md](05_parameterization.md) | 参数化：`parameter_tables`（含 `RAND_TABLE_BIT` 哨兵）+ **四个谓词位图** + 内存复用 | ✅ |
-| [06_rowiterator.md](06_rowiterator.md) | 与 RowIterator 1:1：**显式栈翻译**（两阶段模式）、`NewIterator`、`count_examined_rows` 消费点 | ✅ |
+| [06_rowiterator.md](06_rowiterator.md) | ★ **AccessPath→RowIterator 翻译的唯一定位**（329 行，`09_executor_iterator` 第三章已并入此处）：1:1 映射、显式栈（为何不用递归）、两阶段与 `IteratorToBeCreated`、`NewIterator`+`count_examined_rows`、**batch mode 沿树传递**（★是监控埋点批量，非计算批量）、**翻译边界：什么被延迟什么没有**（★纠正"物化子查询惰性翻译"这一误传；真惰性在 `Query_expression` 根迭代器 / `SortingIterator` 结果迭代器 / 临时表 instantiate）、各 switch 分支要点、MATERIALIZE 特殊处理、EXPLAIN ANALYZE 的 `TimingIterator` 包装与翻译失败路径 | ✅ |
 | [07_postprocessing_explain.md](07_postprocessing_explain.md) | 后处理 + `WalkAccessPaths` 模板 + EXPLAIN 反解（`ExplainChild`） | ✅ |
 | [08_extension.md](08_extension.md) | 扩展指南：如何新增一个 AccessPath 类型（六处改动） | ✅ |
 | [09_finalize.md](09_finalize.md) | **最终化**：`FinalizePlanForQueryBlock` 逐段（合并 FILTER、延迟建表、Item 改写、聚合器设置、hypergraph 不支持 LIS） | ✅ |

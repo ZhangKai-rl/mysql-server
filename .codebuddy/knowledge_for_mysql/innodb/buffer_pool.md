@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 控制块状态机、LRU 中点替换、预读、脏页刷盘（page cleaner）、doublewrite、自适应刷脏。
 >
-> **边界**：本篇讲 buffer pool 内部机制，**含完整的脏页刷盘**（page cleaner 批次组织、锁契约、邻接刷盘、全量刷脏、用户线程单页刷）；redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)，**doublewrite 的完整实现见 [`dblwr.md`](dblwr.md)**，dblwr 之下的 I/O 原语与 AIO 见 [`io.md`](io.md)、文件层见 [`fil.md`](fil.md)，B-tree 页内操作见 [`btr.md`](btr.md)，AHI 见 [`ahi.md`](ahi.md)，崩溃恢复见 [`recovery.md`](recovery.md)。
+> **边界**：本篇讲 buffer pool 内部机制，**含完整的脏页刷盘**（page cleaner 批次组织、锁契约、邻接刷盘、全量刷脏、用户线程单页刷）；redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)，**doublewrite 的完整实现见 [`dblwr.md`](dblwr.md)**，dblwr 之下的 I/O 原语与 AIO 见 [`io.md`](io.md)、文件层见 [`fil.md`](fil.md)，B-tree 页内操作见 [`btr.md`](../index/btr.md)，AHI 见 [`ahi.md`](../index/ahi.md)，崩溃恢复见 [`recovery.md`](recovery.md)。
 
 ## 目录
 
@@ -900,7 +900,7 @@ switch (io_type) {
 
 #### change buffer：用延迟写换随机读 I/O
 
-> **★ 完整剖析见专篇 [`ibuf.md`](ibuf.md)**——为什么只缓存**非唯一二级索引**的 INSERT（"必须读页做唯一性检查"与"页不在 BP 才缓存"逻辑互斥；而**唯一索引的 delete-mark / purge 反而可以缓存**）、ibuf 树与 bitmap 的物理布局、记录格式（counter 保证时序）、插入路径的 14 条否决条件、合并的 8 条触发条件、三级自我保护 contract、参数与监控。
+> **★ 完整剖析见专篇 [`ibuf.md`](../index/ibuf.md)**——为什么只缓存**非唯一二级索引**的 INSERT（"必须读页做唯一性检查"与"页不在 BP 才缓存"逻辑互斥；而**唯一索引的 delete-mark / purge 反而可以缓存**）、ibuf 树与 bitmap 的物理布局、记录格式（counter 保证时序）、插入路径的 14 条否决条件、合并的 8 条触发条件、三级自我保护 contract、参数与监控。
 >
 > 本节只保留它与 **Buffer Pool 的接口**部分。
 
@@ -935,7 +935,7 @@ switch (io_type) {
 
 #### AHI：纯内存，零 I/O
 
-自适应哈希索引（`btr/btr0sea.cc`）在 B-tree 之上建内存哈希索引，**不产生任何文件 I/O**。它降低的是**逻辑读**（减少 B-tree 层数），从而**间接**减少物理读。8.0.30 起分片。完整机制（哈希键自适应算法、双门槛构建、探测验证、失效维护、锁协议）见 [`ahi.md`](ahi.md)。
+自适应哈希索引（`btr/btr0sea.cc`）在 B-tree 之上建内存哈希索引，**不产生任何文件 I/O**。它降低的是**逻辑读**（减少 B-tree 层数），从而**间接**减少物理读。8.0.30 起分片。完整机制（哈希键自适应算法、双门槛构建、探测验证、失效维护、锁协议）见 [`ahi.md`](../index/ahi.md)。
 
 ### LRU 替换与淘汰
 
@@ -968,7 +968,7 @@ void buf_LRU_make_block_young(buf_page_t *bpage) {
 
 > 腾讯提交、MySQL 官方确认仍存在于 8.0.44/9.7.1 的缺陷。它就发生在上文「压缩页三态」的 `FILE_PAGE → ZIP_DIRTY` 转换路径上，**该转换的副作用（保留 `access_time`）正是缺陷载体**。
 >
-> **边界**：本节讲 buffer pool 侧（驱逐竞态窗口、`access_time` 继承）；change buffer 侧的判据问题（`IBUF_BITMAP_BUFFERED` 位才是权威）见 [`ibuf.md`](ibuf.md)「4.5 Bug#120698」。
+> **边界**：本节讲 buffer pool 侧（驱逐竞态窗口、`access_time` 继承）；change buffer 侧的判据问题（`IBUF_BITMAP_BUFFERED` 位才是权威）见 [`ibuf.md`](../index/ibuf.md)「4.5 Bug#120698」。
 
 **现象**：`btr_check_sibling_boundary` 报 "last record on left page >= first record on right page"——B+tree 相邻页记录乱序，压缩表 + change buffer 场景下的静默数据损坏。
 
@@ -1908,7 +1908,7 @@ release 版是空宏（buf0buf.h）：`#define buf_block_dbg_add_level(block, le
 
 所以每次拿锁后必须按**当前用途**重新声明——这是"页锁是通用资源、锁序角色由上下文注入"的设计，与 `buf_page_t` 状态机"身份由 state 决定"同构。
 
-**最极端的用法是"伪装降级"**：ibuf merge 把普通二级索引页声明成 `SYNC_IBUF_TREE_NODE`（低于正常的 `SYNC_TREE_NODE`），使"先 ibuf 树后目标页"的拿锁顺序合法化；安全性靠 io_fix（io-fixed block 禁止其他线程 latch）保证——详见 [`ibuf.md`](ibuf.md) 的 merge 逐行解析。同理恢复期用 `SYNC_NO_ORDER_CHECK` 整体免检（见 [`recovery.md`](recovery.md)）。
+**最极端的用法是"伪装降级"**：ibuf merge 把普通二级索引页声明成 `SYNC_IBUF_TREE_NODE`（低于正常的 `SYNC_TREE_NODE`），使"先 ibuf 树后目标页"的拿锁顺序合法化；安全性靠 io_fix（io-fixed block 禁止其他线程 latch）保证——详见 [`ibuf.md`](../index/ibuf.md) 的 merge 逐行解析。同理恢复期用 `SYNC_NO_ORDER_CHECK` 整体免检（见 [`recovery.md`](recovery.md)）。
 
 ### 观测与调试
 
@@ -2338,5 +2338,5 @@ purge 删 secondary index 的 delete-marked 记录时，页若不在 buffer pool
 **相关文档**
 - 上游（buffer pool 谁调用）见 [`../server/handler.md`](../server/handler.md)（handler 取行下推到引擎）
 - redo 刷盘与 LSN 体系见 [`redo_log.md`](redo_log.md)；崩溃恢复（前滚/回滚）见 [`recovery.md`](recovery.md)
-- B-tree 页内操作与 AHI 见 [`btr.md`](btr.md)
+- B-tree 页内操作与 AHI 见 [`btr.md`](../index/btr.md)
 - 行读取主循环 `row_search_mvcc` 见 [`row_search.md`](row_search.md)

@@ -201,6 +201,7 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 | [10_dml.md](10_dml.md) | ⑤ DML 分支 | **DML 与 SELECT 的差异篇**（SELECT 是主链 02~09，不重复）：`Sql_cmd_dml` 类体系（SELECT 也继承它）、INSERT 的 `write_record` 链（不走迭代器）、UPDATE/DELETE 单表快路径 vs 多表迭代器、Halloween 问题与两阶段读、与 SELECT 在 read_set/write_set/ICP/覆盖索引的差异 |
 | [12_prepared_statement.md](12_prepared_statement.md) | ⑤' PS 路径（与主链并行） | **预编译语句**：`COM_STMT_*` 五命令与二进制协议（报文逐字段）、`Prepared_statement` 生命周期、**社区版无 plan cache 的证据链**（PS 只缓存语法树、每次 execute 重做 optimize）、`Item_param` 三套类型与 `const_for_execution`（为什么 prepare 期不能折叠 `?`）、reprepare 自动修复、执行链路到 InnoDB |
 | [13_item_expression.md](13_item_expression.md) | 横切（表达式层） | **Item 表达式体系**：为何 Item 既是 AST 又是执行节点（零转换 vs 状态分散的权衡）、**`type()`/`result_type()`/`data_type()` 三套类型**的分工、类型聚合与 unsigned 陷阱、**三阶段生命周期**（构造/`itemize`/`fix_fields`）、`walk`/`transform`/`compile` 改写机制、**`Item_sum` 聚合状态机**（simple vs distinct、`endup` 泵回、`COUNT(DISTINCT)` 的 O(1) 特例）、`Item_cache` 惰性求值、`Item_equal` 等价类、**为何无表达式 JIT** |
+| [14_sql_digest.md](14_sql_digest.md) | 横切（SQL 指纹） | **语句 digest（归一化 + 指纹）**：词法器边解析边收集 token 流（不是重写文本）→ SHA-256 得 32 字节 DIGEST → 重放出 DIGEST_TEXT；归一化精确规则（字面量→`?`、一元负号吸收二元保留、IN 折叠、NULL 二义性靠 yacc 补刀）；两条独立通道（token 流 vs `QT_NORMALIZED_FORMAT`）；PFS 以 `(schema, digest)` 聚合；与 SPM signature 是"同思想不同体系"（digest 不参与计划选择） |
 
 ### 横切内容（不占主链步骤）
 

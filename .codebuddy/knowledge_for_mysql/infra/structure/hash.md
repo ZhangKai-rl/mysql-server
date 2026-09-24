@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，盘点 MySQL 的**全部自研哈希实现**，并按设计维度糅合对照：server 无锁 `LF_HASH`（split-ordered list + hazard pointer）、InnoDB 无锁 `ut_lock_free_hash_t`（开放寻址 + 链表数组 + 引用计数）、InnoDB 有锁经典 `hash_table_t`（链地址法 + 分片 rw_lock）。三者回答同一个问题——"高并发下怎么维护一张全局字典"——却走了三条路：**论文方案 / 教科书方案 / 经典教科书**。核心结论：**通用性越强，理论原型越重；写越少，锁越少**。
 >
-> **边界**：本篇讲哈希容器本身（跨层数据结构，不属锁原语——分类见 [`../lock/README.md`](../lock/README.md)）。用户视角在别处详写：lock_sys（`rec_hash`/`prdt_hash` 及其 `locksys::Latches` 分片锁保护）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)，buffer pool `page_hash` 见 [`../../innodb/buffer_pool.md`](../../innodb/buffer_pool.md)，AHI 见 [`../../innodb/ahi.md`](../../innodb/ahi.md)，数据字典见 [`../../server/dd/dd.md`](../../server/dd/dd.md)；LF_HASH 的最大用户 MDL_map 见 [`../lock/transactional/mdl.md`](../lock/transactional/mdl.md)；读者无锁的 RCU（`MyRcuLock`）见 [`../lock/primitives/rcu.md`](../lock/primitives/rcu.md)；`mt_fast_modulo_t` 依赖的 `Seq_lock` 见 [`../lock/primitives/seq_lock.md`](../lock/primitives/seq_lock.md)。
+> **边界**：本篇讲哈希容器本身（跨层数据结构，不属锁原语——分类见 [`../lock/README.md`](../lock/README.md)）。用户视角在别处详写：lock_sys（`rec_hash`/`prdt_hash` 及其 `locksys::Latches` 分片锁保护）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)，buffer pool `page_hash` 见 [`../../innodb/buffer_pool.md`](../../innodb/buffer_pool.md)，AHI 见 [`../../index/ahi.md`](../../index/ahi.md)，数据字典见 [`../../server/dd/dd.md`](../../server/dd/dd.md)；LF_HASH 的最大用户 MDL_map 见 [`../lock/transactional/mdl.md`](../lock/transactional/mdl.md)；读者无锁的 RCU（`MyRcuLock`）见 [`../lock/primitives/rcu.md`](../lock/primitives/rcu.md)；`mt_fast_modulo_t` 依赖的 `Seq_lock` 见 [`../lock/primitives/seq_lock.md`](../lock/primitives/seq_lock.md)。
 
 ## 目录
 
@@ -867,7 +867,7 @@ key 合法转移：`UNUSED → 真实key`、`UNUSED → AVOID`（其余禁止）
 | buf_pool | `page_hash` | `page_id.hash()` | **唯一 SYNC_RW_LOCK**（`srv_n_page_hash_locks` 把分片锁，上限 `MAX_PAGE_HASH_LOCKS`） |
 | buf_pool | `zip_hash` | frame 索引 | SYNC_NONE + `zip_hash_mutex`（存 `buf_block_t*`，供 buddy allocator） |
 | dict_sys | `table_hash` / `table_id_hash` | 表名 hash / 表 id | SYNC_NONE + `dict_sys->mutex` |
-| AHI | `btr0sea.h` 的 `hash_table`（`adaptive=true`） | `(space,index,prefix)` 折叠 | SYNC_NONE + 8 个 part latch（全 nowait 哲学，见 [`../../innodb/ahi.md`](../../innodb/ahi.md)） |
+| AHI | `btr0sea.h` 的 `hash_table`（`adaptive=true`） | `(space,index,prefix)` 折叠 | SYNC_NONE + 8 个 part latch（全 nowait 哲学，见 [`../../index/ahi.md`](../../index/ahi.md)） |
 | `ha0storage` | 字符串去重存储 | 字符串 hash | SYNC_NONE（单线程启动期用） |
 
 **AHI 的查找路径**（`btr_search_guess_on_hash`，全 nowait 哲学）：`btr_search_s_lock_nowait(index)` 拿 part S 锁 → `ha_search_and_get_data` 查桶（沿 ha_node_t 链按 hash_value 匹配）→ `buf_block_from_ahi(rec)` 得块 → `buf_page_get_known_nowait` 固定块 → 释放 S 锁 → 验证 space/index_id 与 `btr_search_check_guess`。注释明确：S 锁期间 AHI 项不会被移除，因此块一定还在缓冲池。**哈希桶和 part latch 一起放在 cache line 上**（`search_part_t` 的 `alignas(INNODB_CACHE_LINE_SIZE)`）。AHI 的 `heap` 字段存 ha_node_t（`hash_get_heap` 有 `ut_ad(table->n_sync_obj == 0)`——heap 只允许出现在无锁模式）。
@@ -1041,6 +1041,6 @@ ut_lock_free_hash_t 用三个特殊 key + 三个特殊 val 把"空/删除/迁移
 
 **相关文档**
 - LF_HASH 最大用户 MDL_map 的用法（placement new 三回调、随机淘汰阈值 `unused > 1000 && > count*0.25`、LF_HASH 取代 5.6 分区的演进）见 [`../lock/transactional/mdl.md`](../lock/transactional/mdl.md)
-- `hash_table_t` 的用户视角：lock_sys（`rec_hash`/`prdt_hash` 及其 `locksys::Latches` 分片锁）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)；buffer pool `page_hash` 见 [`../../innodb/buffer_pool.md`](../../innodb/buffer_pool.md)；AHI 见 [`../../innodb/ahi.md`](../../innodb/ahi.md)
+- `hash_table_t` 的用户视角：lock_sys（`rec_hash`/`prdt_hash` 及其 `locksys::Latches` 分片锁）见 [`../lock/transactional/innodb_trx_lock.md`](../lock/transactional/innodb_trx_lock.md)；buffer pool `page_hash` 见 [`../../innodb/buffer_pool.md`](../../innodb/buffer_pool.md)；AHI 见 [`../../index/ahi.md`](../../index/ahi.md)
 - 同一问题的另一个方案 RCU（`MyRcuLock`，整体快照 + 读计数等零）见 [`../lock/primitives/rcu.md`](../lock/primitives/rcu.md)；`mt_fast_modulo_t` 依赖的 `Seq_lock` 见 [`../lock/primitives/seq_lock.md`](../lock/primitives/seq_lock.md)
 - 数据结构归属与全量清单见 [`../README.md`](../README.md)

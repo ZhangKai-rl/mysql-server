@@ -417,7 +417,7 @@ return (thd->lex->max_execution_time ? thd->lex->max_execution_time
 | hint | 状态 |
 |------|------|
 | `MAX_STATEMENT_TIME` | 5.7.7 旧名，8.0 **已彻底移除**（全库 0 匹配），用 `MAX_EXECUTION_TIME` 替代 |
-| `HASH_JOIN` / `NO_HASH_JOIN` | 枚举仍存在、语法器仍登记，但 **8.0.39 无任何代码消费**（grep `HASH_JOIN_HINT_ENUM` 无 `hint_table_state` 调用）。hash join 由 hypergraph 优化器按 `optimizer_switch hash_join` 决定，hint 基本不生效 |
+| `HASH_JOIN` / `NO_HASH_JOIN` | 枚举仍存在、语法器仍登记，但 **8.0.39 无任何代码消费**（grep `HASH_JOIN_HINT_ENUM` 无 `hint_table_state` 调用）。⚠️ 且**不是**"由 hypergraph 按 `optimizer_switch hash_join` 决定"——`OPTIMIZER_SWITCH_HASH_JOIN` 在 `sql/` 下只有常量定义与默认值两处、**无任何消费点**，两条优化器路径都不读它。开关与 hint 双双失效 |
 | 旧式 `USE INDEX`/`FORCE INDEX`/`IGNORE INDEX` | 不是 `/*+ */` optimizer hint；若新式 INDEX hint 生效会被跳过（`sql_resolver.cc:1220`） |
 
 ---

@@ -604,4 +604,4 @@ row_undo_mod (row0umod.cc:1272)
 
 ### 相关主题
 - 行内外置列标志（`dfield_t::ext`、20B BLOB ref）见 [`record.md`](record.md)
-- 溢出页在 btr 中的交互、LOB 与 purge 见 [`../btr.md`](../btr.md) 与 [`../undo_log.md`](../undo_log.md)
+- 溢出页在 btr 中的交互、LOB 与 purge 见 [`../btr.md`](../../index/btr.md) 与 [`../undo_log.md`](../undo_log.md)

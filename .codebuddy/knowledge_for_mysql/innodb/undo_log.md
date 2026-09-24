@@ -1618,7 +1618,7 @@ log_consumer_register(log, log_meb_consumer.get());
 - undo 页与 undo 记录本身受 redo 保护，见 [`redo_log.md`](redo_log.md)
 - 行记录中 `DB_ROLL_PTR` 字段的物理格式见 [`physical/record.md`](physical/record.md)；页结构通览见 [`physical/page_structure.md`](physical/page_structure.md)
 - fsp / segment / inode 的通用机制见 [`physical/tablespace.md`](physical/tablespace.md)
-- purge 删除索引记录的 B-tree 操作见 [`btr.md`](btr.md)
+- purge 删除索引记录的 B-tree 操作见 [`btr.md`](../index/btr.md)
 - purge 使用 buffer pool watch 的哨兵机制见 [`buffer_pool.md`](buffer_pool.md)
 - DDL 整体框架与 Online/INSTANT 见 [`ddl.md`](ddl.md)
 - undo header 中 GTID 的持久化路径见 [`../server/replication/gtid.md`](../server/replication/gtid.md)

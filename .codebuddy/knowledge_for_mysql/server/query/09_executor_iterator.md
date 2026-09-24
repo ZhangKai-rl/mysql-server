@@ -10,7 +10,7 @@
 - [零、定位与关键设计](#零定位与关键设计)
 - [一、RowIterator 基类与火山契约](#一rowiterator-基类与火山契约)
 - [二、迭代器逐个详解](#二迭代器逐个详解)
-- [三、CreateIteratorFromAccessPath：显式栈翻译](#三createiteratorfromaccesspath显式栈翻译)
+- [三、从 AccessPath 到 Iterator：翻译入口](#三从-accesspath-到-iterator翻译入口)（翻译机制详见 [`08_access_path/06_rowiterator`](08_access_path/06_rowiterator.md)）
 - [四、执行入口 ExecuteIteratorQuery](#四执行入口-executeiteratorquery)
 - [五、与 handler / InnoDB 的边界](#五与-handler--innodb-的边界)
 
@@ -606,7 +606,17 @@ bool LimitOffsetIterator::Init() {
 | BNL | 外层批量入 buffer，内层扫一遍 | 内层全表扫 O(N×M) → O(N+M)，**但 8.0 执行器已把它改写为 hash join** |
 | BKA | 外层批量收集 key → MRR 按 rowid 排序回表 | 批量随机 IO → 顺序 IO（`mrr_batch_size` 控制批大小） |
 
-**Hash Join 与 NLJ 的选择**（优化器侧）：hash join 适合**无索引的等值连接**（内层没索引时 NLJ 要全扫，hash join 建一次表只扫一遍）；有索引时 NLJ 的逐行 lookup 通常更便宜。优化器在 `setup_join_buffering`（`sql_optimizer.cc:3616`）决策，`OPTIMIZER_SWITCH_HASH_JOIN`（默认 ON，8.0.18+）控制。
+**Hash Join 与 NLJ 的选择**（优化器侧）：hash join 适合**无索引的等值连接**（内层没索引时 NLJ 要全扫，hash join 建一次表只扫一遍）；有索引时 NLJ 的逐行 lookup 通常更便宜。决策在 `setup_join_buffering`——它把内层表的 `op_type` 设为 `QEP_TAB::OT_BNL`，执行器侧再由 `UseHashJoin()` 据此转成 hash join。
+
+> ⚠️ **纠正：`hash_join` 开关在 8.0.39 已失效。** `OPTIMIZER_SWITCH_HASH_JOIN` 在整个 `sql/` 下**只有两处出现**——`sql_const.h` 的常量定义（`1ULL << 21`）与 `sys_vars.cc` 里 `optimizer_switch` 默认位掩码——**没有任何消费点**。经典优化器侧的实际判定就是一个结构体成员比较，完全不读开关：
+>
+> ```cpp
+> static bool UseHashJoin(QEP_TAB *qep_tab) {
+>   return qep_tab->op_type == QEP_TAB::OT_BNL;
+> }
+> ```
+>
+> hypergraph 优化器侧同样不读（直接由 `ProposeHashJoin` 提出候选）。所以"关掉 `hash_join` 退回 BNL"是**旧版本行为**，8.0.39 已不成立。同理 `HASH_JOIN` / `NO_HASH_JOIN` hint 也**无代码消费**（见 [`07_optimize/11_optimizer_hints.md`](07_optimize/11_optimizer_hints.md)）。
 
 **NestedLoopIterator**（`composite_iterators.cc:466`）—— **重点：NULL 补全**
 
@@ -894,81 +904,30 @@ int FollowTailIterator::Read() {
 
 ---
 
-## 三、CreateIteratorFromAccessPath：显式栈翻译
+## 三、从 AccessPath 到 Iterator：翻译入口
 
-`sql/join_optimizer/access_path.cc:379`。
+AccessPath 是"计划"（数据），RowIterator 是"执行"（行为），两者近乎 **1:1**，由 `CreateIteratorFromAccessPath` 桥接：
 
-### 3.1 为什么用显式栈而不是递归
+| AccessPath | RowIterator |
+|---|---|
+| `TABLE_SCAN` / `INDEX_SCAN` | `TableScanIterator` / `IndexScanIterator` |
+| `REF` / `REF_OR_NULL` / `EQ_REF` | `RefIterator` / `RefOrNullIterator` / `EQRefIterator` |
+| `INDEX_RANGE_SCAN` | `IndexRangeScanIterator` |
+| `NESTED_LOOP_JOIN` | `NestedLoopIterator` |
+| `HASH_JOIN` | `HashJoinIterator` |
+| `SORT` | `SortingIterator` |
+| `FILTER` | `FilterIterator` |
+| `MATERIALIZE` | `MaterializeIterator` |
+| `WINDOW` | `WindowIterator`（缓冲/非缓冲两型） |
+| ... | ... |
 
-源码注释给的理由：
+> ★ **翻译机制本身详见 [`08_access_path/06_rowiterator.md`](08_access_path/06_rowiterator.md)**：显式栈（为何不用递归）、两阶段、`IteratorToBeCreated`、各 AccessPath 类型的 switch 分支要点、batch mode 传递、惰性实例化、MATERIALIZE 的特殊处理、翻译失败路径。**本篇不重复**，只保留"计划↔执行 1:1"这个对照关系与下面两点。
 
-> *"The access path trees can be pretty deep, and the stack frames can be big on certain compilers/setups, so instead of explicit recursion, we push jobs onto a MEM_ROOT-backed stack."*
+两点与执行模型强相关、放在本篇讲：
 
-三个要点：
+**① 翻译发生在 optimize 末尾，不是优化期。** 计划（AccessPath）在优化期完整生成，执行树（RowIterator）到 `Query_expression::optimize` 才实例化——这就是"计划树一次性生成、执行树按需实例化"的分界。
 
-1. **栈帧太大**：AccessPath 树可以很深（复杂 join / 多层物化），递归有爆栈风险
-2. **用 MEM_ROOT 内存换栈空间**：`todo` 是 `Mem_root_array`，`children` 数组也直接分配在 MEM_ROOT 上——**即使 todo 扩容，`job.children` 地址也不变**（子迭代器的 `destination` 指针正指向它们）
-3. **两阶段模式**：第一次弹到某 job 时 `children.is_null()` → 分配 children、压回自己、压入所有子 job；等子 job 完成（它们的 `destination` 就是 `job.children[i]`）后再次弹到自己 → 真正构造
-
-```cpp
-struct IteratorToBeCreated {
-  AccessPath *path;
-  JOIN *join;
-  bool eligible_for_batch_mode;
-  unique_ptr_destroy_only<RowIterator> *destination;    // 结果写到哪里
-  Bounds_checked_array<unique_ptr_destroy_only<RowIterator>> children;
-};
-...
-while (!todo.empty()) {
-  IteratorToBeCreated job = todo.back();
-  todo.pop_back();
-  ...
-  switch (path->type) { ... }
-  path->iterator = iterator.get();          // :1192 反向指针
-  *job.destination = std::move(iterator);   // :1193 move 到父节点持有的槽位
-}
-```
-
-**创建顺序**：`SetupJobsForChildren` 把 **inner 先压、outer 后压**——栈是 LIFO，出栈顺序是 outer → inner，保证 "left before right"（物化路径的 invalidators 依赖此顺序）。
-
-### 3.2 关键 switch 分支
-
-| 类型 | 行号 | 要点 |
-|---|---|---|
-| `TABLE_SCAN` / `INDEX_SCAN` / `REF` | :423 / :429 / :442 | 按 `reverse` 选模板参数 |
-| `EQ_REF` | :462 | **不传 expected_rows**（至多一行，无需 record buffer） |
-| `INDEX_RANGE_SCAN` | :504 | geometry / reverse / 正序三种 |
-| `INDEX_MERGE` / `ROWID_INTERSECTION` / `ROWID_UNION` | :528 / :565 / :608 | 多子节点循环压栈 |
-| `NESTED_LOOP_JOIN` | :703 | `SetupJobsForChildren(outer, inner)` → `NestedLoopIterator(children[0], children[1], join_type, pfs_batch_mode)` |
-| `BKA_JOIN` | :728 | **特殊**：先在压子 job **之前**设置 `mrr_path->mrr().bka_path = path`，再从 `mrr_path->iterator->real_iterator()` 拿 `MultiRangeRowIterator*` |
-| `HASH_JOIN` | :751 | **build = inner（右）、probe = outer（左）** |
-| `FILTER` | :832 | 先 `FinalizeMaterializedSubqueries()` 再建 `FilterIterator` |
-| `SORT` | :846 | 创建后把 `SortingIterator*` 回填到 `filesort->tables[0]->sorting_iterator` |
-| `TEMPTABLE_AGGREGATE` | :886 | **两个子节点**：`children[0]=subquery`（batch mode=true）、`children[1]=table_path` |
-| `MATERIALIZE` | :943 | 见 3.4 |
-| `WINDOW` | :1065 | 按 `needs_buffering` 选缓冲/非缓冲 |
-| `DELETE_ROWS` / `UPDATE_ROWS` | :1153 / :1170 | **特殊**：压子 job **之前**先调 `SetUpTablesForDelete`/`FinalizeOptimizationForUpdate`（子迭代器构造需要看到最终 read set） |
-
-### 3.3 迭代器与 AccessPath 的 1:1
-
-```cpp
-// access_path.h:357
-/// If an iterator has been instantiated for this access path, points to the iterator.
-/// Used for constructing iterators that need to talk to each other
-/// (e.g. for recursive CTEs, or BKA join), and also for locating timing information.
-RowIterator *iterator = nullptr;
-```
-
-- **非拥有的裸指针**（所有权在父节点 children 数组里的 `unique_ptr_destroy_only`）。迭代器都分配在 MEM_ROOT 上、生命周期到查询结束，所以安全
-- **EXPLAIN ANALYZE 时是 `TimingIterator<T>*`**，取真实类型必须走 `real_iterator()`
-- **三个用途**：BKA 拿 `MultiRangeRowIterator`、MATERIALIZE 找 `FollowTailIterator`、EXPLAIN 取 profiler
-
-**`IteratorsAreNeeded()`**（`sql_optimizer.cc:11463`）：次级引擎若声明 `USE_EXTERNAL_EXECUTOR`（整体 offload），则**完全不建迭代器树**。
-
-### 3.4 MATERIALIZE 分支的特殊处理
-
-1. **子节点数是 N+1 且异构**：`children[0]` 是"物化后读临时表的迭代器"（必须是单表访问，有 assert 限定类型）；`children[1..N]` 是各 query block 的迭代器，且**每个可能属于不同的 JOIN**
-2. **必须等所有子节点就绪**：因为 `QueryBlock::recursive_reader` 需要通过 `path->iterator` **反向查找**子迭代器树里的 `FollowTailIterator`，这只有子迭代器都创建完、反向指针回填完才可能
+**② 翻译可以被整体跳过。** `IteratorsAreNeeded()`：次级引擎若声明 `USE_EXTERNAL_EXECUTOR`（整体 offload，如 HeatWave），则**完全不建迭代器树**——连 `FinalizePlanForQueryBlock()` 都不会改计划。
 
 ---
 

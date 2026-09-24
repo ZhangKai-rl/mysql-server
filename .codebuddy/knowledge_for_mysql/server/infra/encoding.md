@@ -456,8 +456,11 @@ uchar *net_store_length(uchar *packet, ulonglong length) {
 | [`record.md`](../../innodb/physical/record.md) | **行内字段级编码** | 变长长度前缀（1/2B、`0x40`/`0xc0` 外置位、逆序）、NULL 位图、REDUNDANT 目录、DB_TRX_ID/ROLL_PTR |
 | [`tablespace.md`](../../innodb/physical/tablespace.md) / [`page_structure.md`](../../innodb/physical/page_structure.md) | **页头字段的字节布局** | FIL header、FSP header、XDES、inode 的逐字段偏移 |
 | [`redo_log.md`](../../innodb/redo_log.md) | **redo 记录格式** | mlog 记录头、物理/逻辑日志类型 |
+| [`../../infra/structure/data_repr.md`](../../infra/structure/data_repr.md) | **行的"表示结构"（不是字节编码，是结构化层）** | `Field`(68 子类) / `TABLE::record[2]` / `dtype_t` 位域 / `dfield_t` / `dtuple_t` / `rec_t` 三层对偶与层间转换 |
 
-★ **判断内容该进哪篇**：问"这个编码是**谁专属**的"——行内 VARCHAR 长度前缀是**行格式**专属（进 record.md）；mach 变长整数被页/redo/动态元数据**复用**（进本文）；页头字段布局是**页结构**专属（进 page_structure.md）。同一份编码只在专属的那篇详写，其余交叉引用。
+★ **判断内容该进哪篇**：问两件事——
+1. "这个编码是**谁专属**的"：行内 VARCHAR 长度前缀是**行格式**专属（进 record.md）；mach 变长整数被页/redo/动态元数据**复用**（进本文）；页头字段布局是**页结构**专属（进 page_structure.md）。同一份编码只在专属的那篇详写，其余交叉引用。
+2. "这是在讲**字节怎么摆**，还是在讲**结构怎么组织**"：前者是编码（上面四篇）；后者是表示结构——如 `dtuple_t` 的字段数组、`dtype_t` 的位域打包、`Field` 与行缓冲的关系——进 `data_repr.md`。二者相邻但不同层：`data_repr.md` 讲"dtuple 是什么、怎么转成 REC"，`record.md` 讲"REC 的字节具体怎么摆"。
 
 ### 容易误解的概念
 

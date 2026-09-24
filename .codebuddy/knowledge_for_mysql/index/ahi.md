@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，核心文件 `storage/innobase/btr/btr0sea.cc` / `include/btr0sea.h` / `ha/ha0ha.cc`。涵盖：**它到底是什么**（一个可丢弃的启发式缓存，不是磁盘索引）、**哈希键如何"自适应"**（前缀长度学习算法）、**查询路径的 8 道门禁**、**建/删/改的维护协议与 nowait 哲学**、**★ 分片按 (space_id, index_id) 路由导致的单索引热点问题**、**关闭 AHI 可能 600 秒后 crash 的危险代码**。
 
-> **边界**：本篇讲 **AHI 本身**。B-tree 的游标搜索与页面结构见 [`btr.md`](btr.md)；Buffer Pool 的读页与预读见 [`buffer_pool.md`](buffer_pool.md)；change buffer 见 [`ibuf.md`](ibuf.md)。
+> **边界**：本篇讲 **AHI 本身**。B-tree 的游标搜索与页面结构见 [`btr.md`](btr.md)；Buffer Pool 的读页与预读见 [`buffer_pool.md`](../innodb/buffer_pool.md)；change buffer 见 [`ibuf.md`](ibuf.md)。
 
 - [概述](#概述)
 - [理论基础](#理论基础)
@@ -976,5 +976,5 @@ static MYSQL_SYSVAR_ULONG(
 **相关文档**
 
 - B-tree 游标搜索与页面结构：[`btr.md`](btr.md)
-- Buffer Pool 读页与预读：[`buffer_pool.md`](buffer_pool.md)
+- Buffer Pool 读页与预读：[`buffer_pool.md`](../innodb/buffer_pool.md)
 - change buffer：[`ibuf.md`](ibuf.md)

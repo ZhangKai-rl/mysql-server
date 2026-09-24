@@ -12,6 +12,7 @@
 ① 本文[「如何新增文档」](#如何新增文档)——放哪、拆不拆、归位 vs 并存、编号、收尾清单
 ② 本文[「准入标准」](#准入标准)——三条硬门槛、难点怎么讲、六类事实错误、不该进什么
 ③ [`_template.md`](_template.md)——单篇骨架 + 13 条动笔自检
+④ **先整体看一遍知识库现状**——本文「目录索引」扫全库有哪些篇 + 与候选主题相关的篇读它们的「边界」行（见「第一步」前置），**避免重复造轮子**
 
 ---
 
@@ -42,7 +43,7 @@
 
 ## 目录索引
 
-> **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`infra/` 是**横切基础设施**（数据结构 + 锁，横跨 include/mysys/sql/innodb）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
+> **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`infra/`、`index/` 是**横切主题**（基础设施 = 数据结构+锁；索引 = 横跨 SQL 语法/优化器/引擎存储）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
 
 ### server/ —— Server 层
 
@@ -53,11 +54,11 @@
 | [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
 | [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
-| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/GTID 持久化/读侧 dump）、binlog_event（事件三层类体系/序列化/checksum/各事件字节布局）、binlog_sbr（语句级复制/unsafe 判定/MIXED 降级）、binlog_encryption（两级密钥/keyring 轮换/reencrypt）、mysqlbinlog（工具架构/打印/DECODE-ROWS/过滤/收尾）、semisync（半同步插件/active_tranxs 等待/ACK receiver/降级恢复）、gtid、replication（复制拓扑与故障转移：协议/双定位/拓扑/过滤/延迟复制/GTID_ONLY/failover）、prpl（并行复制）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
+| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/GTID 持久化/读侧 dump）、binlog_event（事件三层类体系/序列化/checksum/各事件字节布局）、binlog_sbr（语句级复制/unsafe 判定/MIXED 降级）、binlog_encryption（两级密钥/keyring 轮换/reencrypt）、mysqlbinlog（工具架构/打印/DECODE-ROWS/过滤/收尾）、semisync（半同步插件/active_tranxs 等待/ACK receiver/降级恢复）、gtid、replication（复制拓扑与故障转移：协议/双定位/拓扑/过滤/延迟复制/GTID_ONLY/failover）、prpl（并行复制）、preserve_commit_order（从库提交保序：FIFO 队列/MDL 复用/缺陷档案）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
 | [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配
 | [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
 | [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |
-| [infra/](server/infra/) | 通用机制：dbug、pfs、memory、vio、variables、encoding、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
+| [infra/](server/infra/) | 通用机制：dbug、pfs、memory、vio、variables、encoding、charset（字符集与 collation，★ UCA 900 权重算法 + InnoDB 比较回调）、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
 | [plugin/](server/plugin/) | 可扩展框架：plugin（插件体系）、component（组件）、service（服务）、abi（C++ ABI 横切专题） |
 | [logging/](server/logging/) | 服务器日志：error_log、general_log、slow_log |
 
@@ -69,11 +70,8 @@
 |------|------|
 | [buffer_pool.md](innodb/buffer_pool.md) | **Buffer Pool**：页状态机与 fix 体系、★ 完整缺页读路径（同步 `pread`、`buf_wait_for_read` 等 S 锁技巧）、★ 完整脏页刷盘（三路径/批次 single-flight/邻接刷/自适应刷脏）、LRU 中点替换、预读、压缩页三态 |
 | [dblwr.md](innodb/dblwr.md) | **doublewrite**：为什么必须有（torn page 与 redo 的能力边界）、文件布局（批量区 + SYNC 槽位、奇偶文件功能切分）、批量/单页写流程、崩溃恢复时序与 torn page 判定 |
-| [ahi.md](innodb/ahi.md) | **自适应哈希索引**：B-tree 之上的可丢弃缓存、8.0.30 分片、★ 哈希键前缀长度自适应算法、构建双门槛与全 nowait 哲学、锁按 (space_id, index_id) 路由的局限 |
-| [ibuf.md](innodb/ibuf.md) | **change buffer（insert buffer）**：为什么只缓存非唯一二级索引 INSERT、物理布局、插入 14 条否决条件与合并 8 条触发条件、merge 可能触发页分裂 |
 | [mvcc.md](innodb/mvcc.md) | **MVCC**：ReadView 结构与三层漏斗判定、二级索引 `PAGE_MAX_TRX_ID` 页级粗筛、undo 版本链回溯、半一致性读、purge 与最老 ReadView 的水位闭环 |
 | [row_search.md](innodb/row_search.md) | `row_search_mvcc`：取行主链与游标推进（承接 handler.md） |
-| [btr.md](innodb/btr.md) | **索引 B-tree 结构与操作**：`btr_cur_search_to_nth_level` 逐行解析、页内二分、乐观/悲观插入与页分裂、删除与合并、更新三路径、索引锁完整语义、node pointer、`Btree_load` 批量构建、树生命周期（创建/分配/释放/截断） |
 | [physical/tablespace.md](innodb/physical/tablespace.md) | 表空间物理结构与空间管理：FSP/XDES/inode 逐字节布局、fseg 分配与释放、`FSP_FLAGS`、碎片度量 |
 | [physical/page_structure.md](innodb/physical/page_structure.md) | 页物理结构与全页类型清单：页头/infimum/supremum/heap/目录槽、12 类常见页逐字节 layout |
 | [physical/record.md](innodb/physical/record.md) | 行记录格式：record header、变长编码、NULL 位图、offsets 数组协议、instant 行版本状态机 |
@@ -113,6 +111,7 @@
 | [queue.md](infra/structure/queue.md) | 队列 | **有界 MPMC 队列（一个算法两种裁剪）**：server `Integrals_lockfree_queue`（仅整型，虚拟索引 + MSB 占用位 + `Null`/`Erased` 哨兵，全套 API）vs InnoDB `mpmc_bq`（任意类型，槽 seq 判空满，最小 MPMC）——需求半径决定 API 半径 |
 | [counter.md](infra/structure/counter.md) | 计数器 | 分片计数器两代：`ib_counter_t`（RDTSC 散槽 + 非原子 `+=`，读 fuzzy）vs `Counter::Shards`（真原子 + Pad，读精确）；cache 乒乓解法与 fuzzy 误差量级分析 |
 | [link_buf.md](infra/structure/link_buf.md) | 链缓冲 | `Link_buf` 无锁环形"链缓冲"：乱序 `add_link` + tail 沿链推进（槽级锁 + 二次确认）；redo `recent_written`/`recent_closed` 两条串行链的解耦 |
+| [data_repr.md](infra/structure/data_repr.md) | 行数据表示（跨层） | "一行数据在各层怎么表示"的完整链路：server `Field`(68 子类)/`TABLE::record[2]` → handler 边界（只传 `uchar*`）→ InnoDB `dtype_t`(prtype 位域打包)/`dfield_t`/`dtuple_t` → `rec_t` 字节流；★ 三种行表示对照、`n_fields_cmp`、`mbminmaxlen` 5 位打包、转换桥梁（`rec_convert_dtuple_to_rec` / `cmp_dtuple_rec_with_match_low`） |
 
 **锁与同步（lock/）**
 
@@ -126,6 +125,30 @@
 | [mdl.md](infra/lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：**18 namespace 与两套策略**（scoped/object）、**fast path 与 obtrusive/unobtrusive 的延迟精算**（`m_fast_path_state` 单字位布局 + 单向物化）、双兼容矩阵（granted + **4 张 waiting 优先级矩阵**）、`can_grant_lock` 三级短路、`reschedule_waiters` 公平调度、wait-for graph 死锁检测（BFS+DFS、静态权重 victim、**深度 32 即判死锁**）、锁升级 SU→SNW→X 与 online/instant DDL、用户级锁 GET_LOCK |
 | [innodb_trx_lock.md](infra/lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁（`lock_t` 一统表锁/行锁）：**表锁机制**（意向锁、`count_by_mode` 快路径、AUTOINC）、**行锁四形态深入剖析**（源码判定版冲突矩阵、supremum 归一化）、隐含锁物化、等待与唤醒（slot 1:1:1、授予的公平性调度）、wait-for graph 死锁检测（DFS 着色 + victim 权重 + 假阳性双校验）、锁与 MVCC/半一致性读边界；**谓词锁**（R-tree 第四种锁语义：MBR 谓词挂锁尾、三张 hash 表、只有插入意向会等待）、**AUTOINC**（三档模式、语句级释放、持久化与 gap 成因）；含 41 个核心函数完整代码剖析（加锁决策主链 `lock_rec_lock` 三兄弟、冲突判定、授予、入队、挂起） |
 | [thr_lock.md](infra/lock/transactional/thr_lock.md) | 事务锁 | server 层表锁 THR_LOCK：两级结构（`THR_LOCK` + `THR_LOCK_DATA`）、13 种 `thr_lock_type` **优先级编码进枚举值**、**排序代替死锁检测**（`sort_locks` 的 `LOCK_CMP` 全序）、写优先与防饥饿（`max_write_lock_count` 默认关闭）、MyISAM 并发插入 4 处锁升级；**InnoDB `lock_count()==0` 空壳**但 `thr_lock_type` 仍是跨层意图协议 |
+
+### [index/](index/) —— 索引（横切主题）
+
+> 索引横跨 SQL 层（语法/优化器）→ handler 接口 → 存储引擎（B-tree 存储与维护），以"索引"为第一主语的篇进本目录；索引只是一部分的特性篇留在原处（全文检索 feat/fts、空间 R-tree server/datatype/gis、功能/多值索引 feat/generated_columns），由知识地图导航。**地图与阅读路径见 [`index/README.md`](index/README.md)**（六层：概念 → SQL → 优化器 → handler → 存储结构 → 辅助与治理）。
+
+| 文件 | 内容 |
+|------|------|
+| [btr.md](index/btr.md) | **B-tree 结构与操作（btr 模块全套）**：游标体系与 store/restore 逐行、`btr_cur_search_to_nth_level` 逐行解析、页内二分、中间页与 node pointer、乐观/悲观插入与页分裂、删除与合并、更新三路径、索引锁完整语义（SMO 预测裁剪）、`Btree_load` 批量构建、树生命周期 |
+| [rtree.md](index/rtree.md) | **R-tree 索引结构全套**：MBR 编码与记录布局、两阶段子树选择、二次分裂、MBR 上溯两条路、谓词锁与 SSN；操作 × B-tree/R-tree 对照表 |
+| [inverted.md](index/inverted.md) | **倒排索引存储与编码**：ilist 字节级布局（VLC 终止位 + delta + 0x00 哨兵）、6 档分档、删除旁路表示与 optimize 重编码、cache/辅助表"只追加"边界 |
+| [metadata.md](index/metadata.md) | **索引元数据对象模型**：`dd::Index` ↔ `dict_index_t` ↔ SDI 三层分工、`se_private_data` 五键桥、`n_uniq` 三种情况、原子 DDL 时序 |
+| [physical_storage.md](index/physical_storage.md) | **索引物理存储与持久化**：root page 恒定、每索引两段、MLOG 统一型 redo 体系、bulk load 豁免 + DDL log、空间回收与崩溃恢复 |
+| [transaction.md](index/transaction.md) | **索引 × MVCC/purge/唯一性**：delete-mark 两阶段、`row_vers_old_has_index_entry` 版本链回溯、purge 定位与删除、唯一性必须加锁 |
+| [construction.md](index/construction.md) | **KEY 类与索引构造**：KEY/KEY_PART_INFO 全成员与两级 flags、DDL → KEY → dd::Index → dict_index_t 三条链路、构造期/开表期不对称表 |
+| [record_format.md](index/record_format.md) | **索引记录存储格式**：三种记录字段组成、trx_id_offset 快速通道、BLOB 768 前缀规则、info bits、instant 只影响聚簇 |
+| [partitioning.md](index/partitioning.md) | **索引 × 分区**：本地索引与 `dd::Partition_index`、唯一键含分区键约束、逐分区 DDL、先裁剪后逐分区搜索、统计基数只取最大分区 |
+| [secondary.md](index/secondary.md) | **二级索引整合专篇**：生命周期闭环（插入五步/更新删旧插新/两阶段删除/purge）、change buffer 决策点、读路径分支全景、`row_sel_sec_rec_is_for_clust_rec` 双向校验 |
+| [types.md](index/types.md) | **索引类型总览**：语义 vs 实现的分离、`dict_index_t::type` 十位标志体系、`n_uniq` 粒度；聚簇（主键/GEN_CLUST_INDEX/GIPK）、二级、唯一、降序、前缀、功能、多值、全文倒排、空间 R-tree、不可见 全谱系 |
+| [access.md](index/access.md) | **回表与三类访问优化**：回表完整链路（版本回溯 + 一致性复核）、覆盖索引两层判定、ICP 三层链路（`row_search_idx_cond_check` 逐行）、MRR/DS-MRR（双 handler + rowid 排序）、Skip Scan |
+| [constraint.md](index/constraint.md) | **索引承载的约束**：唯一性检查两条链路（聚簇/二级）、NULL 语义、与 change buffer 的逻辑互斥；外键双索引指针、必须有索引的原因、检查与加锁、级联与 `FK_MAX_CASCADE_DEL=15` |
+| [stats.md](index/stats.md) | **索引统计**：persistent 分层采样（LA 层 + 分段随机 + REF01 外推）vs transient 随机页采样、`n_diff_pfxNN` 持久化、10% 重算判据、`rec_per_key` 传递链、**基数漂移 16 条根因** |
+| [operations.md](index/operations.md) | **索引的生老病死与观测**：`ADD INDEX` 完整链路、三种算法与 online 例外、row log 超限后果；`DROP INDEX` 三段式延迟释放；`SHOW INDEX`/`I_S`/PFS/sys schema 观测 |
+| [ahi.md](index/ahi.md) | **自适应哈希索引**：B-tree 之上的可丢弃缓存、8.0.30 分片、★ 哈希键前缀长度自适应算法、构建双门槛与全 nowait 哲学、锁按 (space_id, index_id) 路由的局限 |
+| [ibuf.md](index/ibuf.md) | **change buffer（insert buffer）**：为什么只缓存非唯一二级索引 INSERT、物理布局、插入 14 条否决条件与合并 8 条触发条件、merge 可能触发页分裂 |
 
 ### [cloud/](cloud/) —— 云环境（外部知识）
 
@@ -151,6 +174,12 @@
 
 ### 第一步：决定放哪
 
+> **前置（必做，2026-09-22 用户拍板）：动笔前先整体看知识库现状**。
+> ① 扫一遍本文「目录索引」——全库现在有哪些篇、各目录的主题边界是什么；
+> ② 找出与候选主题相关的篇（同目录 + 相邻目录），**读它们文首的「> 边界」行或「概述」**——
+>    确认新主题的每一块内容是否已被覆盖、边界在哪；
+> ③ 做完 ①② 再走下面的决策树。目的：**避免重复**——最常见的返工是"新篇讲的内容已有宿主篇讲透"或"边界与既有篇重叠打架"。
+
 ```
 新主题
   │
@@ -171,10 +200,13 @@
   │     是 → server/handler.md（唯一的边界文档，留在 server/ 根）
   │
   ├─ 是存储引擎内部实现吗？
-  │     是 → innodb/
+  │     是 → innodb/（但"索引"是第一主语的存储结构——btr/AHI/change buffer——进 index/）
   │
   ├─ 是锁/同步机制吗？（横跨 include/mysys/sql/innodb 的主题）
-  │     是 → lock/（同步原语进 primitives/，事务锁进 transactional/）
+  │     是 → infra/lock/（同步原语进 primitives/，事务锁进 transactional/）
+  │
+  ├─ 是"索引"主题吗？（横跨 SQL 语法/优化器/引擎存储，以索引为第一主语）
+  │     是 → index/（索引只是一部分的特性篇——全文/空间/生成列——留在 feat|datatype，由 index/README 导航）
   │
   ├─ 是外部论文的深度剖析吗？（事实来源是论文，不是本仓库源码）
   │     是 → papers/，一篇论文一个文件；文首「边界」行必须与相关源码文档互指

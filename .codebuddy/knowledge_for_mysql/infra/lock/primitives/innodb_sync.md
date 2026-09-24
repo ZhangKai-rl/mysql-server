@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 InnoDB 自研同步原语的四层谱系：`os_event`（manual-reset 事件 + signal_count 防丢信号）、sync0arr 等待数组（event 已嵌入被等对象，数组只剩诊断职责）、`ib0mutex.h` 的 PolicyMutex 模板族（TTAS 自旋 + event/futex 两种慢路径）、策略层（统计/锁序校验的零成本注入）、以及 `rw_lock_t` 的 **lock_word 单字三态编码**（S/SX/X + 递归）。
 >
-> **边界**：本篇讲 InnoDB 原语的**类型与机制**；全局 latch 实例清单见 [`../README.md`](../README.md) A3；server 侧原语（mysys 三层封装）见 [`mysys_primitives.md`](mysys_primitives.md)；两个著名用户——B-tree 索引锁与页 latch 协议——见 [`../../innodb/btr.md`](../../../innodb/btr.md) 与 [`../../innodb/buffer_pool.md`](../../../innodb/buffer_pool.md)。
+> **边界**：本篇讲 InnoDB 原语的**类型与机制**；全局 latch 实例清单见 [`../README.md`](../README.md) A3；server 侧原语（mysys 三层封装）见 [`mysys_primitives.md`](mysys_primitives.md)；两个著名用户——B-tree 索引锁与页 latch 协议——见 [`../../index/btr.md`](../../../index/btr.md) 与 [`../../innodb/buffer_pool.md`](../../../innodb/buffer_pool.md)。
 
 ## 目录
 
@@ -940,13 +940,13 @@ case SYNC_FSP_PAGE:
 
 | 用它的子系统 | 用的是哪种 | 说明 | 展开在哪 |
 |---|---|---|---|
-| **B-tree 索引锁** | `dict_index_t::lock`（`rw_lock_t`，SMO 用 **SX**） | 搜索持 S、修改叶持 X、结构修改持 SX——本篇 SX 语义的第一用户 | [`../../innodb/btr.md`](../../../innodb/btr.md) |
+| **B-tree 索引锁** | `dict_index_t::lock`（`rw_lock_t`，SMO 用 **SX**） | 搜索持 S、修改叶持 X、结构修改持 SX——本篇 SX 语义的第一用户 | [`../../index/btr.md`](../../../index/btr.md) |
 | **Buffer Pool 页 latch** | `buf_block_t::lock`（`rw_lock_t`）+ 各 `ib_bpmutex_t`（**BlockMutexPolicy**） | 页 latch 协议与 io_fix 状态机校验 | [`../../innodb/buffer_pool.md`](../../../innodb/buffer_pool.md) |
 | **锁系统分片** | `locksys::Latches`（分片 mutex + `Unique_sharded_rw_lock`） | 512+512 shard，闸门本身又是分片 rwlock | [`../transactional/innodb_trx_lock.md`](../transactional/innodb_trx_lock.md) |
 | **字典锁** | `dict_operation_lock`（`rw_lock_t`，**SX**） | PFS 名 `wait/synch/sxlock/innodb/dict_operation_lock` | [`../../server/dd/dd.md`](../../../server/dd/dd.md) |
 | **事务系统** | `trx_sys_mutex`、`trx_sys_shard_mutex`、`serialisation_mutex` | read view 生成与事务串行化 | [`../../innodb/trx.md`](../../../innodb/trx.md) |
 | **redo / log** | `log_sys` 相关 latch + os_event（写盘等待） | 8.0 的 log 系统大量用 `os_event_wait_for` 与 `std::condition_variable` | [`../../innodb/redo_log.md`](../../../innodb/redo_log.md) |
-| **自适应哈希** | `btr_search_latch`（`rw_lock_t`，可分区） | 热点等值查询的加速结构 | [`../../innodb/ahi.md`](../../../innodb/ahi.md) |
+| **自适应哈希** | `btr_search_latch`（`rw_lock_t`，可分区） | 热点等值查询的加速结构 | [`../../index/ahi.md`](../../../index/ahi.md) |
 | **插入缓冲 / 文件空间** | `ibuf_mutex`、`ibuf_bitmap_mutex` + fil 三级锁（`Fil_shard::m_mutex`×68、`fil_space_t::latch` rw_lock_t，**无独立全局 mutex**） | 二级索引延迟写；表空间管理三级锁（保护对象/锁序/引用计数保活见上文「表空间锁」节） | 本节上文 |
 
 这条"L0 → 本篇 → 各子系统"的链才是完整的：**本篇不解决任何业务问题，它只是让上面每一层都能回答"谁持锁、等了多久、顺序对不对"**。
@@ -1059,6 +1059,6 @@ fprintf(file, "RW-shared spins 0, rounds 0, OS waits 0\n"
 
 **相关文档**
 - server 侧 mysys 三层封装与 prlock 见 [`mysys_primitives.md`](mysys_primitives.md)
-- B-tree 索引锁（`index->lock` 的 SX 使用协议）见 [`../../innodb/btr.md`](../../../innodb/btr.md)
+- B-tree 索引锁（`index->lock` 的 SX 使用协议）见 [`../../index/btr.md`](../../../index/btr.md)
 - 页 latch 与 Buffer Pool 并发协议（`buf_block_t::lock`、`Stateful_latching_rules` 的用户 io_fix）见 [`../../innodb/buffer_pool.md`](../../../innodb/buffer_pool.md)
 - 全局 latch 实例清单（A3）见 [`../README.md`](../README.md)

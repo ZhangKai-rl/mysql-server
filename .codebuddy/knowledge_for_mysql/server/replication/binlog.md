@@ -1334,6 +1334,8 @@ Leader 把整个 group 拉进 commit stage，按事务写入 binlog 的同一顺
 
 `binlog_order_commits` 和"是否走 BGC"是两件不同的事。只要开启 binlog，所有事务提交都进入 `ordered_commit` 的三阶段流水线，这就是 BGC 机制本身。BGC 不是可开关的，它是 binlog 提交的唯一路径。`binlog_order_commits` 只决定 BGC 内部 commit stage 是否保持有序。
 
+> **与从库 `replica_preserve_commit_order` 的两侧对照**（三段接力：主库 flush 序 → 主库引擎提交序 → 从库引擎提交序）见 [`prpl.md`](prpl.md)「两侧对照：'提交序'在主库和从库上各由谁保证」——核心结论：复制协议传输的是 flush 序（binlog 序），主库本参数 OFF 不影响从库保序，两侧机制互不依赖。
+
 ---
 
 ## Commit 阶段与 trx_no

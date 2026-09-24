@@ -1067,7 +1067,7 @@ for (i = 0; i < n; i++) {
 
 ### B-tree 定位：btr_cur_search_to_nth_level
 
-> 本节从「取行」视角概述搜索；B-tree 搜索算法 / 分裂 / 合并 / AHI 的完整机制（latch_mode 全表、8.0 SMO 锁预测裁剪、意图升级重搜等）详见 [`btr.md`](btr.md)。
+> 本节从「取行」视角概述搜索；B-tree 搜索算法 / 分裂 / 合并 / AHI 的完整机制（latch_mode 全表、8.0 SMO 锁预测裁剪、意图升级重搜等）详见 [`btr.md`](../index/btr.md)。
 
 `pcur->open_no_init` / `open_at_side` 内部真正干活的函数——从根下到叶子定位一条记录。这是"取行"的地基。
 
@@ -1254,7 +1254,7 @@ if (!recv_recovery_is_on() && !can_older_trx_be_still_active(max_trx_id)) {
 
 ### 持久游标：store_position / restore_position
 
-> 本节从「取行」视角讲恢复协议；`btr_pcur_t` 结构全字段、乐观/悲观恢复算法与跨页推进的锁序细节详见 [`btr.md`](btr.md)。
+> 本节从「取行」视角讲恢复协议；`btr_pcur_t` 结构全字段、乐观/悲观恢复算法与跨页推进的锁序细节详见 [`btr.md`](../index/btr.md)。
 
 `btr_pcur_t` 的"持久"含义：**释放 page latch、甚至页面被写出 buffer pool / 发生页分裂合并之后，游标依然能靠"记录的排序 key 前缀 + 相对位置"重新定位。**
 

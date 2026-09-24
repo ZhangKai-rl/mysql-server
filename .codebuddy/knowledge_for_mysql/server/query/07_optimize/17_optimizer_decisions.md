@@ -164,7 +164,7 @@ optimize 后段（计划改进 / 代码生成）
 
 | # | 决策 | 性质 | 判据（函数） | 产出 | 可覆盖 |
 |---|---|---|---|---|---|
-| 25 | **join 算法**（NLJ / BNL / BKA / HashJoin） | 规则 + 代价 | `setup_join_buffering` | `JOIN_CACHE` 类型 / HashJoin | `block_nested_loop` / `batched_key_access` / `hash_join` / `mrr` / `mrr_cost_based` / `BNL`/`BKA`/`NO_BNL` hint |
+| 25 | **join 算法**（NLJ / BNL / BKA / HashJoin） | 规则 + 代价 | `setup_join_buffering` | `JOIN_CACHE` 类型 / HashJoin | `block_nested_loop` / `batched_key_access` / ~~`hash_join`~~（**已失效**，无任何消费点）/ `mrr` / `mrr_cost_based` / `BNL`/`BKA`/`NO_BNL` hint |
 | 26 | DISTINCT / GROUP BY / ORDER BY 的化简与改写 | 规则 | `optimize_distinct_group_order` | 一组标志 | 不可覆盖（见 15 篇） |
 | 27 | 能否用索引顺序免排序（GROUP BY 或 ORDER BY 二选一） | 规则 | `test_skip_sort` / `test_if_skip_sort_order` | `m_ordered_index_usage` | `prefer_ordering_index`、`SQL_BIG_RESULT` |
 | 28 | filesort 还是索引（ORDER BY 场景的代价比较） | 代价 | `test_if_cheaper_ordering` | `skip_sort_order` | `prefer_ordering_index` |
@@ -282,11 +282,19 @@ MySQL 8.0 的 join 算法只有四个（**没有 merge join**，见 [`../09_exec
 | **NLJ**（嵌套循环，无缓冲） | 默认 | — |
 | **BNL**（块嵌套循环，join buffer） | 内层无索引可用且 `block_nested_loop=on` | `block_nested_loop`、`join_buffer_size` |
 | **BKA**（批量键访问，MRR 优化） | 内层有索引 + `batched_key_access=on` + MRR 可用 | `batched_key_access`、`mrr`、`mrr_cost_based`、`read_rnd_buffer_size` |
-| **HashJoin** | 等值连接条件、无索引可用（8.0.18+） | `hash_join` |
+| **HashJoin** | 等值连接条件、无索引可用（8.0.18+） | ⚠️ `hash_join` 开关**已失效**（见下） |
 
 决策要点：
 
-1. **HashJoin 取代了 BNL 的默认地位**：理论上 hash join 在各维度不劣于 BNL（见 [`../runtime/05_join_buffer.md`](../runtime/05_join_buffer.md)），所以 8.0 里 BNL 基本只剩"hash_join=off"时的退路。
+1. **HashJoin 取代了 BNL 的默认地位**：理论上 hash join 在各维度不劣于 BNL（见 [`../runtime/05_join_buffer.md`](../runtime/05_join_buffer.md)），所以 8.0 里**执行器把 `OT_BNL` 一律改写成 hash join**——判定就一行，只读结构体成员：
+
+   ```cpp
+   static bool UseHashJoin(QEP_TAB *qep_tab) {
+     return qep_tab->op_type == QEP_TAB::OT_BNL;
+   }
+   ```
+
+   > ⚠️ **8.0.39 已无法再退回 BNL**。`OPTIMIZER_SWITCH_HASH_JOIN` 在整个 `sql/` 下**只有两处出现**——`sql_const.h` 的常量定义（`1ULL << 21`）与 `sys_vars.cc` 里 `optimizer_switch` 的默认位掩码——**没有任何消费点**。经典优化器侧走上面的 `UseHashJoin()`，hypergraph 侧由 `ProposeHashJoin` 直接提出候选，**两条路径都不读这个开关**。旧资料与本文早前版本写的"hash_join=off 退回 BNL"**已不成立**。同理 `HASH_JOIN` / `NO_HASH_JOIN` hint 也无代码消费（见 [`11_optimizer_hints.md`](11_optimizer_hints.md)）。
 2. **BKA 与 HashJoin 不冲突**：BKA 只适用于**内层有索引**的场景（把随机索引查找变成按 rowid 排序的顺序查找，即 DS-MRR）；HashJoin 用于**内层无索引**。二者适用面互补。
 3. **`mrr_cost_based`** 决定 MRR 是"代价驱动"还是"总是用"。
 4. `no_jbuf_after` 参数保证"某些策略之后不能再加 join buffer"（例如 semi-join 的 FirstMatch 之后），这是跨决策的约束。
@@ -320,7 +328,7 @@ MySQL 8.0 的 join 算法只有四个（**没有 merge join**，见 [`../09_exec
 
 | 症状 | 可能原因 |
 |---|---|
-| 全局变慢 | 有人关了 `hash_join` 或 `condition_fanout_filter` |
+| 全局变慢 | 有人关了 `block_nested_loop`（~~`hash_join` 已失效，关了也没用~~）或 `condition_fanout_filter` |
 | 某些查询突然用不了索引 | `range_optimizer_max_mem_size` 太小导致长 IN list 降级 |
 | 索引不可见却没生效 | `use_invisible_indexes` |
 | 排序变多 | `prefer_ordering_index=off` |
@@ -389,7 +397,7 @@ MySQL 为每个决策在 optimizer trace 里留了节点（`semijoin_strategy_ch
 | `derived_merge` | derived/view 合并 |
 | `use_invisible_indexes` | 是否使用 `INVISIBLE` 索引 |
 | `skip_scan` | skip scan |
-| `hash_join` | Hash Join |
+| `hash_join` | Hash Join ⚠️ **已失效**：`sql/` 下仅常量定义与默认值，无任何消费点 |
 | `subquery_to_derived` | 标量/IN 子查询转 derived |
 | `prefer_ordering_index` | 优先用有序索引免排序 |
 | `hypergraph_optimizer` | hypergraph 优化器（**源码注释明说"故意不写进文档"**） |
@@ -405,7 +413,7 @@ MySQL 为每个决策在 optimizer trace 里留了节点（`semijoin_strategy_ch
 | 只留某一种 semi-join 策略 | `firstmatch` / `loosescan` / `duplicateweedout` / `materialization` |
 | 强制/禁用物化 | `materialization` / `subquery_materialization_cost_based` |
 | 阻止 derived 合并 | `derived_merge=off` / `NO_MERGE` hint / 加 `LIMIT`（规则自然阻断） |
-| 强制 HashJoin 或禁用 | `hash_join` / `BNL` / `NO_BNL` hint |
+| 强制 HashJoin 或禁用 | ⚠️ **用 `block_nested_loop` 开关 / `BNL` / `NO_BNL` hint**，**不是** `hash_join`——后者无消费点。`BNL` hint 有真实消费点（`hint_table_state(..., BNL_HINT_ENUM, OPTIMIZER_SWITCH_BNL)`），它决定是否走 `OT_BNL`，进而决定是否 hash join |
 | 让 ORDER BY 用索引 | `prefer_ordering_index=on` |
 | GROUP BY 不用临时表 | `SQL_BIG_RESULT` / `SQL_SMALL_RESULT`（见 15 篇第四章的反向逻辑警告） |
 | 控制 range 优化内存 | `range_optimizer_max_mem_size`（变量，非 switch） |

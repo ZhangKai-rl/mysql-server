@@ -20,7 +20,8 @@ infra/
     ├── hash.md                           ✅ 哈希全盘点（LF_HASH / ut_lock_free_hash_t / hash_table_t 三实现）
     ├── queue.md                          ✅ 有界 MPMC 队列（Integrals_lockfree_queue / mpmc_bq 同族异路）
     ├── counter.md                        ✅ 分片计数器（ib_counter_t / Counter::Shards 两代对比）
-    └── link_buf.md                       ✅ Link_buf：无锁环形"链缓冲"（redo recent_written / recent_closed）
+    ├── link_buf.md                       ✅ Link_buf：无锁环形"链缓冲"（redo recent_written / recent_closed）
+    └── data_repr.md                      ✅ 行数据表示（跨层：server Field/TABLE::record ↔ InnoDB dtype/dfield/dtuple ↔ rec_t）
 ```
 
 ## 归属判据
@@ -45,6 +46,8 @@ infra/
 | `Link_buf<Position>` | innodb | 无锁环形"链缓冲"（乱序报告 + tail 沿链推进） | redo `recent_written` / `recent_closed` | ✅ [link_buf.md](structure/link_buf.md) |
 | `Seq_lock<data_t>` | innodb | 序号锁（seqlock，回调式，引 HPL-2012-68） | `mt_fast_modulo_t`（hash 表快速取模） | 属锁原语，✅ [lock/primitives/seq_lock.md](lock/primitives/seq_lock.md) |
 | `MyRcuLock<T>`（RCU） | server | RCU 锁模式 | `ssl_acceptor_context_data` | 属锁原语，✅ [lock/primitives/rcu.md](lock/primitives/rcu.md) |
+| `dtype_t` / `dfield_t` / `dtuple_t`（+ `big_rec_t`/`upd_t`/`multi_value_data`/`row_ext_t`） | 跨层 | **行数据表示**（类型位域打包 / 字段 / 元组），对偶于 `rec_t` 字节流 | server↔InnoDB 插入检索全链路 | ✅ [data_repr.md](structure/data_repr.md) |
+| `Field`（68 子类）/ `TABLE::record[2]` / `String` / `Copy_field` | server | server 行表示（类型视图 + 字节缓冲） | 执行器、handler 接口、字符集转换 | ✅（同上 data_repr.md，与引擎侧合一篇对比） |
 
 ## 两个无锁 hash 的对比入口
 
