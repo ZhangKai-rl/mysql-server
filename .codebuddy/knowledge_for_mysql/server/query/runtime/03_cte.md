@@ -153,7 +153,7 @@ if (cte != nullptr && cte->references.size() >= 2 &&
 **8.0 后期可源码佐证的能力演进**（版本号需外部 changelog 交叉定位）：
 
 - **EXPLAIN 专门显示 CTE**：`Common_table_expr::name` 字段注释 "Used only for EXPLAIN FORMAT=tree"；`explain_access_path.cc` 打印 "Materialize CTE / recursive CTE / union CTE"；`with_explain.test` 明确"多次引用只在第一处展开、其余显示 `<derivedN>`，让用户看懂是单次物化"。
-- **hypergraph 优化器改变 CTE 计划**：测试里大量 `--skip_if_hypergraph # Chooses a different plan`，是 8.0.23 引入 hypergraph 后 CTE 执行路径变化的源码可见痕迹。
+- **hypergraph 优化器改变 CTE 计划**：测试里大量 `--skip_if_hypergraph # Chooses a different plan`，是 8.0.22 引入 hypergraph 后 CTE 执行路径变化的源码可见痕迹。
 
 **语法能力清单（8.0.39 逐一核实）**：
 

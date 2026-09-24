@@ -980,7 +980,7 @@ void LinuxAIOHandler::collect {
 
 ### redo log 的 I/O（归位）与各文件 I/O 总览
 
-> **★ redo 的写/刷完整实现见 [`redo_log.md`](redo_log.md)「redo 的 I/O 路径」**——五个专用后台线程（`log_writer` / `log_flusher` / `log_checkpointer` / 两个 notifier / `log_files_governor`）、`log_writer_write_buffer` 的环形写与 512 对齐、`log_flush_low` 的 O_DSYNC 分支、**redo 与数据文件的 I/O 方式差异表**、write-ahead（`innodb_log_write_ahead_size` 与 read-on-write）、fsync vs fdatasync。
+> **★ redo 的写/刷完整实现见 [`redo_log.md`](redo_log.md)「redo 的 I/O 路径」**——六个专用后台线程（`log_writer` / `log_flusher` / `log_checkpointer` / 两个 notifier / `log_files_governor`）、`log_writer_write_buffer` 的环形写与 512 对齐、`log_flush_low` 的 O_DSYNC 分支、**redo 与数据文件的 I/O 方式差异表**、write-ahead（`innodb_log_write_ahead_size` 与 read-on-write）、fsync vs fdatasync。
 >
 > 本节只保留 I/O 全景需要的**横切对比**，以及不属于 redo 的部分。
 

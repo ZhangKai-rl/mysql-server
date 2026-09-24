@@ -464,7 +464,7 @@ return SJ_OPT_MATERIALIZE_LOOKUP;                      // 否则索引查找
 | 策略 | AccessPath 形态 | 关键构造函数 | 去重靠什么 |
 |---|---|---|---|
 | **FirstMatch** | `NestedLoop(JoinType::SEMI)` | `CreateNestedLoopAccessPath(..., JoinType::SEMI)` | SEMI join type：内层"找到第一个匹配就停"（`NestedLoopIterator` 状态机切回 `NEEDS_OUTER_ROW`） |
-| **LooseScan（单表）** | 表访问 + `REMOVE_DUPLICATES_ON_INDEX` | `NewRemoveDuplicatesOnIndexAccessPath` | 索引去重节点（见 [`../../08_access_path/README.md`](../../08_access_path/README.md)） |
+| **LooseScan（单表）** | 表访问 + `REMOVE_DUPLICATES_ON_INDEX` | `NewRemoveDuplicatesOnIndexAccessPath` | 索引去重节点（见 [`../../08_access_path.md`](../../08_access_path.md)） |
 | **LooseScan（多表）** | `NestedLoopSemiJoinWithDuplicateRemoval` | `NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` | semijoin NestedLoop 与索引去重**合一** |
 | **Duplicate Weedout** | 子树 + `WEEDOUT` 节点 | `CreateWeedoutOrLimitAccessPath`（带 `flush_weedout_table`） | 独立 WEEDOUT 节点（内部是 rowid 临时表） |
 | **MaterializeLookup** | `MATERIALIZE` + ref 访问 | `NewMaterializeAccessPath`（`MATERIALIZE_SEMIJOIN` 分支递归建 virtual join） | 物化临时表的唯一键 |
@@ -487,7 +487,7 @@ FirstMatch.
 
 **④ Weedout 的代价是"瞎抄的"。** `Substructure::WEEDOUT` 分支里，`CreateWeedoutOrLimitAccessPath` 之后有一句 *"Copy costs (even though it makes no sense for the LIMIT 1 case)"*——即 WEEDOUT 节点的代价直接从子树复制，作者自己都知道这不精确。
 
-**⑤ Materialize 在"另一个世界"里递归建树。** `MATERIALIZE_SEMIJOIN` 分支（在 `GetTableAccessPath` 里）递归调用 `ConnectJoins()` 把 semi-join 内层当成一个**独立的 virtual join** 建树，再包 `NewMaterializeAccessPath`（详见 [`../../08_access_path/README.md`](../../08_access_path/README.md) 的"GetTableAccessPath 五分支"）。物化之后，外层用 ref 访问物化临时表（Lookup）或全扫（Scan），这就是两种 Materialize 策略的分野。
+**⑤ Materialize 在"另一个世界"里递归建树。** `MATERIALIZE_SEMIJOIN` 分支（在 `GetTableAccessPath` 里）递归调用 `ConnectJoins()` 把 semi-join 内层当成一个**独立的 virtual join** 建树，再包 `NewMaterializeAccessPath`（详见 [`../../08_access_path.md`](../../08_access_path.md) 的"GetTableAccessPath 五分支"）。物化之后，外层用 ref 访问物化临时表（Lookup）或全扫（Scan），这就是两种 Materialize 策略的分野。
 
 ### 5.1 FirstMatch：split jump
 

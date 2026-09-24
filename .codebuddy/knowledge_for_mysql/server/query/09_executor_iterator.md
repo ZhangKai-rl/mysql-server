@@ -10,7 +10,7 @@
 - [零、定位与关键设计](#零定位与关键设计)
 - [一、RowIterator 基类与火山契约](#一rowiterator-基类与火山契约)
 - [二、迭代器逐个详解](#二迭代器逐个详解)
-- [三、从 AccessPath 到 Iterator：翻译入口](#三从-accesspath-到-iterator翻译入口)（翻译机制详见 [`08_access_path/06_rowiterator`](08_access_path/06_rowiterator.md)）
+- [三、从 AccessPath 到 Iterator：翻译入口](#三从-accesspath-到-iterator翻译入口)（翻译机制详见 [`08_access_path.md`](08_access_path.md)「翻译成执行」）
 - [四、执行入口 ExecuteIteratorQuery](#四执行入口-executeiteratorquery)
 - [五、与 handler / InnoDB 的边界](#五与-handler--innodb-的边界)
 
@@ -739,7 +739,7 @@ range->end_key.flag   = HA_READ_AFTER_KEY;      // 单 key 的闭开区间
 
 **NestedLoopSemiJoinWithDuplicateRemovalIterator**（`.cc:2145`）—— loose scan 的"跳过"语义：取一个外层行 → 取**恰好一条**内层行 → 命中后设 `m_deduplicate_against_previous_row`，之后**不扫内层**地跳过所有同 key 外层行；未命中则不设标志。
 
-> ★ 这些迭代器对应的 **AccessPath 形态**（`NewRemoveDuplicatesOnIndexAccessPath` / `NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` 等在 `ConnectJoins` 里如何组装）见 [`08_access_path/README.md`](08_access_path/README.md)；五种 semi-join 策略分别落成哪个节点/迭代器的对照表见 [`07_optimize/logical/03_semijoin.md`](07_optimize/logical/03_semijoin.md) 5.0 节。
+> ★ 这些迭代器对应的 **AccessPath 形态**（`NewRemoveDuplicatesOnIndexAccessPath` / `NewNestedLoopSemiJoinWithDuplicateRemovalAccessPath` 等在 `ConnectJoins` 里如何组装）见 [`08_access_path.md`](08_access_path.md)；五种 semi-join 策略分别落成哪个节点/迭代器的对照表见 [`07_optimize/logical/03_semijoin.md`](07_optimize/logical/03_semijoin.md) 5.0 节。
 
 ### 2.6 去重
 
@@ -921,7 +921,7 @@ AccessPath 是"计划"（数据），RowIterator 是"执行"（行为），两�
 | `WINDOW` | `WindowIterator`（缓冲/非缓冲两型） |
 | ... | ... |
 
-> ★ **翻译机制本身详见 [`08_access_path/06_rowiterator.md`](08_access_path/06_rowiterator.md)**：显式栈（为何不用递归）、两阶段、`IteratorToBeCreated`、各 AccessPath 类型的 switch 分支要点、batch mode 传递、惰性实例化、MATERIALIZE 的特殊处理、翻译失败路径。**本篇不重复**，只保留"计划↔执行 1:1"这个对照关系与下面两点。
+> ★ **翻译机制本身详见 [`08_access_path.md`](08_access_path.md)**：显式栈（为何不用递归）、两阶段、`IteratorToBeCreated`、各 AccessPath 类型的 switch 分支要点、batch mode 传递、惰性实例化、MATERIALIZE 的特殊处理、翻译失败路径。**本篇不重复**，只保留"计划↔执行 1:1"这个对照关系与下面两点。
 
 两点与执行模型强相关、放在本篇讲：
 

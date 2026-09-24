@@ -57,7 +57,7 @@ MySQL 的 Worklog 编号（`WL#nnnn`）在源码注释里直接出现。官方�
 | **8.0.13** | **函数索引**（functional key parts，基于生成列实现） | 13_functional_mv_index |
 | **8.0.17** | **多值索引**（multi-valued index，JSON 数组） | 13_functional_mv_index |
 | **8.0.18** | **Hash Join**（取代 BNL 的默认地位） | 09_executor_iterator、runtime/05_join_buffer |
-| **8.0.20** | **`EXPLAIN ANALYZE`** | 11_explain_and_trace |
+| **8.0.18** | **`EXPLAIN ANALYZE`** | 11_explain_and_trace |
 | **8.0.22** | **`AccessPath` + RowIterator 改造完成**；**hypergraph 优化器实验性引入**（默认 off）；不可见索引 | 08_access_path、09_hypergraph |
 | **8.0.28** | **CSE（公共子表达式消除）** 进入 hypergraph 路径 | physical/18_hypergraph_advanced |
 | **8.0.31** | **INTERSECT / EXCEPT** 进入社区版；`Query_term` 树重构完成 | 19_set_operation、05_contextualize |
@@ -274,4 +274,4 @@ grep -rn "WL#" sql/ | head -50
 - [`14_plan_stability.md`](14_plan_stability.md) —— 计划稳定性与能力边界
 - [`17_optimizer_decisions.md`](17_optimizer_decisions.md) —— 决策全景（含 bad case 定位入口）
 - [`../05_contextualize.md`](../05_contextualize.md) —— `Query_term` 重构
-- [`../08_access_path/README.md`](../08_access_path/README.md) —— AccessPath 改造（8.0.22）
+- [`../08_access_path.md`](../08_access_path.md) —— AccessPath 改造（8.0.22）

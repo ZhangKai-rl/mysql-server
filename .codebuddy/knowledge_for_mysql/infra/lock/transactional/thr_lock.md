@@ -279,7 +279,9 @@ InnoDB:   —— 根本没有 THR_LOCK_DATA 成员
 
 ### 锁类型体系
 
-#### 13 种 `thr_lock_type`
+#### `thr_lock_type`：枚举 14 个成员，13 种真实锁类型
+
+> ★ **计数口径**：枚举从 `TL_IGNORE`(-1) 到 `TL_WRITE_ONLY`(12) 共 **14** 个成员；源码 `static_assert(TL_WRITE_ONLY + 1 == array_elements(...))` 验的是 **13** —— 因为排除了 `TL_IGNORE`。`TL_IGNORE` 是"跟上次一样"的占位值，`store_lock()` 必须忽略它，不算一种锁。下表按 14 个成员全列。
 
 | 类型 | 含义 |
 |---|---|

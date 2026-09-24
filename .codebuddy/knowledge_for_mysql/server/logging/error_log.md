@@ -76,7 +76,7 @@ int log_vmessage(int log_type, va_list fili) {   // 2046
 
 | sink | 组件文件 | 落盘形式 |
 |---|---|---|
-| **trad** | `log_sink_trad.cc` | 传统文本 `error.log`（`[MY-xxxx] [LEVEL] message`） |
+| **internal**（服务名 `log_sink_internal`） | `sql/server_component/`——**服务器内置实现，不是可加载组件** | 传统文本 `error.log`（`[MY-xxxx] [LEVEL] message`） |
 | **json** | `log_sink_json.cc` | JSON 行 |
 | **syseventlog** | `log_sink_syseventlog.cc` | 系统日志（Linux syslog / Windows EventLog） |
 | **perfschema** | `log_sink_perfschema.cc` | `performance_schema.error_log` 表 |

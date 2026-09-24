@@ -47,7 +47,7 @@
 
 ### server/ —— Server 层
 
-**SQL 处理主链**：见 **[query/README.md](server/query/README.md)**（52 篇 = 主链 20 篇（其中 [`08_access_path/`](server/query/08_access_path/) 拆成 9 篇）+ [`07_optimize/`](server/query/07_optimize/) 优化器 24 篇 + [`runtime/`](server/query/runtime/) 执行期专题 8 篇；主链：协议分发 → 解析 → contextualize → prepare → 优化 → AccessPath → 迭代器执行 → DML）
+**SQL 处理主链**：见 **[query/README.md](server/query/README.md)**（45 篇 = 主链 13 篇（含 [`08_access_path.md`](server/query/08_access_path.md)）+ [`07_optimize/`](server/query/07_optimize/) 优化器 24 篇 + [`runtime/`](server/query/runtime/) 执行期专题 8 篇；主链：协议分发 → 解析 → contextualize → prepare → 优化 → AccessPath → 迭代器执行 → DML）
 
 | 文件 / 目录 | 内容 |
 |---|---|
@@ -58,7 +58,7 @@
 | [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配
 | [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
 | [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |
-| [infra/](server/infra/) | 通用机制：dbug、pfs、memory、vio、variables、encoding、charset（字符集与 collation，★ UCA 900 权重算法 + InnoDB 比较回调）、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、reading_guide（★ 源码阅读知识地图） |
+| [infra/](server/infra/) | 通用机制：dbug（DBUG 宏族）、pfs + pfs_statement（Performance Schema 埋点与语句级）、memory（内存分配与 PSI 记账）、vio（虚拟 I/O 与网络）、variables（系统变量体系）、encoding、charset（字符集与 collation，★ UCA 900 权重算法 + InnoDB 比较回调）、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、mtr（mysql-test 框架）、build（编译构建体系）、reading_guide（★ 源码阅读知识地图） |
 | [plugin/](server/plugin/) | 可扩展框架：plugin（插件体系）、component（组件）、service（服务）、abi（C++ ABI 横切专题） |
 | [logging/](server/logging/) | 服务器日志：error_log、general_log、slow_log |
 

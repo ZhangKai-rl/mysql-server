@@ -358,7 +358,9 @@ TREE 输出形如：
     -> Index lookup on t2  (cost=0.30 rows=1)
 ```
 
-**`cost`/`rows` 的来源**：AccessPath 的 `cost` 字段（`num_output_rows()`），即优化器估算值（07 篇）。
+**`cost`/`rows` 的来源**：`rows` 来自 `num_output_rows()`；`cost` 来自 AccessPath 的 **`init_cost`** 字段——**不是 `cost` 字段**。
+
+> ⚠️ 展示层与内部层的差异：EXPLAIN 打印的是"读第一行"的代价（`init_cost`，源码注释明说它更直观、也便于与 `EXPLAIN ANALYZE` 对照），而优化器内部比价用的是"读全量"的 `cost`。同一个查询里，"全量代价高但首行快"的计划在 EXPLAIN 上会显得比实际便宜。三字段语义见 [`08_access_path.md`](08_access_path.md)「代价三字段与过滤前后两套值」。
 
 > ⚠️ `explain_json_format_version`（8.3 加的变量）**本版本不存在**，全库 0 匹配。
 

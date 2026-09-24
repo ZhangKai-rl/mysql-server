@@ -46,6 +46,8 @@
 
 ### 为什么自增需要专门的锁
 
+> **视角声明**：本篇从**跨层特性**视角讲三档模式的语义、默认值与对复制的影响，以及 handler 侧的获取路径。**AUTOINC 作为锁机制本身**（`lock_t` 的第五种表锁模式、兼容矩阵、为什么必须是语句级释放、与 `autoinc_mutex` 的分工）的权威剖析见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)「AUTOINC 锁」——两处互指，不重复详写。
+
 自增值在**引擎内部**生成，不走事务的行锁，因此需要单独的机制保证并发下不重复。三种模式是"**并发度 vs 语句级确定性**"的权衡：
 
 | 模式 | 常量 | 行为 | 适用场景 |
@@ -76,7 +78,9 @@ MYSQL_SYSVAR_LONG(autoinc_lock_mode, innobase_autoinc_lock_mode,
 
 ## 核心实现
 
-### 锁获取：innobase_lock_autoinc（`ha_innodb.cc:8684`）
+### handler 侧获取：innobase_lock_autoinc（跨层调用路径）
+
+> 下面这个 switch 的**锁语义**（每种模式到底拿什么锁、为什么 mode 2 不拿表锁）见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)「AUTOINC 锁」；本篇关注**调用路径与分支条件**。
 
 ```cpp
 dberr_t ha_innobase::innobase_lock_autoinc(void) {

@@ -306,7 +306,7 @@ InnoDB 的读写锁是自研的 `rw_lock_t`（不是 server 的 `mysql_rwlock_t`
 |------|----|------|
 | `LOCK_TABLE` | 意向锁 **IS/IX** | 表级意向锁：行锁的"电梯"，DDL 判断表上是否有行锁 |
 | `LOCK_TABLE` | 表级 **S/X** | `LOCK TABLES`、DDL 的表锁 |
-| `LOCK_TABLE` | **AUTOINC 锁** | 自增列三档模式（跨层特性，详见 [`../feat/auto_increment.md`](../../feat/auto_increment.md)） |
+| `LOCK_TABLE` | **AUTOINC 锁** | 锁模式定义 / 兼容矩阵（AI 与 AI 不兼容）/ 语句级释放的由来判断——**锁机制权威在 [`innodb_trx_lock.md`](transactional/innodb_trx_lock.md)「AUTOINC 锁」**；三档模式（`innodb_autoinc_lock_mode`）对复制的影响与 handler 获取路径见 [`../../feat/auto_increment.md`](../../feat/auto_increment.md)（另一视角，两处互指不重复详写） |
 | `LOCK_REC` | **record / gap / next-key / insert intention** | 行级四标志（`LOCK_REC_NOT_GAP`/`LOCK_GAP`/`LOCK_INSERT_INTENTION` 组合） |
 | `PRDT_REC`/`PRDT_PAGE` | **谓词锁** | R-tree 空间索引（`lock0prdt.cc`） |
 | — | 等待与死锁检测 | `lock0wait.cc` + `lock_deadlock_*`（waits-for graph + DFS 回滚受害者） |

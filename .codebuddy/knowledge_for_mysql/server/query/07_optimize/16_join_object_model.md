@@ -5,7 +5,7 @@
 > **边界**：本篇讲"字段是什么、谁写、谁读、何时失效"。字段背后的**算法**不在这里：
 > - `POSITION` 字段语义与 join order 搜索 → [`physical/06_join_order.md`](physical/06_join_order.md)
 > - `Key_use` 语义与 `find_best_ref` 代价 → [`physical/07_access_method.md`](physical/07_access_method.md)
-> - `AccessPath` 结构与两条创建路径 → [`../08_access_path/README.md`](../08_access_path/README.md)
+> - `AccessPath` 结构与两条创建路径 → [`../08_access_path.md`](../08_access_path.md)
 > - range 优化器内部（`SEL_ARG` / `QUICK_*`）→ [`physical/08_range_optimizer.md`](physical/08_range_optimizer.md)
 > - 分组/去重相关标志的推导过程 → [`15_groupby_distinct_order.md`](15_groupby_distinct_order.md)
 > - hypergraph 的对象模型（无 QEP_TAB）→ [`physical/09_hypergraph.md`](physical/09_hypergraph.md)
@@ -553,7 +553,7 @@ void set_idx(plan_idx i) {
 
 - [`physical/06_join_order.md`](physical/06_join_order.md) —— `POSITION` 全字段与搜索算法
 - [`physical/07_access_method.md`](physical/07_access_method.md) —— `Key_use` 与访问方法代价
-- [`../08_access_path/README.md`](../08_access_path/README.md) —— AccessPath 结构与两条创建路径
+- [`../08_access_path.md`](../08_access_path.md) —— AccessPath 结构与两条创建路径
 - [`15_groupby_distinct_order.md`](15_groupby_distinct_order.md) —— 分组/排序标志的推导
 - [`physical/09_hypergraph.md`](physical/09_hypergraph.md) —— hypergraph 的对象模型
 - [`../01_protocol_to_dispatch.md`](../01_protocol_to_dispatch.md) —— mem_root 一次性回收

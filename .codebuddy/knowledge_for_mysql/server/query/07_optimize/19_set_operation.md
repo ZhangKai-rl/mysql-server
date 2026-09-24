@@ -518,4 +518,4 @@ SET debug='d,ast';
 - [`../runtime/08_materialization.md`](../runtime/08_materialization.md) —— 物化与临时表的运行期细节
 - [`../09_executor_iterator.md`](../09_executor_iterator.md) —— `AppendIterator` / `MaterializeIterator` / `TableScanIterator`
 - [`16_join_object_model.md`](16_join_object_model.md) —— `m_root_iterator` 归属于 unit（本篇的执行入口）
-- [`../08_access_path/README.md`](../08_access_path/README.md) —— AccessPath 类型（`APPEND` / `MATERIALIZE` / `LIMIT_OFFSET`）
+- [`../08_access_path.md`](../08_access_path.md) —— AccessPath 类型（`APPEND` / `MATERIALIZE` / `LIMIT_OFFSET`）

@@ -2,7 +2,7 @@
 
 > 优化器是查询处理中最大的子系统之一，独立成此目录（作为 query 主链第 5 步）。本目录按**逻辑优化 → 物理优化 → 计划改进**三层组织，全部算法级。
 >
-> **上下游**：`../06_resolver_prepare.md`（②→③）→ **本目录**（③→④，产出 AccessPath）→ `../08_access_path/README.md`（④ AccessPath 树）→ `../09_executor_iterator.md`（⑤ 迭代器）。执行期专题见 `../runtime/`。
+> **上下游**：`../06_resolver_prepare.md`（②→③）→ **本目录**（③→④，产出 AccessPath）→ `../08_access_path.md`（④ AccessPath 树）→ `../09_executor_iterator.md`（⑤ 迭代器）。执行期专题见 `../runtime/`。
 
 ## 目录结构
 

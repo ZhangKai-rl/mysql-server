@@ -58,7 +58,7 @@ InnoDB 是索引组织表（IOT）：聚簇索引的叶子就是表数据本身�
 |------|------|
 | 5.6 | WL#7277 快速索引创建：新增 `btr0bulk.cc` 排序批量构建，建索引不再逐条插入 |
 | 5.7 | 新增全局变量 `innodb_fill_factor`（10–100，默认 100）控制 bulk 页的预留空间；分裂填充因子可经变量调整 |
-| 8.0 | `btr0bulk.cc` 重构为 `btr0load.cc` 的 `Btree_load` 类，并接入并行 DDL 框架 `ddl0loader`/`ddl0builder`；B-tree SMO 的树锁从 X 演进为 **SX + 搜索路径预测裁剪**；分裂填充逻辑回归硬编码 50%，可调变量移除；LOB 重构（`lob::BtrContext`，旧 `btr_store_big_rec_extern_fields` 删除）；`node_ptr_optimistic_delete` 拆为 `btr_node_ptr_delete` + `btr_insert_on_non_leaf_level`；instant ADD COLUMN 的物化判断进入更新路径 |
+| 8.0 | `btr0bulk.cc` 重构为 `btr0load.cc` 的 `Btree_load` 类，并接入并行 DDL 框架 `ddl0loader`/`ddl0builder`；B-tree SMO 的树锁从 X 演进为 **SX + 搜索路径预测裁剪**；**页分裂**的填充因子回归硬编码 50%（`innodb_fill_factor` 仍存在，但只作用于 **bulk load** 的预留空间，`Btree_load` 用它算 `m_reserved_space`，默认 100、范围 10–100）；LOB 重构（`lob::BtrContext`，旧 `btr_store_big_rec_extern_fields` 删除）；`node_ptr_optimistic_delete` 拆为 `btr_node_ptr_delete` + `btr_insert_on_non_leaf_level`；instant ADD COLUMN 的物化判断进入更新路径 |
 | 8.0.30 | AHI 大改：全局单一 `search_latch` 拆为按 (space_id, index_id) 哈希的 **sharded latch**，新增只读变量 `innodb_adaptive_hash_index_parts`（1–512，默认 8）；`btr_search_info_t` 改名 `btr_search_t`；`hash_table_t` 以 0 个内部同步对象创建（内容完全由 part latch 保护） |
 | 8.0.27 | redo 新增 `MLOG_LIST_END_DELETE_8027` / `MLOG_COMP_LIST_END_DELETE_8027` 新格式（恢复端兼容新旧） |
 

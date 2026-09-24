@@ -152,7 +152,7 @@ join 枚举经历三代算法。全景如下——**各代的详细源码落点�
 
 | | 旧优化器（greedy） | 新优化器（hypergraph） |
 |---|---|---|
-| 起源 | 5.x 一路演进，源自 System R 左深树 | 8.0.20+ 引入，源自 DPhyp 论文 |
+| 起源 | 5.x 一路演进，源自 System R 左深树 | **8.0.22** 引入（`optimizer_switch` 的 `hypergraph_optimizer`，实验特性），源自 DPhyp 论文 |
 | join 形状 | **只支持左深树** | 支持 bushy tree（任意形状） |
 | 算法 | 贪心 + 剪枝 | `EnumerateAllConnectedPartitions`（DPhyp） |
 | 默认 | 默认开启 | `optimizer_switch=hypergraph_optimizer` 开启 |
@@ -166,7 +166,7 @@ join 枚举经历三代算法。全景如下——**各代的详细源码落点�
 - **逻辑优化** = 逻辑等价变换（规则），不涉及具体执行方式
 - **物理优化** = 在等价逻辑表达式里，用代价挑具体实现（访问方法、join 顺序、join 方式）
 
-"先规则、后代价"——规则负责缩小空间，代价负责挑出最优。这是本目录 11 篇组织逻辑的根源。
+"先规则、后代价"——规则负责缩小空间，代价负责挑出最优。这是本目录 24 篇组织逻辑的根源。
 
 ---
 
@@ -264,7 +264,7 @@ join 枚举经历三代算法。全景如下——**各代的详细源码落点�
 | 796 | `optimize_distinct_group_order` | ① | [15 篇 3 章](15_groupby_distinct_order.md) |
 | 894-916 | `setup_join_buffering`（BNL/BKA/HashJoin） | ③ | [10 篇](10_plan_refinement.md) [17 篇 决策 25](17_optimizer_decisions.md) |
 | **1011-1023** | `alloc_qep` / `test_skip_sort` / `finalize_table_conditions` / `make_join_readinfo` / `make_tmp_tables_info` | **④ 计划改进** | [10 篇](10_plan_refinement.md) [15 篇 4/6 章](15_groupby_distinct_order.md) |
-| **1037** | **`create_access_paths()`** | 代码生成 | [`../08_access_path/README.md`](../08_access_path/README.md) |
+| **1037** | **`create_access_paths()`** | 代码生成 | [`../08_access_path.md`](../08_access_path.md) |
 | 1064 | `push_to_engines`（引擎条件下推） | ④ | [10 篇](10_plan_refinement.md) |
 
 > **注意**：逻辑优化（①）不是一次性完成的。它分布在 `JOIN::optimize` 前段（`optimize_cond`）+ prepare 阶段（semi-join/derived merge/连接简化）+ 部分在 join 顺序之后（`substitute_for_best_equal_field`，因为"最优字段"依赖 join 顺序）。
@@ -282,29 +282,49 @@ Query_block::prepare
 
 ## 五、本目录各篇导航
 
+> 本目录共 **24 篇**：根下 15 篇 + `logical/` 4 篇 + `physical/` 5 篇。按"主链阶段 → 专项 → 横切"三组导航。
+
 ```
 optimizer/
-├── 00_overview.md        本篇
-├── 01_cost_model.md      代价模型 + 统计信息（②③ 的前提）
-├── logical/              ① 逻辑优化
+├── 【基础】
+│   ├── 00_overview.md        本篇：两阶段模型、两条优化路径、各篇导航
+│   └── 01_cost_model.md      代价模型 + 统计信息（②③ 的前提）
+├── 【① 逻辑优化】logical/
 │   ├── 02_subquery.md          子查询改写决策树
 │   ├── 03_semijoin.md          semi-join（五策略、改写/优化/执行）
 │   ├── 04_logical_join.md      连接简化（外连接转内、derived/view/CTE merge）
 │   └── 05_logical_predicate.md 谓词优化（等值传播、常量折叠、下推、ICP）
-├── physical/             ②③ 物理优化
+├── 【②③ 物理优化】physical/
 │   ├── 06_join_order.md        join order 搜索（greedy + 限深 DFS + 剪枝）
 │   ├── 07_access_method.md     访问方法选择（const 表 / ref / range / scan）
 │   ├── 08_range_optimizer.md   range 优化（SEL_TREE 区间森林）
-│   └── 09_hypergraph.md        hypergraph（DPhyp）
-└── 10_plan_refinement.md ④ 计划改进
+│   ├── 09_hypergraph.md        hypergraph（DPhyp 算法级）
+│   └── 18_hypergraph_advanced.md  hypergraph 进阶（CSE、最终化、与经典优化器对照）
+├── 【④ 计划改进】
+│   └── 10_plan_refinement.md  计划改进阶段
+├── 【专项：某类查询/对象的优化】
+│   ├── 11_optimizer_hints.md   optimizer hint 体系
+│   ├── 12_partition_pruning.md 分区裁剪
+│   ├── 13_functional_mv_index.md 功能索引与多值索引
+│   ├── 15_groupby_distinct_order.md GROUP BY / DISTINCT / ORDER BY
+│   ├── 19_set_operation.md     UNION / INTERSECT / EXCEPT
+│   ├── 20_view_resolution.md  视图解析与合并
+│   └── 21_collation_index_usability.md collation 与索引可用性
+└── 【横切：对象模型 / 决策集 / 演进 / 观测】
+    ├── 14_plan_stability.md   计划稳定性（★ 外部知识对照：SPM/他库方案，非 8.0.39 实现）
+    ├── 16_join_object_model.md JOIN/POSITION/QEP_TAB 对象模型
+    ├── 17_optimizer_decisions.md 优化器决策全集（数十个 if 的"为什么"）
+    ├── 22_optimizer_worklog_timeline.md WL 与版本演进时间线
+    └── 23_optimizer_trace_internals.md optimizer trace 内部实现
 ```
 
 **推荐阅读顺序**：
 
-1. **入门**：00 → 01 → 06 → 07（主链：框架 → 代价 → join order → 访问方法）
-2. **深入物理优化**：08（range 是最复杂的访问方法）
+1. **入门主链**：00 → 01 → 06 → 07（框架 → 代价 → join order → 访问方法）
+2. **深入物理优化**：08（range 是最复杂的访问方法）→ 09 → 18（hypergraph）
 3. **深入逻辑优化**：03（semi-join）→ 04（连接简化）→ 05（谓词）
-4. **新特性**：09（hypergraph）
+4. **查具体决策**：17（决策全集，按主题索引）、16（对象模型）
+5. **排查与演进**：23（trace 怎么用）→ 22（什么版本改了什么）
 
 ---
 
@@ -324,7 +344,7 @@ SELECT t1.a FROM t1 WHERE t1.a IN (SELECT t2.b FROM t2 WHERE t2.c > 5);
 | 4 | **② 初始分析** | `extract_const_tables` 检测 const 表；`update_ref_and_keys` 生成 Key_use；`estimate_rowcount` 首次 range 分析 | [07 篇](physical/07_access_method.md) |
 | 5 | **③ 物理优化** | `make_join_plan`：greedy search 定 join 顺序、`best_access_path` 选访问方法（`t2.c>5` → range）、semi-join 策略选择 | [06](physical/06_join_order.md) [07](physical/07_access_method.md) [08](physical/08_range_optimizer.md) |
 | 6 | **④ 计划改进** | `test_if_skip_sort` 看能否用索引顺序；`make_join_readinfo` → `push_index_cond` 把条件下推为 ICP | [10 篇](10_plan_refinement.md) |
-| 7 | **代码生成** | `create_access_paths` 产出 AccessPath 树 → `CreateIteratorFromAccessPath` 生成迭代器 | [`../08_access_path/README.md`](../08_access_path/README.md)、[`../09_executor_iterator.md`](../09_executor_iterator.md) |
+| 7 | **代码生成** | `create_access_paths` 产出 AccessPath 树 → `CreateIteratorFromAccessPath` 生成迭代器 | [`../08_access_path.md`](../08_access_path.md)、[`../09_executor_iterator.md`](../09_executor_iterator.md) |
 
 ---
 

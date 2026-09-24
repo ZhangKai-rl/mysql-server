@@ -49,7 +49,7 @@ SQL 处理是**七个阶段、每阶段产出一棵树**。先看"动作 + 产�
 | ③ 语义 contextualize（含 itemize） | 逻辑查询树 QE/QB/Query_term + Item 树 | [05_contextualize](05_contextualize.md) |
 | ④ prepare（resolve + transform） | 绑定/改写后的 Item 树 + 逻辑树 | [06_resolver_prepare](06_resolver_prepare.md) |
 | ⑤ optimize | AccessPath 物理计划 | [07_optimize](07_optimize/README.md) |
-| ⑥ 迭代器化 | RowIterator 树 | [08_access_path](08_access_path/README.md) → [09_executor](09_executor_iterator.md) |
+| ⑥ 迭代器化 | RowIterator 树 | [08_access_path](08_access_path.md) → [09_executor](09_executor_iterator.md) |
 | ⑦ execute | 结果集 | [09_executor](09_executor_iterator.md) |
 
 > **补充与易混点**：
@@ -196,7 +196,7 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 | [05_contextualize.md](05_contextualize.md) | ①→② | `contextualize()` 全景、各类节点做什么、Query_term 树（8.0.31 重构）、Item 与 `itemize`、完整分步示例 |
 | [06_resolver_prepare.md](06_resolver_prepare.md) | ②→③ | `Query_block::prepare()` 46 步、`setup_*` 函数族、`fix_fields`、name resolution、semi-join/derived 改写 |
 | **[07_optimize/](07_optimize/README.md)** | ③→④ | **优化器（23 篇，子目录）**：代价模型与统计、`logical/` 逻辑优化（子查询/semi-join/连接简化/谓词）、`physical/` 物理优化（join order/访问方法/range/hypergraph + CSE 等高阶模块）、计划改进；专项篇：GROUP BY/DISTINCT 决策、对象模型、set operation、VIEW；横切篇：决策全景、collation 与索引可用性、worklog 时间线 |
-| [08_access_path/README.md](08_access_path/README.md) | ④ | AccessPath 44 种类型、新旧优化器两条创建路径、与 Iterator 1:1 |
+| [08_access_path.md](08_access_path.md) | ④ | AccessPath 44 种类型、新旧优化器两条创建路径、与 Iterator 1:1 |
 | **[09_executor_iterator.md](09_executor_iterator.md)** | ⑤ | **RowIterator 火山模型（算法级）**：火山契约、`unlock_row` 三种例外、NLJ 的 NULL 补全状态机、HashJoin 三形态与 chunk 估算、BKA 的 MRR cookie、**index merge 三个迭代器**（多路归并取交集/堆归并去重/两阶段 Unique）、排序/物化在 `Init()`、显式栈翻译、`ExecuteIteratorQuery` |
 | [10_dml.md](10_dml.md) | ⑤ DML 分支 | **DML 与 SELECT 的差异篇**（SELECT 是主链 02~09，不重复）：`Sql_cmd_dml` 类体系（SELECT 也继承它）、INSERT 的 `write_record` 链（不走迭代器）、UPDATE/DELETE 单表快路径 vs 多表迭代器、Halloween 问题与两阶段读、与 SELECT 在 read_set/write_set/ICP/覆盖索引的差异 |
 | [12_prepared_statement.md](12_prepared_statement.md) | ⑤' PS 路径（与主链并行） | **预编译语句**：`COM_STMT_*` 五命令与二进制协议（报文逐字段）、`Prepared_statement` 生命周期、**社区版无 plan cache 的证据链**（PS 只缓存语法树、每次 execute 重做 optimize）、`Item_param` 三套类型与 `const_for_execution`（为什么 prepare 期不能折叠 `?`）、reprepare 自动修复、执行链路到 InnoDB |

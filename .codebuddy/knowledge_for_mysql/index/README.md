@@ -4,7 +4,7 @@
 >
 > **归属判据**：以"索引"为**第一主语**的篇进本目录；索引只是其一部分的特性篇留在原处（全文检索 [`../feat/fts.md`](../feat/fts.md)、空间 [`../server/datatype/gis.md`](../server/datatype/gis.md)、功能/多值索引 [`../feat/generated_columns.md`](../feat/generated_columns.md)），由下面的分类导航聚合。
 >
-> **为什么不拆子目录**：知识库规则是"同一阶段 ≥3~4 篇才建子目录"。本目录现有 3 篇分属两个类，先用分类导航体现结构；某类攒够 3~4 篇再物理建子目录（`storage/`、`optimization/`、`types/`）。
+> **为什么不拆子目录**：本目录现有 **17 篇**，用下面的「九个分类 + 四条纵向底座」导航表组织。按知识库规则"同一阶段 ≥3~4 篇才建子目录"，② 存储结构（5 篇）与纵向底座（4 篇）**已过阈值**；之所以仍不物理拆分，是因为这些篇之间交叉引用极密（如 `secondary.md` 同时属于②存储结构与生命周期、`btr.md` 承载⑧锁与并发），拆成子目录会把"一篇横跨多类"的关系切碎。**当前的取舍是：用导航表表达分类，用实体文件保持交叉自由**——若后续篇数继续增长且出现真正的同质子群（如"辅助结构"攒到 4 篇以上），再考虑建子目录。
 
 ## 目录
 
@@ -36,7 +36,13 @@
 
 ## 分类导航表
 
-> **两条纵向底座**（横贯九分类，不属于任何一格）：[`metadata.md`](metadata.md)（索引的**元数据对象模型**：`dd::Index` ↔ `dict_index_t` ↔ SDI ↔ `se_private_data` 五键，root page no 是两套字典的桥）与 [`physical_storage.md`](physical_storage.md)（索引的**物理存储与持久化**：根页恒定/两段式分配/索引页布局/MLOG redo 体系/bulk load 豁免与 DDL log/空间回收与恢复）。类型语义 → 对象模型 → 存储结构 → 物理与持久化，这条链由这两篇补上底座。
+> **四条纵向底座**（横贯九分类，不属于任何一格）：
+> ① [`metadata.md`](metadata.md)——索引的**元数据对象模型**（`dd::Index` ↔ `dict_index_t` ↔ SDI ↔ `se_private_data` 五键，root page no 是两套字典的桥）；
+> ② [`construction.md`](construction.md)——**索引怎么被构造出来**（`KEY`/`KEY_PART_INFO` 与三条构造链路）；
+> ③ [`record_format.md`](record_format.md)——**索引记录的存储格式**（三种记录字段组成、trx_id_offset 快速通道、BLOB 前缀）；
+> ④ [`physical_storage.md`](physical_storage.md)——**索引的物理存储与持久化**（根页恒定/两段式分配/索引页布局/MLOG redo 体系/bulk load 豁免与 DDL log/空间回收与恢复）。
+>
+> 类型语义 → 构造 → 对象模型 → 存储结构 → 记录格式 → 物理与持久化，这条链由这四篇补上底座。
 
 | 分类 | 本目录实体篇 | 导航到（一处详写，不复制） |
 |------|------------|--------------------------|

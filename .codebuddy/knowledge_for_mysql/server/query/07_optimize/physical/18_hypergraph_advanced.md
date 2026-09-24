@@ -641,6 +641,6 @@ SELECT * FROM t1 WHERE (t1.a=1 AND t1.b>3) OR (t1.a=1 AND t1.b<0);
 
 - [`09_hypergraph.md`](09_hypergraph.md) —— 建图、DPhyp 枚举、CostingReceiver
 - [`../01_cost_model.md`](../01_cost_model.md) —— 经典代价模型与 `server_cost` / `engine_cost` 可配置常量（与本篇第四章的 `constexpr` 形成对照）
-- [`../../08_access_path/README.md`](../../08_access_path/README.md) —— AccessPath 结构与 `ExpandFilterAccessPaths`
+- [`../../08_access_path.md`](../../08_access_path.md) —— AccessPath 结构与 `ExpandFilterAccessPaths`
 - [`../../06_resolver_prepare.md`](../../06_resolver_prepare.md) —— 经典优化器侧的谓词改写（与 CSE 对比）
 - [`../../runtime/06_rollup.md`](../../runtime/06_rollup.md) —— rollup 的 Item 替换（与 `replace_item` 同源）
