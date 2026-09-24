@@ -805,6 +805,8 @@ enum fts_table_state_enum {
 
 ## 五、倒排列表 ilist 与 VLC 编码
 
+> **视角声明**：倒排列表的**存储与编码是索引结构问题**，权威剖析见 [`../index/inverted.md`](../index/inverted.md)（ilist 字节级布局、VLC 终止位与 delta、6 档分档、删除旁路表示与 optimize 重编码）。本篇作为全文检索全链路的一环保留编码细节，但**不重复那里的权威内容**——若两处冲突以 `inverted.md` 为准。
+
 ### 5.1 VLC 变长整数
 
 `fts0vlc.ic`：每字节低 7 位存数据，**高位 0x80 表示"这是最后一个字节"**（与 JSONB 的 0x80 续行位方向相反！）：

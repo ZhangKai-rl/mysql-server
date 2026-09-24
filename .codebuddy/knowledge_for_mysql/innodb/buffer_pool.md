@@ -1450,7 +1450,7 @@ return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
 
 刷脏经 `dblwr::write`（buf0dblwr.cc）走 doublewrite：先把页写到 doublewrite buffer（独立文件双池，8.0.20+），再写数据文件。
 
-**为什么必须 doublewrite——防半页写（torn page）**：InnoDB 页 16KB，操作系统/磁盘扇区通常 4KB（甚至 512B）。一次 16KB 写若中途崩溃，只有部分扇区落盘，页撕裂。若有 doublewrite：数据文件里的撕裂页可从 doublewrite buffer 的完整副本恢复；若无，撕裂页无 redo 保护（redo 只记逻辑修改，假设页本身完整），崩溃恢复会因 checksum 校验失败而无法重放。
+**为什么刷脏必须经 doublewrite**：防半页写（torn page）——页 16KB 而扇区通常 4KB，中途崩溃会撕裂；redo 只记逻辑修改并假设页本身完整，撕裂页无法重放。★ 完整论证（redo 的能力边界、崩溃恢复时 dblwr 如何修页）见 [`dblwr.md`](dblwr.md)，本篇只留结论。
 
 刷脏经 `dblwr::write` 进入时有两条分支：
 
@@ -1463,7 +1463,7 @@ return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
 
 8.0.20+ 重构：dblwr 从系统表空间的固定区域改为独立文件（`#ib_<page_size>_<id>.dblwr`），与系统表空间解耦、可经 `innodb_doublewrite_dir` 放到别的设备。
 
-> **★ 矫正一处常见说法**：多个 dblwr 文件**不是"双池（active + ready）轮换"**，而是**奇偶 id 的功能切分**——奇数 id 文件承载 **LRU 批量段 + 全部单页 SYNC 槽位**，偶数 id 文件承载 **flush list 批量段**。
+> 多个 dblwr 文件是**奇偶 id 的功能切分**（奇数：LRU 批量段 + 全部单页 SYNC 槽位；偶数：flush list 批量段），不是"双池轮换"——完整剖析见 [`dblwr.md`](dblwr.md)。
 
 **★ doublewrite 的完整剖析见专篇 [`dblwr.md`](dblwr.md)**——文件布局（无文件头的扁平页数组）、批量/单页两条路径的完整源码、崩溃恢复时如何用 dblwr 修页、加密帧为什么单独存在、`O_DIRECT_NO_FSYNC` 下哪些 fsync 被跳过、参数与监控、源码里的已知 TODO。
 

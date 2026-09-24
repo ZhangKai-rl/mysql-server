@@ -343,26 +343,30 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
 - **entry 太大不缓存**：`entry_size >= 空页可用空间/2`（约 8 KB）→ 放弃（否则 merge 时装不下）。
 - **两级重试**：先 `BTR_MODIFY_PREV`（乐观），返回 `DB_FAIL` 后用 `BTR_MODIFY_TREE`（悲观，可能引 ibuf 树分裂）。
 
-#### 3.3 ★ 不缓存的 14 条条件（完整清单）
+#### 3.3 ★ 不缓存的条件：五道闸，不是一张平铺清单
 
-| # | 条件 | 位置 |
-|---|---|---|
-| 1 | `innodb_change_buffering = none` 或 `ibuf->max_size == 0` | `ibuf0ibuf.ic` |
-| 2 | 聚簇索引 | `ibuf0ibuf.ic` + `ut_a` |
-| 3 | 空间索引 / 含降序列 / quiesce 中的表 / DD 表空间 | `ibuf0ibuf.ic` |
-| 4 | **唯一二级索引 + INSERT** | `ibuf0ibuf.ic` |
-| 5 | `innodb_force_recovery >= 4` | `ibuf0ibuf.ic` |
-| 6 | op 与 change_buffering 组合不允许 | `ibuf0ibuf.cc` |
-| 7 | **页已在 BP，或已设 buffer pool watch** |  |
-| 8 | `entry_size >= 空页可用空间/2` |  |
-| 9 | `ibuf->size >= max_size + 10` |  |
-| 10 | 悲观插入前 `ibuf_add_free_page` 失败 |  |
-| 11 | **页在 BP 中，或页上有显式记录锁** |  |
-| 12 | INSERT 且"已缓存量 + 本条 + 目录槽 > FREE 位代表的空间" |  |
-| 13 | DELETE 且 `min_n_recs < 2` 或 watch 已触发 |  |
-| 14 | counter 无法计算（遇到老格式记录） |  |
+否决条件分布在 `ibuf_insert` → `ibuf_insert_low` 的**五个检查阶段**——越往后越接近真正写入，判定的东西也越从"能不能用"变成"这一刻行不行"：
 
-> **第 11 条是"写完立刻读"负收益的根因之一**：`buf_page_peek(page_id)` 为真的页一律不缓存。
+| 阶段 | # | 条件 | 判定点 |
+|---|---|---|---|
+| **A 全局开关**（ibuf 整体能不能用） | 1 | `innodb_change_buffering = none` 或 `ibuf->max_size == 0` | `ibuf_insert_low`：`ibuf->max_size == 0` |
+| | 5 | `innodb_force_recovery >= 4`（崩溃恢复模式不写 ibuf） | `ibuf_insert_low` |
+| **B 索引类型**（这个索引能不能缓存） | 2 | 聚簇索引——ibuf 只服务二级索引（`ut_a` 断言级） | `ibuf0ibuf.ic` |
+| | 3 | 空间索引 / 含降序列 / quiesce 中的表 / DD 表空间 | `ibuf0ibuf.ic` |
+| | 4 | **唯一二级索引 + INSERT**（唯一性必须立即校验，见「为什么只缓存非唯一二级索引」） | `ibuf0ibuf.ic` |
+| | 6 | op 与 `change_buffering` 选项组合不允许（如只开 inserts 却来一个 delete-mark） | `ibuf0ibuf.cc` |
+| **C 页级现状**（这一刻这张页能不能缓存） | 7 | **页已在 BP，或已设 buffer pool watch**（purge 正在处理） | `ibuf_insert` 的 `check_watch` 分支 |
+| | 11 | **页在 BP 中，或页上有显式记录锁** | `ibuf_insert_low`：`buf_page_peek(page_id) \|\| lock_rec_expl_exist_on_page(page_id)` |
+| | 13 | DELETE 且 `min_n_recs < 2` 或 watch 已触发 | `ibuf_insert_low`：`min_n_recs < 2 \|\| buf_pool_watch_occurred(page_id)` |
+| **D 容量与空间** | 8 | `entry_size >= 空页可用空间/2`（约 8KB）——否则 merge 时装不进目标页 | `ibuf_insert_low` |
+| | 9 | `ibuf->size >= max_size + IBUF_CONTRACT_DO_NOT_INSERT`（+10 是留出的收缩余量） | `ibuf_insert_low` |
+| | 10 | 悲观插入前 `ibuf_add_free_page()` 失败（ibuf 树要分裂却申请不到空闲页） | `ibuf_insert_low` |
+| | 12 | INSERT 且"已缓存量 + 本条 + 目录槽 > FREE 位代表的空间"（与 `page_dir_calc_reserved_space(1)` 比较） | `ibuf_insert_low` |
+| **E 格式兼容** | 14 | counter 无法计算（遇到"无 counter 的老格式"记录，见 3.2） | `ibuf_insert_low` |
+
+★ **第 7 条与第 11 条不是重复条目，而是两个检查点**：第 7 条在 `ibuf_insert` 的 `check_watch` 分支（bitmap 检查之后、构造 entry 之前），第 11 条在 `ibuf_insert_low` 写入前的最终检查。两者之间隔了 entry 构造与 ibuf 树搜索，**期间目标页可能已被并发读入 BP**，所以必须再查一次。"页在 BP"这个条件在两处出现是**时序造成的必要重查**，不是清单凑数。
+
+> **第 11 条是"写完立刻读"负收益的根因之一**：`buf_page_peek(page_id)` 为真的页一律不缓存——刚写过（页还热在 BP）又改，本来也不该走 ibuf（见「收益与代价」）。
 
 ```c
   if (buf_page_peek(page_id) || lock_rec_expl_exist_on_page(page_id)) {

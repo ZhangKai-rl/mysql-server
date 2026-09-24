@@ -843,6 +843,7 @@ todo->push_back({outer, join, false, &job->children[0], {}});   // outer 传 fal
 | 想看什么 | 手段 |
 |---|---|
 | 计划树的形状 | `EXPLAIN FORMAT=TREE`（`--><--` 缩进树，最直观）、`EXPLAIN FORMAT=JSON` |
+| EXPLAIN 怎么把树打印出来 | ★ 权威在 [`11_explain_and_trace.md`](11_explain_and_trace.md)（EXPLAIN 是第一主语：`ExplainChild` 结构、TREE/JSON 构造器、传统表格与 `opt_explain_*` 的分工）。本篇只从 AccessPath 视角交代"输出的信息从哪来" |
 | 每个节点的估算代价 | `EXPLAIN` 的 cost 列 / `FORMAT=JSON` 的 `query_cost`——**注意打印的是 `init_cost` 不是 `cost`** |
 | 实际耗时与行数 | `EXPLAIN ANALYZE`（靠 `TimingIterator` 包装 + `iterator` 反向指针回填） |
 | `init_once_cost` | 只在 **optimizer trace** 里（`SET optimizer_trace="enabled=on"`），EXPLAIN 不打印 |

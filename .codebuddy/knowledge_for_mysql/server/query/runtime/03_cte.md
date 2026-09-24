@@ -445,6 +445,8 @@ int FollowTailIterator::Read() {
 
 ## 五、共享物化与重扫
 
+> **视角声明**：`clone_tmp_table()` 与 `DELAYED_OPEN` 的**机制权威**在 [`08_materialization.md`](08_materialization.md)「共享物化：clone_tmp_table() 与 DELAYED_OPEN」（物化是第一主语，含完整源码逐段）。本篇只从 **CTE 视角**保留"多引用只物化一次"与"读者同步"这两条使用侧结论，不重复那里的机制剖析。
+
 ### 5.1 多引用只物化一次：clone_tmp_table
 
 同一 CTE 的第二个及后续引用不再 `create_tmp_table`，而是 `open_table_from_share` 基于同一个 `TABLE_SHARE` 克隆一个新的 TABLE 句柄——**共享底层数据、各自独立游标**。第一个是写者，克隆是读者。

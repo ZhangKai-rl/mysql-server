@@ -65,6 +65,55 @@ new_value = old_value ⊕ entering_row ⊖ leaving_row
 
 ⚠️ **理论限制**：inversion 要求聚合有**逆运算**。加法有逆（减法），故 `SUM`/`COUNT`/`AVG` 可行；但 **`MAX`/`MIN` 没有逆运算**——移除一个元素后无法得知新的极值（除非改用单调栈等结构），字符串聚合同理。所以 inversion 不是万能的。
 
+#### 判定链：两级条件 + 函数级"一票否决"
+
+```cpp
+// sql/window.cc  check_window_functions1()
+m_static_aggregates =
+    (m_frame->m_from->m_border_type == WBT_UNBOUNDED_PRECEDING &&
+     m_frame->m_to->m_border_type == WBT_UNBOUNDED_FOLLOWING);
+// If static aggregates, inversion isn't necessary
+m_row_optimizable   = (m_frame->m_query_expression == WFU_ROWS)  && !m_static_aggregates;
+m_range_optimizable = (m_frame->m_query_expression == WFU_RANGE) && !m_static_aggregates;
+
+for (Item_sum &wf : m_functions) {
+  Window_evaluation_requirements reqs;   // 默认 row_optimizable = range_optimizable = true
+  if (wf.check_wf_semantics1(thd, select, &reqs)) return true;
+  ...
+  m_row_optimizable   &= reqs.row_optimizable;    // ★ 一票否决
+  m_range_optimizable &= reqs.range_optimizable;
+}
+```
+
+两级条件：
+
+1. **帧级**：帧单位必须是 ROWS（行号偏移）才谈得上"进出各一行"；RANGE 帧走另一套标志（`range_optimizable`）。此外**静态聚合**（`UNBOUNDED PRECEDING ~ UNBOUNDED FOLLOWING`，整个 partition 就是一个 frame）**不需要** inversion——frame 根本不动，无从增量。
+2. **函数级**：每个窗口函数经 `check_wf_semantics1()` 填自己的 `Window_evaluation_requirements`（两个标志默认 `true`），最后逐个 `&=`。源码注释点名了谁能谁不能：
+
+   > Set to true if we can compute a sliding window by a combination of undoing the contribution of rows going out of the frame and adding the contribution of rows coming into the frame. **For example, SUM and AVG allows this, but MAX/MIN do not.** Only applicable if the frame has ROW bounds unit.
+
+#### 失效的代价：退化成 O(n × frame_size)
+
+关闭后退回朴素实现——**每个 frame 重新扫一遍**：
+
+```
+ROWS BETWEEN 1000 PRECEDING AND CURRENT ROW   -- frame_size ≈ 1000
+  inversion 开：每行 O(1)（加一行、减一行）→ 整窗 O(n)
+  inversion 关：每行重扫 1000 行           → 整窗 O(1000n)
+```
+
+★ **连坐语义最容易被忽略**：`m_row_optimizable` 是**窗口级**标志，不是函数级。`SUM(x) OVER (...)` 单独跑是 O(n)；只要同一窗口里再加一个 `MAX(y) OVER (...)`，`&=` 会让**两个函数一起退化**——不是"MAX 慢一点"，而是 SUM 也被拖回朴素实现。
+
+#### 怎么判断有没有走到 inversion（这是个观测盲区）
+
+| 手段 | 能看到什么 |
+|---|---|
+| 源码标志 | `Window::optimizable_row_aggregates()` / `optimizable_range_aggregates()`（注释明说只在 `m_needs_buffering` 为真时有意义） |
+| EXPLAIN | **看不出来**——窗口函数不单独成节点，是否启用 inversion 完全不暴露 |
+| 实证法 | 加大 `N PRECEDING` 观察耗时曲线：随 N 增长不明显 = inversion 生效；**随 N 线性放大 = 已退化** |
+
+★ 这是窗口函数调优里最"看不见"的一环：EXPLAIN 不暴露、状态变量也没有，只能靠"帧规模 × 函数组合"的经验判断——**同一窗口里混用 SUM 与 MAX/MIN 是最典型的退化写法**。
+
 ### 为什么必须先排序
 
 窗口函数的语义建立在 `PARTITION BY + ORDER BY` 之上，执行前输入必须**按 partition + order 排好序**。这个排序（filesort）往往是窗口函数查询的主要代价——`Window::m_sorting_order` 就是二者合并后的物理排序键。

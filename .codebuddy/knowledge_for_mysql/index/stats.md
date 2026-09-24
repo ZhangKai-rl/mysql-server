@@ -433,24 +433,53 @@ else if (range.range_flag & SKIP_RECORDS_IN_RANGE && ...) {
 
 ### 为什么索引基数会漂移：源码级根因
 
+16 条根因不是散点，按**偏差产生的机制**分四类。它们会**叠加**——同一个查询的基数偏差往往同时命中 3~4 条，这才是"漂移"的全貌。
+
+#### A. 采样本身的统计误差（估计量天然有偏）
+
+采样就是"用 20 页推断百万页"。以下四条都在放大这个偏差：
+
 | # | 根因 | 证据 |
 |---|---|---|
-| 1 | 采样规模极小（20 页 / 8 页）对百万页表是 2e-5 采样率 | `srv_stats_persistent_sample_pages=20` |
-| 2 | 外推假设 `R` 在 LA 层与叶子层相同——键分布倾斜时崩塌 | `dict_stats_index_set_n_diff` 注释 "we assume this ratio is the same" |
-| 3 | "A 页平均不同值数代表全表"——页间密度方差被 ×N 放大 | 同上 |
-| 4 | transient 的 `add_on` 是拍脑袋常数 | `btr0cur.cc:5761` |
-| 5 | `stat_n_rows` 本身就是估计值，却是 `rec_per_key` 的分子 | `dict_stats_update_transient` dict0stats.cc:728 |
-| 6 | `stat_modified_counter` 无锁、rollback 不回滚 | dict0mem.h:2299 |
-| 7 | 10% 阈值 + `n_rows` 是估计值；小表 `n_rows/10==0` 频繁触发 | row0mysql.cc:1144 |
-| 8 | 后台线程 10 秒节流 + 一次一个表 | dict0stats_bg.cc:51 |
-| 9 | 树变化或锁等待时**静默放弃**，未算完的前缀保留旧值 | dict0stats.cc:1821/1888/1971 |
-| 10 | 锁竞争使采样页数减半重试 → 系统性偏低 | dict0stats.cc:1894/1991 |
-| 11 | delete-marked 默认排除，DELETE 后未 purge 前不一致 | dict0stats.cc:921/1352 |
-| 12 | `stat_n_rows` 与 `n_diff` 可能算于不同时刻，且 `HA_STATUS_NO_LOCK` 下不持锁读 | ha_innodb.cc:17432 注释 "This is acceptable" |
-| 13 | persistent 不保存 `stat_n_non_null_key_vals` → `nulls_ignored` 退化成 `rec_per_key=1.0` | dict0stats.cc:2660 |
-| 14 | range 估计被 `table_n_rows/2` 裁剪，`table_n_rows` 又是估计值 → 误差传递 | btr0cur.cc:5417 |
-| 15 | 并发下 `records_in_range` 重试 4 次后返回常数 **10** | btr0cur.cc:5183/5445 |
-| 16 | "boring record" 假定整页同键的叶子页 n_diff==1，页分裂后可能低估 | dict0stats.cc:63/1318 |
+| 1 | 采样规模极小（20 页 / 8 页）——百万页表的采样率约 2e-5 | `srv_stats_persistent_sample_pages=20` |
+| 2 | 外推假设 `R`（LA 层与叶子层不同值数之比）两层相同——**键分布倾斜时崩塌** | `dict_stats_index_set_n_diff` 注释 "we assume this ratio is the same" |
+| 3 | "一页的平均不同值数代表全表"——页间密度方差被放大 N 倍 | 同上 |
+| 16 | "boring record"：整页同键的叶子页假定 `n_diff==1`，页分裂后可能低估 | `dict0stats.cc` |
+
+★ **量级直觉**：偏差 ∝ 页间密度差异 × (总页数 / 采样页数)。**索引越倾斜（状态列、租户 id、时间前缀），偏差越大**——这正是低基数列上优化器最容易选错访问方法的原因。**怎么验证**：`ANALYZE TABLE` 前后对比 `mysql.innodb_index_stats` 的 `n_diff_pfxNN`，波动幅度就是这几条的直接体现。
+
+#### B. 估计值的误差传递（一个估计值当另一个的分子）
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 5 | `stat_n_rows` 本身就是估计值，却作为 `rec_per_key` 的**分子** | `dict_stats_update_transient` |
+| 12 | `stat_n_rows` 与 `n_diff` 可能算于**不同时刻**，且 `HA_STATUS_NO_LOCK` 下不持锁读 | `ha_innodb.cc` 注释 "This is acceptable" |
+| 14 | range 估计被 `table_n_rows/2` 裁剪，而 `table_n_rows` 又是估计值 → 误差传递 | `btr0cur.cc` |
+
+★ 这一类最隐蔽：每个环节单独看都"可接受"，但误差会沿 **`n_rows → rec_per_key → range 估计 → 代价`** 逐级放大，终点是 join 顺序选错。
+
+#### C. 并发与时序（统计永远滞后于数据）
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 6 | `stat_modified_counter` 无锁累加、事务**回滚不回滚**计数 | `dict0mem.h` |
+| 8 | 后台重算 10 秒节流 + 一次只处理一个表 | `dict0stats_bg.cc` |
+| 9 | 树变化或锁等待时**静默放弃**，未算完的前缀保留旧值 | `dict0stats.cc` |
+| 10 | 锁竞争使采样页数**减半重试** → 系统性偏低 | `dict0stats.cc` |
+| 11 | delete-marked 默认排除：DELETE 后、purge 前统计不一致 | `dict0stats.cc` |
+
+★ 第 10 条的方向性很重要：它不是随机误差，而是**单向偏低**（重试时采样更少 → 低估区分度 → 优化器低估索引价值）。
+
+#### D. 机制性退化与兜底常数（估算失败时返回"兜底值"）
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 4 | transient 的 `add_on` 是拍脑袋常数 | `btr0cur.cc` |
+| 7 | 10% 重算阈值 + `n_rows` 是估计值；小表 `n_rows/10==0` 会频繁触发重算 | `row0mysql.cc` |
+| 13 | persistent **不落盘** `stat_n_non_null_key_vals` → `nulls_ignored` 退化成 `rec_per_key=1.0` | `dict0stats.cc` |
+| 15 | 并发下 `records_in_range` 重试 4 次后返回常数 **10** | `btr0cur.cc` |
+
+★ **第 13 与第 15 是最危险的两条**：它们不是"偏一点"，而是直接返回**极端值**——`rec_per_key=1.0` 让优化器以为该索引每行唯一（代价极低），`records_in_range=10` 是彻底脱离数据的兜底。**排查口诀**：EXPLAIN 的 rows 出现 1 或 10 这种"整得可疑"的值，优先怀疑这两条（其次是第 14 条的 `/2` 裁剪）。
 
 ### 易混淆点
 

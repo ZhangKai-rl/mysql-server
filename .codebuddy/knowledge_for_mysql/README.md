@@ -53,6 +53,7 @@
 |---|---|
 | [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
 | [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
+| [lifecycle/](server/lifecycle/) | **服务器生命周期（3 篇）**：[01_initialize](server/lifecycle/01_initialize.md)（`--initialize` 数据目录初始化：bootstrap 自举、DD 硬编码建表、InnoDB 建库、root 口令与证书）、[02_startup](server/lifecycle/02_startup.md)（启动主链路：两阶段选项解析、★ 两阶段插件注册、DD 加载与升级判定、崩溃恢复的位置、网络监听与 ready 宣告）、[03_shutdown](server/lifecycle/03_shutdown.md)（三入口关闭、两阶段 kill、★ InnoDB 九态关闭状态机与 `pre_dd_shutdown` 屏障、`innodb_fast_shutdown` 三档、退出码） |
 | [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
 | [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/GTID 持久化/读侧 dump）、binlog_event（事件三层类体系/序列化/checksum/各事件字节布局）、binlog_sbr（语句级复制/unsafe 判定/MIXED 降级）、binlog_encryption（两级密钥/keyring 轮换/reencrypt）、mysqlbinlog（工具架构/打印/DECODE-ROWS/过滤/收尾）、semisync（半同步插件/active_tranxs 等待/ACK receiver/降级恢复）、gtid、replication（复制拓扑与故障转移：协议/双定位/拓扑/过滤/延迟复制/GTID_ONLY/failover）、prpl（并行复制）、preserve_commit_order（从库提交保序：FIFO 队列/MDL 复用/缺陷档案）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
 | [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配

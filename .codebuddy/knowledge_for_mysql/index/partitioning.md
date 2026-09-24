@@ -197,20 +197,9 @@ for (uint i = 0; i < m_tot_parts; ++oldp, ++newp) {
 `ha_innopart::info_low`（`ha_innopart.cc:3484-3789`）三类聚合：
 
 - **行数/页数（`HA_STATUS_VARIABLE`）：逐分区求和**（3559-3572）——`n_rows += ib_table->stat_n_rows`，同时记录 `biggest_partition`；
-- **索引统计（`HA_STATUS_CONST`）：不求和、不加权，只取最大分区的索引**（3674-3789）：
+- **索引统计（`HA_STATUS_CONST`）：不求和、不加权，只取最大分区的索引**（3674-3789）——`stat_n_diff_key_vals[]` 不做跨分区合成，`rec_per_key` 用**最大分区**的行数算（而非总和）。源码 TODO 自陈这一取舍："Only analyze the PK for all partitions, then the secondary indexes only for the largest partition!"
 
-```cpp
-ib_table = m_part_share->get_table_part(biggest_partition);
-for (ulong i = 0; i < table->s->keys; i++) {
-  dict_index_t *index = innopart_get_index(biggest_partition, i);
-  /* innodb_rec_per_key() will use index->stat_n_diff_key_vals[] and the
-     value we pass index->table->stat_n_rows. */
-  const rec_per_key_t rec_per_key = innodb_rec_per_key(index, j, max_rows);
-  key->set_records_per_key(j, rec_per_key);
-}
-```
-
-即 `stat_n_diff_key_vals[]` **不做跨分区合成**——直接用最大分区的索引统计，行数参数是 `max_rows`（最大分区行数，非总和）。代码 3522-3523 的 TODO 印证："Only analyze the PK for all partitions, then the secondary indexes only for the largest partition!"。
+> ★ 分区统计的完整剖析（`info_low` 逐段源码、"分区分布不均 → 计划突变"的后果）见 [`../feat/partitioning.md`](../feat/partitioning.md)——**分区是跨层特性，那里是权威**；统计本身怎么采集（persistent/transient 采样、`n_diff_pfxNN`、基数漂移）见 [`stats.md`](stats.md)。本篇只保留"索引 × 分区"的聚合规则这一层。
 
 **ANALYZE PARTITION**：`set_altered_partitions()`（`partition_handler.cc:1274`）把 `read_partitions` 只置位指定分区 → `update_table_stats` 只跑这些分区；`stats.update_time` 取各分区 max。
 

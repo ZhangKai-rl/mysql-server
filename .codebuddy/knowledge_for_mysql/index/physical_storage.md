@@ -135,24 +135,18 @@ root 页上的段头偏移（16K 页，绝对偏移）：
 
 **索引在表空间里的组织**：同一表空间多索引共存，每索引独立两段、页号交错是常态，靠页头 `PAGE_INDEX_ID`（8B）区分归属；file-per-table 下所有索引 + SDI 索引在一个 `.ibd`；SDI 索引是 `DICT_SDI` 类型的独立树（页类型 `FIL_PAGE_SDI`）。
 
-#### 索引页布局：PAGE_HEADER 逐字段
+#### 索引页布局
 
-索引页 = FIL Header(38B) + PAGE_HEADER(56B) + 记录堆 + Page Directory（自页尾向前）+ FIL Trailer(8B)。PAGE_HEADER 逐字段（`page0types.h:45-105`）：
+索引页 = FIL Header(38B) + PAGE_HEADER(56B) + 记录堆 + Page Directory（自页尾向前）+ FIL Trailer(8B)。
 
-| 字段 | 偏移(绝对) | 语义 |
+> PAGE_HEADER 的**逐字段 layout 以 [`../innodb/physical/page_structure.md`](../innodb/physical/page_structure.md) 为准**（页结构是那一篇的第一主语，含 12 类页的完整 layout）。本篇只补**索引语义**相关的字段：
+
+| 字段 | 偏移 | 索引语义（本篇视角） |
 |---|---|---|
-| `PAGE_N_DIR_SLOTS` | 38 | 目录槽数 |
-| `PAGE_HEAP_TOP` | 40 | 记录堆顶 |
-| `PAGE_N_HEAP` | 42 | 堆记录数；**bit15 = compact 标志** |
-| `PAGE_FREE` | 44 | 已删记录自由链表头 |
-| `PAGE_GARBAGE` | 46 | 已删记录字节数 |
-| `PAGE_LAST_INSERT` | 48 | 上次插入位置 |
-| `PAGE_DIRECTION` / `PAGE_N_DIRECTION` | 50 / 52 | 插入方向 / 同方向连续次数（顺序插入优化） |
-| `PAGE_N_RECS` | 54 | 用户记录数 |
-| `PAGE_MAX_TRX_ID` | 56 | 可能修改本页的最大 trx_id（**仅二级索引/ibuf 用**，聚簇恒 0——故 `btr_truncate` 借它打标记） |
-| `PAGE_LEVEL` | 64 | 层号，叶层=0 |
-| `PAGE_INDEX_ID` | 66 | 所属 index id（8B） |
-| `PAGE_BTR_SEG_LEAF` / `PAGE_BTR_SEG_TOP` | 74 / 84 | 两段头（仅 root 有效） |
+| `PAGE_INDEX_ID` | 66 | 所属 index id（8B）——同一表空间多索引页号交错，靠它区分归属 |
+| `PAGE_MAX_TRX_ID` | 56 | 可能修改本页的最大 trx_id，**仅二级索引/ibuf 用**（聚簇恒 0——故 `btr_truncate` 借它打标记） |
+| `PAGE_LEVEL` | 64 | 层号，叶层=0；root 页恒定（长高不换根） |
+| `PAGE_BTR_SEG_LEAF` / `PAGE_BTR_SEG_TOP` | 74 / 84 | 两段头，**仅 root 有效**；所有索引页都预留这 56 字节段头空间，是"每个索引页都能成为 root"的前提 |
 
 #### 树高度：现算不缓存
 

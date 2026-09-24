@@ -14,6 +14,8 @@ InnoDB 统计信息是**优化器估算代价的输入**（行数、索引区分
 
 ### 为什么放在 `server/dd/` 目录下
 
+> **边界**：本篇是 **DD/持久化视角**——统计存在哪、表级开关怎么存、后台重算与持久化表的关系。★ **采集算法本身**（persistent 分层采样 vs transient 随机页采样、`n_diff_pfxNN`、10% 重算判据、基数漂移根因）的权威剖析在 [`../../index/stats.md`](../../index/stats.md)（索引是第一主语），两处互指不重复详写。
+
 它跟 DD 有两处硬关联：
 
 1. **持久统计存在 `mysql.innodb_table_stats` / `mysql.innodb_index_stats`**——这两张是 **InnoDB 的 DDSE_PROTECTED 表**，物理上就在 `mysql.ibd` 里（见 [`dd.md`](dd.md) 的 30 张 DD 表 + InnoDB 自有 5 张）；
