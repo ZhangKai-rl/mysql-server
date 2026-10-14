@@ -394,16 +394,60 @@ bool TableScanIterator::Init() {
   if (first_init && set_record_buffer(table(), m_expected_rows)) return true;
 }
 int TableScanIterator::Read() {
+  int tmp;
   if (table()->is_union_or_table()) {                // 普通表/UNION：快路径
     while ((tmp = table()->file->ha_rnd_next(m_record))) {
-      if (tmp == HA_ERR_RECORD_DELETED && !thd()->killed) continue;  // MyISAM 并发删
+      /* ha_rnd_next can return RECORD_DELETED for MyISAM when one thread is
+      reading and another deleting without locks. */
+      if (tmp == HA_ERR_RECORD_DELETED && !thd()->killed) continue;
       return HandleError(tmp);
     }
+    if (m_examined_rows != nullptr) ++*m_examined_rows;
+
   } else {                                           // EXCEPT/INTERSECT：带计数器
-    // 见下
+    while (true) {                                   // 外层循环 = 跳过不合格的行
+      // ★ m_remaining_dups > 0 ⇒ 同一行还要再出几次
+      //   ⇒ 此时**不再调 ha_rnd_next**，只减计数器就 break
+      //     引擎侧只扫了一遍，多行是在这里"展开"出来的
+      if (m_remaining_dups == 0) {                   // 初始总是 0
+        while ((tmp = table()->file->ha_rnd_next(m_record))) {
+          if (tmp == HA_ERR_RECORD_DELETED && !thd()->killed) continue;
+          return HandleError(tmp);
+        }
+        if (m_examined_rows != nullptr) ++*m_examined_rows;
+
+        // Filter out rows not qualifying for INTERSECT, EXCEPT by reading the counter.
+        const ulonglong cnt =
+            static_cast<ulonglong>(table()->set_counter()->val_int());
+        if (table()->is_except()) {
+          if (table()->is_distinct()) {
+            if (cnt >= 1) break;                     // EXCEPT DISTINCT：cnt≥1 出 1 行
+          } else {
+            m_remaining_dups = cnt;                  // EXCEPT ALL：出 cnt 行
+          }
+        } else {
+          if (table()->is_distinct()) {
+            if (cnt == 0) break;                     // INTERSECT DISTINCT：被减过则跳过
+          } else {
+            HalfCounter c(cnt);
+            m_remaining_dups = std::min(c[0], c[1]); // INTERSECT ALL：min(左重复数, 右已匹配数)
+          }
+        }
+      } else {
+        --m_remaining_dups;                          // ★ 同一行再返回一次
+        break;
+      }
+      // 走到这里 = 本行不合格，继续外层循环取下一行
+    }
+    if (++m_stored_rows > m_limit_rows) {            // 限制实际输出行数
+      return HandleError(HA_ERR_END_OF_FILE);
+    }
   }
+  return 0;
 }
 ```
+
+⇒ ★ **最关键的一点**：`m_remaining_dups > 0` 时**不重新调引擎**——只减计数器就返回同一行。物化时用"一行 + 一个计数器"压缩存储，到扫描阶段在这里展开成多行，**引擎只扫了一遍**。
 
 **集合运算的计数器技巧**：物化阶段对 EXCEPT/INTERSECT **只写一行 + 一个计数器**（`TABLE::m_set_counter`），扫描时再展开：
 - `EXCEPT DISTINCT`：cnt ≥ 1 出 1 行，cnt = 0 跳过
@@ -423,6 +467,117 @@ int TableScanIterator::Read() {
 | `ZeroRowsIterator` / `ZeroRowsAggregatedIterator` | 永远 EOF / 出**一行全 NULL**（`SELECT SUM(x) WHERE 2+2=5`） |
 | `TableValueConstructorIterator`（`.cc:920`） | `VALUES ROW(..),ROW(..)`：切换 `Item_values_column` 到下一行 |
 | `FullTextSearchIterator`（`ref_row_iterators.cc:648`） | `ft_init()` + `ha_ft_read()`，按相关度取命中 |
+
+#### 短路与零输入迭代器详解
+
+这几个"一行/零行"迭代器看着简单，但每个都藏着**语义难点或极易踩的边界**。
+
+**① `UnqualifiedCountIterator` ★ —— 一行也不读**
+
+```cpp
+int UnqualifiedCountIterator::Read() {
+  if (!m_has_row) return -1;
+  for (Item *item : *m_join->fields) {
+    if (item->type() == Item::SUM_FUNC_ITEM &&
+        down_cast<Item_sum *>(item)->sum_func() == Item_sum::COUNT_FUNC) {
+      ulonglong count = get_exact_record_count(m_join->qep_tab,
+                                               m_join->primary_tables, &error);
+      down_cast<Item_sum_count *>(item)->make_const(static_cast<longlong>(count));
+    }
+  }
+  ...
+}
+```
+
+`get_exact_record_count()` 对每个表调 `ha_records()` 然后**相乘**（笛卡尔积）。
+
+⚠️ **它的适用边界极其苛刻**（判定在 `opt_sum_query()`，必须全部满足）：
+
+- WHERE 必须为**空**（`conds == nullptr`）
+- 不能有关联/随机依赖：`where_tables & (OUTER_REF_TABLE_BIT | RAND_TABLE_BIT)` → 放弃
+- 不能有 semi-join / antijoin nest
+- `COUNT` 的参数必须**不可能为 NULL**（`COUNT(可空列)` 直接作废）
+- 不能有外连接的 inner table 被 WHERE 引用
+- 不能含 schema table / 物化派生表（行数此刻还不可知）
+- **SELECT 列表里只要有任何非常量、非 COUNT 的项就作废**
+- 只有 `COUNT_FUNC` 被处理（`SUM/AVG/...` 走 `aggr_impossible`）
+
+★ **最反直觉的一条**：走这个迭代器**恰恰要求"至少有一个表不能瞬间给出精确行数"**。如果所有表都能在优化期给出精确行数，就直接 `make_const` 折成常量、走 "Select tables optimized away"，**根本不用这个迭代器**。
+
+另外 **hypergraph 优化器不做这个优化**（测试自证：`--skip_if_hypergraph  # Does not optimize COUNT(*) specially yet.`）——因为它依赖 `m_join->qep_tab` 这套老结构。
+
+**② `ZeroRowsAggregatedIterator` ★ —— 为什么必须出一行全 NULL**
+
+类注释直接给了例子：
+
+```cpp
+/**
+  Like ZeroRowsIterator, but produces a single output row, since there are
+  aggregation functions present and no GROUP BY. E.g.,
+
+    SELECT SUM(f1) FROM t1 WHERE 2+2 = 5;
+
+  should produce a single row, containing only the value NULL.
+ */
+```
+
+实现是**把所有基表整行标记为 NULL 行，然后对每个字段调 `no_rows_in_result()`**：
+
+```cpp
+  // Mark tables as containing only NULL values
+  for (Table_ref *table = m_join->query_block->leaf_tables; ...)
+    table->table->set_null_row();
+
+  for (Item *item : *m_join->fields) item->no_rows_in_result();
+```
+
+⚠️ 注释特别提醒：**必须对 `m_join->fields` 全部调用**（不只是输出列），因为 `join->having` 可能引用不在结果列里的字段。
+
+这就是 SQL 空集语义的落地：`SUM(空集) = NULL` 而非 0，`COUNT(空集) = 0`，且**结果集仍有一行**。
+
+两者的选择点：
+
+```cpp
+  /**
+    ... send a row even if the join produced no rows if:
+     - there is an aggregate function (sum_func_count!=0), and
+     - the query is not grouped, and
+     - a possible HAVING clause evaluates to TRUE.
+  */
+  bool send_row_on_empty_set() const {
+    return (do_send_rows && tmp_table_param.sum_func_count != 0 &&
+            group_list.empty() && !group_optimized_away &&
+            query_block->having_value != Item::COND_FALSE);
+  }
+```
+
+推论：**有 GROUP BY 时空集就是 0 行**（聚合函数不产生"空组"）；**HAVING 恒假时也是 0 行**。聚合版本之后还会挂 HAVING+LIMIT，非聚合版本则不挂。
+
+两个 AccessPath 的基数标注也印证：`ZERO_ROWS` 是 `0.0`，`ZERO_ROWS_AGGREGATED` 是 `1.0`。
+
+**③ `FakeSingleRowIterator` 的两个场景**
+
+- 全是 const 表（`SELECT 1;`、`SELECT * FROM t1 WHERE pk=3;`）
+- **顶层就是外连接**时，给左端造一个"虚拟常数行"（`is_top_level_outer_join`）
+
+**④ `TableValueConstructorIterator` —— 靠"重新绑定引用"换行**
+
+`VALUES ROW(1,10), ROW(2,20)` **不物化、不扫表**。`Read()` 里把每个 `Item_values_column` 的 `set_value()` 改成指向下一行：
+
+```cpp
+    for (const Item *value : **m_row_it) {
+      Item_values_column *ref = down_cast<Item_values_column *>(*output_refs_it);
+      ref->set_value(const_cast<Item *>(value));
+    }
+```
+
+单行时不创建引用对象，直接用 `Query_block::item_list`。另外它的行序全靠 `examined_rows` 计数器，所以 AccessPath 里强制 `count_examined_rows = true`。
+
+**⑤ 这些短路在哪被决定**
+
+- `JOIN::create_root_access_path_for_join()`：按 `select_count` → `is_table_value_constructor` → `const_tables == primary_tables` 的顺序短路
+- `JOIN::create_access_paths_for_zero_rows()`：由 `send_row_on_empty_set()` 分叉
+- 最终由 `ConnectIterators()` 落到具体迭代器类
 
 ### 2.2 ref 族
 
@@ -563,6 +718,242 @@ RowIterator → TableRowIterator
 | `key_compare_cost(total*log2(n))`（堆归并） | `RowIDUnionIterator` 的 `Priority_queue` |
 | `Unique::get_use_cost`（去重） | `IndexMergeIterator::Init()` 的 `unique_add` + `unique->get` |
 
+#### ★ 归并流程总览
+
+> 源码坐标：`[R1] sql/range_optimizer/rowid_ordered_retrieval.h/.cc` · `[R1b] sql/range_optimizer/rowid_capable_row_iterator.h` · `[R2] sql/range_optimizer/index_merge.h/.cc` · `[R3] sql/range_optimizer/range_optimizer.cc` · `[A1] sql/join_optimizer/access_path.h`
+> ⚠️ **8.0.39 路径校正**：这三个迭代器在 **`sql/range_optimizer/`** 下（老的 `sql/opt_range.cc` 已拆分）。子迭代器成员叫 **`m_children`**（不是 `m_source_iters`）。
+
+```
+【1】RowIDIntersectionIterator —— 轮转"追赶"式归并，k 路全等才输出（AND）
+    scan A  5 ─ 7 ─ 9 ─ 11 ─ …     候选 rowid 由"最先读到它的那一路"提出
+    scan B  5 ─ 8 ─ 9 ─ 12 ─ …     last_rowid_count = 已确认的路数
+    scan C  4 ─ 5 ─ 9 ─ …          cmp<0 ⇒ 跳过并 UnlockRow；cmp>0 ⇒ 换候选、计数归 1
+                                   count == k ⇒ 命中 ⇒ 输出 5, 9（天然无重复）
+
+【2】RowIDUnionIterator —— 优先队列 k 路归并，出队后与 prev_rowid 比一次（OR）
+    scan A  5 ─ 9 ┐
+    scan B  5 ─ 7 ├─► Priority_queue(min-heap) ─► 5,5,7,7,8,9
+    scan C  7 ─ 8 ┘                                  └ 相邻相等即丢弃 ⇒ 5,7,8,9
+
+【3】IndexMergeIterator —— Unique 物化排序去重（两阶段），不做在线归并
+    Phase 1 (Init)  scan A 5 9 ┐
+                    scan B 5 7 ├─► unique_add(rowid) ─► Unique::get(table)
+                    scan C 7 8 ┘   (内存 quicksort / 溢出落盘 merge sort)
+                                        │ 有序、无重复的 rowid 流
+    Phase 2 (Read)  ────────────────────┘
+                    SortFile/SortBufferIndirectIterator 按 rowid 回表 ⇒ 5,7,8,9
+                    EOF 后 doing_pk_scan = true ⇒ 接着扫 CPK 分支（两集合 rowid 不相交）
+```
+
+#### `RowIDIntersectionIterator`：轮转追赶，凑齐 k 路才输出
+
+```cpp
+// [R1b] —— 只有"能给出 rowid"的迭代器才能当 ROR 归并的孩子
+class RowIDCapableRowIterator : public TableRowIterator {
+ public:
+  // 上一次 Read() 成功后该迭代器所处的 rowid；只在 ROR 归并中被父节点读取。
+  virtual uchar *last_rowid() const = 0;
+};
+```
+
+`Init()` 只做"准备"：分配 rowid 缓冲、为每路子扫描**克隆独立 handler**（single handler 只能保存一个 key scan 的上下文）并置 `HA_MRR_SORTED` 保证各路 rowid 升序——这是 ROR 归并的前提。
+
+```cpp
+// [R1] —— Read() 的核心循环（节选）
+int RowIDIntersectionIterator::Read() {
+  size_t current_child_idx = 0;   // ★ 非 static：每次 Read() 都从 0 号孩子开始提候选
+  for (;;) {
+    RowIterator *child = m_children[current_child_idx].get();
+    if (int error = child->Read(); error != 0) return error;
+    if (m_cpk_child) {            // ★ CPK 分支只当"过滤器"：候选不在 PK range 里就换下一个
+      while (!down_cast<IndexRangeScanIterator *>(m_cpk_child->real_iterator())
+                  ->row_in_ranges()) {
+        child->UnlockRow();       // 只加锁于最终输出的行：读了又不输出必须释放锁
+        if (int error = child->Read(); error != 0) return error;
+      }
+    }
+    const uchar *child_rowid =
+        down_cast<IndexRangeScanIterator *>(child->real_iterator())->file->ref;
+    memcpy(m_last_rowid, child_rowid, table()->file->ref_length);
+    RowIterator *child_with_last_rowid = child;   // 记住"最先读到该 rowid 的那一路"
+    uint last_rowid_count = 1;
+
+    while (last_rowid_count < m_children.size()) {   // 让其余各路依次"确认"候选
+      current_child_idx = (current_child_idx + 1) % m_children.size();
+      child = m_children[current_child_idx].get();
+      child_rowid = down_cast<IndexRangeScanIterator *>(child->real_iterator())->file->ref;
+      int cmp;
+      do {
+        if (int error = child->Read(); error != 0) {
+          if (!thd()->transaction_rollback_request)   // 死锁等已回滚的场景别再解锁
+            child_with_last_rowid->UnlockRow();
+          return error;
+        }
+        cmp = table()->file->cmp_ref(child_rowid, m_last_rowid);  // ★ 纯二进制 ref 比较
+        if (cmp < 0) child->UnlockRow();   // 该路落后于候选 ⇒ 丢弃这行 ⇒ 解锁
+      } while (cmp < 0);
+
+      if (cmp > 0) {                       // 该路超过了候选 ⇒ 候选升级
+        memcpy(m_last_rowid, child_rowid, table()->file->ref_length);
+        child_with_last_rowid->UnlockRow();   // 旧候选作废
+        last_rowid_count = 1;                 // 计数归 1，重新开始确认
+        child_with_last_rowid = child;
+      } else {
+        last_rowid_count++;                   // cmp == 0：这一路也确认了同一个 rowid
+      }
+    }
+    // 所有路都返回了同一个 rowid —— 交集命中
+    if (retrieve_full_rows) {
+      int error = table()->file->ha_rnd_pos(table()->record[0], m_last_rowid);
+      if (error == HA_ERR_RECORD_DELETED) continue;   // 已被并发删除 ⇒ 回循环再取
+      if (error == 0) return 0;
+      return HandleError(error);
+    } else {
+      return 0;   // 覆盖索引，或父节点(Union)会负责回表
+    }
+  }
+}
+```
+
+★ `cmp_ref` 是 handler 的**二进制 rowid 比较**——不比较字段值、也不产生三值逻辑，所以字段是否为 NULL 完全不参与归并判定。交集只认"rowid 相等"。
+
+#### `RowIDUnionIterator`：优先队列 k 路归并 + 出堆后去重
+
+```cpp
+// [R1] —— 比较器：按"各路当前 rowid"建小顶堆
+struct Quick_ror_union_less {
+  bool operator()(RowIterator *a, RowIterator *b) {
+    RowIDCapableRowIterator *real_a =
+        down_cast<RowIDCapableRowIterator *>(a->real_iterator());
+    RowIDCapableRowIterator *real_b =
+        down_cast<RowIDCapableRowIterator *>(b->real_iterator());
+    return m_file->cmp_ref(real_a->last_rowid(), real_b->last_rowid()) > 0;
+  }
+  const handler *m_file;
+};
+```
+
+`Init()` 一次性完成：预留堆容量、分配 `cur_rowid`/`prev_rowid` **双缓冲**、对每个孩子 `Init()` 并**先读一行入堆**（k 路归并的"初始填充"），最后 `ha_rnd_init`。
+
+```cpp
+// [R1] —— Read()：经典 k 路归并 + 输出后去重
+int RowIDUnionIterator::Read() {
+  for (;;) {
+    bool dup_row;
+    do {
+      if (queue.empty()) return -1;                     // 所有路都 EOF
+      RowIterator *quick = queue.top();                 // 当前全局最小 rowid 所在的那一路
+      memcpy(cur_rowid,
+             down_cast<RowIDCapableRowIterator *>(quick->real_iterator())->last_rowid(),
+             rowid_length);
+      if (int ret = quick->Read(); ret != 0) {
+        if (ret != -1) return ret;
+        queue.pop();                                    // 该路耗尽 ⇒ 出堆
+      } else {
+        queue.update_top();                             // 该路推进一格 ⇒ 下调维持堆序
+      }
+      if (!have_prev_rowid) { dup_row = false; have_prev_rowid = true; }
+      else dup_row = !table()->file->cmp_ref(cur_rowid, prev_rowid);  // 与"上一次输出的"比
+    } while (dup_row);                                  // ★ 相同则丢弃 —— 这就是去重
+
+    using std::swap;
+    swap(cur_rowid, prev_rowid);                        // ★ 双缓冲轮转，避免再拷一次
+    int error = table()->file->ha_rnd_pos(table()->record[0], prev_rowid);
+    if (error == HA_ERR_RECORD_DELETED) continue;
+    if (error == 0) return 0;
+    return HandleError(error);
+  }
+}
+```
+
+**与 Intersection 的差别**：交集是**判定式**——候选必须被全部 k 路确认才输出，所以不需要去重（同一 rowid 不可能输出两次）、也不需要优先队列（轮转即可）；并集是**产出式**——堆顶最小者即输出，但同一 rowid 可能出现在多路（OR 条件重叠），因此必须在**出堆后、回表前**去重。并集**永远自己回表**。
+
+#### `IndexMergeIterator`：离线物化归并（异类）
+
+★ **为什么必须用 `Unique`**：`ROWID_INTERSECTION/UNION` 要求每路**按 rowid 升序产出**（ROR）才能在线归并；`INDEX_MERGE` 用于那些**不保证 rowid 有序**的分支，无法在线 k 路归并，只能先物化全部 rowid、排序、去重，再顺序回表。代价是 `Unique` 可能落盘。
+
+```cpp
+// [R2] —— Init() 就是整个 Phase 1
+bool IndexMergeIterator::Init() {
+  empty_record(table());
+  table()->set_keyread(true);          // 阶段1 只读索引项
+  table()->prepare_for_position();     // 需要 position() 才能拿到 rowid
+  if (unique == nullptr) {
+    unique.reset(new (mem_root) Unique(refpos_order_cmp, (void *)file,
+                                       file->ref_length, sort_buffer_size));
+  }
+  ...
+  for (unique_ptr_destroy_only<RowIterator> &child : m_children) {
+    IndexRangeScanIterator *range_scan_it =
+        down_cast<IndexRangeScanIterator *>(child->real_iterator());
+    table()->covering_keys.set_bit(range_scan_it->index);   // 强制走 index-only
+    if (child->Init()) return true;
+    for (;;) {
+      int result = child->Read();
+      if (result == -1) break;                       // 该分支 EOF
+      // ★ 会被 CPK 分支取到的 rowid 不再入 Unique —— 保证两段结果集不相交
+      if (pk_quick_select && down_cast<IndexRangeScanIterator *>(
+                                 pk_quick_select.get()->real_iterator())->row_in_ranges())
+        continue;
+      handler *child_file = range_scan_it->file;
+      child_file->position(table()->record[0]);      // 由索引项算出 rowid
+      if (unique->unique_add(child_file->ref)) return true;
+    }
+  }
+  if (unique->get(table())) return true;             // 排序+去重
+  doing_pk_scan = false;
+  table()->set_keyread(false);                       // ★ index_merge 不支持 "using index"
+  read_record = init_table_iterator(thd(), table(), false, false);
+  return false;
+}
+
+// Read() 即 Phase 2
+int IndexMergeIterator::Read() {
+  if (doing_pk_scan) return pk_quick_select->Read();      // 第二段：聚簇 PK 扫描
+  int result;
+  if ((result = read_record->Read()) == -1) {
+    read_record.reset();
+    if (pk_quick_select) {                                // 第一段结束 ⇒ 切到 CPK
+      doing_pk_scan = true;
+      if (pk_quick_select->Init()) return 1;
+      return pk_quick_select->Read();
+    }
+  }
+  return result;
+}
+```
+
+**层次关系（以源码为准）**：`IndexMergeIterator` **不是** Intersection/Union 的父壳，而是**平级的替代方案**——它要求孩子是 `IndexRangeScanIterator`。真正有上下层关系的是 **Union → Intersection**：优化器对每个 disjunct 先尝试 `get_best_ror_intersect()`，命中就把 `ROWID_INTERSECTION` 作为 `ROWID_UNION` 的孩子，并改写为 `need_rows_in_rowid_order=true` + `retrieve_full_rows=false`（让父节点统一回表）。
+
+#### 优化器侧参数与代价分水岭
+
+```cpp
+// [A1] access_path.h
+struct { TABLE *table; bool forced_by_hint; bool allow_clustered_primary_key_scan;
+         Mem_root_array<AccessPath *> *children; } index_merge;
+struct { TABLE *table; Mem_root_array<AccessPath *> *children;
+         AccessPath *cpk_child;                 // 聚簇 PK 分支：只过滤不取行
+         bool forced_by_hint;
+         bool retrieve_full_rows;               // 是否由交集自己 ha_rnd_pos 回表
+         bool need_rows_in_rowid_order;         // 是否为父(Union)保存 rowid / 建独立 handler
+         bool reuse_handler;                    // 首路复用 table->file
+         bool is_covering;                      // 各路索引字段并集 ⊇ needed_fields
+       } rowid_intersection;
+```
+
+★ **`is_covering` 是代价模型的分水岭**：`retrieve_full_rows = !is_covering`。覆盖时总成本 = `SUM(index_scan_cost)`；不覆盖时还要叠一次 `get_sweep_read_cost()`——按"随机 rowid 回表"的磁盘 sweep 模型（含 seek），通常远大于索引扫描本身。所以优化器能靠"是否 covering"直接否决一个交集计划（`ror_intersect_add()` 里 `is_covering` 一旦为真，`disk_sweep_cost` 记 0）。
+
+选择顺序：所有分支都是 ROR 时**优先造 ROR-union**（源码注释：*guaranteed to be cheaper*），失败才回落 `INDEX_MERGE`。
+
+#### `Init()` / `Read()` 职责分工小结
+
+| 迭代器 | `Init()`（一次性） | `Read()`（每趟） | 回表在谁手里 |
+|---|---|---|---|
+| `RowIDIntersection` | 分配缓冲、克隆 handler、`ha_rnd_init`、逐路 Init | 轮转追赶，凑齐 k 路才返回 1 行 | `retrieve_full_rows==true` 时自己；否则交父 Union |
+| `RowIDUnion` | 建堆、双缓冲、预读首行入堆、`ha_rnd_init` | 取堆顶 → 与 `prev_rowid` 去重 → `ha_rnd_pos` | 永远自己（并集是顶层） |
+| `IndexMerge` | **Phase 1 全部**：跑干所有分支、`unique_add`、`get()` 排序、建回表迭代器 | **Phase 2**：取一行；EOF 后切 CPK | `read_record` + CPK 分支 |
+
+★ 一句话记忆：**Intersection/Union 是"在线流式归并"（`Init` 轻、`Read` 重），IndexMerge 是"离线物化归并"（`Init` 极重、`Read` 极轻）**——这也是 `IndexMergeIterator` 在火山模型里显得"异类"的原因：它把主要工作放进了 `Init()`（与 2.7 的 `SortingIterator`、2.8 的 `MaterializeIterator` 同构）。
 ### 2.4 过滤与限制
 
 **FilterIterator**：见 1.4（教科书式 σ 算子）。
@@ -583,6 +974,171 @@ bool LimitOffsetIterator::Init() {
 
 `count_all_rows`（`SQL_CALC_FOUND_ROWS`）时**继续读到底**只为计数，无任何提前终止收益。
 
+#### ★ `FilterIterator`：最小的火山模型中间节点
+
+> 源码坐标：`[I2] sql/iterators/composite_iterators.h/.cc`（注意：`FilterIterator` 与 `LimitOffsetIterator` 都在 **composite** 文件里，不在 `basic_row_iterators`）
+> **与 08 篇分工**：参数搬运（`NewFilterAccessPath()` / `NewLimitOffsetAccessPath()`）属于 [`08_access_path.md`](08_access_path.md)。
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+int FilterIterator::Read() {
+  for (;;) {
+    int err = m_source->Read();
+    if (err != 0) return err;
+
+    bool matched = m_condition->val_int();
+
+    if (thd()->killed) { thd()->send_kill_message(); return 1; }
+    /* check for errors evaluating the condition */
+    if (thd()->is_error()) return 1;
+
+    if (!matched) {
+      m_source->UnlockRow();
+      continue;
+    }
+    return 0;   // Successful row.
+  }
+}
+```
+
+`Init()` 是纯转发（`return m_source->Init();`）。所以 `FilterIterator` **是无状态的**，可安全反复 `Init()`（相关子查询里会大量发生）。全部状态机在 `Read()` 的 `for(;;)` 里。
+
+**三个容易漏掉的细节**：
+
+1. ★ **条件为 NULL 与为 0 走同一条分支**。`val_int()` 返回 `longlong`，NULL 会被求值路径写成 `0`（并通过 `null_value` 标记），所以 `WHERE NULL` / `WHERE 0` / `WHERE <false>` 都进 `if (!matched)`——**条件为 NULL 的行被丢弃**，不需要单独的 NULL 分支。真正要区分 NULL 的语义（`NOT IN`、外连接 `IS NULL`）在 `Item` 层就已化归成整数。
+2. **错误检查在求值之后**：`thd()->killed` 与 `thd()->is_error()` 必须放在 `val_int()` 之后——除零、溢出、类型转换错误都是在这一步产生的（如 `WHERE 1/0`）。
+3. ★ **被丢弃的行要 `UnlockRow()`**：否则 InnoDB 会在整个扫描期间保持这些行的锁，直到扫描结束——这是批量模式下锁范围被放大的主要来源。
+
+#### ★ `LimitOffsetIterator`：offset 被推迟到第一次 `Read()`
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+bool LimitOffsetIterator::Init() {
+  if (m_source->Init()) return true;
+  if (m_offset > 0) {
+    m_seen_rows = m_limit;      // ★ 故意设成"已超限"
+    m_needs_offset = true;
+  } else {
+    m_seen_rows = 0;
+    m_needs_offset = false;
+  }
+  return false;                 // ★ 一行 offset 都不吃
+}
+
+int LimitOffsetIterator::Read() {
+  if (m_seen_rows >= m_limit) {
+    if (m_needs_offset) {
+      // We skip OFFSET rows here and not in Init(), since performance schema
+      // batch mode may not be set up by the executor before the first Read().
+      // This makes sure that
+      //   a) we get the performance benefits of batch mode even when reading
+      //      OFFSET rows, and
+      //   b) we don't inadvertedly enable batch mode (e.g. through the
+      //      NestedLoopIterator) during Init(), since the executor may not
+      //      be ready to _disable_ it if it gets an error before first Read().
+      for (ha_rows row_idx = 0; row_idx < m_offset; ++row_idx) {
+        int err = m_source->Read();
+        if (err != 0) return err;
+        if (m_skipped_rows != nullptr) ++*m_skipped_rows;
+        m_source->UnlockRow();
+      }
+      m_seen_rows = m_offset;
+      m_needs_offset = false;
+    }
+
+    if (m_seen_rows >= m_limit) {
+      if (m_count_all_rows) {
+        // Count rows until the end or error (ignore the error if any).
+        while (m_source->Read() == 0) ++*m_skipped_rows;
+      }
+      return -1;
+    }
+  }
+
+  const int result = m_source->Read();
+  if (m_reject_multiple_rows) {
+    if (result != 0) { ++m_seen_rows; return result; }
+    // We read a row. Check for scalar subquery cardinality violation
+    if (m_seen_rows - m_offset > 0) {
+      my_error(ER_SUBQUERY_NO_1_ROW, MYF(0));
+      return 1;
+    }
+  }
+  ++m_seen_rows;
+  return result;
+}
+```
+
+★ **分工最反直觉的一点**：类注释写着 "Init() eats the first offset rows"，实际却一行 offset 都不吃。原因写在上面那段源码注释里——**PSI batch mode 在 `Init()` 阶段还没被 `ExecuteIteratorQuery()` 装好**，若在 `Init()` 里读 offset 行，① 拿不到 batch mode 的性能收益，② 若中途报错，执行器还没准备好去关掉 batch mode。
+
+**`m_seen_rows` 的双语义**：它累加"已看过多少行"，**包含被 offset 跳过的行**。所以 `LIMIT 10 OFFSET 5` 是 `limit=10, offset=5`，`Read()` 最多吐 5 行——`AccessPath` 里 `limit` 存的是"含 offset 的总量"，不是"要吐的行数"。
+
+**`m_limit == 0` 时的早退**：无 offset 时 `Init()` 后 `m_seen_rows == 0`，`LIMIT 0` 则第一次 `Read()` 进 `0 >= 0` 分支直接返回 -1，**整棵树一次 `Read()` 都没下发**。
+
+> ⚠️ 需区分两件事：这是**本迭代器**在 `Read()` 里早退；而"`LIMIT 0` 时连孩子都不 `Init()`"发生在更上层——`JOIN::create_access_paths_for_zero_rows()` 会把整棵子树换成 `ZERO_ROWS` 路径，`LimitOffsetIterator` 根本不会被创建。
+
+#### `send_records` 与 `SQL_CALC_FOUND_ROWS`
+
+构造点（`[I10] sql/join_optimizer/access_path.cc`）决定 `m_skipped_rows` 指向谁：
+
+```cpp
+      case AccessPath::LIMIT_OFFSET: {
+        ha_rows *send_records = nullptr;
+        if (param.send_records_override != nullptr) {
+          send_records = param.send_records_override;
+        } else if (join != nullptr) {
+          send_records = &join->send_records;
+        }
+        iterator = NewIterator<LimitOffsetIterator>(
+            thd, mem_root, std::move(job.children[0]), param.limit,
+            param.offset, param.count_all_rows, param.reject_multiple_rows,
+            send_records);
+        break;
+      }
+```
+
+| 场景 | `m_skipped_rows` 指向 | 含义 |
+|---|---|---|
+| 单 query block 普通 LIMIT | `&join->send_records` | 用于 `FOUND_ROWS()` |
+| UNION 上的 LIMIT + `SQL_CALC_FOUND_ROWS` | `send_records_override`（即 `Query_expression::send_records`） | UNION 的计数器挂在 `Query_expression` 上，不在单个 JOIN |
+| 无 `SQL_CALC_FOUND_ROWS` | 仍指向 `&join->send_records` | 无害的计数 |
+
+⇒ `count_all_rows` 为 true 时那个 `while (m_source->Read() == 0) ++*m_skipped_rows;` 会**把源迭代器读到 EOF**——这就是 `SQL_CALC_FOUND_ROWS` 拿不到 LIMIT 提前结束优化的根本原因，注释写得很直白："you will not get any performance benefits of early end"。
+
+#### `reject_multiple_rows`：标量子查询的运行期基数检查
+
+被优化器从标量子查询变换来的派生表在编译期无法保证只返回一行，所以装一个运行期守卫：**读到第二行（扣掉 offset 后 `m_seen_rows > 0`）就报 `ER_SUBQUERY_NO_1_ROW`**。
+
+同一枚开关有第二处实现——物化路径里是 `MaterializeIterator` 判 `stored_rows > 1`（见 2.8）。两者不重复触发，`AccessPath` 只会把它下发给其中一个。
+
+#### 迭代火山模型的 Read 链
+
+```
+        ExecuteIteratorQuery()  while ((error = root_iterator->Read()) == 0)
+                          │
+        ┌─────────────────────────────────────────┐
+        │           LimitOffsetIterator           │  Read(): 判 m_seen_rows / 推进 offset
+        └─────────────────────────────────────────┘
+                          │ m_source->Read()
+        ┌─────────────────────────────────────────┐
+        │             FilterIterator              │  Read(): for(;;) 读→val_int()→丢弃
+        └─────────────────────────────────────────┘
+                          │ m_source->Read()
+        ┌─────────────────────────────────────────┐
+        │           NestedLoopIterator            │  Read(): 状态机
+        └─────────────────────────────────────────┘
+                     ╱                    ╲
+        ┌───────────────────┐    ┌───────────────────┐
+        │  TableScanIterator │    │  EQRefIterator    │  叶子：直接和 handler 打交道
+        └───────────────────┘    └───────────────────┘
+
+   返回值语义（本篇 1.2 契约，逐层原样透传）：
+     0  → 有一行，record buffer 已填好
+     -1 → EOF
+     1  → 错误
+```
+
+★ **关键观察**：`Filter` 与 `LimitOffset` 都是**拉模型**——上层每调一次 `Read()` 才按需向下拉，绝不预取。整棵树的驱动力完全来自最顶上那个 `while` 循环。
 ### 2.5 连接
 
 **MySQL 8.0 的 join 方式全集**（先有个横向地图，再逐个剖析）：
@@ -751,6 +1307,240 @@ range->end_key.flag   = HA_READ_AFTER_KEY;      // 单 key 的闭开区间
 
 > confluent weedout（对所有字段去重）在**优化期已被改写成 LIMIT 1**（`sql_executor.cc:1216`）。
 
+#### ★ 三种去重迭代器：对应两种 semijoin 策略
+
+> 源码坐标：`[I2] sql/iterators/composite_iterators.h/.cc` · `[I8] sql/sql_executor.cc`（`do_sj_dups_weedout`）· `[I11] sql/sql_executor.h`（`SJ_TMP_TABLE`）
+> **与 08 篇分工**：semijoin 策略由优化器选定并落成 `AccessPath::REMOVE_DUPLICATES` / `_ON_INDEX` / `WEEDOUT` 属于 [`08_access_path.md`](08_access_path.md)；本段只讲三个迭代器各自的 `Init()`/`Read()` 语义与内存代价。
+
+```
+  semijoin: SELECT * FROM t1 WHERE t1.a IN ( SELECT t2.b FROM t2 );
+
+  策略 A  LooseScan（"先去重，再 join"）
+      ────────────────────────────────────────────────────────
+      Remove duplicates on t2_idx        <- 沿索引跳过重复键
+          └─ Index scan on t2            <- 已按 semijoin key 有序
+      →  join 到 t1，每个 t2 键值只参与一次
+      →  内存：O(1)（只存上一个键值）
+
+  策略 B  Duplicate Weedout（"先 join，再去重"）
+      ────────────────────────────────────────────────────────
+      Nested loop (t1 ⋈ t2)              <- 当作普通 inner join，可自由重排
+          └─ Weedout                     <- 用 rowid 组合写临时表判重
+      →  内存：O(已输出行数 × rowid 组合长度)
+
+  共同前提：semijoin 一旦能"去掉重复"，就能当 inner join 重排 join 顺序；
+  inner join 可重排、semijoin 不可重排 —— 这是所有 semijoin 策略的出发点。
+```
+
+**`RemoveDuplicatesIterator`：按 `group_items` 与上一行比较**
+
+```cpp
+// [I2] sql/iterators/composite_iterators.h
+/**
+  An iterator that removes consecutive rows that are the same according to
+  a set of items (typically the join key), so-called "loose scan"
+  (not to be confused with "loose index scan", which is made by the
+  range optimizer). This is similar in spirit to WeedoutIterator above
+  (removing duplicates allows us to treat the semijoin as a normal join),
+  but is much cheaper if the data is already ordered/grouped correctly,
+  as the removal can happen before the join, and it does not need a
+  temporary table.
+ */
+class RemoveDuplicatesIterator final : public RowIterator {
+ public:
+  RemoveDuplicatesIterator(THD *thd,
+                           unique_ptr_destroy_only<RowIterator> source,
+                           JOIN *join, Item **group_items,
+                           int group_items_size);
+  bool Init() override;
+  int Read() override;
+ private:
+  unique_ptr_destroy_only<RowIterator> m_source;
+  Bounds_checked_array<Cached_item *> m_caches;
+  bool m_first_row;
+};
+```
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+bool RemoveDuplicatesIterator::Init() {
+  m_first_row = true;
+  return m_source->Init();
+}
+
+int RemoveDuplicatesIterator::Read() {
+  for (;;) {
+    int err = m_source->Read();
+    if (err != 0) return err;
+    if (thd()->killed) { thd()->send_kill_message(); return 1; }
+
+    bool any_changed = false;
+    for (Cached_item *cache : m_caches) {
+      any_changed |= cache->cmp();
+    }
+
+    if (m_first_row || any_changed) {
+      m_first_row = false;
+      return 0;
+    }
+    continue;   // Same as previous row, so keep scanning.
+  }
+}
+```
+
+★ `Init()` 只置 `m_first_row = true`，**故意不重置 `m_caches`**——因为 `Cached_item::cmp()` 的语义是"比当前值与我缓存的值，并把当前值缓存下来"，第一次调用时缓存是脏的，靠 `m_first_row` 兜住"第一行必须输出"。
+
+★ `any_changed |= cache->cmp()` 中的 `|=` **不能写成 `||`**——短路会让后面的 `Cached_item` 拿不到更新，下一行就比错了。这是这段代码最微妙的地方。
+
+**`RemoveDuplicatesOnIndexIterator`：真正的 LooseScan**
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+int RemoveDuplicatesOnIndexIterator::Read() {
+  for (;;) {
+    int err = m_source->Read();
+    if (err != 0) return err;
+    if (thd()->killed) { thd()->send_kill_message(); return 1; }
+
+    // ★ "跳到下一个不同键值"就是这三行
+    if (!m_first_row && key_cmp(m_key->key_part, m_key_buf, m_key_len) == 0) {
+      continue;                        // 键值相同 → 丢弃，继续向下拉一行
+    }
+    m_first_row = false;
+    key_copy(m_key_buf, m_table->record[0], m_key, m_key_len);
+    return 0;
+  }
+}
+```
+
+⇒ **为什么 LooseScan 不需要额外内存**：整个判重状态就是 `m_key_buf` 这一个固定长度（`key_len`）的缓冲区。代价是它依赖孩子按该索引前缀有序，且只认索引前缀（不像 `Cached_item` 能对任意表达式去重）。
+
+`NestedLoopSemiJoinWithDuplicateRemovalIterator` 则把去重塞进 join 里（semijoin 内侧有多张表时用）：
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+bool NestedLoopSemiJoinWithDuplicateRemovalIterator::Init() {
+  if (m_source_outer->Init()) return true;
+  m_deduplicate_against_previous_row = false;
+  return false;    // ★ 故意不 Init() 内层：内层由 Read() 每次自己 Init()
+}
+
+int NestedLoopSemiJoinWithDuplicateRemovalIterator::Read() {
+  m_source_inner->SetNullRowFlag(false);
+  for (;;) {                                  // Termination condition within loop.
+    for (;;) {                                // 找一个与上次不同的外层行
+      int err = m_source_outer->Read();
+      if (err != 0) return err;
+      if (m_deduplicate_against_previous_row &&
+          key_cmp(m_key->key_part, m_key_buf, m_key_len) == 0) {
+        continue;                             // 同键 → 跳过
+      }
+      break;
+    }
+    if (m_source_inner->Init()) return 1;     // 每换一个外层行就重扫一次内层
+    int err = m_source_inner->Read();
+    if (err == 1) return 1;                   // Error
+    if (err == -1) {
+      // 本外层行在内层没匹配到 → 继续找同键的下一个外层行
+      m_deduplicate_against_previous_row = false;
+      continue;
+    }
+    m_deduplicate_against_previous_row = true;
+    key_copy(m_key_buf, m_table_outer->record[0], m_key, m_key_len);
+    return 0;
+  }
+}
+```
+
+**`WeedoutIterator`：Duplicate Weedout**
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+bool WeedoutIterator::Init() {
+  if (m_sj->tmp_table->file->ha_delete_all_rows()) return true;   // 清空判重表
+  if (m_sj->tmp_table->hash_field != nullptr &&
+      !m_sj->tmp_table->file->inited) {
+    m_sj->tmp_table->file->ha_index_init(0, false);
+  }
+  for (SJ_TMP_TABLE_TAB *tab = m_sj->tabs; tab != m_sj->tabs_end; ++tab) {
+    TABLE *table = tab->qep_tab->table();
+    if (m_tables_to_get_rowid_for & table->pos_in_table_list->map()) {
+      table->prepare_for_position();      // 告诉 handler 接下来要 position() 拿 rowid
+    }
+  }
+  return m_source->Init();
+}
+
+int WeedoutIterator::Read() {
+  for (;;) {
+    int ret = m_source->Read();
+    if (ret != 0) return ret;
+
+    for (SJ_TMP_TABLE_TAB *tab = m_sj->tabs; tab != m_sj->tabs_end; ++tab) {
+      TABLE *table = tab->qep_tab->table();
+      if ((m_tables_to_get_rowid_for & table->pos_in_table_list->map()) &&
+          can_call_position(table)) {
+        table->file->position(table->record[0]);   // ← 抓 rowid 到 file->ref
+      }
+    }
+
+    ret = do_sj_dups_weedout(thd(), m_sj);
+    if (ret == -1) return 1;    // Error
+    if (ret == 0) return 0;     // Not a duplicate
+    // Duplicate → 继续拉下一行
+  }
+}
+```
+
+注意 `Read()` **没有**像 `FilterIterator` 那样对丢弃的行 `UnlockRow()`——因为丢弃的是"重复的组合"，其中的行仍会被上层以别的组合使用。
+
+**判重的两级结构与行格式**
+
+```cpp
+// [I8] sql/sql_executor.cc —— do_sj_dups_weedout() 拼行
+  uchar *ptr = sjtbl->tmp_table->visible_field_ptr()[0]->field_ptr();
+  // 1. 存长度
+  if (sjtbl->tmp_table->visible_field_ptr()[0]->get_length_bytes() == 1) {
+    *ptr = (uchar)(sjtbl->rowid_len + sjtbl->null_bytes); ptr++;
+  } else {
+    int2store(ptr, sjtbl->rowid_len + sjtbl->null_bytes); ptr += 2;
+  }
+  // 2. 清零 null bytes
+  uchar *const nulls_ptr = ptr;
+  if (sjtbl->null_bytes) { memset(ptr, 0, sjtbl->null_bytes); ptr += sjtbl->null_bytes; }
+  // 3. 逐个拷 rowid
+  for (uint i = 0; tab != tab_end; tab++, i++) {
+    handler *h = tab->qep_tab->table()->file;
+    if (tab->qep_tab->table()->is_nullable() &&
+        tab->qep_tab->table()->has_null_row()) {
+      *(nulls_ptr + tab->null_byte) |= tab->null_bit;      // NULL 补行
+      memset(ptr + tab->rowid_offset, 0, h->ref_length);
+    } else {
+      memcpy(ptr + tab->rowid_offset, h->ref, h->ref_length);
+    }
+  }
+
+  if (!check_unique_constraint(sjtbl->tmp_table)) return 1;   // 第一级：hash 判重
+  error = sjtbl->tmp_table->file->ha_write_row(sjtbl->tmp_table->record[0]);
+  if (error) {
+    if (sjtbl->tmp_table->file->is_ignorable_error(error)) return 1;  // 第二级：唯一键冲突
+    ...
+  }
+  return 0;
+```
+
+```
+  第一级：check_unique_constraint()  —— 只在 hash_field 存在时用
+                                       （键太长放不进 B-tree 唯一索引时的退路）
+  第二级：ha_write_row() 唯一键冲突 —— 常规路径，ignorable error 即重复
+
+  临时表行格式：[len:1或2字节][null bytes][rowid(t1)][rowid(t2)]...
+                                 └── 由 SJ_TMP_TABLE_TAB::rowid_offset 定位
+```
+
+⇒ **Weedout 为什么比 LooseScan 贵**：必须在 join **之后**判重，所以 join 本身会产生所有重复组合（放大），且临时表随输出行数增长，行数多时 `create_ondisk_from_heap()` 溢写磁盘。换来的是"去重发生在 t1 侧"以及"join 顺序完全自由"。
+
+⚠️ **8.0.39 符号核对**：老版本叫 `check_unique`，8.0.39 实际是 **`check_unique_constraint()`**（`sql/sql_tmp_table.cc`）。它返回 true 表示"约束满足=**不重复**"，命名容易看反。
 ### 2.7 排序
 
 **`SortingIterator`：整个排序发生在 `Init()`**（`sorting_iterator.cc:438`）。之后按 2×2 组合选结果迭代器：
@@ -771,6 +1561,337 @@ range->end_key.flag   = HA_READ_AFTER_KEY;      // 单 key 的闭开区间
 
 **溢出判定**：由 `filesort()` 决定——`m_sort_result.io_cache` 被真正初始化就说明落盘了。`m_num_rows_estimate` 只用于**是否启用优先队列**（Top-N 堆排序）。
 
+#### ★ `SortingIterator`：`Init()` 排序、`Read()` 纯代理
+
+> 源码坐标：`[I3] sql/iterators/sorting_iterator.h/.cc` · `[I7] sql/filesort.cc` · `[I12] sql/filesort.h`（`Filesort`）· `[I13] sql/table.h`（`TABLE::sorting_iterator` / `duplicate_removal_iterator`）
+> **与 08 篇分工**：`NewSortAccessPath()` 如何从 ORDER BY / GROUP BY 造出 `AccessPath::SORT` 属于 [`08_access_path.md`](08_access_path.md)。
+
+**`Init()` / `Read()` 职责分工**——本篇里分工最极端的例子：
+
+```
+   Init()
+     ├─ ReleaseBuffers()            释放上一次的排序结果（若有）
+     ├─ DoSort()                    ★ 把 m_source_iterator 拉到 EOF，交给 ::filesort()
+     └─ 根据"结果落在哪"选一个 result iterator（6 选 1），Init() 它
+
+   Read()
+     └─ return m_result_iterator->Read()     纯代理（一行函数）
+
+   ★ 再调一次 Init() → 会重新 DoSort()，不是 rewind。
+     原因见类注释：依赖的 Index_lookup 可能变了（相关子查询里会发生）。
+```
+
+```cpp
+// [I3] sql/iterators/sorting_iterator.h
+/**
+  An adapter that takes in another RowIterator and produces the same rows,
+  just in sorted order. (The actual sort happens in Init().) Unfortunately, it
+  is still bound to working off a TABLE object, which means that you can't
+  use it to e.g. sort the output of a join without materializing into a
+  temporary table first ...
+
+  The primary reason for this is that we currently have no way of communicating
+  read sets through Iterators, and SortingIterator needs to add fields used in
+  ORDER BY to the read set for the appropriate tables. ...
+ */
+class SortingIterator final : public RowIterator {
+ public:
+  // Does not take ownership of "filesort" ... It _does_ take ownership of
+  // "source" ... "examined_rows", if not nullptr, is incremented for each
+  // successful Read().
+  //
+  // num_rows_estimate is used only for whether we intend to use the priority
+  // queue optimization or not; if we estimate fewer rows than we can fit into
+  // RAM, we never use the priority queue.
+  SortingIterator(THD *thd, Filesort *filesort,
+                  unique_ptr_destroy_only<RowIterator> source,
+                  ha_rows num_rows_estimate, table_map tables_to_get_rowid_for,
+                  ha_rows *examined_rows);
+
+  bool Init() override;
+  int Read() override { return m_result_iterator->Read(); }
+  void UnlockRow() override { m_result_iterator->UnlockRow(); }
+  void CleanupAfterQuery();
+
+ private:
+  int DoSort();
+  void ReleaseBuffers();
+
+  Filesort *m_filesort;
+  unique_ptr_destroy_only<RowIterator> m_source_iterator;
+  unique_ptr_destroy_only<RowIterator> m_result_iterator;
+  Filesort_info m_fs_info;
+  Sort_result m_sort_result;
+  const ha_rows m_num_rows_estimate;
+  const table_map m_tables_to_get_rowid_for;
+  ha_rows *m_examined_rows;
+
+  // ★ 6 种结果迭代器之一，union 避免堆分配
+  union IteratorHolder {
+    IteratorHolder() {}
+    ~IteratorHolder() {}
+    SortBufferIterator<true> sort_buffer_packed_addons;
+    SortBufferIterator<false> sort_buffer;
+    SortBufferIndirectIterator sort_buffer_indirect;
+    SortFileIterator<true> sort_file_packed_addons;
+    SortFileIterator<false> sort_file;
+    SortFileIndirectIterator sort_file_indirect;
+  } m_result_iterator_holder;
+};
+```
+
+`Init()` 结尾那个 **6 选 1 分派表**是本段最值得记的结构：
+
+| 条件 | 结果迭代器 | 含义 |
+|---|---|---|
+| 内存 + addon + packed | `SortBufferIterator<true>` | 缓冲里直接是完整行（压缩） |
+| 内存 + addon + 非 packed | `SortBufferIterator<false>` | 缓冲里是完整行 |
+| 内存 + **rowid 排序** | `SortBufferIndirectIterator` | 缓冲里只有 rowid，需回表 |
+| 溢写磁盘 + addon + packed | `SortFileIterator<true>` | 从 IO_CACHE 读完整行 |
+| 溢写磁盘 + addon + 非 packed | `SortFileIterator<false>` | 同上 |
+| 溢写磁盘 + rowid | `SortFileIndirectIterator` | 从 IO_CACHE 读 rowid 再回表 |
+
+```cpp
+// [I3] sql/iterators/sorting_iterator.cc
+int SortingIterator::DoSort() {
+  assert(m_sort_result.io_cache == nullptr);
+  m_sort_result.io_cache =
+      (IO_CACHE *)my_malloc(key_memory_TABLE_sort_io_cache, sizeof(IO_CACHE),
+                            MYF(MY_WME | MY_ZEROFILL));
+
+  ha_rows found_rows;
+  bool error = ::filesort(thd(), m_filesort, m_source_iterator.get(),
+                          m_tables_to_get_rowid_for, m_num_rows_estimate,
+                          &m_fs_info, &m_sort_result, &found_rows);
+  for (TABLE *table : m_filesort->tables) {
+    table->set_keyread(false);  // Restore if we used indexes
+  }
+  return error;
+}
+```
+
+**与 `Filesort` 的分工**
+
+```
+   SortingIterator（本文件）                    filesort.cc（真正的排序）
+   ───────────────────────────               ─────────────────────────────
+   · 驱动：把 source iterator 交出去           · 从 source_iterator 拉所有行
+   · 持有 Filesort*（不拥有）                  · 决定 addon fields vs rowid
+   · 持有 Filesort_info（排序缓冲）            · 决定 PQ vs 全排 vs 归并
+   · 持有 Sort_result（结果落在哪）            · 真正比较、写 chunk、merge
+   · Init() 后根据结果形态造 result iterator    · 把结果放进 Sort_result
+   · Read() 逐行吐出                           · 排序期间不吐任何行
+
+   一句话：SortingIterator = "驱动 filesort 并逐行吐出"，排序本身全在 filesort.cc。
+```
+
+#### ★ 两条路径：普通排序 vs 排序去重
+
+⚠️ **8.0.39 符号核对**：`m_remove_duplicates` **不在** `SortingIterator` 上，而在 **`Filesort`**（`[I12]`）和 `Sort_param`（`[I7]`）上——这是常被记错的一点。路径选择在优化期构造 `Filesort` 时就定了：
+
+```cpp
+// [I7] sql/filesort.cc —— Filesort 构造函数
+Filesort::Filesort(THD *thd, Mem_root_array<TABLE *> tables_arg,
+                   bool keep_buffers_arg, ORDER *order, ha_rows limit_arg,
+                   bool remove_duplicates, bool force_sort_rowids,
+                   bool unwrap_rollup)
+    : m_thd(thd), tables(std::move(tables_arg)),
+      keep_buffers(keep_buffers_arg), limit(limit_arg),
+      sortorder(nullptr), using_pq(false),
+      m_remove_duplicates(remove_duplicates),
+      m_force_sort_rowids(force_sort_rowids),
+      m_sort_order_length(make_sortorder(order, unwrap_rollup)) {}
+```
+
+去重在两个时机生效（**不是只在内存排序时**）：
+
+```cpp
+// [I7] —— 内存路径：额外分配"上一个键"的暂存区
+    // If deduplicating, we'll need to remember the previous key somehow.
+    if (filesort->m_remove_duplicates) {
+      param->m_last_key_seen =
+          static_cast<uchar *>(thd->mem_root->Alloc(longest_key));
+    }
+
+// [I7] —— 归并/落盘路径：靠"当前键必须严格大于上一个已输出的键"判重
+        bool is_duplicate = false;
+        if (param->m_remove_duplicates) {
+          if (seen_any_records &&
+              !mcl.key_is_greater_than(merge_chunk->current_key(),
+                                       param->m_last_key_seen)) {
+            is_duplicate = true;
+          }
+        }
+```
+
+```
+   普通排序 (m_remove_duplicates == false)
+   ─────────────────────────────────────
+   结果行数 == 输入行数
+
+   排序去重 (m_remove_duplicates == true，典型：SELECT DISTINCT / GROUP BY)
+   ────────────────────────────────────────────────────────────────────
+   排序/归并过程中丢弃相邻同键行
+     · 内存路径：param->m_last_key_seen 暂存上一个键
+     · 落盘路径：key_is_greater_than(current, last_seen) 判重
+   结果行数 <= 输入行数
+
+   ★ SortingIterator::Init() 的 6 选 1 分派对两条路径是同一份代码，
+     去重完全发生在 filesort 内部。
+```
+
+已知限制（`[I7]`）：**`SELECT DISTINCT ... ORDER BY x LIMIT n` 拿不到优先队列（PQ）优化**——
+
+```cpp
+  if (param->m_remove_duplicates) {
+    trace_filesort.add("usable", false)
+        .add_alnum("cause", "duplicate removal not supported yet");
+    return false;
+  }
+```
+
+#### ★ rowid 排序：`tables_to_get_rowid_for` 非空时
+
+```
+   addon fields 排序（默认，快）
+   ─────────────────────────────
+   排序缓冲里存：[sort key][SELECT 需要的字段值(addon)]
+   Read() 时只需把 addon 解包回 record buffer —— 无回表
+   → SortBufferIterator / SortFileIterator
+
+   rowid 排序（tables_to_get_rowid_for 非空，或 addon 太长，或 force_sort_rowids）
+   ─────────────────────────────────────────────────────────────────────────
+   排序缓冲里存：[sort key][rowid]（+ 每表 1 字节 NULL flag，若表可空）
+   1. filesort() 调 table->prepare_for_position()（让 handler 准备好 rowid buffer）
+   2. result iterator 的 Init() 对每张表 ha_index_or_rnd_end() 再 ha_rnd_init()
+   3. Read() 每次：读 rowid → table->file->ha_rnd_pos(record[0], ref_pos)
+   → SortBufferIndirectIterator / SortFileIndirectIterator
+   代价：每行一次随机回表 I/O（"indirect" 名字的来源）
+```
+
+```cpp
+// [I3] sql/iterators/sorting_iterator.cc —— 为什么要重新开关扫描
+bool SortFileIndirectIterator::Init() {
+  m_sum_ref_length = 0;
+  for (TABLE *table : m_tables) {
+    // The sort's source iterator could have initialized an index
+    // read, and it won't call end until it's destroyed (which we
+    // can't do before destroying SortingIterator, since we may need
+    // to scan/sort multiple times). Thus, as a small hack, we need
+    // to reset it here.
+    table->file->ha_index_or_rnd_end();
+    EndFullTextIndexScan(table);
+
+    int error = table->file->ha_rnd_init(false);
+    if (error) { table->file->print_error(error, MYF(0)); return true; }
+
+    if (m_has_null_flags && table->is_nullable()) ++m_sum_ref_length;
+    m_sum_ref_length += table->file->ref_length;
+  }
+  if (m_ref_pos == nullptr) {
+    m_ref_pos = thd()->mem_root->ArrayAlloc<uchar>(m_sum_ref_length);
+  }
+  return false;
+}
+
+int SortFileIndirectIterator::Read() {
+  for (;;) {
+    if (my_b_read(m_io_cache, m_ref_pos, m_sum_ref_length))
+      return -1; /* End of file */
+    uchar *ref_pos = m_ref_pos;
+    bool skip = false;
+    for (TABLE *table : m_tables) {
+      if (m_has_null_flags && table->is_nullable()) {
+        if (*ref_pos++) {                    // NULL 补行
+          table->set_null_row();
+          ref_pos += table->file->ref_length;
+          continue;
+        } else {
+          table->reset_null_row();
+        }
+      }
+      int tmp = table->file->ha_rnd_pos(table->record[0], ref_pos);
+      ref_pos += table->file->ref_length;
+      /* The following is extremely unlikely to happen */
+      if (tmp == HA_ERR_RECORD_DELETED ||
+          (tmp == HA_ERR_KEY_NOT_FOUND && m_ignore_not_found_rows)) {
+        skip = true;                          // ★ 排序期间到回表期间行被并发删掉 → 静默跳过
+        break;
+      } else if (tmp != 0) {
+        return HandleError(thd(), table, tmp);
+      }
+    }
+    if (skip) continue;
+    if (m_examined_rows != nullptr) ++*m_examined_rows;
+    return 0;
+  }
+}
+```
+
+#### 预估行数如何影响 buffer 决策
+
+`m_num_rows_estimate` 只在 `filesort()` 里用于两个决策点。
+
+**决策点一：是否用优先队列 PQ**
+
+```cpp
+  if (check_if_pq_applicable(trace, param, fs_info, num_rows_estimate,
+                             memory_available)) {
+    ...
+    filesort->using_pq = true;
+    param->using_pq = true;
+    param->m_addon_fields_status = Addon_fields_status::using_priority_queue;
+  }
+```
+
+**决策点二：给排序缓冲预分配多大**（只在不用 PQ 时）
+
+```cpp
+    // NOTE: param->max_rows_per_buffer is merely informative (for optimizer
+    // trace) in this case, not actually used.
+    if (num_rows_estimate < MERGEBUFF2) num_rows_estimate = MERGEBUFF2;
+    ha_rows keys =
+        memory_available / (param->max_record_length() + sizeof(char *));
+    param->max_rows_per_buffer =
+        min(num_rows_estimate > 0 ? num_rows_estimate : 1, keys);
+    fs_info->set_max_size(memory_available, param->max_record_length());
+```
+
+⇒ 缓冲能放多少行 = `min(预估行数, sort_buffer_size / (行长 + 指针长))`，至少按 `MERGEBUFF2`（=15）估。**优化器估得太低会让缓冲预分配偏小**，导致本可一趟内存排完的结果被切成更多 chunk、写盘、再归并。它**不改变**内存上限（仍是 `sort_buffer_size`），只改变"一次性往里塞多少"的预期。
+
+#### 与 `TABLE::sorting_iterator` / `duplicate_removal_iterator` 的反向绑定
+
+```cpp
+// [I13] sql/table.h
+  /**
+    Not owned by the TABLE; used only from filesort_free_buffers().
+    See comments on SortingIterator::CleanupAfterQuery().
+  */
+  SortingIterator *sorting_iterator{nullptr};
+  SortingIterator *duplicate_removal_iterator{nullptr};
+```
+
+绑定发生在创建 `SortingIterator` **之后**（`[I10]`），是一条**反向指针**（`TABLE` → 曾在它上面排过序的迭代器），用途只有一个：提前释放排序缓冲。
+
+```cpp
+// [I7] sql/filesort.cc
+void filesort_free_buffers(TABLE *table, bool full) {
+  table->unique_result.sorted_result.reset();
+  ...
+  if (full) {
+    if (table->sorting_iterator != nullptr) {
+      table->sorting_iterator->CleanupAfterQuery();
+      table->sorting_iterator = nullptr;  // The TABLE object can be reused.
+    }
+    if (table->duplicate_removal_iterator != nullptr) {
+      table->duplicate_removal_iterator->CleanupAfterQuery();
+      table->duplicate_removal_iterator = nullptr;
+    }
+  }
+}
+```
+
+⇒ 为什么要反向绑定？排序缓冲可能很大（`sort_buffer_size` 级）。`JOIN::destroy()` 时会整体释放，这通常够用；但 DELETE/UPDATE、`ALTER TABLE ... ORDER BY` 等一次性 filesort 希望更早释放。TABLE **不拥有**这两个指针，销毁迭代器前必须手动置 nullptr，否则悬空。
 ### 2.8 物化与聚合
 
 **MaterializeIterator**（`composite_iterators.cc:824`）—— `Init()` 是全部工作：
@@ -814,6 +1935,299 @@ ROLLUP：`first_changed_idx` = 变了的第一个分组列，`m_last_unchanged_g
 
 **零输入行但有聚合**（`SELECT SUM(x) FROM t`）：`READING_FIRST_ROW` 遇 EOF 时调 `item->no_rows_in_result()`，输出一行 NULL。
 
+#### ★ `MaterializePathParameters`：两个关键开关
+
+> 源码坐标：`[I2] sql/iterators/composite_iterators.h/.cc` · `[I14] sql/join_optimizer/materialize_path_parameters.h` · `[I1] sql/iterators/basic_row_iterators.h`（`FollowTailIterator`）
+> **与 08 篇分工**：`NewMaterializeAccessPath()` 如何把派生表/CTE/UNION 折成 `AccessPath::MATERIALIZE` 属于 [`08_access_path.md`](08_access_path.md)。
+
+```cpp
+// [I14] sql/join_optimizer/materialize_path_parameters.h
+  /**
+     Used for when pushing LIMIT down to MaterializeIterator; this is
+     more efficient than having a LimitOffsetIterator above the
+     MaterializeIterator, since we can stop materializing when there are
+     enough rows. (This is especially important for recursive CTEs.)
+     Note that we cannot have a LimitOffsetIterator _below_ the
+     MaterializeIterator, as that would count wrong if we have deduplication,
+     and would not work at all for recursive CTEs.
+     Set to HA_POS_ERROR for no limit.
+  */
+  ha_rows limit_rows;
+
+  /**
+     True if this is the top level iterator for a
+     materialized derived table transformed from a scalar subquery which needs
+     run-time cardinality check.
+  */
+  bool reject_multiple_rows;
+```
+
+⇒ **`limit_rows` 为什么必须专门开一个参数**：把 `LIMIT` 放在 MaterializeIterator **上面**只是"少读几行"，省不下物化代价；放在**下面**则在有去重时会数错（去重吃掉的行也算了 limit），对递归 CTE 完全不成立。所以要下推到物化内部。
+
+#### ★ `MaterializeIterator::Init()`：invalidators 如何触发清空
+
+```cpp
+// [I2] sql/iterators/composite_iterators.cc
+template <typename Profiler>
+bool MaterializeIterator<Profiler>::Init() {
+  // ① CTE 共享物化：若本 CTE 已被别的引用物化过，直接用
+  const bool use_shared_cte_materialization =
+      !table()->materialized && m_cte != nullptr && !m_rematerialize &&
+      any_of(m_cte->tmp_tables.begin(), m_cte->tmp_tables.end(),
+             [](const Table_ref *table_ref) {
+               return table_ref->table != nullptr &&
+                      table_ref->table->materialized;
+             });
+
+  if (table()->materialized) {
+    bool rematerialize = m_rematerialize;
+
+    if (!rematerialize && !use_shared_cte_materialization) {
+      /*
+        See if any lateral tables that we depend on have changed since
+        last time (which would force a rematerialization).
+        TODO: It would be better ... to check the actual column values
+        instead of just whether we've seen any new rows.
+      */
+      for (const Invalidator &invalidator : m_invalidators) {
+        if (invalidator.iterator->generation() !=
+            invalidator.generation_at_last_materialize) {
+          rematerialize = true;
+          break;
+        }
+      }
+    }
+
+    if (!rematerialize) {
+      // Just a rescan of the same table.
+      return m_table_iterator->Init();
+    }
+  }
+  table()->set_not_started();
+
+  if (!table()->is_created()) {
+    if (instantiate_tmp_table(thd(), table())) return true;
+    empty_record(table());
+  } else {
+    table()->file->ha_index_or_rnd_end();
+    table()->file->ha_delete_all_rows();        // ★ 清空
+  }
+  ...
+  // ② 逐个 query block 物化
+  if (m_query_expression != nullptr && m_query_expression->is_recursive()) {
+    if (MaterializeRecursive()) return true;
+  } else {
+    for (const materialize_iterator::QueryBlock &query_block :
+         m_query_blocks_to_materialize) {
+      if (MaterializeQueryBlock(query_block, &stored_rows)) return true;
+      if (table()->is_union_or_table()) {
+        // For INTERSECT and EXCEPT, this is done in TableScanIterator
+        if (m_reject_multiple_rows && stored_rows > 1) {
+          my_error(ER_SUBQUERY_NO_1_ROW, MYF(0));
+          return true;
+        } else if (stored_rows >= m_limit_rows) {
+          break;                                // ★ limit 下推的生效点
+        }
+      }
+    }
+  }
+
+  table()->materialized = true;
+  // ③ 刷新 invalidators 的 generation 快照
+  for (Invalidator &invalidator : m_invalidators) {
+    invalidator.generation_at_last_materialize =
+        invalidator.iterator->generation();
+  }
+  return m_table_iterator->Init();
+}
+```
+
+**invalidators 触发机制**：
+
+```
+   每个 CacheInvalidatorIterator 维持一个自增 generation 计数器：
+     CacheInvalidatorIterator::Init() / Read() / SetNullRowFlag() → ++m_generation
+
+   MaterializeIterator 构造时记下"上次物化时各 invalidator 的 generation"（初值 -1）
+
+   每次 Init()：
+     for (invalidator : m_invalidators)
+        if (invalidator.iterator->generation()
+            != invalidator.generation_at_last_materialize)
+            → rematerialize = true;
+
+   物化完成后刷新快照。
+
+   ★ 典型场景：LATERAL 派生表。外层每产出一行，内层依赖它的派生表内容就变了
+     → generation 涨 → 下一次 Init() 走 rematerialize 分支
+       ha_delete_all_rows() 清空 + 重新跑所有 query block
+
+   ⚠️ invalidation 是"粗粒度"的：只看有没有新行流过，不比值（源码 TODO 明说）。
+```
+
+单块物化的读循环（`MaterializeQueryBlock()`）：
+
+```cpp
+  while (true) {
+    if (*stored_rows >= m_limit_rows) break;          // ★ limit 下推
+
+    int error = query_block.subquery_iterator->Read();
+    if (error > 0 || thd()->is_error()) return true;
+    else if (error < 0) break;
+    else if (thd()->killed) { thd()->send_kill_message(); return true; }
+
+    if (query_block.copy_items) {                     // ★ 求值
+      if (copy_funcs(query_block.temp_table_param, thd())) return true;
+    }
+
+    if (is_union_or_table) {
+      if (query_block.disable_deduplication_by_hash_field) {
+        assert(doing_hash_deduplication());
+      } else if (!check_unique_constraint(t)) {
+        continue;                                     // 重复 → 丢弃
+      }
+    } else if (query_block.m_operand_idx == 0) {
+      ...  // INTERSECT / EXCEPT 左侧：维护 set_counter
+    }
+
+    error = t->file->ha_write_row(t->record[0]);
+    if (error == 0) { ++*stored_rows; continue; }
+    if (!t->file->is_ignorable_error(error)) {
+      // 内存临时表满 → 转磁盘
+      bool is_duplicate;
+      if (create_ondisk_from_heap(thd(), t, error, true, true, &is_duplicate))
+        return true;
+      if (t->hash_field) t->file->ha_index_init(0, false);
+      ...
+    }
+  }
+```
+
+#### 多 query block 物化流程（含递归 CTE）
+
+```
+                     MaterializeIterator::Init()
+                                 │
+                 ┌───────────────┴───────────────┐
+                 │  已 materialized?              │
+                 │  · CTE 共享命中 → 跳过         │
+                 │  · rematerialize == true → 重跑│
+                 │  · invalidators generation 变 → 重跑
+                 │  · 否则只 m_table_iterator->Init() 直接返回（rescan）
+                 └───────────────┬───────────────┘
+                                 ▼
+                     ha_delete_all_rows() / instantiate_tmp_table()
+                                 │
+                 ┌───────────────┴───────────────┐
+                 │ unit->is_recursive()?          │
+                 └───┬───────────────────────┬───┘
+                    YES                      NO
+                     ▼                        ▼
+          MaterializeRecursive()      for (query_block : blocks)
+                     │                        │ MaterializeQueryBlock()
+   ┌─────────────────┴──────────┐             │  Init → while Read → copy_funcs
+   │ (1) 非递归块各跑一次        │             │  → check_unique_constraint
+   │ (2) 递归块循环到收敛        │             │  → ha_write_row
+   │     do {                   │             ▼
+   │       last = stored_rows   │      reject_multiple_rows && stored_rows > 1
+   │       for (is_recursive_ref)│         → ER_SUBQUERY_NO_1_ROW
+   │         MaterializeQueryBlock│
+   │     } while (stored_rows > last)
+   └────────────────────────────┘
+                     ▼
+        table()->materialized = true → 刷新 invalidators 快照 → m_table_iterator->Init()
+```
+
+★ **递归协作的关键**（`[I1]`，`FollowTailIterator`）：
+
+```cpp
+  // Give each recursive iterator access to the stored number of rows
+  for (const materialize_iterator::QueryBlock &query_block :
+       m_query_blocks_to_materialize) {
+    if (query_block.is_recursive_reference) {
+      query_block.recursive_reader->set_stored_rows_pointer(&stored_rows);
+    }
+  }
+```
+
+`FollowTailIterator` 的契约（类注释）：它像 `tail -f` 一样**边写边读同一张临时表**；且 **后续 `Init()` 不把游标拨回开头**——这正是递归能推进的原因。落盘溢写时 `MaterializeIterator` 回调 `RepositionCursorAfterSpillToDisk()`。
+
+#### ★ `AggregateIterator`（流式）vs `TemptableAggregateIterator`（临时表）
+
+| | `AggregateIterator` | `TemptableAggregateIterator` |
+|---|---|---|
+| 前提 | 输入**已按 group key 有序**（来自排序或索引扫描），或无 GROUP BY | 输入无序 |
+| `Init()` | 只重置状态机 + `m_source->Init()`；**不跑子查询** | **跑完整个子查询**：逐行 `copy_funcs` → 查组（hash 或 index）→ `ha_update_row`（已有组）/ `ha_write_row`（新组） |
+| `Read()` | 真正推进聚合：`m_source->Read()` + `aggregator_add()` | 纯代理 `m_table_iterator->Read()` |
+| 输出时机 | 边读边吐（第一个组读完就吐） | `Init()` 跑完后才有第一行 |
+| 内存 | O(一行)——`m_first_row_this_group` / `m_first_row_next_group` 两个打包缓冲 | O(组数 × 行宽)，可能落盘 |
+| 组判定 | `update_item_cache_if_changed(group_fields)` 与"上一行"比 | `ha_index_read_map(HA_READ_KEY_EXACT)` 或 `check_unique_constraint()` 查表 |
+
+`AggregateIterator::Read()` 里**组切换**那一段是精髓（类注释给了完整例子）：
+
+```cpp
+        int first_changed_idx =
+            update_item_cache_if_changed(m_join->group_fields);
+        if (first_changed_idx >= 0) {
+          // The group changed. Store the new row (we can't really use it yet;
+          // next Read() will deal with it), then load back the group values
+          // so that we can output a row for the current group.
+          StoreFromTableBuffers(m_tables, &m_first_row_next_group);
+          LoadIntoTableBuffers(m_tables, pointer_cast<const uchar *>(
+                                             m_first_row_this_group.ptr()));
+          ...
+          m_state = LAST_ROW_STARTED_NEW_GROUP;
+          return 0;
+        }
+```
+
+⇒ 它**不知道一组何时结束，直到看到下一组的第一行**，所以必须"把下一组的首行暂存起来，再把本组首行恢复回 record buffer"才能正确输出聚合值。
+
+#### `StreamingIterator`：不真正物化的"物化"
+
+```cpp
+// [I2] sql/iterators/composite_iterators.h
+/**
+  StreamingIterator is a minimal version of MaterializeIterator that does not
+  actually materialize; instead, every Read() just forwards the call to the
+  subquery iterator and does the required copying from one set of fields to
+  another.
+
+  It is used for when the optimizer would normally set up a materialization,
+  but you don't actually need one, ie. you don't want to read the rows multiple
+  times after writing them, and you don't want to access them by index (only
+  a single table scan).
+ */
+```
+
+```cpp
+int StreamingIterator::Read() {
+  m_join->set_ref_item_slice(m_input_slice);
+  auto switch_to_output_slice = create_scope_guard([&] { ... });
+
+  int error = m_subquery_iterator->Read();
+  if (error != 0) return error;
+
+  if (copy_funcs(m_temp_table_param, thd())) return 1;   // ★ 只做字段拷贝
+
+  if (m_provide_rowid) {
+    memcpy(table()->file->ref, &m_row_number, sizeof(m_row_number));
+    ++m_row_number;
+  }
+  return 0;
+}
+```
+
+⇒ 与 `MaterializeIterator` 对比很能说明火山模型：**同一个 `Read()` 契约，两种代价**。流式版每行都要重新执行子查询；物化版只在 `Init()` 里执行一次。
+
+**`Init()` / `Read()` 职责分工总结**（这三个迭代器同构）：
+
+```
+   MaterializeIterator::Init()  → 跑完所有子查询，写满临时表
+   MaterializeIterator::Read()  → 切 slice + return m_table_iterator->Read()
+
+   ★ 所以 CTE / 派生表不管被引用多少次，子查询只跑一遍（除非 rematerialize）。
+```
 ### 2.9 窗口函数
 
 **WindowIterator**（非缓冲，`:1535`）—— 一行三阶段 `copy_funcs`：
@@ -839,6 +2253,144 @@ if (copy_funcs(m_temp_table_param, thd(), CFT_WF)) return 1;           // 3. 本
 
 分区切换时把该行暂存为 `FBC_FIRST_IN_NEXT_PARTITION`（内存里），本轮先算完旧分区，下一轮 `bring_back_frame_row()`（`:404`）恢复它再真正缓冲。
 
+#### ★ `needs_buffering` 决定走哪个迭代器
+
+> 源码坐标：`[I4] sql/iterators/window_iterators.h/.cc` · `[I15] sql/window.h`（`Window::needs_buffering()`、`reset_round()`、`check_partition_boundary()`）· `[I9] sql/join_optimizer/access_path.h`（`AccessPath::WINDOW` 参数）
+> **与 08 篇分工**：`NewWindowAccessPath()` 如何按 `needs_buffering` 造出 `AccessPath::WINDOW` 属于 [`08_access_path.md`](08_access_path.md)。
+
+```cpp
+// [I15] sql/window.h
+  /**
+    If we cannot compute one of window functions without looking at succeeding
+    rows, return true, else false.
+  */
+  bool needs_buffering() const { return m_needs_frame_buffering; }
+```
+
+两个迭代器在**构造函数里就断言**了各自的前提——这是"二选一"最直接的证据：
+
+```cpp
+// [I4] sql/iterators/window_iterators.cc
+WindowIterator::WindowIterator(...)
+    : RowIterator(thd), m_source(std::move(source)), ... {
+  assert(!m_window->needs_buffering());          // ★ 无缓冲
+}
+
+BufferingWindowIterator::BufferingWindowIterator(...)
+    : RowIterator(thd), m_source(std::move(source)), ... {
+  assert(m_window->needs_buffering());           // ★ 需缓冲
+}
+```
+
+```
+   needs_buffering == false（窗口函数只需"当前行及其之前"）
+       → WindowIterator：Read() 一行进、一行出，O(1) 内存
+       典型：ROW_NUMBER() / RANK() / SUM() OVER (ROWS UNBOUNDED PRECEDING)
+             / 任何 frame 上界不超过当前行的
+
+   needs_buffering == true（需要看到后面的行才能算）
+       → BufferingWindowIterator：Read() 要把行攒进 frame buffer，攒够才吐
+       典型：SUM() OVER (ROWS 2 FOLLOWING)、LAST_VALUE()、
+             RANGE 帧（要看到 peer 组结束才知道边界）
+```
+
+#### `WindowIterator`：`Read()` 是三步 copy + 一次分区检查
+
+```cpp
+// [I4] sql/iterators/window_iterators.cc
+bool WindowIterator::Init() {
+  if (m_source->Init()) return true;
+  m_window->reset_round();                       // ★ 重置窗口函数的"轮"状态
+  m_input_slice = m_join->get_ref_item_slice();  // 记下输入 slice
+  return false;
+}
+
+int WindowIterator::Read() {
+  SwitchSlice(m_join, m_input_slice);
+  int err = m_source->Read();
+  SwitchSlice(m_join, m_output_slice);
+  if (err != 0) return err;
+
+  if (copy_funcs(m_temp_table_param, thd(), CFT_HAS_NO_WF)) return 1;   // ①
+  m_window->check_partition_boundary();                                 // ②
+  if (copy_funcs(m_temp_table_param, thd(), CFT_WF)) return 1;          // ③
+
+  // ④ 只有最后一个窗口才算"依赖窗口函数的表达式"
+  if (m_window->is_last() && copy_funcs(m_temp_table_param, thd(), CFT_HAS_WF))
+    return 1;
+
+  return 0;
+}
+```
+
+★ 四步顺序不能乱：
+
+1. **`SwitchSlice(m_input_slice)` → 读源行**：源表达式必须在输入 slice 下求值；读完后立刻切到输出 slice。
+2. **`copy_funcs(CFT_HAS_NO_WF)`**：先算**不依赖窗口函数**的表达式（如 `1 + t.a`），把值存进输出表的字段。
+3. **`check_partition_boundary()`**：**分区推进**——发现新分区就 `reset_partition_state()`，把 `ROW_NUMBER()` 等归零。这就是"窗口帧随行推进"在无需缓冲时的全部实现：无需 buffer，因为 frame 上界不超过当前行。
+4. **`copy_funcs(CFT_WF)`**：算窗口函数本体。最后 `CFT_HAS_WF` 只在 `m_window->is_last()` 时算——多窗口时必须等所有窗口都算完才能算依赖它们的表达式（如 `foo() OVER w1 + bar() OVER w2` 里的 `+`）。
+
+`UnlockRow()` 是空实现并注明 "There's nothing we can do here"——窗口计算已经消费了行，无法安全回退锁。
+
+#### `BufferingWindowIterator`：攒够才吐
+
+```cpp
+// [I4] sql/iterators/window_iterators.h（节选）
+class BufferingWindowIterator final : public RowIterator {
+ public:
+  bool Init() override;
+  int Read() override;
+ private:
+  int ReadBufferedRow(bool new_partition_or_eof);
+  /// If true, we may have more buffered rows to process that need to be
+  /// checked for before reading more rows from the source.
+  bool m_possibly_buffered_rows;
+  /// Whether the last input row started a new partition, and was tucked away
+  /// to finalize the previous partition; if so, we need to bring it back
+  /// for processing before we read more rows.
+  bool m_last_input_row_started_new_partition;
+  bool m_eof;
+};
+```
+
+```cpp
+// [I4] sql/iterators/window_iterators.cc
+bool BufferingWindowIterator::Init() {
+  if (m_source->Init()) return true;
+  m_window->reset_round();
+  m_possibly_buffered_rows = false;
+  m_last_input_row_started_new_partition = false;
+  m_eof = false;
+  m_input_slice = m_join->get_ref_item_slice();
+  return false;
+}
+```
+
+★ **`Read()` 的循环语义**（类注释原文要点）：
+
+```
+   1. 先把行缓冲进 frame buffer（Window::m_frame_buffer）
+   2. 调 process_buffered_windowing_record()
+   3. 若 output_row_ready → return 0（吐一行）
+      否则 → 继续从源读更多行，推迟求值与返回
+   4. 读完一个完整分区（或 EOF）后，把剩余行全部求值输出
+
+   ★ 关键细节：为了判断"上一行确实是本分区的最后一行"，必须多读一行
+     来探测分区边界；而那一行在求值时会被反复覆盖，所以处理完当前分区后
+     必须重新建立"下一分区第一行"的状态 —— 这就是
+     m_last_input_row_started_new_partition 的用途。
+```
+
+三个 tmp table 的角色（类注释）：
+
+```
+   - 输入表：父迭代器产出，已按 PARTITION BY + ORDER BY 排序
+   - 输出表：temp_table_param 指定，写入本步求值后的记录
+             （若无最终 ORDER BY / DISTINCT，这次写入可被优化掉）
+   - frame buffer：仅 buffering 时需要，由 Window::m_frame_buffer 持有
+```
+
+以 `SUM(A+FLOOR(B)) OVER (ROWS 2 FOLLOWING)` 为例的求值顺序：`copy_fields` 拷贝字段到 OUT → `copy_funcs` 算 `FLOOR(B)` 并存进 OUT 的字段 → 把 OUT 的行**缓冲进 frame buffer** → 攒到 frame 完整才求值 SUM。
 ### 2.10 修改类
 
 **UpdateRowsIterator / DeleteRowsIterator**（`sql_update.cc:2864` / `sql_delete.cc:1186`）—— **两阶段更新**（这正是 [10_dml.md](10_dml.md) "buffer row id 两阶段读"的驱动方）：
@@ -849,6 +2401,324 @@ if (copy_funcs(m_temp_table_param, thd(), CFT_WF)) return 1;           // 3. 本
 
 注意 `Read()` 返回 **-1**——它把整个 join 结果在一次 `Read()` 里消费完。
 
+#### ★ 共同契约：包在源迭代器外面的"修改器"
+
+> 源码坐标：`[I5] sql/iterators/delete_rows_iterator.h`（实现在 `[I17] sql/sql_delete.cc`）· `[I6] sql/iterators/update_rows_iterator.h`（实现在 `[I16] sql/sql_update.cc`）· `[I8] sql/sql_executor.cc` · `[I3] sql/join_optimizer/access_path.{h,cc}`
+> ⚠️ 8.0.39 **没有** `sql/iterators/delete_rows_iterator.cc` / `update_rows_iterator.cc`——两个类的实现分别放在 `sql_delete.cc` 与 `sql_update.cc`。
+
+两个类都是**单子节点的装饰者**，挂在 join 根迭代器之上：不产生行、不消费行，**只产生副作用**。`Read()` 仍遵循 0 / -1 / 1 契约，但**实际上永远不会返回 0**——一次 `Read()` 把整个 join 结果消费完，然后返回 -1（成功）或 1（出错）。
+
+```cpp
+// [I5] sql/iterators/delete_rows_iterator.h
+/// An iterator that deletes all rows returned by its child iterator.
+class DeleteRowsIterator final : public RowIterator {
+ public:
+  DeleteRowsIterator(THD *thd, unique_ptr_destroy_only<RowIterator> source,
+                     JOIN *join, table_map tables_to_delete_from,
+                     table_map immediate_tables);
+  bool Init() override;
+  int Read() override;
+  // ★ 自身是"一次性"节点，没有 per-row 批次语义，PFS 批次直接透传给源
+  void StartPSIBatchMode() override { m_source->StartPSIBatchMode(); }
+  void EndPSIBatchModeIfStarted() override { m_source->EndPSIBatchModeIfStarted(); }
+  // ★ 修改类节点既不接受 NULL 行补齐，也不自己持行锁 —— 走到这里就是 bug
+  void SetNullRowFlag(bool /*is_null_row*/) override { assert(false); }
+  void UnlockRow() override { assert(false); }
+ private:
+  unique_ptr_destroy_only<RowIterator> m_source;
+  JOIN *m_join;
+  table_map m_tables_to_delete_from;
+  /// The tables to delete from immediately while scanning the join result.
+  table_map m_immediate_tables;
+  /// All the tables that are part of a hash join. For those tables the row ID
+  /// will already be available in handler::ref, and calling handler::position()
+  /// will overwrite it with an incorrect row ID.
+  table_map m_hash_join_tables;
+  table_map m_transactional_tables{0};
+  table_map m_tables_with_before_triggers{0};
+  table_map m_tables_with_after_triggers{0};
+  /// Temporary files holding row IDs to delete after the scan is complete.
+  Mem_root_array<unique_ptr_destroy_only<Unique>> m_tempfiles;
+  Mem_root_array<TABLE *> m_delayed_tables;
+  ha_rows m_deleted_rows{0};
+  bool m_has_delayed_deletes{false};
+
+  bool DoImmediateDeletesAndBufferRowIds();
+  bool DoDelayedDeletes();
+  bool DoDelayedDeletesFromTable(TABLE *table);
+};
+```
+
+**★ 建树顺序的特殊性——本节唯一"反火山"的地方**
+
+`CreateIteratorForAccessPath()` 在子迭代器**还没创建**时先做全局 setup，然后才展开子节点：
+
+```cpp
+case AccessPath::DELETE_ROWS: {
+  const auto &param = path->delete_rows();
+  if (job.children.is_null()) {
+    // Setting up tables for delete must be done before the child
+    // iterators are created, as some of the child iterators need to see
+    // the final read set when they are constructed, so doing it in
+    // DeleteRowsIterator's constructor or Init() is too late.
+    SetUpTablesForDelete(thd, join);          // ★ 改 read set，必须在建树前
+    SetupJobsForChildren(mem_root, param.child, join,
+                         eligible_for_batch_mode, &job, &todo);
+    continue;                                 // 子建完后再回来 new DeleteRowsIterator
+  }
+  iterator = NewIterator<DeleteRowsIterator>(
+      thd, mem_root, std::move(job.children[0]), join,
+      param.tables_to_delete_from, param.immediate_tables);
+  break;
+}
+case AccessPath::UPDATE_ROWS: {
+  const auto &param = path->update_rows();
+  if (job.children.is_null()) {
+    // Do the final setup for UPDATE before the child iterators are created.
+    if (FinalizeOptimizationForUpdate(join)) return nullptr;   // ★ 同理
+    SetupJobsForChildren(mem_root, param.child, join,
+                         eligible_for_batch_mode, &job, &todo);
+    continue;
+  }
+  iterator = CreateUpdateRowsIterator(thd, mem_root, join,
+                                      std::move(job.children[0]));
+  break;
+}
+```
+
+⇒ **原因**：扫描类子迭代器（`TableScanIterator` / `IndexScanIterator`）在**构造时**就依据 `TABLE::read_set` 决定是否走 covering index、是否回表。而 setup 会往 read set 追加删除/更新必需的列（主键、binlog 前镜像列等）——若放在本迭代器的构造或 `Init()` 里，子迭代器已按旧 read set 建好了，行为就错了。
+
+```cpp
+// [I17] sql/sql_delete.cc
+void SetUpTablesForDelete(THD *thd, JOIN *join) {
+  for (const Table_ref *tr = join->query_block->leaf_tables; tr != nullptr;
+       tr = tr->next_leaf) {
+    if (!tr->is_deleted()) continue;
+    TABLE *table = tr->table;
+    table->covering_keys.clear_all();   // ★ 不再允许 covering index 扫描
+    table->prepare_for_position();      // ★ 需要 handler::position() 拿 rowid
+    table->mark_columns_needed_for_delete(thd);  // ★ 把删除所需列加进 read set
+  }
+  THD_STAGE_INFO(thd, stage_deleting_from_main_table);
+}
+```
+
+#### ★ `m_immediate_tables`：边读边删 vs 延迟删
+
+`GetImmediateDeleteTables()` 的判据——本质是**规避 Halloween problem**（不能在还要继续读的表上边读边删）：
+
+```cpp
+// 若被删的表同时在查询里被引用，一律延迟 —— 删了会干扰对它的读取
+for (Table_ref *tr = join->query_block->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+  if (!tr->is_deleted()) continue;
+  if (unique_table(tr, join->tables_list, false) != nullptr) return 0;
+}
+table_map candidate_tables = join->const_table_map;      // 1) const 表
+if (join->primary_tables > join->const_tables) {
+  const Table_ref *first_non_const = ...;
+  candidate_tables |= first_non_const->map();            // 2) 第一张非 const 表
+}
+return delete_tables & candidate_tables;
+```
+
+⇒ **"立即删除"只允许发生在 const 表或 join 顺序的第一张非 const 表上**；其余目标表一律延迟。EXPLAIN 里的 `(immediate)` / `(buffered)` 标注就是这个位图的直接呈现。
+
+#### `DeleteRowsIterator::Init()`：一行都不删
+
+```cpp
+// [I17] sql/sql_delete.cc
+bool DeleteRowsIterator::Init() {
+  if (CheckSqlSafeUpdate(thd(), m_join)) return true;   // sql_safe_updates 下拒绝无 key 全表删
+  if (m_source->Init()) return true;                    // ★ 唯一硬职责之一
+
+  for (Table_ref *tr = m_join->query_block->leaf_tables; tr != nullptr;
+       tr = tr->next_leaf) {
+    TABLE *const table = tr->table;
+    const uint tableno = tr->tableno();
+    if (!IsBitSet(tableno, m_tables_to_delete_from)) continue;
+
+    if (IsBitSet(tableno, m_tables_with_after_triggers)) {
+      // AFTER DELETE 触发器可能访问本表，因此必须立即删、不能攒批
+      (void)table->file->ha_extra(HA_EXTRA_DELETE_CANNOT_BATCH);
+    }
+    if (thd()->lex->is_ignore()) table->file->ha_extra(HA_EXTRA_IGNORE_DUP_KEY);
+    if (thd()->is_error()) return true;
+
+    // ★ 每个"非 immediate"目标表配一个 Unique：按 rowid 排序 + 去重 + 可溢盘
+    if (!IsBitSet(tableno, m_immediate_tables)) {
+      auto tempfile = make_unique_destroy_only<Unique>(
+          thd()->mem_root, refpos_order_cmp, table->file,
+          table->file->ref_length, thd()->variables.sortbuff_size);
+      if (tempfile == nullptr || m_tempfiles.push_back(std::move(tempfile)) ||
+          m_delayed_tables.push_back(table)) return true;
+    }
+  }
+  assert(!thd()->is_error());
+  return false;
+}
+```
+
+#### ★ 每读到一行做什么
+
+```cpp
+for (Table_ref *tr = m_join->query_block->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+  const table_map map = tr->map();
+  if (!Overlaps(map, m_tables_to_delete_from)) continue;      // 不是目标表
+  const bool immediate = Overlaps(map, m_immediate_tables);   // ★ 唯一的分流开关
+  TABLE *const table = tr->table;
+  Unique *const tempfile = immediate ? nullptr : m_tempfiles[unique_counter++].get();
+
+  // 外连接没匹配到（NULL 行）或同一行上轮已删 → 跳过
+  if (table->has_null_row() || table->has_deleted_row()) continue;
+
+  // ★ hash join 表的 rowid 已在 file->ref 里，再调 position() 会覆盖成"最后读到的行"
+  if (!Overlaps(map, m_hash_join_tables)) {
+    table->file->position(table->record[0]);
+  }
+
+  if (immediate) {
+    const ha_rows last_deleted = m_deleted_rows;
+    table->set_deleted_row();
+    if (DeleteCurrentRowAndProcessTriggers(            // ★ 当场真删
+            thd(), table, Overlaps(map, m_tables_with_before_triggers),
+            Overlaps(map, m_tables_with_after_triggers), &m_deleted_rows))
+      return true;
+    if (last_deleted != m_deleted_rows &&
+        !Overlaps(map, m_transactional_tables)) {
+      thd()->get_transaction()->mark_modified_non_trans_table(Transaction_ctx::STMT);
+    }
+  } else {
+    m_has_delayed_deletes = true;                      // ★ 只记 rowid
+    if (tempfile->unique_add(table->file->ref)) return true;
+  }
+}
+```
+
+#### ★ `Read()`：一次调用跑完整条 DELETE
+
+```cpp
+// [I17] sql/sql_delete.cc
+int DeleteRowsIterator::Read() {
+  bool local_error = false;
+
+  // ① 先把 join 吐出的所有行处理完：immediate 表当场删，其余缓冲 rowid
+  while (true) {
+    if (const int read_error = m_source->Read();
+        read_error > 0 || thd()->is_error()) { local_error = true; break; }
+    else if (read_error < 0) break;                       // EOF
+    else if (thd()->killed) { thd()->send_kill_message(); return 1; }
+    else {
+      if (DoImmediateDeletesAndBufferRowIds()) { local_error = true; break; }
+    }
+  }
+
+  // ② 若缓冲了 delayed 删除：即使出错，只要改过非事务表也要删完
+  //    （理由：已做的删除回滚不了，删掉其余表的对应行能让各表状态更一致）
+  if (m_has_delayed_deletes &&
+      (!local_error || thd()->get_transaction()->has_modified_non_trans_table(
+                           Transaction_ctx::STMT))) {
+    THD_STAGE_INFO(thd(), stage_deleting_from_reference_tables);
+    if (DoDelayedDeletes()) local_error = true;
+  }
+
+  const THD::killed_state killed_status =
+      !local_error ? THD::NOT_KILLED : thd()->killed.load();
+
+  if (!local_error ||
+      thd()->get_transaction()->cannot_safely_rollback(Transaction_ctx::STMT)) {
+    if (mysql_bin_log.is_open()) {
+      int errcode = 0;
+      if (!local_error) thd()->clear_error();
+      else errcode = query_error_code(thd(), killed_status == THD::NOT_KILLED);
+      thd()->thread_specific_used = true;
+      // ★ 只有"全部目标表都是事务表"时 binlog 写失败才整体回滚
+      if (thd()->binlog_query(THD::ROW_QUERY_TYPE, thd()->query().str,
+                              thd()->query().length, m_transactional_tables != 0,
+                              false, false, errcode) &&
+          m_transactional_tables == m_tables_to_delete_from) {
+        local_error = true;
+      }
+    }
+  }
+
+  if (local_error) return 1;
+  else {
+    thd()->set_row_count_func(m_deleted_rows);   // "Query OK, N rows affected"
+    return -1;
+  }
+}
+```
+
+**为什么必须读完才返回 -1**（三个理由）：
+
+1. delayed 表的 rowid 全集只有扫完才知道，且 `Unique` 必须先**排序去重**才能按物理顺序高效回表；
+2. 中途出错但已改过非事务表（`cannot_safely_rollback`）时，仍要把 delayed 删完以求各表状态一致；
+3. binlog 是**语句级**的，必须在所有删除动作结束后才能定 errcode 并写一次。
+
+#### `UpdateRowsIterator`：`FinalizeOptimizationForUpdate()` 与 immediate 判定
+
+```cpp
+// [I16] sql/sql_update.cc —— 只是转发到 Query_result_update::optimize()
+bool FinalizeOptimizationForUpdate(JOIN *join) {
+  return down_cast<Query_result_update *>(join->query_block->query_result())
+      ->optimize();
+}
+```
+
+它做的事同样是"必须在子迭代器创建前"：同步 `update_table->table`、清 `covering_keys`、AFTER UPDATE trigger 时 `HA_EXTRA_UPDATE_CANNOT_BATCH`、`CheckSqlSafeUpdate()`，然后**从 `AccessPath::UPDATE_ROWS::immediate_tables` 反解出"立即更新表"**：
+
+```cpp
+AccessPath *root_path = join->root_access_path();
+assert(root_path->type == AccessPath::UPDATE_ROWS);
+const table_map immediate_update_tables = root_path->update_rows().immediate_tables;
+if (immediate_update_tables != 0) {
+  assert(immediate_update_tables == main_table->pos_in_table_list->map());
+  table_to_update = main_table;      // ★ 非空 ⇒ "边读边改"的那张表
+} else {
+  table_to_update = nullptr;
+}
+```
+
+⇒ **UPDATE 的 immediate 最多只有一张表**（最外层表）：`GetImmediateUpdateTable()` 只考察 `join->qep_tab[0]` 且它必须 `is_updated()`；多目标表时先用 `CollectColumnsReferencedInJoinConditions()` 把"影响后续表行选择的列"收进 `tmp_set`，再用 `safe_update_on_fly()` 判定——**若被更新的字段会影响后面表的行选择，则不能 on-the-fly**。
+
+`Init()` 极简（唯一副作用是开半一致读）：
+
+```cpp
+// [I16] sql/sql_update.cc
+bool UpdateRowsIterator::Init() {
+  if (m_source->Init()) return true;        // ★ 唯一硬职责
+  if (m_outermost_table != nullptr &&
+      !Overlaps(m_hash_join_tables, m_outermost_table->pos_in_table_list->map())) {
+    // 最外层表是 nested loop 的左参数，可以请求半一致读
+    m_outermost_table->file->try_semi_consistent_read(true);
+  }
+  return false;
+}
+UpdateRowsIterator::~UpdateRowsIterator() {   // 配对关闭
+  if (m_outermost_table != nullptr && m_outermost_table->is_created()) {
+    m_outermost_table->file->try_semi_consistent_read(false);
+  }
+}
+```
+
+`Read()` 与 DELETE 逐行对称（同样 **从不返回 0**），收尾三件套一致：`DoDelayedUpdates()` → 关掉半一致读 → 写一次语句级 binlog → 返回 -1/1。结果由 `Query_result_update::send_eof()` 取回 `found_rows()` / `updated_rows()`，这就是 `Rows matched: N  Changed: M`。
+
+★ **为什么"一行的更新可能在扫描结束后才执行"**：immediate 最多一张表，其余所有目标表只被缓冲成 `(rowid, 已求值的新值)` 对。注意临时表里存的是**已求值的新值**而不是 Item 树——既避免扫描过程中表内容变化导致 Item 求值不确定（Halloween），也让 delayed 阶段不需要重新求值。
+
+#### 两者对照
+
+| | `DeleteRowsIterator` | `UpdateRowsIterator` |
+|---|---|---|
+| 目标集合 | `table_map m_tables_to_delete_from` | `Table_ref *m_update_tables` 链 |
+| immediate 判据 | `table_map m_immediate_tables`（可多表：const ∪ 首张非 const） | `TABLE *m_immediate_table`（**最多一张**） |
+| 延迟缓冲 | 每表一个 `Unique`（只存 rowid，可溢盘） | 每表一个临时表（rowid + **已求值的新值**） |
+| 每行动作 | `DeleteCurrentRowAndProcessTriggers()` | immediate: `fill_record_n_invoke_before_triggers()` + `ha_update_row()`；deferred: `StoreRowId()` + `fill_record()` + `ha_write_row()` |
+| 收尾 | `DoDelayedDeletes()` → `Unique::get()` → 回表删 | `DoDelayedUpdates()` → 扫临时表 → `PositionScanOnRow()` → `copy_field->invoke_do_copy()` → `ha_update_row()` |
+| `Read()` 返回 | -1 / 1 | -1 / 1 |
+
+**三条共同不变式**：① `Init()` 只做"准备"，**任何一行都不改**；② `Read()` 内部自己把源迭代器读到 EOF，一次调用完成整条语句；③ 即使中途出错，只要 `cannot_safely_rollback(STMT)`（改过非事务表），也要把 delayed 阶段跑完，最后再**写一次**语句级 binlog。
+
+> 另注：**EXPLAIN ANALYZE** 下 `DoImmediateDeletesAndBufferRowIds()` / `DoImmediateUpdatesAndBufferRowIds()` 都在开头直接 `return false`，不产生任何副作用。
 ### 2.11 其它
 
 **TimingIterator**（`timing_iterator.h:165`）—— EXPLAIN ANALYZE 的计时器：

@@ -126,6 +126,8 @@ inline int my_b_write(IO_CACHE *info, const uchar *buffer, size_t count) {
 - `my_b_flush_io_cache()` 只做 `write(2)`（经 `mysql_encryption_file_write`），**不等于 fsync**；fsync 只在 `disk_sync` 为真时顺带做，binlog 主文件不走这条路而是显式 `sync()`
 - `_my_b_write()` 的 `pos_in_file + buffer_length > end_of_file` 是**容量超限的唯一判定点**，返回 `EFBIG`
 
+> ★ **binlog 永远走 page cache、无 O_DIRECT 选项、无 `fadvise DONTNEED` 清理**（`sql/` 下 fadvise 0 命中）。决策依据：binlog 是 write-through 模式（写完即按 `sync_binlog` fsync），page cache 里的脏页存活极短、缓存写无收益；读侧（dump 线程）是顺序读，OS readahead 反而有益。与 redo 同构但**没有** O_DSYNC 写穿透选项——server 层 `IO_CACHE` 体系整体无此概念。全库"page cache 参与决策"的剖析（谁可绕、谁写穿透、谁清理）见 [`../../innodb/io.md`](../../innodb/io.md)「page cache 参与决策」节。
+
 ```
  事务线程                     FLUSH 阶段(leader)         SYNC 阶段(leader)
  ─────────                     ────────────────           ────────────────
@@ -686,6 +688,323 @@ MGR 完全开源（GPLv2），代码位于 `plugin/group_replication/`。上层 
 
 ---
 
+### ★ 类名核实：`class Ticket` 在 8.0.39 不存在
+
+真名是 **`binlog::BgcTicket`**，位于 `sql/binlog/group_commit/bgc_ticket.h`（不是 `sql/binlog.h`，也不存在 `sql/rpl_ticket.h`）。`sql/binlog/group_commit/bgc_ticket.h:40-157`：
+
+```cpp
+/// @brief Represents the Binlog Group Commit Ticket - BGC Ticket.
+/// @details Context: BGC ticket is granted to sessions with the same View,
+/// which may be changed with the View Change Event (server connecting to /
+/// disconnecting from group). When View Change Event is generated, it is
+/// granted a separate ticket value (value+1). All sessions that should be
+/// executed after View Change Event are assigned with a ticket value + 2.
+/// Implementation: Ticket is composed of 1 synchronization bit, used for
+/// critical section implementation and 63 bits that represent a ticket value.
+/// ... After reachning the maximum
+/// value for a ticket, ticket value is wrapped up to the first valid ticket
+/// value.
+/// @see Bgc_ticket_manager
+class BgcTicket {
+ public:
+  using ValueType = std::uint64_t;
+
+  /// @brief Default value of ticket, which means it is not being used.
+  static constexpr BgcTicket::ValueType kTicketUnset = 0;
+
+  explicit BgcTicket(const ValueType &ticket = first_ticket_value);
+
+  friend class AtomicBgcTicket;
+  ...
+  /// @brief Comparison operator
+  /// @details Comparison without (!) first bit, meaning that if some thread
+  /// locked on lhs or rhs, tickets can still be equal
+  friend bool operator==(const BgcTicket &lhs, const BgcTicket &rhs);
+
+  /// @brief Obtain ticket value (1st bit cleared out)
+  ValueType get_value() const;
+
+  /// @brief Obtain ticket, may be in use or not (cannot be easily compared)
+  /// @returns Internal value of the ticket (value+sync bit)
+  const ValueType &get() const { return m_ticket; }
+
+  /// @brief sets synchronization bit to 1, only 1 thread can operate on this
+  /// ticket
+  void set_in_use();
+  /// @brief sets synchronization bit to 0, other thread may "lock" this ticket
+  /// for writing
+  void set_used();
+  /// @brief checks whether this ticket is "locked" for writing
+  bool is_in_use() const;
+
+  /// @brief Returns incremented ticket, this remain unchanged
+  BgcTicket next() const;
+
+  /// @brief Increments this ticket value
+  void set_next();
+
+  bool is_set() const;
+
+ public:
+  /// 64-bit mask with all 0s except for the most significant bit, to extract
+  /// synchronization bit
+  static constexpr ValueType set_bit = 1ULL << 63;
+  /// 64-bit mask with all 0s except for the most significant bit, to clear out
+  /// synchronization bit - get ticket value
+  static constexpr ValueType clear_bit = set_bit - 1;
+  /// Maximum allowed value for a ticket, after which will wrap around to
+  /// first_ticket_value
+  static constexpr ValueType max_ticket_value =
+      std::numeric_limits<ValueType>::max() & clear_bit;
+  /// Minimum allowed value for a ticket
+  static constexpr ValueType first_ticket_value = 1;
+
+ protected:
+  ValueType m_ticket;  ///< 1 bit for synchronization, 63 bits - ticket value
+};
+```
+
+/* 【注】① 成员名是 `m_ticket` 不是 `m_value`；② `get()` 返回**含同步位**的原始值，
+   比大小/取纯值要用 `get_value()` 或比较运算符（它们内部都 `& clear_bit`）；
+   ③ `release()` / `is_locked()` 的真名是 `set_used()` / `is_in_use()`。 */
+
+实现（`sql/binlog/group_commit/bgc_ticket.cc:29-76`）：
+
+```cpp
+BgcTicket::BgcTicket(const ValueType &ticket) : m_ticket(ticket) {}
+
+bool BgcTicket::is_set() const {
+  return (m_ticket & clear_bit) != kTicketUnset;
+}
+
+BgcTicket::ValueType BgcTicket::get_value() const {
+  return m_ticket & clear_bit;
+}
+void BgcTicket::set_in_use() { m_ticket |= set_bit; }
+void BgcTicket::set_used() { m_ticket &= clear_bit; }
+bool BgcTicket::is_in_use() const { return m_ticket & set_bit; }
+
+BgcTicket BgcTicket::next() const {
+  auto current = get_value();
+  if (current == max_ticket_value) {
+    current = first_ticket_value - 1;
+  }
+  return BgcTicket(current + 1);
+}
+
+void BgcTicket::set_next() { m_ticket = next().get(); }
+
+bool operator<(const BgcTicket &lhs, const BgcTicket &rhs) {
+  return (lhs.get() & BgcTicket::clear_bit) <
+         (rhs.get() & BgcTicket::clear_bit);
+}
+```
+
+### MSB 当锁用：一次 CAS 同时比较"值"和"是否被占用"
+
+`sql/binlog/group_commit/bgc_ticket_manager.h:109-116`：
+
+```
+  Operations are serialized by using the most significant bit of each of
+  the ticket pointer atomic variables and mark them as in use (set to `1`)
+  or not in use (set to `0`). The first thread to be able to compare the
+  ticket pointer atomic variable with a value that has the most significant
+  bit unset and exchange it by a value with the most significant bit set
+  (using a CAS) gets the ownership over the pointer operations. This
+  mechanism allows us to atomically compare two distinct values, the ticket
+  value in itself and whether or not it's in use by another thread.
+```
+
+/* 【注】★ 这是一个很巧的设计：把"锁"塞进被保护的值的最高位，于是**一次 CAS 就能
+   同时完成**"值没变 + 没人占用"这两个条件的原子判定——不需要额外的 mutex。 */
+
+### 会话计数队列与"计数对齐"放行
+
+管理器成员（`sql/binlog/group_commit/bgc_ticket_manager.h:369-392`）：
+
+```cpp
+ private:
+  /** The pointer to the ticket that is open to assigning more sessions. */
+  AtomicBgcTicket m_back_ticket{binlog::BgcTicket::first_ticket_value};
+  /** The pointer to the ticket for which the processing window is active. */
+  AtomicBgcTicket m_front_ticket{binlog::BgcTicket::first_ticket_value};
+  /**
+    The pointer to the coalesced ticket, 0 means that the coalescing has not
+    been requested yet.
+  */
+  AtomicBgcTicket m_coalesced_ticket{0};
+  /** The number of sessions assigned to the back ticket. */
+  queue_value_type m_back_ticket_sessions_count{0};
+  /** The number of sessions processed in the front ticket window. */
+  queue_value_type m_front_ticket_processed_sessions_count{0};
+  /**
+    The queue keeping the total sessions assigned to each ticket that is
+    closed to assignments (front + on-wait).
+  */
+  queue_type m_sessions_per_ticket{max_concurrent_tickets};
+```
+
+领取与推进（`sql/binlog/group_commit/bgc_ticket_manager.cc:45-107`）：
+
+```cpp
+binlog::BgcTicket binlog::Bgc_ticket_manager::assign_session_to_ticket() {
+  AtomicBgcTicketGuard back_ticket_guard = m_back_ticket.scoped_lock();
+  ++this->m_back_ticket_sessions_count;
+  return back_ticket_guard.get_next();
+}
+...
+std::pair<binlog::BgcTicket, binlog::BgcTicket>
+binlog::Bgc_ticket_manager::push_new_ticket(BgcTmOptions options) {
+  AtomicBgcTicketGuard back_ticket_guard = m_back_ticket.scoped_lock();
+  auto prev_ticket = back_ticket_guard.get_prev();
+  if (options == BgcTmOptions::inc_session_count)
+    ++this->m_back_ticket_sessions_count;
+
+  if (this->m_back_ticket_sessions_count != 0) {
+    this->m_sessions_per_ticket.push(this->m_back_ticket_sessions_count);
+    this->m_back_ticket_sessions_count = 0;
+    assert(this->m_sessions_per_ticket.get_state() !=
+           queue_type::enum_queue_state::NO_SPACE_AVAILABLE);
+    back_ticket_guard.set_next(prev_ticket.next());
+  }
+  return std::make_pair(prev_ticket, back_ticket_guard.get_next());
+}
+
+std::pair<binlog::BgcTicket, binlog::BgcTicket>
+binlog::Bgc_ticket_manager::pop_front_ticket(BgcTmOptions options) {
+  AtomicBgcTicketGuard front_ticket_guard = m_front_ticket.scoped_lock();
+  BgcTicket prev_front = front_ticket_guard.get_prev();
+  if (options == BgcTmOptions::inc_session_count)
+    ++this->m_front_ticket_processed_sessions_count;
+
+  BgcTicket::ValueType front_ticket_sessions =
+      this->m_sessions_per_ticket.front();
+  if (prev_front != this->m_back_ticket.load() &&
+      this->m_front_ticket_processed_sessions_count == front_ticket_sessions) {
+    this->m_front_ticket_processed_sessions_count = 0;
+    this->m_sessions_per_ticket.pop();
+    front_ticket_guard.set_next(prev_front.next());  // increment on release
+  }
+  return {prev_front, front_ticket_guard.get_next()};
+}
+```
+
+/* 【注】★ "计数对齐"就落在 `pop_front_ticket()` 的那个 `==` 上：
+   只有当**前排 ticket 已处理的会话数 == 该 ticket 被分配的会话数**时才推进 front。
+   即"这一批全部处理完才放行下一批"。配套的 `m_sessions_per_ticket` 队列记录
+   每个已关闭 ticket 的会话总数。 */
+
+对齐放行的说明原文（`bgc_ticket_manager.h:185-195`）：
+
+```
+  Note that there is a loop associated with `pop_front_ticket`. This
+  operation only closes the front ticket processing window if the counter
+  for the front ticket assigned sessions equals the counter for the front
+  ticket processed sessions. ...
+  When `pop_front_ticket` returns different before and after values, it
+  means that the front ticket pointer now points to the after value and
+  that the assigned sessions count for the before value was poped from the
+  session-count queue.
+```
+
+### 等待与放行：1 秒 timedwait
+
+`sql/rpl_commit_stage_manager.cc:170-212`：
+
+```cpp
+void Commit_stage_manager::wait_for_ticket_turn(THD *thd,
+                                                bool update_ticket_manager) {
+  auto &ticket_ctx = thd->rpl_thd_ctx.binlog_group_commit_ctx();
+  if (ticket_ctx.has_waited()) return;
+
+  auto &ticket_manager = binlog::Bgc_ticket_manager::instance();
+  binlog::BgcTicket ticket(ticket_ctx.get_session_ticket());
+
+  CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_wait_on_ticket");
+  // Check, first, if the session ticket is already being processed, to avoid
+  // acquiring the mutex
+  if (ticket != ticket_manager.get_front_ticket() &&
+      ticket > ticket_manager.get_coalesced_ticket() && !thd->killed) {
+    CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("inside_wait_on_ticket");
+    PSI_stage_info old_stage;
+    {
+      MUTEX_LOCK(guard, &this->m_lock_wait_for_ticket_turn);
+      thd->ENTER_COND(&this->m_cond_wait_for_ticket_turn,
+                      &this->m_lock_wait_for_ticket_turn,
+                      &stage_wait_on_commit_ticket, &old_stage);
+      struct timespec abstime;
+      while (ticket != ticket_manager.get_front_ticket() &&
+             ticket > ticket_manager.get_coalesced_ticket() && !thd->killed) {
+        // in rare cases View Changes cause ticket changes with no broadcast
+        set_timespec(&abstime, 1);
+        mysql_cond_timedwait(&this->m_cond_wait_for_ticket_turn,
+                             &this->m_lock_wait_for_ticket_turn, &abstime);
+      }
+    }
+    thd->EXIT_COND(&old_stage);
+  }
+  ...
+}
+```
+
+/* 【注】★ 那个 `set_timespec(&abstime, 1)`（1 秒）不是常规超时，而是**防丢广播**的
+   兜底：注释明说 "in rare cases View Changes cause ticket changes with no
+   broadcast"——View Change 改了 ticket 却可能没有 broadcast，靠这 1 秒轮询兜住。 */
+
+### 领取 / 结束：三个真名入口
+
+```cpp
+void Binlog_group_commit_ctx::set_session_ticket(binlog::BgcTicket ticket) {
+  if (Binlog_group_commit_ctx::manual_ticket_setting()->load()) {
+    assert(this->m_session_ticket.is_set() == false);
+    this->m_session_ticket = ticket;
+  }
+}
+
+void Binlog_group_commit_ctx::assign_ticket() {
+  if (this->m_session_ticket.is_set()) {
+    return;
+  }
+  auto ticket_opaque =
+      binlog::Bgc_ticket_manager::instance().assign_session_to_ticket();
+  this->m_session_ticket = ticket_opaque;
+}
+```
+
+```cpp
+void Commit_stage_manager::finish_session_ticket(THD *thd) {
+  auto &ticket_ctx = thd->rpl_thd_ctx.binlog_group_commit_ctx();
+  if (ticket_ctx.get_session_ticket().is_set()) {
+    this->wait_for_ticket_turn(thd);
+    ticket_ctx.reset();
+  }
+}
+
+void Commit_stage_manager::signal_end_of_ticket(bool force) {
+  auto &ticket_manager = binlog::Bgc_ticket_manager::instance();
+  // Check, first, if there are any tickets other than the active, to avoid
+  // taking the mutex.
+  if (force ||
+      ticket_manager.get_front_ticket() != ticket_manager.get_back_ticket()) {
+    auto [previous_front, current_front] = ticket_manager.pop_front_ticket();
+    // if pop was successful - front changed, notify waiting threads
+    if (force || previous_front != current_front) {
+      MUTEX_LOCK(guard, &this->m_lock_wait_for_ticket_turn);
+      mysql_cond_broadcast(&this->m_cond_wait_for_ticket_turn);
+    }
+  }
+}
+```
+
+调用点（`sql/binlog.cc:8857-8866`）：
+
+```cpp
+  CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_assign_session_to_bgc_ticket");
+  thd->rpl_thd_ctx.binlog_group_commit_ctx().assign_ticket();
+```
+
+★ **真名对照**：`MYSQL_BIN_LOG::wait_for_ticket()` / `set_ticket()` / `release_ticket()` 与 `m_ticket_counter` **均不存在**（全仓 0 命中）。真实入口是 `Commit_stage_manager::wait_for_ticket_turn()`、`Binlog_group_commit_ctx::assign_ticket()`、`Commit_stage_manager::finish_session_ticket()`。
+
 ## 内部 2PC（两阶段提交）
 
 ### 为什么需要 2PC
@@ -814,6 +1133,578 @@ MySQL 的"2PC"有两副面孔，共用同一套 prepare/commit 引擎接口：
 - **外部 XA**：用户显式 `XA START` / `XA PREPARE` / `XA COMMIT`，跨多个 MySQL 实例，额外写 `XA_prepare_log_event`。引擎侧细节（detach、by_xid 接口、XA 返回码、崩溃恢复状态机）见 [`../../innodb/trx.md`](../../innodb/trx.md)「外部 XA：与内部 2PC 的差异」。
 
 ---
+
+### TC 入口：`MYSQL_BIN_LOG::prepare`
+
+`sql/binlog.cc:8017-8053`：
+
+```c
+/*
+  Prepare the transaction in the transaction coordinator.
+
+  This function will prepare the transaction in the storage engines
+  (by calling @c ha_prepare_low) what will write a prepare record
+  to the log buffers.
+
+  @retval 0    success
+  @retval 1    error
+*/
+int MYSQL_BIN_LOG::prepare(THD *thd, bool all) {
+  DBUG_TRACE;
+
+  assert(opt_bin_log);
+
+  /*
+    Set HA_IGNORE_DURABILITY to not flush the prepared record of the
+    transaction to the log of storage engine (for example, InnoDB
+    redo log) during the prepare phase. So that we can flush prepared
+    records of transactions to the log of storage engine in a group
+    right before flushing them to binary log during binlog group
+    commit flush stage. Reset to HA_REGULAR_DURABILITY at the
+    beginning of parsing next command.
+    NOTE
+  */
+  thd->durability_property = HA_IGNORE_DURABILITY;
+
+  CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_prepare_in_engines");
+  int error = ha_prepare_low(thd, all);
+
+  CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("after_ha_prepare_low");
+  // Invoke `commit` if we're dealing with `XA PREPARE` in order to use BCG
+  // to write the event to file.
+  if (!error && all && is_xa_prepare(thd)) return this->commit(thd, true);
+
+  return error;
+}
+```
+
+/* 【注】★ 这段注释是 **2PC 与 group commit 耦合的关键**：prepare 时刻意用
+   `HA_IGNORE_DURABILITY` **不刷**引擎 redo，把刷盘推迟到 binlog group commit 的
+   flush stage 集中做——这样 N 个事务只刷一次 redo。代价是 prepare 与 flush 之间
+   崩溃时引擎侧没有 prepare 记录，靠的是 binlog 先落盘来兜（见后文"持久化顺序"）。 */
+
+`ordered_commit()` 的前置条件也明写了这一点（`sql/binlog.h:612-673`）：
+
+```
+    Pre-condition: transactions should have called ha_prepare_low, using
+                   HA_IGNORE_DURABILITY, before entering here.
+    ...
+    Stage 1 (FLUSH):
+    1. Sync the engines (ha_flush_logs), since they prepared using non-durable
+       settings (HA_IGNORE_DURABILITY).
+```
+
+### 遍历 ha_list：`ha_prepare_low`
+
+`sql/handler.cc:2294-2329`：
+
+```c
+int ha_prepare_low(THD *thd, bool all) {
+  DBUG_TRACE;
+  int error = 0;
+  Transaction_ctx::enum_trx_scope trx_scope =
+      all ? Transaction_ctx::SESSION : Transaction_ctx::STMT;
+  auto ha_list = thd->get_transaction()->ha_trx_info(trx_scope);
+
+  if (ha_list) {
+    for (auto const &ha_info : ha_list) {
+      if (!ha_info.is_trx_read_write() &&  // Do not call two-phase commit if
+                                           // transaction is read-only
+          !thd_holds_xa_transaction(thd))  // but only if is not an XA
+                                           // transaction
+        continue;
+
+      auto ht = ha_info.ht();
+      int err = ht->prepare(ht, thd, all);
+      if (err) {
+        if (!thd_holds_xa_transaction(
+                thd)) {  // If XA PREPARE, let error be handled by caller
+          char errbuf[MYSQL_ERRMSG_SIZE];
+          my_error(ER_ERROR_DURING_COMMIT, MYF(0), err,
+                   my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
+        }
+        error = 1;
+      }
+      assert(!thd->status_var_aggregated);
+      thd->status_var.ha_prepare_count++;
+
+      if (error) break;
+    }
+    DBUG_EXECUTE_IF("crash_commit_after_prepare", DBUG_SUICIDE(););
+  }
+
+  return error;
+}
+```
+
+★ **"是否走 2PC" 的判据不是 hton 标志位**：`HTON_SUPPORTS_2PC` / `HA_2PC_PREPARE` 在 8.0.39 **全仓 0 命中**。真实判据在 `trans_register_ha()`（`sql/handler.cc:1330-1335`）：
+
+```c
+  trn_ctx->register_ha(trx_scope, ha_info, ht_arg);
+  trn_ctx->set_ha_trx_info(trx_scope, ha_info);
+
+  if (ht_arg->prepare == nullptr) trn_ctx->set_no_2pc(trx_scope, true);
+```
+
+/* 【注】引擎**没实现** `hton->prepare` ⇒ `m_no_2pc = true`；再配合上面的
+   `is_trx_read_write()` 跳过只读 ⇒ 只有"可读写且引擎支持 prepare"才真走 2PC。 */
+
+### InnoDB 侧：undo state ACTIVE → PREPARED，原子性由单个 mtr 保证
+
+`storage/innobase/trx/trx0trx.cc:2979-3035`：
+
+```c
+/** Prepares a transaction for given rollback segment.
+ @return lsn_t: lsn assigned for commit of scheduled rollback segment */
+static lsn_t trx_prepare_low(
+    trx_t *trx,               /*!< in/out: transaction */
+    trx_undo_ptr_t *undo_ptr, /*!< in/out: pointer to rollback
+                              segment scheduled for prepare. */
+    bool noredo_logging)      /*!< in: turn-off redo logging. */
+{
+  if (undo_ptr->insert_undo != nullptr || undo_ptr->update_undo != nullptr) {
+    mtr_t mtr;
+    trx_rseg_t *rseg = undo_ptr->rseg;
+
+    mtr_start_sync(&mtr);
+
+    if (noredo_logging) {
+      mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+    }
+
+    /* Change the undo log segment states from TRX_UNDO_ACTIVE to
+    TRX_UNDO_PREPARED: these modifications to the file data
+    structure define the transaction as prepared in the file-based
+    world, at the serialization point of lsn. */
+
+    rseg->latch();
+
+    if (undo_ptr->insert_undo != nullptr) {
+      /* It is not necessary to obtain trx->undo_mutex here
+      because only a single OS thread is allowed to do the
+      transaction prepare for this transaction. */
+      trx_undo_set_state_at_prepare(trx, undo_ptr->insert_undo, false, &mtr);
+    }
+
+    if (undo_ptr->update_undo != nullptr) {
+      if (!noredo_logging) {
+        trx_undo_gtid_set(trx, undo_ptr->update_undo, true);
+      }
+      trx_undo_set_state_at_prepare(trx, undo_ptr->update_undo, false, &mtr);
+    }
+
+    rseg->unlatch();
+
+    /*--------------*/
+    /* This mtr commit makes the transaction prepared in
+    file-based world. */
+    mtr_commit(&mtr);
+    /*--------------*/
+    ...
+```
+
+/* 【注】★ 这就是"prepare 的原子性"落点：insert_undo 与 update_undo 的状态改写
+   **在同一个 mtr 里**，一次 `mtr_commit` 就让事务在"文件世界"里成为 prepared。
+   `mtr_start_sync()` 是**同步**提交（不等 group commit）。 */
+
+真正写盘的那几行（`storage/innobase/trx/trx0undo.cc:1843-1889`）：
+
+```c
+  ut_ad(undo->state == TRX_UNDO_ACTIVE);
+  undo->set_prepared(trx->xid);
+
+  mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, undo->state, MLOG_2BYTES, mtr);
+
+  mlog_write_ulint(undo_header + TRX_UNDO_FLAGS, undo->flag, MLOG_1BYTE, mtr);
+
+  trx_undo_write_xid(undo_header, &undo->xid, mtr);
+```
+
+/* 【注】`TRX_UNDO_STATE` 在 **segment header** 上（偏移 0），不是 log header。
+   XA ROLLBACK 走同一函数的 `rollback=true` 分支，把状态写回 `TRX_UNDO_ACTIVE`。 */
+
+上层包装与 handlerton 接线：
+
+```c
+dberr_t trx_prepare_for_mysql(trx_t *trx) {
+  trx_start_if_not_started_xa(trx, false, UT_LOCATION_HERE);
+
+  TrxInInnoDB trx_in_innodb(trx, true);
+  ...
+  trx->op_info = "preparing";
+
+  trx_prepare(trx);
+
+  trx->op_info = "";
+
+  return (DB_SUCCESS);
+}
+```
+
+```c
+  innobase_hton->prepare = innobase_xa_prepare;
+```
+
+### commit 侧：`MYSQL_BIN_LOG::commit()` 与 Xid_log_event 的写入点
+
+`sql/binlog.cc:8055-8140`（函数头注释是三阶段划分的权威表述）：
+
+```c
+/**
+  Commit the transaction in the transaction coordinator.
+  ...
+  For binary log group commit, the commit is separated into three
+  parts:
+
+  1. First part consists of filling the necessary caches and
+     finalizing them (if they need to be finalized). After this,
+     nothing is added to any of the caches.
+
+  2. Second part execute an ordered flush and commit. This will be
+     done using the group commit functionality in ordered_commit.
+
+  3. Third part checks any errors resulting from the ordered commit
+     and handles them appropriately.
+
+  @retval RESULT_SUCCESS   success
+  @retval RESULT_ABORTED   error, transaction was neither logged nor committed
+  @retval RESULT_INCONSISTENT  error, transaction was logged but not committed
+*/
+```
+
+★ **`Xid_log_event` 的落点**（`sql/binlog.cc:8230-8257`）：
+
+```c
+    /*
+      We are committing a 2PC transaction if it is a "real" transaction
+      and has an XID assigned (because some handlerton registered). A
+      transaction is "real" if either 'all' is true or
+      'trn_ctx->is_active(Transaction_ctx::SESSION)' is not true.
+
+      Note: This is kind of strange since registering the binlog
+      handlerton will then make the transaction 2PC, which is not really
+      true. This occurs for example if a MyISAM statement is executed
+      with row-based replication on.
+    */
+    else if (real_trans && xid && trn_ctx->rw_ha_count(trx_scope) > 1 &&
+             !trn_ctx->no_2pc(trx_scope)) {
+      Xid_log_event end_evt(thd, xid);
+      if (cache_mngr->trx_cache.finalize(thd, &end_evt)) return RESULT_ABORTED;
+    }
+```
+
+/* 【注】★ 三个条件缺一不可：① `rw_ha_count > 1`——**只有涉及 ≥2 个引擎才写 Xid**
+   （单独 InnoDB 时 binlog 与 InnoDB 算 2 个）；② `!no_2pc`；③ 有 xid。
+   这就是"只有一个引擎参与时不写 Xid_log_event"的代码证据。 */
+
+`Xid_log_event::write()` 只有三行（`sql/log_event.cc:6064-6070`）：
+
+```c
+bool Xid_log_event::write(Basic_ostream *ostream) {
+  DBUG_EXECUTE_IF("do_not_write_xid", return 0;);
+  return (write_header(ostream, sizeof(xid)) ||
+          wrapper_my_b_safe_write(ostream, (uchar *)&xid, sizeof(xid)) ||
+          write_footer(ostream));
+}
+```
+
+类定义与继承（`sql/log_event.h:1691-1768`）——注意它是**双继承**：
+
+```c
+class Xid_log_event : public binary_log::Xid_event, public Xid_apply_log_event {
+ public:
+#ifdef MYSQL_SERVER
+  Xid_log_event(THD *thd_arg, my_xid x)
+      : binary_log::Xid_event(x),
+        Xid_apply_log_event(thd_arg, header(), footer()) {
+    common_header->set_is_valid(true);
+  }
+  int pack_info(Protocol *protocol) override;
+#else
+  void print(FILE *file, PRINT_EVENT_INFO *print_event_info) const override;
+#endif
+  ...
+  size_t get_data_size() override { return sizeof(xid); }
+```
+
+/* 【注】`binary_log::Xid_event` 提供**序列化**能力（可被 mysqlbinlog 等外部工具读），
+   `Xid_apply_log_event` 提供 **server 侧 apply** 能力。这是 8.0 把 binlog 事件
+   拆成 `libbinlogevents` 后的典型形态。 */
+
+引擎侧提交在 8.0 已改名（`sql/tc_log.cc:137-148`）：
+
+```c
+bool trx_coordinator::commit_in_engines(THD *thd, bool all,
+                                        bool run_after_commit) {
+  if (all) {
+    CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_commit_in_engines");
+  }
+  if (thd->get_transaction()
+          ->xid_state()
+          ->is_detached())  // if processing a detached XA, commit by XID
+    return trx_coordinator::commit_detached_by_xid(thd, run_after_commit);
+  else  // if not, commit normally
+    return ha_commit_low(thd, all, run_after_commit);
+}
+```
+
+/* 【注】★ `MYSQL_BIN_LOG::commit()` 里**不再直接** `ha_commit_low`，而是走
+   `trx_coordinator::commit_in_engines()`——`ha_commit_low` 被包在这一层里。 */
+
+### `Transaction_ctx`：一份上下文，两个 scope
+
+`sql/transaction_info.h:53-198`（节选）：
+
+```c
+class Transaction_ctx {
+ public:
+  enum enum_trx_scope { STMT = 0, SESSION };
+
+  SAVEPOINT *m_savepoints;
+
+  void register_ha(enum_trx_scope scope, Ha_trx_info *ha_info, handlerton *ht);
+
+ public:
+  struct THD_TRANS {
+    /* true is not all entries in the ht[] support 2pc */
+    bool m_no_2pc;
+    int m_rw_ha_count;
+    Ha_trx_info *m_ha_list;
+    ...
+    void reset() {
+      m_no_2pc = false;
+      m_rw_ha_count = 0;
+      reset_unsafe_rollback_flags();
+    }
+    bool is_empty() const { return m_ha_list == nullptr; }
+  };
+
+ private:
+  THD_TRANS m_scope_info[2];
+
+  XID_STATE m_xid_state;
+
+  MEM_ROOT m_mem_root;  // Transaction-life memory allocation pool
+
+ public:
+  /*
+    (Mostly) binlog-specific fields use while flushing the caches
+    and committing transactions.
+    We don't use bitfield any more in the struct. Modification will
+    be lost when concurrently updating multiple bit fields. It will
+    cause a race condition in a multi-threaded application. And we
+    already caught a race condition case between xid_written and
+    ready_preempt in MYSQL_BIN_LOG::ordered_commit.
+  */
+  struct {
+    bool enabled{false};      // see ha_enable_transaction()
+    bool xid_written{false};  // The session wrote an XID
+    bool real_commit{false};  // Is this a "real" commit?
+    bool commit_low{false};   // see MYSQL_BIN_LOG::ordered_commit
+    bool run_hooks{false};    // Call the after_commit hook
+#ifndef NDEBUG
+    bool ready_preempt{false};  // internal in MYSQL_BIN_LOG::ordered_commit
+#endif
+  } m_flags;
+```
+
+/* 【注】① **没有** "normal / binlog 两份 Transaction_ctx"——8.0 只有
+   `THD::m_transaction` 一份（`sql/sql_class.h:1919`）；所谓"两个 scope"是
+   `m_scope_info[2]`（STMT / SESSION）。`THD::Transaction_state`（`sql_class.h:1922-1946`）
+   是 **Attachable_trx** 的辅助结构，不是第二份事务上下文。
+   ② 那段"不用 bitfield"的注释记录了一个**真实的并发 bug**：多 bit field 并发更新
+   会丢修改，曾在 `xid_written` 与 `ready_preempt` 之间踩过。 */
+
+### XID 何时分配、编码成什么
+
+分配点就在 `trans_register_ha()` 里（`sql/handler.cc:1330-1335`），且**只设一次**（`sql/xa.h:351-359`）：
+
+```c
+  trn_ctx->xid_state()->set_query_id(thd->query_id);
+```
+
+```c
+  void set_query_id(query_id_t query_id) {
+    if (m_xid.is_null()) m_xid.set(query_id);
+  }
+```
+
+/* 【注】★ 8.0 **没有** `xid_cache` / `xid_cache_insert` / `assign_automatic_xid()`
+   （全仓 grep 均 0 命中）。XID 不再进全局缓存，而是由 `query_id` 就地编码。 */
+
+编码格式（`sql/xa.cc:93-120`）：
+
+```c
+static const uint MYSQL_XID_PREFIX_LEN = 8;  // must be a multiple of 8
+static const uint MYSQL_XID_OFFSET = MYSQL_XID_PREFIX_LEN + sizeof(server_id);
+static const uint MYSQL_XID_GTRID_LEN = MYSQL_XID_OFFSET + sizeof(my_xid);
+
+my_xid xid_t::get_my_xid() const {
+  static_assert(XIDDATASIZE == MYSQL_XIDDATASIZE,
+                "Our #define needs to match the one in plugin.h.");
+
+  if (gtrid_length == static_cast<long>(MYSQL_XID_GTRID_LEN) &&
+      bqual_length == 0 &&
+      !memcmp(data, MYSQL_XID_PREFIX, MYSQL_XID_PREFIX_LEN)) {
+    my_xid tmp;
+    memcpy(&tmp, data + MYSQL_XID_OFFSET, sizeof(tmp));
+    return tmp;
+  }
+  return 0;
+}
+
+void xid_t::set(my_xid xid) {
+  formatID = 1;
+  memcpy(data, MYSQL_XID_PREFIX, MYSQL_XID_PREFIX_LEN);
+  memcpy(data + MYSQL_XID_PREFIX_LEN, &server_id, sizeof(server_id));
+  memcpy(data + MYSQL_XID_OFFSET, &xid, sizeof(xid));
+  gtrid_length = MYSQL_XID_GTRID_LEN;
+  bqual_length = 0;
+}
+```
+
+/* 【注】XID = `前缀(8B) + server_id(4B) + query_id(8B)`。带上 server_id 是为了
+   **跨实例唯一**——这正是崩溃恢复时能区分"本实例产生的 XID"的依据。 */
+
+`XID_STATE` 的状态机（`sql/xa.h:295-360`）：
+
+```c
+class XID_STATE {
+ public:
+  enum xa_states {
+    XA_NOTR = 0,
+    XA_ACTIVE,
+    XA_IDLE,
+    XA_PREPARED,
+    XA_ROLLBACK_ONLY
+  };
+  ...
+ private:
+  XID m_xid;
+  /**
+    This mutex used for eliminating a possibility to run two
+    XA COMMIT/XA ROLLBACK statements concurrently against the same xid value.
+    m_xa_lock is used on handling XA COMMIT/XA ROLLBACK and acquired only for
+    external XA branches.
+  */
+  std::mutex m_xa_lock;
+
+  /// Used by external XA only
+  xa_states xa_state;
+  bool m_is_detached = false;
+```
+
+### 事务开头的 GTID 事件：匿名不是另一个类
+
+★ `Anonymous_gtid_log_event` **在 8.0.39 不存在类定义**（`sql/` 下 34 处命中全在注释与 type_code 名里）。只有 **`Gtid_log_event` 一个类**，匿名与否由 `common_header->type_code` 区分（`sql/log_event.cc:12984-13025`）：
+
+```c
+  DBUG_TRACE;
+  if (thd->owned_gtid.sidno > 0) {
+    spec.set(thd->owned_gtid);
+    sid = thd->owned_sid;
+  } else {
+    assert(thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS);
+    spec.set_anonymous();
+    spec.gtid.clear();
+    sid.clear();
+  }
+
+  Log_event_type event_type =
+      (spec.type == ANONYMOUS_GTID ? binary_log::ANONYMOUS_GTID_LOG_EVENT
+                                   : binary_log::GTID_LOG_EVENT);
+  common_header->type_code = event_type;
+```
+
+/* 【注】★ 匿名时 `Log_event` 的标志位是 `LOG_EVENT_IGNORABLE_F`（构造列表里那行
+   `thd_arg->variables.gtid_next.type == ANONYMOUS_GTID ? LOG_EVENT_IGNORABLE_F : 0`）
+   ——IGNORABLE 意味着老版本从库遇到不认识的事件可以**跳过而不是报错**。 */
+
+### Commit 阶段与 trx_no：prepare 用 id、commit 用 no
+
+`trx_no` 的分配（**commit 时**，不是 prepare 时）——`storage/innobase/trx/trx0trx.cc:1496-1522`：
+
+```c
+/** Assigns the trx->no and add the transaction to the serialisation_list.
+Skips adding to the serialisation_list if the transaction is read-only, in
+which case still the trx->no is assigned. */
+static inline bool trx_add_to_serialisation_list(trx_t *trx) {
+  trx_sys_serialisation_mutex_enter();
+
+  trx->no = trx_sys_allocate_trx_no();
+
+  /* Update the latest transaction number. */
+  ut_d(trx_sys->rw_max_trx_no = trx->no);
+
+  if (trx->read_only) {
+    trx_sys_serialisation_mutex_exit();
+    return false;
+  }
+
+  UT_LIST_ADD_LAST(trx_sys->serialisation_list, trx);
+
+  if (UT_LIST_GET_LEN(trx_sys->serialisation_list) == 1) {
+    trx_sys->serialisation_min_trx_no.store(trx->no);
+  }
+
+  trx_sys_serialisation_mutex_exit();
+  return true;
+}
+```
+
+分配器（`storage/innobase/include/trx0sys.ic:234-276`）：
+
+```c
+/** Allocates a new transaction id or transaction number.
+@return new, allocated trx id or trx no */
+inline trx_id_t trx_sys_allocate_trx_id_or_no() {
+  ut_ad(trx_sys_mutex_own() || trx_sys_serialisation_mutex_own());
+
+  trx_id_t trx_id = trx_sys->next_trx_id_or_no.fetch_add(1);
+
+  if (trx_id % trx_sys_get_trx_id_write_margin() == 0) {
+    /* Reserve the next range of trx_id values. This thread has acquired
+    either the trx_sys_mutex or the trx_sys_serialisation_mutex.
+    ...
+    */
+    trx_sys_write_max_trx_id();
+  }
+  return trx_id;
+}
+
+inline trx_id_t trx_sys_allocate_trx_id() {
+  ut_ad(trx_sys_mutex_own());
+  return trx_sys_allocate_trx_id_or_no();
+}
+
+inline trx_id_t trx_sys_allocate_trx_no() {
+  ut_ad(trx_sys_serialisation_mutex_own());
+  return trx_sys_allocate_trx_id_or_no();
+}
+```
+
+/* 【注】★ id 与 no **共用同一个自增计数器**（`next_trx_id_or_no`），只是取的时机不同
+   （id 在事务第一次写时、no 在 commit 时）且**持的 mutex 不同**
+   （`trx_sys_mutex` vs `trx_sys_serialisation_mutex`）——两个 `ut_ad` 就是这条契约。 */
+
+两个字段的注释（`storage/innobase/include/trx0trx.h:748-758`）：
+
+```c
+  trx_id_t id; /*!< transaction id */
+
+  trx_id_t no; /*!< transaction serialization number:
+               max trx id shortly before the
+               transaction is moved to
+               COMMITTED_IN_MEMORY state.
+               Protected by trx_sys_t::mutex
+               when trx->in_rw_trx_list. Initially
+               set to TRX_ID_MAX. */
+```
+
+/* 【注】★ 为什么需要两个：**id 决定可见性**（ReadView 比的是 id），
+   **no 决定提交顺序**（purge 与 MVCC 的 `serialisation_min_trx_no` 用 no）。
+   一个事务 id 很小但 no 很大（长事务）是常态——这正是"长事务拖住 purge"的机制。
+   `no` 初值是 `TRX_ID_MAX`，所以没提交的事务 no 是"无穷大"。 */
 
 ## binlog 与崩溃恢复：2PC 裁决
 
@@ -1014,7 +1905,7 @@ void recover_one_internal_trx(xarecover_st const &info, handlerton &ht,
 
 但 DD 和 SE 是两个独立的、各自有持久化日志的子系统，谁都无法单方面保证跨系统的原子性。于是和普通 DML 一样，**binlog 被推举为协调者（Coordinator）**：
 
-- DDL 执行时，引擎先把物理变更做成一个 **prepared 事务**（InnoDB 侧走 DDL log，见 [`../../innodb/ddl.md`](../../innodb/ddl.md)），并把该事务的 XID 记录下来；
+- DDL 执行时，引擎先把物理变更做成一个 **prepared 事务**（InnoDB 侧走 DDL log，见 [`../../feat/ddl/ddl.md`](../../feat/ddl/ddl.md)），并把该事务的 XID 记录下来；
 - DDL 语句本体作为一个 **Query_log_event** 写入 binlog；
 - 崩溃后，binlog 用这个 XID 判断：binlog 里有完整的 DDL 事件 → 该 prepared 事务应 commit；否则 rollback。
 
@@ -1639,6 +2530,195 @@ mysqlbinlog --hexdump binlog_file                          # 十六进制 dump �
 
 ---
 
+### 通用头：19 字节，偏移常量
+
+`libbinlogevents/include/binlog_event.h:406-436`（注意在 **libbinlogevents**，不在 `sql/log_event.h`）：
+
+```cpp
+/*
+   Event header offsets;
+   these point to places inside the fixed header.
+*/
+#define EVENT_TYPE_OFFSET 4
+#define SERVER_ID_OFFSET 5
+#define EVENT_LEN_OFFSET 9
+#define LOG_POS_OFFSET 13
+#define FLAGS_OFFSET 17
+...
+#define LOG_EVENT_HEADER_LEN 19U /* the fixed header length */
+
+/// The maximum value for MAX_ALLOWED_PACKET.  This is also the
+/// maxmium size of binlog events, and dump threads always use this
+/// value for max_allowed_packet.
+constexpr size_t max_log_event_size = 1024 * 1024 * 1024;
+
+/**
+   Fixed header length, where 4.x and 5.0 agree. ...
+*/
+#define LOG_EVENT_MINIMAL_HEADER_LEN 19U
+```
+
+/* 【注】★ `max_log_event_size = 1 GiB` —— 这也是**单个 binlog 事件的上限**，
+   dump 线程拿它当 `max_allowed_packet`。所以一行超过 1 GiB 会直接失败。 */
+
+### `Log_event_header` 结构
+
+`libbinlogevents/include/binlog_event.h:597-716`：
+
+```cpp
+class Log_event_header {
+ public:
+  /*
+    Timestamp on the master(for debugging and replication of
+    NOW()/TIMESTAMP).  It is important for queries and LOAD DATA
+    INFILE. This is set at the event's creation time, except for Query
+    and Load (and other events) events where this is set at the query's
+    execution time, which guarantees good replication (otherwise, we
+    could have a query and its event with different timestamps).
+  */
+  struct timeval when;
+
+  /**
+    Event type extracted from the header. In the server, it is decoded
+    by read_log_event(), but adding here for complete decoding.
+  */
+  Log_event_type type_code;
+
+  /*
+    The server id read from the Binlog.
+  */
+  unsigned int unmasked_server_id;
+
+  /* Length of an event, which will be written by write() function */
+  size_t data_written;
+
+  /*
+    The offset in the log where this event originally appeared (it is
+    preserved in relay logs, making SHOW SLAVE STATUS able to print
+    coordinates of the event in the master's binlog).
+  */
+  unsigned long long log_pos;
+
+  /*
+    16 or less flags depending on the version of the binary log.
+    See the definitions above for LOG_EVENT_TIME_F,
+    LOG_EVENT_FORCED_ROTATE_F, LOG_EVENT_THREAD_SPECIFIC_F, and
+    LOG_EVENT_SUPPRESS_USE_F for notes.
+  */
+  uint16_t flags;
+
+  /**
+    The following type definition is to be used whenever data is placed
+    and manipulated in a common buffer. Use this typedef for buffers
+    that contain data containing binary and character data.
+  */
+  typedef unsigned char Byte;
+
+  explicit Log_event_header(Log_event_type type_code_arg = ENUM_END_EVENT)
+      : type_code(type_code_arg), data_written(0), log_pos(0), flags(0) {
+    when.tv_sec = 0;
+    when.tv_usec = 0;
+  }
+```
+
+/* 【注】布局 = `when(4B) + type_code(1B) + server_id(4B) + event_size(4B) + log_pos(4B) + flags(2B) = 19B`。
+   ★ 为什么只有 19 字节且"4.x 与 5.0 一致"：FD / Rotate 两个事件必须在**还不知道格式**
+   时就能被读出来，所以它们的头被"冻结"成 `LOG_EVENT_MINIMAL_HEADER_LEN = 19`。 */
+
+### 序列化：`write_header_to_memory()`
+
+`sql/log_event.cc:1252-1289`：
+
+```cpp
+uint32 Log_event::write_header_to_memory(uchar *buf) {
+  // Query start time
+  ulong timestamp = (ulong)get_time();
+  ...
+  /*
+    Header will be of size LOG_EVENT_HEADER_LEN for all events, except for
+    FORMAT_DESCRIPTION_EVENT and ROTATE_EVENT, where it will be
+    LOG_EVENT_MINIMAL_HEADER_LEN (remember these 2 have a frozen header,
+    because we read them before knowing the format).
+  */
+
+  int4store(buf, timestamp);
+  buf[EVENT_TYPE_OFFSET] = get_type_code();
+  int4store(buf + SERVER_ID_OFFSET, server_id);
+  uint32 event_size = static_cast<uint32>(common_header->data_written);
+  DBUG_EXECUTE_IF("set_query_log_event_size_to_5", {
+    if (get_type_code() == binary_log::QUERY_EVENT) event_size = 5;
+  });
+  int4store(buf + EVENT_LEN_OFFSET, event_size);
+  int4store(buf + LOG_POS_OFFSET, static_cast<uint32>(common_header->log_pos));
+  int2store(buf + FLAGS_OFFSET, common_header->flags);
+
+  return LOG_EVENT_HEADER_LEN;
+}
+```
+
+### `log_pos` 的填法与 CRC 的参与
+
+`sql/log_event.cc:1291-1341`：
+
+```cpp
+bool Log_event::write_header(Basic_ostream *ostream, size_t event_data_length) {
+  uchar header[LOG_EVENT_HEADER_LEN];
+  bool ret;
+  DBUG_TRACE;
+
+  /* Store number of bytes that will be written by this event */
+  common_header->data_written = event_data_length + sizeof(header);
+
+  if (need_checksum()) {
+    crc = checksum_crc32(0L, nullptr, 0);
+    common_header->data_written += BINLOG_CHECKSUM_LEN;
+  }
+
+  /*
+    Usually events are written into binlog cache first. And later, they are
+    flushed into binlog file. When events are being written into binlog cache,
+    log_pos(a.k.a. end_log_pos) field is meaningless. So it is set to 0. the
+    log_pos field will be updated later when the events are being flushed into
+    binlog file.
+
+    In a few cases(e.g. rotation(FD, Rotate events)), events are written into
+    binlog file directly through event->write(). In these cases, log_pos is
+    updated to the begin position of the event before calling event->write().
+    Then log_pos is updated to the end position of the event here.
+  */
+  if (common_header->log_pos != 0) {
+    common_header->log_pos += common_header->data_written;
+  }
+
+  write_header_to_memory(header);
+
+  ret = ostream->write(header, LOG_EVENT_HEADER_LEN);
+
+  /*
+    Update the checksum.
+
+    In case this is a Format_description_log_event, we need to clear
+    the LOG_EVENT_BINLOG_IN_USE_F flag before computing the checksum,
+    since the flag will be cleared when the binlog is closed.  On
+    verification, the flag is dropped before computing the checksum
+    too.
+  */
+  if (need_checksum() &&
+      (common_header->flags & LOG_EVENT_BINLOG_IN_USE_F) != 0) {
+    common_header->flags &= ~LOG_EVENT_BINLOG_IN_USE_F;
+    int2store(header + FLAGS_OFFSET, common_header->flags);
+  }
+  crc = my_checksum(crc, header, LOG_EVENT_HEADER_LEN);
+
+  return ret;
+}
+```
+
+/* 【注】★ 两个容易被忽略的点：① 写进 **cache** 时 `log_pos` 是 0（此时还不知道最终位置），
+   只有直接写**文件**（FD / Rotate）时才先填起始位置再累加；② 算 CRC 前要把
+   `LOG_EVENT_BINLOG_IN_USE_F` 位清掉，因为 binlog 正常关闭时这个位会被清——
+   否则校验时会因"关闭前后 flag 不同"而误报损坏。 */
+
 ## binlog 文件加密（binlog_encryption）
 
 > **文件级**加密（8.0.14+，含 relay log），完整机制（两级密钥 / 512B TLV 文件头 / `Aes_ctr_cipher` 流密码 / keyring 轮换 + `reencrypt_logs` / 读侧透明解密）已独立成篇：**[`binlog_encryption.md`](binlog_encryption.md)**。此处只留最简速览：
@@ -1745,6 +2825,340 @@ Body:
 ```
 
 ---
+
+### `binlog_row_image` 变量与三值枚举
+
+`sql/sys_vars.cc:1454-1487`：
+
+```cpp
+static const char *binlog_row_image_names[] = {"MINIMAL", "NOBLOB", "FULL",
+                                               NullS};
+static Sys_var_enum Sys_binlog_row_image(
+    "binlog_row_image",
+    "Controls whether rows should be logged in 'FULL', 'NOBLOB' or "
+    "'MINIMAL' formats. 'FULL', means that all columns in the before "
+    "and after image are logged. 'NOBLOB', means that mysqld avoids logging "
+    "blob columns whenever possible (e.g. blob column was not changed or "
+    "is not part of primary key). 'MINIMAL', means that a PK equivalent (PK "
+    "columns or full row if there is no PK in the table) is logged in the "
+    "before image, and only changed columns are logged in the after image. "
+    "(Default: FULL).",
+    SESSION_VAR(binlog_row_image), CMD_LINE(REQUIRED_ARG),
+    binlog_row_image_names, DEFAULT(BINLOG_ROW_IMAGE_FULL), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_binlog_row_image), ON_UPDATE(nullptr));
+```
+
+```cpp
+// Values for binlog_row_image sysvar
+enum enum_binlog_row_image {
+  /** PKE in the before image and changed columns in the after image */
+  BINLOG_ROW_IMAGE_MINIMAL = 0,
+  /** Whenever possible, before and after image contain all columns except
+     blobs. */
+  BINLOG_ROW_IMAGE_NOBLOB = 1,
+  /** All columns in both before and after image. */
+  BINLOG_ROW_IMAGE_FULL = 2
+};
+```
+
+### 判据不在 `pack_row()` 里，而在上游两个函数
+
+★ **`THD::is_binlog_row_image_minimal()` / `is_binlog_row_image_noblob()` 在 8.0.39 不存在**（全仓 0 命中）。真实判据是**直接读 `thd->variables.binlog_row_image` 做 switch**，分两处：
+
+**(1) 标记阶段** —— `TABLE::mark_columns_per_binlog_row_image()`（`sql/table.cc:5690-5765`）：
+
+```cpp
+void TABLE::mark_columns_per_binlog_row_image(THD *thd) {
+  DBUG_TRACE;
+  assert(read_set->bitmap);
+  assert(write_set->bitmap);
+
+  /*
+    If in RBR we may need to mark some extra columns,
+    depending on the binlog-row-image command line argument.
+   */
+  if ((mysql_bin_log.is_open() && thd->is_current_stmt_binlog_format_row() &&
+       !ha_check_storage_engine_flag(s->db_type(), HTON_NO_BINLOG_ROW_OPT))) {
+    /* if there is no PK, then mark all columns for the BI. */
+    if (s->primary_key >= MAX_KEY) bitmap_set_all(read_set);
+
+    switch (thd->variables.binlog_row_image) {
+      case BINLOG_ROW_IMAGE_FULL:
+        if (s->primary_key < MAX_KEY) bitmap_set_all(read_set);
+        bitmap_set_all(write_set);
+        break;
+      case BINLOG_ROW_IMAGE_NOBLOB:
+        /* for every field that is not set, mark it unless it is a blob */
+        for (Field **ptr = field; *ptr; ptr++) {
+          Field *my_field = *ptr;
+          /*
+            bypass blob fields. These can be set or not set, we don't care.
+            Later, at binlogging time, if we don't need them in the before
+            image, we will discard them.
+
+            If set in the AI, then the blob is really needed, there is
+            nothing we can do about it.
+           */
+          if ((s->primary_key < MAX_KEY) &&
+              (my_field->is_flag_set(PRI_KEY_FLAG) ||
+               (my_field->type() != MYSQL_TYPE_BLOB)))
+            bitmap_set_bit(read_set, my_field->field_index());
+
+          if (my_field->type() != MYSQL_TYPE_BLOB)
+            bitmap_set_bit(write_set, my_field->field_index());
+        }
+        break;
+      case BINLOG_ROW_IMAGE_MINIMAL:
+        /* mark the primary key if available in the read_set */
+        if (s->primary_key < MAX_KEY)
+          mark_columns_used_by_index_no_reset(s->primary_key, read_set);
+        break;
+
+      default:
+        assert(false);
+    }
+    file->column_bitmaps_signal();
+  }
+}
+```
+
+/* 【注】① **没有主键 ⇒ 无条件 `bitmap_set_all(read_set)`**——MINIMAL 也救不了无主键表，
+   这就是"无主键表 row binlog 特别大"的根因；② NOBLOB 的 BLOB 判据统一写成
+   `field->type() == MYSQL_TYPE_BLOB`，且**注释说明 AI 里的 BLOB 一定保留**
+   （因为 AI 里的 BLOB 意味着它真的被改了）；③ 注释里那句
+   "we will strip extra fields in the read_set at binlogging time"预告了第 (2) 步。 */
+
+**(2) 写 BI 前的裁剪** —— `binlog_prepare_row_images()`（`sql/binlog.cc:11254-11310`）：
+
+```cpp
+void binlog_prepare_row_images(const THD *thd, TABLE *table) {
+  DBUG_TRACE;
+  /**
+    Remove from read_set spurious columns. The write_set has been
+    handled before in table->mark_columns_needed_for_update.
+   */
+  ...
+  if (table->s->primary_key < MAX_KEY &&
+      (thd->variables.binlog_row_image < BINLOG_ROW_IMAGE_FULL) &&
+      !ha_check_storage_engine_flag(table->s->db_type(),
+                                    HTON_NO_BINLOG_ROW_OPT)) {
+    /**
+      Just to be sure that tmp_set is currently not in use as
+      the read_set already.
+    */
+    assert(table->read_set != &table->tmp_set);
+    // Verify it's not used
+    assert(bitmap_is_clear_all(&table->tmp_set));
+
+    switch (thd->variables.binlog_row_image) {
+      case BINLOG_ROW_IMAGE_MINIMAL:
+        /* MINIMAL: Mark only PK */
+        table->mark_columns_used_by_index_no_reset(table->s->primary_key,
+                                                   &table->tmp_set);
+        break;
+      case BINLOG_ROW_IMAGE_NOBLOB:
+        /**
+          NOBLOB: Remove unnecessary BLOB fields from read_set
+                  (the ones that are not part of PK).
+         */
+        bitmap_union(&table->tmp_set, table->read_set);
+        for (Field **ptr = table->field; *ptr; ptr++) {
+          Field *field = (*ptr);
+          if ((field->type() == MYSQL_TYPE_BLOB) &&
+              !field->is_flag_set(PRI_KEY_FLAG))
+            bitmap_clear_bit(&table->tmp_set, field->field_index());
+        }
+        break;
+      default:
+        assert(0);  // impossible.
+    }
+
+    /* set the temporary read_set */
+    table->column_bitmaps_set_no_signal(&table->tmp_set, table->write_set);
+  }
+  ...
+}
+```
+
+/* 【注】★ 用 `table->tmp_set` 做一个**临时 read_set**，写完 BI 后由调用方
+   `column_bitmaps_set_no_signal(old_read_set, old_write_set)` 还原——
+   这样"执行需要的列"与"写 binlog 需要的列"可以不同，互不干扰。 */
+
+### `pack_row()`：只按传入 bitmap 序列化，本身不含模式 switch
+
+`sql/rpl_record.cc:270-402`（节选主体）：
+
+```cpp
+size_t pack_row(TABLE *table, MY_BITMAP const *columns_in_image,
+                uchar *row_data, const uchar *record,
+                enum_row_image_type row_image_type, ulonglong value_options) {
+  DBUG_TRACE;
+  cs::util::ReplicatedColumnsView fields{table};
+  fields.add_filter(
+      cs::util::ColumnFilterFactory::ColumnFilterType::outbound_func_index);
+
+  // Since we don't want any hidden generated columns to be included in the
+  // binlog, we must clear any bits for these columns in the bitmap. We will
+  // use TABLE::pack_row_tmp_set for this purpose, so first we ensure that it
+  // isn't in use somewhere else.
+  assert(bitmap_is_clear_all(&table->pack_row_tmp_set));
+
+  // Copy all the bits from the "columns_in_image", and clear all the bits for
+  // hidden generated columns.
+  bitmap_copy(&table->pack_row_tmp_set, columns_in_image);
+  bitmap_intersect(&table->pack_row_tmp_set,
+                   &fields.get_included_fields_bitmap());
+
+  // Number of columns in image (counting only those that will be written)
+  uint image_column_count = bitmap_bits_set(&table->pack_row_tmp_set);
+
+  ptrdiff_t const rec_offset = record - table->record[0];
+
+  // This is a moving cursor that points to the byte where the next
+  // field will be written.
+  uchar *pack_ptr = row_data;
+  ...
+  // Null bits.
+  Bit_writer null_bits(pack_ptr);
+  pack_ptr += (image_column_count + 7) / 8;
+
+  for (auto field : fields) {
+    bool is_partial_json = false;
+    if (bitmap_is_set(&table->pack_row_tmp_set, field->field_index())) {
+      if (field->is_null(rec_offset)) {
+        null_bits.set(true);
+      } else {
+        null_bits.set(false);
+
+        // Store the field when it is not NULL.
+        pack_field(&pack_ptr, field, rec_offset, row_image_type, value_options,
+                   &is_partial_json);
+      }
+    }
+    ...
+  }
+  ...
+  // Reset the pack_row_tmp_set so it can be used elsewhere.
+  bitmap_clear_all(&table->pack_row_tmp_set);
+  return static_cast<size_t>(pack_ptr - row_data);
+}
+```
+
+/* 【注】★ 三个要点：① `pack_row()` 只看 `columns_in_image`（= read_set / write_set），
+   **不认识** FULL/MINIMAL/NOBLOB；② 隐藏生成列被 `bitmap_intersect` 显式剔除
+   （"we don't want any hidden generated columns to be included in the binlog"）；
+   ③ 布局是 `null_bits(ceil(n/8) 字节) + 各字段值`，NULL 只占位不写值。 */
+
+### 三个写入入口：WRITE / UPDATE / DELETE
+
+`sql/binlog.cc:11109-11132`：
+
+```cpp
+int THD::binlog_write_row(TABLE *table, bool is_trans, uchar const *record,
+                          const unsigned char *extra_row_info) {
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+
+  /*
+    Pack records into format for transfer. We are allocating more
+    memory than needed, but that doesn't matter.
+  */
+  Row_data_memory memory(table, record);
+  if (!memory.has_memory()) return HA_ERR_OUT_OF_MEM;
+
+  uchar *row_data = memory.slot(0);
+
+  size_t const len = pack_row(table, table->write_set, row_data, record,
+                              enum_row_image_type::WRITE_AI);
+
+  Rows_log_event *const ev =
+      binlog_prepare_pending_rows_event<Write_rows_log_event>(
+          table, server_id, len, is_trans, extra_row_info);
+
+  if (unlikely(ev == nullptr)) return HA_ERR_OUT_OF_MEM;
+
+  return ev->add_row_data(row_data, len);
+}
+```
+
+`sql/binlog.cc:11134-11169`（UPDATE：先裁剪 BI，再各打一次 `pack_row`）：
+
+```cpp
+int THD::binlog_update_row(TABLE *table, bool is_trans,
+                           const uchar *before_record,
+                           const uchar *after_record,
+                           const unsigned char *extra_row_info) {
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+  int error = 0;
+
+  /**
+    Save a reference to the original read and write set bitmaps.
+    We will need this to restore the bitmaps at the end.
+   */
+  MY_BITMAP *old_read_set = table->read_set;
+  MY_BITMAP *old_write_set = table->write_set;
+
+  /**
+     This will remove spurious fields required during execution but
+     not needed for binlogging. This is done according to the:
+     binlog-row-image option.
+   */
+  binlog_prepare_row_images(this, table);
+
+  Row_data_memory row_data(table, before_record, after_record,
+                           variables.binlog_row_value_options);
+  if (!row_data.has_memory()) return HA_ERR_OUT_OF_MEM;
+
+  uchar *before_row = row_data.slot(0);
+  uchar *after_row = row_data.slot(1);
+
+  size_t const before_size =
+      pack_row(table, table->read_set, before_row, before_record,
+               enum_row_image_type::UPDATE_BI);
+  size_t const after_size = pack_row(
+      table, table->write_set, after_row, after_record,
+      enum_row_image_type::UPDATE_AI, variables.binlog_row_value_options);
+```
+
+DELETE 尾部（`sql/binlog.cc:11230-11252`）——注意**还原 bitmap**：
+
+```cpp
+  size_t const len = pack_row(table, table->read_set, row_data, record,
+                              enum_row_image_type::DELETE_BI);
+
+  Rows_log_event *const ev =
+      binlog_prepare_pending_rows_event<Delete_rows_log_event>(
+          table, server_id, len, is_trans, extra_row_info);
+
+  if (unlikely(ev == nullptr)) return HA_ERR_OUT_OF_MEM;
+
+  error = ev->add_row_data(row_data, len);
+
+  /* restore read/write set for the rest of execution */
+  table->column_bitmaps_set_no_signal(old_read_set, old_write_set);
+
+  bitmap_clear_all(&table->tmp_set);
+  return error;
+}
+```
+
+/* 【注】① `enum_row_image_type` 有 **4 个值**：`WRITE_AI` / `UPDATE_BI` / `UPDATE_AI` /
+   `DELETE_BI`；② 只有 UPDATE 会调 `binlog_prepare_row_images()`（BI 才需要裁剪，
+   AI 的 write_set 已由 `mark_columns_needed_for_update` 处理）；③ 末尾必须还原
+   `read_set`，否则会污染后续执行。 */
+
+行数据 append 进 rows buffer（`sql/log_event.cc:8196-8209`）：
+
+```cpp
+  assert(m_rows_cur + length <= m_rows_end);
+  memcpy(m_rows_cur, row_data, length);
+  m_rows_cur += length;
+  m_row_count++;
+  return 0;
+}
+```
+
+/* 【注】★ `Write_rows_log_event::write_row()`（`log_event.cc:12165`）是**回放侧**
+   的写行（apply），不是写 binlog 的入口——别混用。 */
 
 ## binlog 事务压缩（binlog_transaction_compression）
 
@@ -1905,7 +3319,7 @@ body:
 | 恢复 | 恢复扫描用 `Decompressing_event_object_istream` 透明解压后正常收集 XID/GTID |
 | 观测 | `performance_schema.binary_log_transaction_compression_stats` 记录压缩/解压字节数 |
 
-### 关键调用栈
+### 关键调用栈（binlog 事务压缩）
 
 **写侧（提交时）：**
 
@@ -2263,7 +3677,7 @@ BGC 三阶段（FLUSH / SYNC / COMMIT）里，follower 线程在进入 stage 失
 **相关文档**
 
 - 2PC 引擎侧执行（prepare 五层逐行、undo 状态、外部 XA、崩溃恢复三幕）见 [`../../innodb/trx.md`](../../innodb/trx.md)
-- 原子 DDL 的**引擎侧** DDL log / `mysql.innodb_ddl_log` / 提交后 replay 见 [`../../innodb/ddl.md`](../../innodb/ddl.md)（本篇只覆盖 binlog/server 侧的 `ddl_xid` 协调）
+- 原子 DDL 的**引擎侧** DDL log / `mysql.innodb_ddl_log` / 提交后 replay 见 [`../../feat/ddl/ddl.md`](../../feat/ddl/ddl.md)（本篇只覆盖 binlog/server 侧的 `ddl_xid` 协调）
 - **event 的三层类体系 / 序列化 / checksum / 各事件字节格式**见 [`binlog_event.md`](binlog_event.md)（本篇只留「Event 格式速览」）
 - **SBR 语句级复制**（`binlog_format` 三态 / unsafe 判定 / MIXED 降级 / 上下文事件）见 [`binlog_sbr.md`](binlog_sbr.md)
 - **binlog 文件加密**（两级密钥 / keyring 轮换 / `reencrypt_logs`）见 [`binlog_encryption.md`](binlog_encryption.md)

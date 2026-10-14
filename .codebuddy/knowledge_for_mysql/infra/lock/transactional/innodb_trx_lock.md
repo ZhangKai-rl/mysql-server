@@ -4,6 +4,8 @@
 >
 > **边界**：本篇讲 InnoDB 事务锁（`lock_t` 体系，行锁为主）。server 层元数据锁见 [`mdl.md`](mdl.md)；AUTOINC 锁与 R-tree 谓词锁本篇已完整展开（跨层 SQL 侧配合另见 [`../../feat/auto_increment.md`](../../../feat/auto_increment.md)、[`../../server/datatype/gis.md`](../../../server/datatype/gis.md)）；保护 `lock_sys` 内存结构的同步原语（`locksys::Latches` 分片锁）是原语、非事务锁，其盘点见 [`../README.md`](../README.md) A3 节。
 
+> 交叉：唯一性检查**为什么必须加锁**、RC/RR 下具体加哪种（`row_ins_scan_sec_index_for_duplicate` 的锁类型推导）见 [`../../../index/transaction.md`](../../../index/transaction.md)——本篇讲 `lock_t` 体系本身，那篇讲它在唯一索引判重上的用法。
+
 ## 目录
 
 - [概述](#概述)
@@ -13,6 +15,7 @@
   - 锁的数据结构
     - [lock_t 与 lock_sys_t](#锁的数据结构lock_t-体系)
   - 加锁流程
+    - [事务锁与 latch 的分层时序](#事务锁与-latch-的分层时序先-latch-后-lock_t)
     - [表锁机制：意向锁与表级 S/X](#表锁机制意向锁与表级-sx)
     - [行锁四种形态的深入剖析](#行锁四种形态的深入剖析)
     - [加锁决策：从"范围关系"到锁类型](#加锁决策从范围关系到锁类型)
@@ -271,6 +274,62 @@ class Shard_latches_guard {
 **演进**：8.0.21 之前是**一把大锁**（`lock_sys->mutex`）保护所有队列，WL#10314 才分片。调试模式频繁"全量校验"（X 锁 global）使单锁方案成为瓶颈，分片后常规路径只碰 1~2 个 shard。
 
 ### 加锁流程
+
+#### 事务锁与 latch 的分层时序：先 latch 后 lock_t
+
+在读表锁/行锁机制前，先理清**事务锁（`lock_t`）与内存锁（latch：页锁/树锁）在同一操作里的层次**——这是两类锁的根本分野，也是源码里"为什么这样调顺序"的答案。
+
+**时序铁律**：一次 DML 里，**先 latch 页（短临界区保护内存结构），再拿事务锁（`lock_t` 保护记录语义）**。以 INSERT 为例，`btr_cur_ins_lock_and_undo` 是两者的衔接点：
+
+```cpp
+static inline dberr_t btr_cur_ins_lock_and_undo(flags, cursor, entry, thr, mtr, inherit) {
+  rec = btr_cur_get_rec(cursor);
+  index = cursor->index;
+  /* ① 事务锁：在"已被 latch 住的叶子页"上做行锁判断/入队 */
+  if (!(flags & BTR_NO_LOCKING_FLAG)) {
+    if (dict_index_is_spatial(index)) {
+      err = lock_prdt_insert_check_and_lock(...);      // 谓词锁
+    } else {
+      err = lock_rec_insert_check_and_lock(...);       // 行锁/插入意向锁/隐含锁物化
+    }
+  }
+  if (err != DB_SUCCESS || !index->is_clustered() || dict_index_is_ibuf(index))
+    return err;
+  /* ② 事务锁就绪后才写聚簇 undo（记录 DB_TRX_ID + roll_ptr） */
+  err = trx_undo_report_row_operation(flags, TRX_UNDO_INSERT_OP, thr, index, ...);
+  ...
+}
+```
+
+（本函数的剖析见 [`../../../index/btr.md`](../../../index/btr.md) 同名字节）
+
+调用 `btr_cur_ins_lock_and_undo` 的两个点（乐观插入 / 悲观分裂插入）都在**叶子页 X latch 已持有**之后——`btr_cur_optimistic_insert` 与 `btr_cur_pessimistic_insert` 的前提就是 cursor 定位处已 latch（时序见 [`../../../index/btr.md`](../../../index/btr.md)「索引锁的实际执行时序」实例 B 的 t2/t7）。完整层次：
+
+```
+mtr 内（latch 域）：
+  树锁 index->lock（S/SX）→ 路径页 pin → 叶子页 X latch
+    └─ btr_cur_ins_lock_and_undo
+         ├─ lock_rec_insert_check_and_lock   ← 事务锁 lock_t（插入意向锁/隐含锁物化）
+         └─ trx_undo_report_row_operation    ← 写 undo
+mtr 提交 → 释放全部 latch；lock_t 继续存在（跨 mtr，直到事务提交/回滚）
+```
+
+**为什么必须是这个顺序**（latch 先于 lock_t）：
+
+1. **lock_t 挂在页的 `rec_hash` 上**——`lock_rec_insert_check_and_lock` 要读页上已有的锁队列、判断冲突、入队，必须持有页 shard latch（`locksys::Shard_latch_guard`）才安全。页都没 latch，锁队列可能正被并发修改。
+2. **latch 是"临界区级"、lock_t 是"事务级"**：latch 保护"这个页的内存内容此刻一致"，mtr 提交即释放；lock_t 表达"这条记录被某事务占用"，要活到事务提交。先短后长、先低后高是自然顺序。
+3. **隐含锁物化是"先读后锁"的典型**：`lock_rec_insert_check_and_lock` 里先读 `DB_TRX_ID`（可能回表）判断是否有隐含锁，再物化成显式锁——这一步**不能**持页 shard latch 做回表（回表要拿别的页 latch，先拿 shard 违反锁序），所以物化前先放 shard、物化后再拿（见「隐含锁」节时序）。
+
+**一张表分清两类锁**：
+
+| 维度 | latch（页锁/树锁 `rw_lock_t`） | 事务锁（行锁/表锁 `lock_t`） |
+|---|---|---|
+| 保护对象 | 内存结构：页内容、锁队列、树结构 | 数据库语义：记录、间隙、表 |
+| 持有者 | 线程（mtr） | 事务 |
+| 生命周期 | mtr 内，提交即释放 | 跨 mtr，事务提交/回滚才释放 |
+| 获取时机 | 操作页之前 | latch 住页之后 |
+| 死锁 | 靠锁序规约预防（`latch_level_t`） | wait-for graph 检测 + 回滚 victim |
+| 数据结构 | `rw_lock_t`（lock_word 单字） | `lock_t`（挂 rec_hash / `table->locks`） |
 
 #### 表锁机制：意向锁与表级 S/X
 
@@ -811,6 +870,190 @@ static inline Conflict rec_lock_check_conflict(const trx_t *trx, ulint type_mode
 
 ##### 四种形态 × 冲突矩阵（源码判定版）
 
+**★ 冲突判定只有一处真身：`locksys::rec_lock_check_conflict()`**（`lock0lock.cc:469`）。⚠️ **不存在 `lock_rec_has_to_wait()`**（那是 5.x 的名字）。8.0.39 拆成四层：
+
+```
+rec_lock_check_conflict()      ← 真正的矩阵 + gap 规则，返回三值 Conflict
+  ↑ rec_lock_has_to_wait()
+  ↑ locksys::has_to_wait()     ← 行/表分派（谓词锁走 lock_prdt_has_to_wait）
+  ↑ lock_has_to_wait()         ← 对外包装，自带一次性 Trx_locks_cache
+```
+
+```cpp
+namespace locksys {
+
+enum class Conflict {
+  HAS_TO_WAIT,     // 必须等待
+  NO_CONFLICT,     // 不冲突
+  CAN_BYPASS,      // ★形式冲突，但本事务已有授予锁挡住了那个等待者 → 可插队绕过
+};
+```
+
+```cpp
+static inline Conflict rec_lock_check_conflict(const trx_t *trx,
+                                               ulint type_mode,
+                                               const lock_t *lock2,
+                                               bool lock_is_on_supremum,
+                                               Trx_locks_cache &trx_locks_cache) {
+  if (trx == lock2->trx ||
+      lock_mode_compatible(static_cast<lock_mode>(LOCK_MODE_MASK & type_mode),
+                           lock_get_mode(lock2))) {
+    return Conflict::NO_CONFLICT;          // ①同事务 / mode 兼容
+  }
+
+  const bool is_hp = trx_is_high_priority(trx);
+  /* If our trx is High Priority and the existing lock is WAITING and not
+      high priority, then we can ignore it. */
+  if (is_hp && lock2->is_waiting() && !trx_is_high_priority(lock2->trx)) {
+    return Conflict::NO_CONFLICT;          // ②高优先级事务可无视别人的"等待中"请求
+  }
+
+  /* We have somewhat complex rules when gap type record locks cause waits */
+
+  if ((lock_is_on_supremum || (type_mode & LOCK_GAP)) &&
+      !(type_mode & LOCK_INSERT_INTENTION)) {
+    /* Gap type locks without LOCK_INSERT_INTENTION flag
+    do not need to wait for anything. This is because
+    different users can have conflicting lock types on gaps. */
+    return Conflict::NO_CONFLICT;          // ③GAP 锁（非 II）不与任何锁冲突
+  }
+
+  if (!(type_mode & LOCK_INSERT_INTENTION) && lock_rec_get_gap(lock2)) {
+    /* Record lock (LOCK_ORDINARY or LOCK_REC_NOT_GAP
+    does not need to wait for a gap type lock */
+    return Conflict::NO_CONFLICT;          // ④记录锁/next-key 不等 GAP 锁
+  }
+
+  if ((type_mode & LOCK_GAP) && lock_rec_get_rec_not_gap(lock2)) {
+    /* Lock on gap does not need to wait for a LOCK_REC_NOT_GAP type lock */
+    return Conflict::NO_CONFLICT;          // ⑤GAP 锁不等纯记录锁
+  }
+
+  if (lock_rec_get_insert_intention(lock2)) {
+    /* No lock request needs to wait for an insert intention lock to be
+    removed. ... Also, insert intention locks do not disturb each other. */
+    return Conflict::NO_CONFLICT;          // ⑥任何锁都不等 II；II 之间互不阻塞
+  }
+
+  /* This is very important that LOCK_INSERT_INTENTION should not overtake a
+  WAITING Gap or Next-Key lock on the same heap_no, because the following
+  insertion of the record would split the gap duplicating the waiting lock,
+  violating the rule that a transaction can have at most one waiting lock. */
+  if (!(type_mode & LOCK_INSERT_INTENTION) && lock2->is_waiting() &&
+      lock2->mode() == LOCK_X && (type_mode & LOCK_MODE_MASK) == LOCK_X) {
+    ...
+    /* In this case, we should ignore lock2, if trx already has a GRANTED lock
+    blocking lock2 from being granted. */
+    if (trx_locks_cache.has_granted_blocker(trx, lock2)) {
+      return Conflict::CAN_BYPASS;         // ⑦本事务已持有授予锁挡住 lock2 → 绕过
+    }
+  }
+
+  return Conflict::HAS_TO_WAIT;            // ⑧兜底：必须等待
+}
+```
+
+> ★★ **判定顺序极关键**：mode 矩阵 → HP 特权 → 四条 gap/II 豁免 → bypass → 兜底。**"GAP 与 GAP 永不冲突"和"II 与 II 永不冲突"的落点就是 ③⑥ 两条**。
+
+**两个 5×5 矩阵**（`lock0priv.h:586` / `:615`）：
+
+```cpp
+/* COMPATIBILITY MATRIX (mode1=row, mode2=column)
+    IS IX S  X  AI
+ IS +  +  +  -  +
+ IX +  +  -  -  +
+ S  +  -  +  -  -
+ X  -  -  -  -  -
+ AI +  +  -  -  -
+ *
+ Note that for rows, InnoDB only acquires S or X locks.
+ For tables, InnoDB normally acquires IS or IX locks.
+ S or X table locks are only acquired for LOCK TABLES.
+ Auto-increment (AI) locks are needed because of
+ statement-level MySQL binlog. */
+static const byte lock_compatibility_matrix[5][5] = {
+    /**         IS     IX       S     X       AI */
+    /* IS */ {true, true, true, false, true},
+    /* IX */ {true, true, false, false, true},
+    /* S  */ {true, false, true, false, false},
+    /* X  */ {false, false, false, false, false},
+    /* AI */ {true, true, false, false, false}};
+```
+
+```cpp
+/* STRONGER-OR-EQUAL RELATION (mode1=row, mode2=column)
+    IS IX S  X  AI
+ IS +  -  -  -  -
+ IX +  +  -  -  -
+ S  +  -  +  -  -
+ X  +  +  +  +  +
+ AI -  -  -  -  +    ← ★ AI 只 ≥ AI，这是 AUTO_INC 最特殊的一条
+*/
+static const byte lock_strength_matrix[5][5] = {
+    /**         IS     IX       S     X       AI */
+    /* IS */ {true, false, false, false, false},
+    /* IX */ {true, true, false, false, false},
+    /* S  */ {true, false, true, false, false},
+    /* X  */ {true, true, true, true, true},
+    /* AI */ {false, false, false, false, true}};
+```
+
+```cpp
+static inline ulint lock_mode_compatible(enum lock_mode mode1,
+                                         enum lock_mode mode2) {
+  return (lock_compatibility_matrix[mode1][mode2]);
+}
+static inline bool lock_mode_stronger_or_eq(enum lock_mode mode1,
+                                            enum lock_mode mode2) {
+  return (lock_strength_matrix[mode1][mode2] != 0);
+}
+```
+
+**★ 表锁 vs 行锁的判定复杂度差异**（`lock0lock.cc:605`）：
+
+```cpp
+bool has_to_wait(const lock_t *lock1, const lock_t *lock2,
+                 Trx_locks_cache &lock1_cache) {
+  if (lock_get_type_low(lock1) == LOCK_REC) {
+    ut_ad(lock_get_type_low(lock2) == LOCK_REC);
+    if (lock1->type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)) {
+      return lock_prdt_has_to_wait(lock1->trx, lock1->type_mode,
+                                   lock_get_prdt_from_lock(lock1), lock2);
+    }
+    return rec_lock_has_to_wait(lock1, lock2, lock1_cache);
+  }
+  // Rules for LOCK_TABLE are much simpler:
+  return (lock1->trx != lock2->trx &&
+          !lock_mode_compatible(lock_get_mode(lock1), lock_get_mode(lock2)));
+}
+```
+
+> ★★ **表锁判定只有一行**：不同 trx + 5×5 矩阵。**完全不看** GAP / REC_NOT_GAP / INSERT_INTENTION / LOCK_WAIT。行锁则额外有 4 条 gap 豁免 + HP 特权 + bypass。这是"行锁远比表锁复杂"的根本代码原因。
+
+**四种形态的常量真身**（⚠️ `LOCK_ORDINARY = 0`，**不是 bit**）：
+
+```cpp
+enum lock_mode {              // lock0types.h:52 —— 是 enum，不是 #define
+  LOCK_IS = 0, LOCK_IX, LOCK_S, LOCK_X, LOCK_AUTO_INC, LOCK_NONE,
+  LOCK_NUM = LOCK_NONE, LOCK_NONE_UNSET = 255
+};
+
+constexpr uint32_t LOCK_MODE_MASK = 0xF;       // bit0-3 = mode
+constexpr uint32_t LOCK_TABLE = 16;            // bit4
+constexpr uint32_t LOCK_REC = 32;              // bit5
+constexpr uint32_t LOCK_TYPE_MASK = 0xF0UL;    // bit4-7 = type
+constexpr uint32_t LOCK_WAIT = 256;            // bit8
+constexpr uint32_t LOCK_ORDINARY = 0;          // ★不是 bit，= "两个 gap bit 都未置位"
+constexpr uint32_t LOCK_GAP = 512;             // bit9
+constexpr uint32_t LOCK_REC_NOT_GAP = 1024;    // bit10
+constexpr uint32_t LOCK_INSERT_INTENTION = 2048;  // bit11
+constexpr uint32_t LOCK_PREDICATE = 8192;      // bit13（bit12 空着）
+constexpr uint32_t LOCK_PRDT_PAGE = 16384;     // bit14
+```
+
+> ⚠️ **不存在 `enum lock_type`**（全仓 0 命中）。取 type 用 `lock_get_type_low(lock) = type_mode & LOCK_TYPE_MASK`，返回 16 或 32。
+> ★ `mode - (LOCK_MODE_MASK & mode) == LOCK_ORDINARY` 是源码里判定 next-key 的常见写法。
+
 记号 **W** = 必须等待，**–** = 放行。行 = 请求方，列 = 队列中既存锁。前提：同一 `(page_id, heap_no)`、不同事务、S↔X 或 X↔X（S↔S 直接放行）。
 
 | 请求 ↓ \ 既存 → | R：`X,REC_NOT_GAP` | G：`X,GAP` | N：`X`（next-key） | I：`X,GAP,INSERT_INTENTION` |
@@ -829,6 +1072,228 @@ static inline Conflict rec_lock_check_conflict(const trx_t *trx, ulint type_mode
 位层面可行（三个取位函数是独立按位与），但语义矛盾（"只锁间隙" ∧ "只锁记录" = 既锁间隙又锁记录 = 应是 next-key，而 next-key 恰是两位都为 0）。由 `lock_rec_lock` / `lock_rec_lock_fast` / `lock_rec_lock_slow` 三处 `ut_ad`（要求精确模式位等于三者之一）+ supremum 归一的 `ut_ad` 联合禁止。若真出现，它在复用判定里"比任何单一形态都弱"（永远无法复用），且会让 II 请求被误判为 `NO_CONFLICT` 而**错误地允许插入**。
 
 #### 加锁决策：从"范围关系"到锁类型
+
+**总入口 `lock_rec_lock()`**（`lock0lock.cc:1953`）——⚠️ **不存在 `lock_rec_lock_common()` / `lock_rec_lock_impl()`**（全仓 0 命中），只有 fast/slow 两条路：
+
+```cpp
+static dberr_t lock_rec_lock(bool impl, select_mode sel_mode, ulint mode,
+                             const buf_block_t *block, ulint heap_no,
+                             dict_index_t *index, que_thr_t *thr) {
+  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+  ut_ad((LOCK_MODE_MASK & mode) != LOCK_S ||
+        lock_table_has(thr_get_trx(thr), index->table, LOCK_IS));  // ★行 S 必须有表级 IS
+  ut_ad((LOCK_MODE_MASK & mode) != LOCK_X ||
+        lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));  // ★行 X 必须有表级 IX
+  ut_ad((LOCK_MODE_MASK & mode) == LOCK_S || (LOCK_MODE_MASK & mode) == LOCK_X);
+  ut_ad(mode - (LOCK_MODE_MASK & mode) == LOCK_GAP ||
+        mode - (LOCK_MODE_MASK & mode) == LOCK_REC_NOT_GAP ||
+        mode - (LOCK_MODE_MASK & mode) == 0);                      // ★只允许 3 种精确模式
+  /* Implicit locks are equivalent to LOCK_X|LOCK_REC_NOT_GAP, so we can omit
+  creation of explicit lock only if the requested mode was LOCK_REC_NOT_GAP */
+  ut_ad(!impl || ((mode & LOCK_REC_NOT_GAP) == LOCK_REC_NOT_GAP));  // ★隐含锁只能等价 X|NOT_GAP
+
+  switch (lock_rec_lock_fast(impl, mode, block, heap_no, index, thr)) {
+    case LOCK_REC_SUCCESS:          return (DB_SUCCESS);            // 已有锁 / impl 无需建
+    case LOCK_REC_SUCCESS_CREATED:  return (DB_SUCCESS_LOCKED_REC); // 新建或置位成功
+    case LOCK_REC_FAIL:
+      return (lock_rec_lock_slow(impl, sel_mode, mode, block, heap_no, index, thr));
+    default: ut_error;
+  }
+}
+```
+
+**快路径 `lock_rec_lock_fast()`**（`:1708`）——三个分支：
+
+```cpp
+  lock_t *lock = lock_rec_get_first_on_page(lock_sys->rec_hash, block);
+
+  if (lock == nullptr) {                        // ★分支 A：整页无任何行锁
+    if (!impl) {
+      RecLock rec_lock(index, block, heap_no, mode);
+      trx_mutex_enter(trx);
+      rec_lock.create(trx);
+      trx_mutex_exit(trx);
+      status = LOCK_REC_SUCCESS_CREATED;
+    }
+    // impl==true 时什么都不做：依赖调用方设置隐含锁（记录里的 trx_id）
+  } else {
+    trx_mutex_enter(trx);
+    if (lock_rec_get_next_on_page(lock) != nullptr || lock->trx != trx ||
+        lock->type_mode != (mode | LOCK_REC) ||
+        lock_rec_get_n_bits(lock) <= heap_no) {
+      status = LOCK_REC_FAIL;                   // ★分支 B：交给 slow
+    } else if (!impl) {
+      /* If the nth bit of the record lock is already set
+      then we do not set a new lock bit, otherwise we do set */
+      if (!lock_rec_get_nth_bit(lock, heap_no)) {
+        lock_rec_set_nth_bit(lock, heap_no);    // ★分支 C：复用已有 lock_t，只置一个 bit
+        status = LOCK_REC_SUCCESS_CREATED;
+      }
+    }
+    trx_mutex_exit(trx);
+  }
+```
+
+> ★ 分支 B 的四个条件：**页上有多条锁 / 锁不属于本 trx / type_mode 不同 / bitmap 太小**。
+
+**慢路径 `lock_rec_lock_slow()`**（`:1837`）——★ 核心是"锁分裂"启发式：
+
+```cpp
+  /* A very common type of lock in InnoDB is "Next Key Lock", which is almost
+  equivalent to two locks: Record Lock and GAP Lock separately.
+  Thus, in case we need to wait, we check if we already own a Record Lock,
+  and if we do, we only need the GAP Lock.
+  We don't do the opposite thing (of checking for GAP Lock, and only requesting
+  Record Lock), because if Next Key Lock has to wait, then it is because of a
+  conflict with someone who locked the record, as locks on gaps are compatible
+  with each other, so even if we have a GAP Lock, narrowing the requested mode
+  to Record Lock will not make the conflict go away. */
+
+  auto checked_mode =
+      (heap_no != PAGE_HEAP_NO_SUPREMUM && lock_mode_is_next_key_lock(mode))
+          ? mode | LOCK_REC_NOT_GAP      // ★★ next-key 先只查 record 部分
+          : mode;
+
+  const auto *held_lock = lock_rec_has_expl(checked_mode, block, heap_no, trx);
+
+  if (held_lock != nullptr) {                   // 自己已有 ≥ 该强度的锁
+    if (checked_mode == mode) {
+      return (DB_SUCCESS);
+    }
+    /* As check_mode != mode, the mode is Next Key Lock, which can not be
+    emulated by implicit lock (which are LOCK_REC_NOT_GAP only). */
+    ut_ad(!impl);
+    lock_reuse_for_next_key_lock(held_lock, mode, block, heap_no, index, trx);
+    return (DB_SUCCESS);
+  }
+
+  const auto conflicting = lock_rec_other_has_conflicting(mode, block, heap_no, trx);
+
+  if (conflicting.wait_for != nullptr) {
+    switch (sel_mode) {
+      case SELECT_SKIP_LOCKED:  return (DB_SKIP_LOCKED);
+      case SELECT_NOWAIT:       return (DB_LOCK_NOWAIT);
+      case SELECT_ORDINARY:
+        RecLock rec_lock(thr, index, block, heap_no, mode);
+        trx_mutex_enter(trx);
+        dberr_t err = rec_lock.add_to_waitq(conflicting.wait_for);
+        trx_mutex_exit(trx);
+        return (err);
+    }
+  }
+
+  /* In case we've used a heuristic to bypass a conflicting waiter, we prefer to
+  create an explicit lock so it is easier to track the wait-for relation.*/
+  if (!impl || conflicting.bypassed) {          // ★ bypass 过等待者时必须建显式锁
+    lock_rec_add_to_queue(LOCK_REC | mode, block, heap_no, index, trx);
+    return (DB_SUCCESS_LOCKED_REC);
+  }
+  return (DB_SUCCESS);                          // impl：不建锁，靠隐含锁
+```
+
+```cpp
+static void lock_reuse_for_next_key_lock(const lock_t *held_lock, ulint mode,
+                                         const buf_block_t *block,
+                                         ulint heap_no, dict_index_t *index,
+                                         trx_t *trx) {
+  if (!held_lock->is_record_not_gap()) {
+    ut_ad(held_lock->is_next_key_lock());
+    return;                        // ★已持有 next-key，已覆盖 gap
+  }
+  /* We have a Record Lock granted, so we only need a GAP Lock. We assume
+  that GAP Locks do not conflict with anything. Therefore a GAP Lock
+  could be granted to us right now if we've requested: */
+  mode |= LOCK_GAP;                // ★把请求降级为"只要 gap 部分"
+  ut_ad(nullptr == lock_rec_other_has_conflicting(mode, block, heap_no, trx).wait_for);
+
+  /* It might be the case we already have one, so we first check that. */
+  if (lock_rec_has_expl(mode, block, heap_no, trx) == nullptr) {
+    lock_rec_add_to_queue(LOCK_REC | mode, block, heap_no, index, trx);
+  }
+}
+```
+
+**`lock_rec_other_has_conflicting()`**（`:917`）——返回 `{wait_for, bypassed}` 二元组：
+
+```cpp
+namespace locksys {
+struct Conflicting {
+  /** a conflicting lock or null if no conflicting lock found */
+  const lock_t *wait_for;
+  /** true iff the trx has bypassed one of waiting locks */
+  bool bypassed;
+};
+}
+
+static locksys::Conflicting lock_rec_other_has_conflicting(
+    ulint mode, const buf_block_t *block, ulint heap_no, const trx_t *trx) {
+  bool bypassed{false};
+  RecID rec_id{block, heap_no};
+  const bool is_supremum = rec_id.is_supremum();
+  locksys::Trx_locks_cache trx_locks_cache{};
+  const lock_t *wait_for = Lock_iter::for_each(rec_id, [&](const lock_t *lock) {
+    const auto conflict = locksys::rec_lock_check_conflict(
+        trx, mode, lock, is_supremum, trx_locks_cache);
+    if (conflict == locksys::Conflict::CAN_BYPASS) {
+      bypassed = true;
+    }
+    return conflict != locksys::Conflict::HAS_TO_WAIT;  // false → 提前停止并返回该 lock
+  });
+  return {wait_for, bypassed};
+}
+```
+
+**★ supremum 上的锁天然是 gap 锁**（`lock_rec_add_to_queue()` `:1619`）：
+
+```cpp
+  /* If rec is the supremum record, then we can reset the gap bit, as
+  all locks on the supremum are automatically of the gap type, and we
+  try to avoid unnecessary memory consumption of a new record lock
+  struct for a gap type lock */
+  if (heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    ut_ad(!(type_mode & LOCK_REC_NOT_GAP));
+    /* There should never be LOCK_REC_NOT_GAP on a supremum
+    record, but let us play safe */
+    type_mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);   // ★清掉两个 gap bit
+  }
+```
+
+**插入意向锁的入口 `lock_rec_insert_check_and_lock()`**（`:5370`）——★ 检查的是**后继记录**：
+
+```cpp
+  const rec_t *next_rec = page_rec_get_next_const(rec);
+  ulint heap_no = page_rec_get_heap_no(next_rec);   // ★待插入间隙的右端点
+
+  lock = lock_rec_get_first(lock_sys->rec_hash, block, heap_no);
+  if (lock == nullptr) {
+    *inherit = false;                               // 后继记录上无锁 → 无需继承
+  } else {
+    *inherit = true;
+
+    /* If another transaction has an explicit lock request which locks
+    the gap, waiting or granted, on the successor, the insert has to wait.
+    An exception is the case where the lock by the another transaction
+    is a gap type lock which it placed to wait for its turn to insert. ... */
+    const ulint type_mode = LOCK_X | LOCK_GAP | LOCK_INSERT_INTENTION;
+    //                              ★★ 插入意向锁 = X + GAP + II
+
+    const auto conflicting =
+        lock_rec_other_has_conflicting(type_mode, block, heap_no, trx);
+
+    /* LOCK_INSERT_INTENTION locks can not be allowed to bypass waiting locks,
+    because they allow insertion of a record which splits the gap which would
+    lead to duplication of the waiting lock, violating the constraint that
+    each transaction can wait for at most one lock at any given time */
+    ut_a(!conflicting.bypassed);    // ★★ II 锁绝对不允许 bypass（与 lock_rec_lock_slow 相反）
+
+    if (conflicting.wait_for != nullptr) {
+      RecLock rec_lock(thr, index, block, heap_no, type_mode);
+      trx_mutex_enter(trx);
+      err = rec_lock.add_to_waitq(conflicting.wait_for);
+      trx_mutex_exit(trx);
+    }
+  }
+```
 
 锁类型不是随便选的，由 `row_compare_row_to_range` 的返回值驱动。它产出三个布尔（`row_to_range_relation_t`），语义都是**"保守为 true"**——`true` = 无法排除相关，`false` = 确定无关：
 
@@ -1112,6 +1577,169 @@ lock->type_mode |= LOCK_WAIT;
 
 #### 隐含锁（implicit lock）：写操作为什么默认不建锁对象
 
+**转显式的入口**（`lock0lock.cc:5481`）——★ 隐含锁**恒等价** `LOCK_X | LOCK_REC_NOT_GAP`：
+
+```cpp
+static void lock_rec_convert_impl_to_expl_for_trx(
+    const buf_block_t *block, const rec_t *rec, dict_index_t *index,
+    const ulint *offsets, trx_t *trx, ulint heap_no) {
+  ut_ad(trx_is_referenced(trx));
+  {
+    locksys::Shard_latch_guard guard{UT_LOCATION_HERE, block->get_page_id()};
+    /* This trx->mutex acquisition here is not really needed.
+    Its purpose is to prevent a state transition between calls to trx_state_eq()
+    and lock_rec_add_to_queue(). ... */
+    trx_mutex_enter(trx);
+
+    ut_ad(!index->is_clustered() ||
+          trx->id == lock_clust_rec_some_has_impl(rec, index, offsets));
+
+    if (!trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
+        !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx)) {
+      ulint type_mode;
+
+      type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
+      //            ★★ 隐含锁 ≡ X | REC_NOT_GAP（永远不含 gap）
+
+      lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+    }
+    trx_mutex_exit(trx);
+  }
+  trx_release_reference(trx);
+}
+```
+
+**★ 聚簇索引 vs 二级索引的两条反查路径**（`:5541`）：
+
+```cpp
+void lock_rec_convert_impl_to_expl(const buf_block_t *block, const rec_t *rec,
+                                   dict_index_t *index, const ulint *offsets) {
+  if (index->is_clustered()) {
+    trx_id_t trx_id;
+    trx_id = lock_clust_rec_some_has_impl(rec, index, offsets);
+    //        ★ 聚簇：直接读记录里的 DB_TRX_ID
+    trx = trx_rw_is_active(trx_id, true);
+  } else {
+    ut_ad(!dict_index_is_online_ddl(index));
+    trx = lock_sec_rec_some_has_impl(rec, index, offsets);
+    //     ★ 二级索引：靠 page max_trx_id + 位图反查（记录本身没有 trx_id 列）
+    if (trx) {
+      ut_ad(!lock_rec_other_trx_holds_expl(LOCK_S | LOCK_REC_NOT_GAP, trx, rec, block));
+    }
+  }
+
+  if (trx != nullptr) {
+    ulint heap_no = page_rec_get_heap_no(rec);
+    ut_ad(trx_is_referenced(trx));
+    /* If the transaction is still active and has no
+    explicit x-lock set on the record, set one for it.
+    trx cannot be committed until the ref count is zero. */
+    lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx, heap_no);
+  }
+}
+```
+
+> ★★ **为什么二级索引必须有 `page_update_max_trx_id()`**：二级索引记录里**没有 `DB_TRX_ID` 列**，所以只能靠页头的 `PAGE_MAX_TRX_ID` 粗筛——"本页被某个 ≥ 该 id 的事务改过"。这也解释了 `lock_rec_insert_check_and_lock()` 成功后为什么要刷新 max_trx_id：
+> ```cpp
+>       if (!inherit_in || index->is_clustered()) break;
+>       /* Update the page max trx id field */
+>       page_update_max_trx_id(block, buf_block_get_page_zip(block), trx->id, mtr);
+> ```
+> （注意 `index->is_clustered()` 时 **break 掉**——聚簇索引不需要。）
+
+**`impl` 参数的语义**（`lock_rec_lock()` 首参）：
+
+```cpp
+@param[in]  impl    if true, no lock is set if no wait is necessary:
+                    we assume that the caller will set an implicit lock
+```
+
+> ★ **"不建锁"的条件是"不需要等待"**：快路径的分支 A（`lock == nullptr`，整页无锁）里 `impl=true` 时**什么都不做**；慢路径末尾 `if (!impl || conflicting.bypassed)` 才建显式锁。**一旦有冲突必须建显式锁**——否则等待关系无从表达。
+
+**⚠️ 勘误**：`lock_rec_create()` **不存在**（已 C++ 化为 `RecLock::create()` → `lock_alloc()` + `lock_add()`）。
+
+**锁对象的分配**（`lock0lock.cc:1180`）——★ 复用池 + 位图紧跟结构体：
+
+```cpp
+/** Total number of cached record locks */
+static const ulint REC_LOCK_CACHE = 8;
+/** Maximum record lock size in bytes */
+static const ulint REC_LOCK_SIZE = sizeof(ib_lock_t) + 256;   // ★ bitmap 上限 256 字节
+static const ulint TABLE_LOCK_CACHE = 8;
+
+lock_t *RecLock::lock_alloc(trx_t *trx, dict_index_t *index, ulint mode,
+                            const RecID &rec_id, ulint size) {
+  if (trx->lock.rec_cached >= trx->lock.rec_pool.size() ||
+      sizeof(*lock) + size > REC_LOCK_SIZE) {
+    //                        ★ bitmap 超过 256 字节 → 不能用缓存池
+    ulint n_bytes = size + sizeof(*lock);
+    mem_heap_t *heap = trx->lock.lock_heap;
+    auto ptr = mem_heap_alloc(heap, n_bytes);   // ★ lock_t + bitmap 一次分配，连续内存
+    lock = reinterpret_cast<lock_t *>(ptr);
+  } else {
+    lock = trx->lock.rec_pool[trx->lock.rec_cached];   // ★ 复用预分配的 8 个
+    ++trx->lock.rec_cached;
+  }
+
+  lock->trx = trx;
+  lock->index = index;
+  lock->type_mode = LOCK_REC | (mode & ~LOCK_TYPE_MASK);
+
+  if (is_predicate_lock(mode)) {
+    rec_lock.n_bits = 8;
+    memset(&lock[1], 0x0, 1);
+  } else {
+    rec_lock.n_bits = static_cast<uint32_t>(8 * size);
+    memset(&lock[1], 0x0, size);               // ★ bitmap 紧跟在 lock_t 之后
+  }
+
+  rec_lock.page_id = rec_id.get_page_id();
+  lock_rec_set_nth_bit(lock, rec_id.m_heap_no);   // ★ 立刻置上本次请求的 heap_no 位
+  return (lock);
+}
+```
+
+```cpp
+/* Safety margin when creating a new record lock: this many extra records
+can be inserted to the page without need to create a lock with a bigger
+bitmap */
+static const ulint LOCK_PAGE_BITMAP_MARGIN = 64;   // lock0priv.h:346
+
+static size_t lock_size(const page_t *page) {
+  ulint n_recs = page_dir_get_n_heap(page);
+  /* Make lock bitmap bigger by a safety margin */
+  return (1 + ((n_recs + LOCK_PAGE_BITMAP_MARGIN) / 8));   // ★ +1 保证非 0
+}
+```
+
+**位图操作原语**（⚠️ 全在 `lock0priv.ic`，**不在 `lock0lock.cc`**）：
+
+```cpp
+static inline void lock_rec_set_nth_bit(lock_t *lock, ulint i) {
+  byte_index = i / 8;
+  bit_index = i % 8;
+  byte *const the_byte = ((byte *)&lock[1]) + byte_index;   // ★★ 位图就紧跟 lock_t 之后
+  ut_ad(!(*the_byte & (1 << bit_index)));
+  *the_byte |= 1 << bit_index;
+  lock->trx->lock.n_rec_locks.fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline bool lock_rec_get_nth_bit(const lock_t *lock, ulint i) {
+  if (i >= lock->rec_lock.n_bits) {
+    return (false);      // ★ 越界（含 ULINT_UNDEFINED）返回 false，不崩溃
+  }
+  b = ((const byte *)&lock[1]) + (i / 8);
+  return (true & *b >> (i % 8));
+}
+```
+
+> ★ `lock_rec_get_next_on_page_const()` 说明**同一个 hash cell 里混着不同 page 的锁**，必须按 `page_id` 过滤：
+> ```cpp
+>   while ((lock = static_cast<const lock_t *>(HASH_GET_NEXT(hash, lock))) != nullptr) {
+>     if (page_id == lock->rec_lock.page_id) return (lock);
+>   }
+> ```
+
 **为什么需要它**：修改一条记录时若每次都建一个显式 `lock_t`，大事务会产生百万级锁对象（内存 + 遍历代价）。InnoDB 的做法是**不建锁**——记录头的 `DB_TRX_ID`（谁最后改的）本身就是一把"看不见的 X 锁"。只有当**别人来检查冲突**时，才把它"物化"成显式锁。这是锁系统的核心省内存设计。
 
 ```cpp
@@ -1152,6 +1780,8 @@ if (!trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
 **物化即授予，不排队**：传入的 type_mode **不含 `LOCK_WAIT`**，`lock_rec_add_to_queue` 走非等待路径——优先复用同事务同页同形态的锁只置一个 bit，否则新建 granted 锁插队列头。语义上隐含锁本来就是该事务已拥有的锁，物化只是"显式化"让别人看得见，不是新请求。
 
 **副作用**：这是**代别的 trx 建锁**（`we_own_trx_mutex=true`）。若此时该 trx 已提交则跳过；否则建一个它"不知道"的显式锁，靠引用计数归零保证安全。这也是为什么提交前必须 `while (trx_is_referenced(trx))` 自旋等待引用清零——否则清堆时别人正拿着这个 `lock_t`。
+
+**物化的调用点全局清单（全库仅 5 处）**：① `lock_sec_rec_read_check_and_lock`（二级读加锁前）② `lock_clust_rec_read_check_and_lock`（聚簇读加锁前）③ `lock_clust_rec_modify_check_and_lock`（聚簇修改前）④ `row_convert_impl_to_expl_if_needed`（仅**部分回滚**，如 IODKU/REPLACE 中段回滚时防中途释放隐式锁破坏可串行化）⑤ 物化本体 `lock_rec_convert_impl_to_expl_for_trx`（被 ①~④ 调用的收敛点）。**提交与死锁检测都不物化**：提交时 trx 置 `TRX_STATE_COMMITTED_IN_MEMORY`，隐式锁随之直接失效（`trx0trx.cc` 注释 "this particular point in time as the moment the trx's implicit locks become released"），无需物化；死锁检测面对的是已建好的显式锁队列 + `LOCK_WAIT` 锁，隐式锁冲突在进入锁队列前就已经被物化。
 
 #### 谓词锁（R-tree 空间索引）：第四种锁语义
 
@@ -1351,6 +1981,213 @@ Grows <---- [HEAD] [G7 -- G3 -- G2 -- G1] --|-- [W4 -- W5 -- W6] [TAIL] ---> Gro
 granted 在头（新授予的插头部）、waiting 在尾（按到达顺序），区分全靠 `type_mode` 的 `LOCK_WAIT` bit。**没有独立的等待队列数据结构**。
 
 #### srv_slot_t 等待槽位：slot ↔ thr ↔ wait_lock 严格 1:1:1
+
+**完整定义**（`include/srv0srv.h:1242`）：
+
+```cpp
+struct srv_slot_t {
+  /** Thread type: user, utility etc. */
+  srv_thread_type type;
+  /** true if this slot is in use. */
+  bool in_use;
+  /** true if the thread is waiting for the event of this slot. */
+  bool suspended;
+
+  /** Time when the thread was suspended. Initialized by
+  lock_wait_table_reserve_slot() for lock wait. */
+  std::chrono::steady_clock::time_point suspend_time;   // ★ 超时判定的基准
+
+  /** Stores the current value of lock_wait_table_reservations, when
+  lock_wait_table_reserve_slot is called.
+  This can be used as a version number to avoid ABA problems.
+  The difference lock_wait_table_reservations - reservation_no tells us how many
+  other threads got suspended while our thr was sleeping.
+  This can be used to determine if the wait was unfairly long, and it is time to
+  boost trx->lock.schedule_weight.
+  Protected by lock->wait_mutex. */
+  uint64_t reservation_no;   // ★★ 不是"等待时长"，是"排队序号快照"（防 ABA + 公平性 BOOST）
+
+  /** Wait time that if exceeded the thread will be timed out. */
+  std::chrono::steady_clock::duration wait_timeout;
+
+  /** Event used in suspending the thread when it has nothing to do. */
+  os_event_t event;          // ★★ 信号量在 slot 上，不在 trx 上；懒创建后永久复用
+
+  /** Suspended query thread (only used for user threads). */
+  que_thr_t *thr;            // ★ 与 thr->slot 互为反指
+};
+```
+
+> ⚠️ **每个 trx 没有 `os_event_t`**——event 挂在 **slot** 上，首次使用时 `os_event_create()`，之后只 `os_event_reset()` 复用。另有一个全局 `lock_sys->timeout_event`。
+>
+> ★ **有两套 slot 数组共用 `srv_slot_t`**：`lock_sys->waiting_threads`（用户线程锁等待）与 `srv_sys->sys_threads`（后台 master/purge/worker）。
+
+**1:1:1 的绑定现场**（`lock0wait.cc:141`）：
+
+```cpp
+static srv_slot_t *lock_wait_table_reserve_slot(
+    que_thr_t *thr, std::chrono::steady_clock::duration wait_timeout) {
+  ut_ad(lock_wait_mutex_own());
+  ut_ad(trx_mutex_own(thr_get_trx(thr)));
+
+  slot = lock_sys->waiting_threads;
+  for (uint32_t i = srv_max_n_threads; i--; ++slot) {   // 线性扫找第一个空槽
+    if (!slot->in_use) {
+      slot->reservation_no = lock_wait_table_reservations++;
+      slot->in_use = true;
+      slot->thr = thr;
+      slot->thr->slot = slot;            // ★★ slot ↔ thr 双向绑定
+
+      if (slot->event == nullptr) {
+        slot->event = os_event_create();  // ★ 懒创建
+        ut_a(slot->event);
+      }
+      os_event_reset(slot->event);       // ★★ 先 reset 再入睡，避免 lost wakeup
+      slot->suspended = true;
+      slot->suspend_time = std::chrono::steady_clock::now();
+      slot->wait_timeout = wait_timeout;
+
+      if (slot == lock_sys->last_slot) {
+        ++lock_sys->last_slot;           // ★ 扩展扫描上界
+      }
+
+      /* We call lock_wait_request_check_for_cycles() because the node
+      representing the `thr` only now becomes visible to the thread which
+      analyzes contents of lock_sys->waiting_threads. ... */
+      lock_wait_request_check_for_cycles();  // ★ 入槽后才"点亮"等待图节点
+      return (slot);
+    }
+  }
+  ib::error(ER_IB_MSG_646) << "There appear to be " << srv_max_n_threads
+      << " user threads currently waiting inside InnoDB, which is the upper"
+         " limit. Cannot continue operation. ...";
+  lock_wait_table_print();
+  ut_error;                              // ★ 槽位耗尽 = 致命错误
+}
+```
+
+**第三端 `wait_lock` 的绑定**（`lock0lock.cc:419`）——一个 trx 同时只能等一把锁：
+
+```cpp
+static inline void lock_set_lock_and_trx_wait(lock_t *lock) {
+  auto trx = lock->trx;
+  ut_ad(trx_mutex_own(trx));
+  ut_a(trx->lock.wait_lock == nullptr);   // ★★ 这就是 1:1:1 的根
+  ut_ad(locksys::owns_lock_shard(lock));
+
+  trx->lock.wait_lock = lock;
+  trx->lock.wait_lock_type = lock_get_type_low(lock);
+  lock->type_mode |= LOCK_WAIT;
+}
+```
+
+**等待图的边存在 `trx->lock.blocking_trx` 上**（`lock0lock.cc:1467`）：
+
+```cpp
+static void lock_create_wait_for_edge(const lock_t *waiting_lock,
+                                      const lock_t *blocking_lock) {
+  trx_t *waiter = waiting_lock->trx;
+  trx_t *blocker = blocking_lock->trx;
+  ut_ad(waiter->lock.blocking_trx.load() == nullptr);
+  /* We don't call lock_wait_request_check_for_cycles() here as it
+  would be slightly premature: the trx is not yet inserted into a slot of
+  lock_sys->waiting_threads at this point ... */
+  waiter->lock.blocking_trx.store(blocker);   // ★★ 边 = trx->lock.blocking_trx
+  lock_report_wait_for_edge_to_server(waiting_lock, blocking_lock);
+}
+```
+
+> ⚠️ **`lock_trx_handle_wait()` 不存在**（全仓 0 命中）。对应职责由 `RecLock::add_to_waitq()` + `lock_wait_suspend_thread()` 承担。
+> ⚠️ **`lock_reset_all_on_table()` 不存在**——真名 `lock_remove_all_on_table()`。
+> ⚠️ **`lock_wait_check_slot()` 不存在**——真名 `lock_wait_check_and_cancel()`。
+> ⚠️ **`que_thr_stop()` 不阻塞线程**——只改 `thr->state = QUE_THR_LOCK_WAIT`，真正的阻塞在 `que_run_threads()` → `lock_wait_suspend_thread()`。
+
+**挂起的三段编排**（`lock0wait.cc:199`）：
+
+```cpp
+  const auto lock_wait_timeout = trx_lock_wait_timeout_get(trx);
+  //                             = THDVAR(thd, lock_wait_timeout)；thd==NULL 时取全局值
+
+  lock_wait_mutex_enter();
+  trx_mutex_enter(trx);
+  trx->error_state = DB_SUCCESS;
+
+  if (thr->state == QUE_THR_RUNNING) {          // ★ 竞态快路径：锁已被授予
+    if (trx->lock.was_chosen_as_deadlock_victim) {
+      trx->error_state = DB_DEADLOCK;           // ★ 但期间被选为死锁受害者
+      trx->lock.was_chosen_as_deadlock_victim = false;
+      ut_d(trx->lock.in_rollback = true);
+    }
+    lock_wait_mutex_exit();
+    trx_mutex_exit(trx);
+    return;                                     // ★ 根本不入槽、不睡
+  }
+
+  slot = lock_wait_table_reserve_slot(thr, lock_wait_timeout);
+
+  if (thr->lock_state == QUE_THR_LOCK_ROW) {
+    srv_stats.n_lock_wait_count.inc();          // ★ Innodb_row_lock_waits
+    srv_stats.n_lock_wait_current_count.inc();  // ★ Innodb_row_lock_current_waits
+    start_time = std::chrono::steady_clock::now();
+  }
+  lock_wait_mutex_exit();
+  auto lock_type = trx->lock.wait_lock_type;
+  trx_mutex_exit(trx);                          // ★★ 睡前必须放开 trx->mutex
+```
+
+```cpp
+  /* ① 睡眠前放开数据字典锁（FK 检查用的 S 锁），避免阻塞 DDL */
+  switch (had_dict_lock) {
+    case RW_S_LATCH: row_mysql_unfreeze_data_dictionary(trx); break;
+    case RW_X_LATCH: rw_lock_x_unlock(dict_operation_lock);   break;
+  }
+
+  /* ② 归还「InnoDB 并发门票」——否则持锁者进不来，逻辑死等 */
+  if (was_declared_inside_innodb) {
+    /* We must declare this OS thread to exit InnoDB, since a
+    possible other thread holding a lock which this thread waits
+    for must be allowed to enter, sooner or later */
+    srv_conc_force_exit_innodb(trx);
+  }
+
+  thd_wait_begin(trx->mysql_thd, lock_type == LOCK_REC ? THD_WAIT_ROW_LOCK
+                                                       : THD_WAIT_TABLE_LOCK);
+
+  os_event_wait(slot->event);   // ★★★ 真正的挂起点：无限期阻塞，本身无超时！
+  //   能被唤醒的唯一途径：lock_wait_release_thread_if_suspended() 的 os_event_set()
+
+  thd_wait_end(trx->mysql_thd);
+```
+
+```cpp
+  /* 醒来后：重进门 + 恢复字典锁 + 释放 slot + 统计 + 定错码 */
+  if (was_declared_inside_innodb) srv_conc_force_enter_innodb(trx);
+  if (had_dict_lock == RW_S_LATCH) row_mysql_freeze_data_dictionary(trx, UT_LOCATION_HERE);
+  else if (had_dict_lock == RW_X_LATCH) rw_lock_x_lock(dict_operation_lock, UT_LOCATION_HERE);
+
+  lock_wait_table_release_slot(slot);
+
+  if (thr->lock_state == QUE_THR_LOCK_ROW) {
+    const auto diff_time = std::chrono::steady_clock::now() - start_time;
+    srv_stats.n_lock_wait_current_count.dec();
+    srv_stats.n_lock_wait_time.add(
+        std::chrono::duration_cast<std::chrono::microseconds>(diff_time).count());
+    if (diff_time > lock_sys->n_lock_max_wait_time) {
+      lock_sys->n_lock_max_wait_time = diff_time;   // ★ Innodb_row_lock_time_max
+    }
+    thd_set_lock_wait_time(trx->mysql_thd, diff_time);
+  }
+
+  if (trx->error_state == DB_DEADLOCK) { ut_d(trx->lock.in_rollback = true); return; }
+  if (trx->error_state == DB_LOCK_WAIT_TIMEOUT) { MONITOR_INC(MONITOR_TIMEOUT); }
+  if (trx_is_interrupted(trx)) {
+    trx->error_state = DB_INTERRUPTED;   // ★ KILL 优先级最高，覆盖超时
+  }
+```
+
+> ⚠️ **`srv_suspend_mysql_thread()` / `srv_resume_mysql_thread()` 都不存在**（前者只在 `que0que.cc:744` 的旧注释里残留）。用户线程实际入睡的是**裸 `os_event_wait(slot->event)`**。
+>
+> ★ ★★ **三处时长计算各不相同**：①统计用 `now() - start_time`（`lock_wait_suspend_thread` 内）；②超时判定用 `now() - slot->suspend_time`；③公平性 BOOST 用 `lock_wait_table_reservations - slot->reservation_no`。
 
 等待线程**不睡在锁上**，睡在全局 `waiting_threads[]` 数组的槽位上：
 
@@ -1604,6 +2441,180 @@ static const lock_t *lock_rec_has_to_wait_for_granted(
 
 #### 唤醒：最多一次的结构性保证
 
+**全局唯一的 `os_event_set` 出口**（`lock0wait.cc:359`）——注释本身就是"最多一次"的证明：
+
+```cpp
+static void lock_wait_release_thread_if_suspended(que_thr_t *thr) {
+  auto trx = thr_get_trx(thr);
+  /* We need a guarantee that for each time a thread is suspended there is at
+  most one time it gets released - or more precisely: that there is at most
+  one reason for it to be woken up. Otherwise it could happen that two
+  different threads will think that they successfully woken up the transaction
+  and that the transaction understands the reason it was woken up is the one
+  they had in mind, say: one thread woken it up because of deadlock and another
+  because of timeout. If the two reasons require different behavior after
+  waking up, then we will be in trouble. Current implementation makes sure
+  that we wake up a thread only once by observing several rules:
+    1. the only way to wake up a trx is to call os_event_set
+    2. the only call to os_event_set is in lock_wait_release_thread_if_suspended
+    3. calls to lock_wait_release_thread_if_suspended are always performed after
+    a call to lock_reset_lock_and_trx_wait(lock), and the sequence of the two is
+    in a critical section guarded by lock_sys latch for the shard containing the
+    waiting lock
+    4. the lock_reset_lock_and_trx_wait(lock) asserts that
+    lock->trx->lock.wait_lock == lock and sets lock->trx->lock.wait_lock = NULL
+  Together all this facts imply, that it is impossible for a single trx to be
+  woken up twice (unless it got to sleep again) because doing so requires
+  resetting wait_lock to NULL. */
+
+  ut_ad(trx_mutex_own(trx));
+  // ★ 这里故意不拿 lock_wait_mutex：靠 trx->mutex + wait_lock 已清 NULL 的协议保证互斥
+  ut_ad(thr->state == QUE_THR_RUNNING);
+  ut_ad(trx->lock.wait_lock == nullptr);
+
+  if (thr->slot != nullptr && thr->slot->in_use && thr->slot->thr == thr) {
+    //                          ★ 三重校验，确保 slot 确实是本 thr 的
+    if (trx->lock.was_chosen_as_deadlock_victim) {
+      trx->error_state = DB_DEADLOCK;              // ★ 死锁受害者在此落地
+      trx->lock.was_chosen_as_deadlock_victim = false;
+      ut_d(trx->lock.in_rollback = true);
+    }
+    os_event_set(thr->slot->event);                // ★★★ 唯一唤醒语句
+  }
+  // ★ 若 thr->slot == nullptr：对方还没入睡（会走 RUNNING 快路径），无需唤醒
+}
+```
+
+**授予/取消的统一出口**（`lock0wait.cc:424`）：
+
+```cpp
+void lock_reset_wait_and_release_thread_if_suspended(lock_t *lock) {
+  ut_ad(locksys::owns_lock_shard(lock));
+  ut_ad(trx_mutex_own(lock->trx));
+  ut_ad(lock->trx->lock.wait_lock == lock);
+
+  /* We clear blocking_trx here and not in lock_reset_lock_and_trx_wait(), as
+  lock_reset_lock_and_trx_wait() is called also when the wait_lock is being
+  moved from one page to another during B-tree reorganization, in which case
+  blocking_trx should not change ... Clearing blocking_trx helps with:
+  1. performance optimization, as lock_wait_snapshot_waiting_threads() can omit
+     this trx when building wait-for-graph
+  2. debugging
+  3. helping lock_make_trx_hit_list() notice that HP trx is no longer waiting */
+  lock->trx->lock.blocking_trx.store(nullptr);   // ★★ 等待图的出边在此删除
+
+  ut_ad(lock->trx_que_state() == TRX_QUE_LOCK_WAIT);
+
+  /* The following function releases the trx from lock wait */
+  que_thr_t *thr = que_thr_end_lock_wait(lock->trx);   // LOCK_WAIT → RUNNING
+
+  /* Reset the wait flag and the back pointer to lock in trx. ... */
+  lock_reset_lock_and_trx_wait(lock);   // wait_lock = nullptr; type_mode &= ~LOCK_WAIT
+
+  if (thr != nullptr) {
+    lock_wait_release_thread_if_suspended(thr);   // ★ 此刻才真正 os_event_set()
+  }
+}
+```
+
+**`que_thr_end_lock_wait()`**（`que0que.cc:267`）——★ 只有"非 active"的 thr 才需要唤醒：
+
+```cpp
+que_thr_t *que_thr_end_lock_wait(trx_t *trx) {
+  que_thr_t *const thr = trx->lock.wait_thr;
+  ut_ad(trx->lock.que_state == TRX_QUE_LOCK_WAIT);
+  ut_a(thr->state == QUE_THR_LOCK_WAIT);
+
+  bool const was_active = thr->is_active;
+  que_thr_move_to_run_state(thr);
+  trx->lock.que_state = TRX_QUE_RUNNING;
+  trx->lock.wait_thr = nullptr;
+
+  /* In MySQL we let the OS thread (not just the query thread) to wait
+  for the lock to be released: */
+  return !was_active ? thr : nullptr;
+  //     ★★ active 说明线程还在跑（没睡），无需 os_event_set
+}
+```
+
+> ★★ **"最多一次"的四条规矩**（源码注释原文）：①唯一唤醒方式是 `os_event_set`；②唯一调用点是本函数；③调用前必先 `lock_reset_lock_and_trx_wait()`，且两者在同一 shard latch 临界区内；④该函数断言 `wait_lock == lock` 并把它置 NULL。**所以"不可能被唤醒两次"——第二次的 `wait_lock` 已经是 NULL，断言就过不去。**
+
+**授予传播：`lock_rec_dequeue_from_page()`**（`lock0lock.cc:2430`）——⚠️ 只剩 **2 行**（旧版那大段逻辑被抽走了）：
+
+```cpp
+static void lock_rec_dequeue_from_page(lock_t *in_lock) {
+  lock_rec_discard(in_lock);   // ① 从 hash cell + trx_locks 摘除
+  lock_rec_grant(in_lock);     // ② 遍历 bitmap 里所有置位的 heap_no，逐个授予传播
+}
+```
+
+```cpp
+static void lock_rec_grant(lock_t *in_lock) {
+  /* In some scenarios, in particular in replication appliers, it is often the
+  case, that there are no WAITING locks, and in such situation iterating over
+  all bits, and calling lock_rec_grant_by_heap_no() slows down the execution
+  noticeably. ... Therefore we first check if there is any lock which is
+  waiting at all. */
+  bool found_waiter = false;
+  for (auto lock = lock_rec_get_first_on_page_addr(lock_hash, page_id);
+       lock != nullptr; lock = lock_rec_get_next_on_page(lock)) {
+    if (lock->is_waiting()) { found_waiter = true; break; }
+  }
+  if (found_waiter) {
+    for (ulint heap_no = 0; heap_no < lock_rec_get_n_bits(in_lock); ++heap_no) {
+      if (lock_rec_get_nth_bit(in_lock, heap_no)) {   // ★ 只处理这把锁真正锁过的行
+        lock_rec_grant_by_heap_no(in_lock, heap_no);
+        ++grant_attempts;
+      }
+    }
+  }
+}
+```
+
+**★ 授予顺序：HP → 重 weight（降序）→ 轻 weight（保序）**（`lock0lock.cc:2210`）：
+
+```cpp
+    if (trx_is_high_priority(trx)) {
+      waiting.push_back(lock);          // ★ 高优先级排最前
+      return (true);
+    }
+    const auto schedule_weight = trx->lock.schedule_weight.load(std::memory_order_relaxed);
+    if (schedule_weight <= 1) {
+      low_priority_light.push_back(lock);
+      return (true);
+    }
+    low_priority_heavier.push_back(LockDescriptorEx{schedule_weight, lock});
+    ...
+  /* We want high schedule weight to be in front, and break ties by position */
+  std::stable_sort(low_priority_heavier.begin(), low_priority_heavier.end(),
+                   [](const LockDescriptorEx &a, const LockDescriptorEx &b) {
+                     return (a.first > b.first);   // ★ weight 大的先拿锁
+                   });
+  for (const auto &descriptor : low_priority_heavier) waiting.push_back(descriptor.second);
+  waiting.insert(waiting.end(), low_priority_light.begin(), low_priority_light.end());
+```
+
+```cpp
+  for (lock_t *wait_lock : waiting) {
+    /* ★★ 只处理「被本次释放者阻塞」的等待锁 → 授予传播是"因果驱动"的，不做全队列重算 */
+    if (blocking_trx != in_trx) return (true);
+
+    const lock_t *blocking_lock =
+        lock_rec_has_to_wait_for_granted(wait_lock, granted, new_granted_index);
+    if (blocking_lock == nullptr) {
+      lock_grant(wait_lock);                        // ★ 授予 + 唤醒
+      lock_rec_move_granted_to_front(wait_lock, rec_id);
+      granted.push_back(wait_lock);                 // ★ 后续等待者必须与它冲突检查
+    } else {
+      lock_update_wait_for_edge(wait_lock, blocking_lock);   // ★ 改阻塞者
+    }
+  }
+```
+
+> ★★ **`granted` 列表同时包含"原本已授予的"和"本轮刚授予的"**——这保证一轮连续授予时不会给出互相冲突的锁。
+>
+> ★ **部分释放** `lock_rec_release(lock, heap_no)` 只清一个 bit，只对该行做授予传播（用于 PREPARE 时解 gap、 supremum 单独释放）。
+
 `lock_grant` 核心只一行 `lock_reset_wait_and_release_thread_if_suspended(lock)`，其内部四步序：
 
 1. 先清 `blocking_trx = nullptr`（wait-for 边正式消失；死锁快照读到 null 跳过该事务，`lock_wait_check_and_cancel` 也靠它区分"wait_lock 暂时为 null（B-tree 搬锁）"与"永久醒来"）；
@@ -1785,6 +2796,334 @@ do {
 
 #### wait-for graph 的构建
 
+⚠️ **勘误（8.0.18 大重写）**：**`class Deadlock_checker` 不存在**（全仓 grep 0 命中）。死锁检测已从 `lock0lock.cc` 整体迁到 **`storage/innobase/lock/lock0wait.cc`**，改为"后台线程周期性建图 + 三色染色找环"。`lock0lock.cc` 里只剩一个纯静态的 **`class Deadlock_notifier`**（只打日志）。
+
+| 常见说法 | 真名 |
+|---|---|
+| `Deadlock_checker::check_and_resolve()` | `lock_wait_update_schedule_and_check_for_deadlocks()`（`lock0wait.cc:1379`） |
+| `Deadlock_checker::search()`（递归 DFS） | `lock_wait_find_and_handle_deadlocks()`（`:1253`，**迭代染色**） |
+| `Deadlock_checker::select_victim()` | `lock_wait_choose_victim()`（`:915`） |
+| `Deadlock_checker::trx_weight_ge()` | `trx_weight_ge()`（`trx/trx0trx.cc:2949`，自由函数） |
+| `report_deadlock()` | `lock_notify_about_deadlock()` → `Deadlock_notifier::notify()` |
+| `lock_deadlock_check()` | **不存在**函数；只有静态 bool `lock_deadlock_found`（`lock0lock.cc:197`） |
+
+**快照结构**（`lock0wait.cc:523`）：
+
+```cpp
+/** A snapshot of information about a single slot which was in use at the moment
+of taking the snapshot */
+struct waiting_trx_info_t {
+  /** The transaction which was using this slot. */
+  trx_t *trx;
+  /** The transaction for which the owner of the slot is waiting for. */
+  trx_t *waits_for;
+  /** The slot this info is about */
+  srv_slot_t *slot;
+  /** The slot->reservation_no at the moment of taking the snapshot */
+  uint64_t reservation_no;
+};
+
+/** As we want to quickly find a given trx_t within the snapshot, we use a
+sorting criterion which is based on trx only. We use the pointer address, as
+any deterministic rule without ties will do. */
+bool operator<(const waiting_trx_info_t &a, const waiting_trx_info_t &b) {
+  return std::less<trx_t *>{}(a.trx, b.trx);   // ★ 按 trx 指针地址排序
+}
+```
+
+**① 建快照**（`:562`）——只扫 `[waiting_threads, last_slot)`：
+
+```cpp
+static uint64_t lock_wait_snapshot_waiting_threads(
+    ut::vector<waiting_trx_info_t> &infos) {
+  infos.clear();
+  lock_wait_mutex_enter();
+  const auto table_reservations = lock_wait_table_reservations;
+  for (auto slot = lock_sys->waiting_threads; slot < lock_sys->last_slot; ++slot) {
+    if (slot->in_use) {
+      auto from = thr_get_trx(slot->thr);
+      auto to = from->lock.blocking_trx.load();   // ★★ 边 = trx->lock.blocking_trx
+      if (to != nullptr) {
+        infos.push_back({from, to, slot, slot->reservation_no});
+      }
+    }
+  }
+  lock_wait_mutex_exit();
+  return table_reservations;
+}
+```
+
+**② 建图**（`:646`）——每个 waiter **最多一条出边**，用 sort + lower_bound（O(n log n)）：
+
+```cpp
+static void lock_wait_build_wait_for_graph(
+    ut::vector<waiting_trx_info_t> &infos, ut::vector<int> &outgoing) {
+  const auto n = static_cast<uint>(infos.size());
+  outgoing.clear();
+  outgoing.resize(n, -1);
+  /* This particular implementation sorts infos by ::trx, and then uses
+  lower_bound to find index in infos corresponding to ::wait_for, which has
+  O(nlgn) complexity and modifies infos, but has a nice property of avoiding any
+  allocations. ... Using unordered_map<trx_t*,int> however causes too much
+  (de)allocations as its bucket chains are implemented as a linked lists ...
+  The fastest implementation was to use custom implementation of a hash table
+  with open addressing and double hashing ... This however did not increase
+  transactions per second, so introducing a custom implementation seems
+  unjustified here. */
+  sort(infos.begin(), infos.end());       // ★ 按 trx 指针地址排序
+  waiting_trx_info_t needle{};
+  for (uint from = 0; from < n; ++from) {
+    needle.trx = infos[from].waits_for;
+    auto it = std::lower_bound(infos.begin(), infos.end(), needle);
+    if (it == infos.end() || it->trx != needle.trx) {
+      continue;      // ★ 阻塞者不在快照里（未睡在 slot 上）→ 无边
+    }
+    auto to = it - infos.begin();
+    ut_ad(from != static_cast<uint>(to));
+    outgoing[from] = static_cast<int>(to);
+  }
+}
+```
+
+**③ 找环：非递归的"染色"**（`:1253`）——★ 用 `current_color` 代替递归栈：
+
+```cpp
+static void lock_wait_find_and_handle_deadlocks(
+    const ut::vector<waiting_trx_info_t> &infos,
+    const ut::vector<int> &outgoing,
+    ut::vector<trx_schedule_weight_t> &new_weights) {
+  const auto n = static_cast<uint>(infos.size());
+  ut::vector<uint> cycle_ids;  cycle_ids.clear();
+  ut::vector<uint> colors;     colors.resize(n, 0);   // ★ 0 = 未访问
+  uint current_color = 0;                             // ★ 每次外层遍历换一个新"颜色"
+
+  for (uint start = 0; start < n; ++start) {
+    if (colors[start] != 0) continue;   /* This node was already fully processed */
+    ++current_color;
+    for (int id = start; 0 <= id; id = outgoing[id]) {
+      /* We don't expect transaction to deadlock with itself only
+      and we do not handle cycles of length=1 correctly */
+      ut_ad(id != outgoing[id]);
+      if (colors[id] == 0) {
+        /* This node was never visited yet */
+        colors[id] = current_color;
+        continue;
+      }
+      /* This node was already visited:
+      - either it has current_color which means we've visited it during current
+        DFS descend, which means we have found a cycle, which we need to verify,
+      - or, it has a color used in a previous DFS which means that current DFS
+        path merges into an already processed portion of wait-for graph, so we
+        can stop now */
+      if (colors[id] == current_color) {
+        /* found a candidate cycle! */
+        lock_wait_extract_cycle_ids(cycle_ids, id, outgoing);
+        if (lock_wait_check_candidate_cycle(cycle_ids, infos, new_weights)) {
+          MONITOR_INC(MONITOR_DEADLOCK);
+        } else {
+          MONITOR_INC(MONITOR_DEADLOCK_FALSE_POSITIVES);   // ★ 假阳性（快照过期）
+        }
+      }
+      break;   // ★ 不论是否成环都停止这条链
+    }
+  }
+  MONITOR_INC(MONITOR_DEADLOCK_ROUNDS);
+  MONITOR_SET(MONITOR_LOCK_THREADS_WAITING, n);
+}
+```
+
+```cpp
+static void lock_wait_extract_cycle_ids(ut::vector<uint> &cycle_ids,
+                                        const uint start,
+                                        const ut::vector<int> &outgoing) {
+  cycle_ids.clear();
+  uint id = start;
+  do {
+    cycle_ids.push_back(id);
+    id = outgoing[id];      // ★ 每个节点最多一条出边，所以必然走回 start
+  } while (id != start);
+}
+```
+
+**④ 验证候选环（防 ABA）**（`:1153`）——两级校验：
+
+```cpp
+  /* ... It may even segfault if we try to access it (because trx_t object
+  could be freed). So we need to somehow verify that the pointer is still
+  valid without accessing it. We do that by checking if slot->reservation_no
+  has changed since taking a snapshot. ... */
+  if (!lock_wait_trxs_are_still_in_slots(cycle_ids, infos)) {
+    lock_wait_mutex_exit();
+    return false;                    // ★ 第一级：slot 已被复用 → 假阳性
+  }
+
+  /* ... They might have been already notified that they should wake up ...
+  but they had not yet chance to act upon it ... we can recognize this
+  situation by looking at trx->lock.wait_lock, as each call to
+  lock_wait_release_thread_if_suspended() is performed only after
+  lock_reset_lock_and_trx_wait() resets trx->lock.wait_lock to NULL.
+  Checking trx->lock.wait_lock in reliable way requires global exclusive latch. */
+  locksys::Global_exclusive_latch_guard gurad{UT_LOCATION_HERE};
+  if (!lock_wait_trxs_are_still_waiting(cycle_ids, infos)) {
+    lock_wait_mutex_exit();
+    return false;                    // ★ 第二级：wait_lock 已为 NULL → 假阳性
+  }
+
+  lock_wait_mutex_exit();
+  trx_t *const chosen_victim = lock_wait_choose_victim(cycle_ids, infos);
+  ut_a(chosen_victim);
+  lock_wait_handle_deadlock(chosen_victim, cycle_ids, infos, new_weights);
+  return true;
+```
+
+```cpp
+static const srv_slot_t *lock_wait_get_slot_if_still_reserved(
+    const ut::vector<waiting_trx_info_t> &infos, const size_t id) {
+  const auto slot = infos[id].slot;
+  if (slot->in_use && slot->reservation_no == infos[id].reservation_no) {
+    return slot;      // ★★ reservation_no 不变 ⇒ 中间没被复用过
+  }
+  return nullptr;
+}
+```
+
+**⑤ victim 选择 + 高优先级仲裁**（`:915`）：
+
+```cpp
+static trx_t *lock_wait_choose_victim(const ut::vector<uint> &cycle_ids,
+                                      const ut::vector<waiting_trx_info_t> &infos) {
+  trx_t *chosen_victim = nullptr;
+  auto sorted_trxs = lock_wait_order_for_choosing_victim(cycle_ids, infos);
+
+  for (auto *trx : sorted_trxs) {
+    if (chosen_victim == nullptr) { chosen_victim = trx; continue; }
+
+    if (trx_is_high_priority(chosen_victim) || trx_is_high_priority(trx)) {
+      auto victim = trx_arbitrate(trx, chosen_victim);   // ★ 高优先级仲裁
+      if (victim != nullptr) {
+        if (victim == trx) chosen_victim = trx;
+        else ut_a(victim == chosen_victim);
+        continue;    // ★★ 仲裁有结论时，直接跳过权重比较
+      }
+      /* 仲裁返回 nullptr → 两个 HP 互不相让，退化为按权重比较 */
+    }
+
+    if (trx_weight_ge(chosen_victim, trx)) {
+      /* The joining transaction is 'smaller', choose it as the victim */
+      chosen_victim = trx;      // ★ 选"更轻"的回滚
+    }
+  }
+  return chosen_victim;
+}
+```
+
+```cpp
+static inline const trx_t *trx_arbitrate(const trx_t *requestor,
+                                         const trx_t *holder) {
+  if (requestor->mysql_thd == nullptr) {          // requestor 是后台事务
+    if (trx_is_high_priority(holder)) return (requestor);  // ★ holder 是 HP → 牺牲后台
+    else return (nullptr);
+  } else if (holder->mysql_thd == nullptr) {      // holder 是后台事务
+    if (trx_is_high_priority(requestor)) return (holder);  // ★ requestor 是 HP → 牺牲后台
+    return (nullptr);
+  }
+  const THD *victim = thd_trx_arbitrate(requestor->mysql_thd, holder->mysql_thd);
+  if (victim != nullptr) {
+    return (victim == requestor->mysql_thd ? requestor : holder);
+  }
+  return (nullptr);   // ★★ null = "don't care" → 回退到 trx_weight_ge
+}
+```
+
+```cpp
+bool trx_weight_ge(const trx_t *a, const trx_t *b) {
+  auto a_notrans_edit = a->mysql_thd != nullptr && thd_has_edited_nontrans_tables(a->mysql_thd);
+  auto b_notrans_edit = b->mysql_thd != nullptr && thd_has_edited_nontrans_tables(b->mysql_thd);
+  if (a_notrans_edit != b_notrans_edit) {
+    return (a_notrans_edit);      // ★ 动过非事务表的"更重"，优先保住
+  }
+  return (TRX_WEIGHT(a) >= TRX_WEIGHT(b));   // ★ undo 记录数 + 持有锁数
+}
+```
+
+```cpp
+static inline bool trx_is_high_priority(const trx_t *trx) {
+  if (trx->mysql_thd == nullptr) return (false);   // ★ 后台事务（purge 等）一律非 HP
+  return (thd_trx_priority(trx->mysql_thd) > 0);   // ★ 读 server 层 THD 的优先级
+}
+```
+
+**⑥ 回滚 victim**（`:694`）——★ 只是"取消当前锁请求 + 唤醒"，不直接回滚：
+
+```cpp
+static void lock_wait_rollback_deadlock_victim(trx_t *chosen_victim) {
+  trx_mutex_enter(chosen_victim);
+  chosen_victim->lock.was_chosen_as_deadlock_victim = true;   // ★ 只打标记
+  ut_a(chosen_victim->lock.wait_lock != nullptr);
+  ut_a(chosen_victim->lock.que_state == TRX_QUE_LOCK_WAIT);
+  lock_cancel_waiting_and_release(chosen_victim);
+  trx_mutex_exit(chosen_victim);
+}
+```
+
+> ★ 标记转成 `DB_DEADLOCK` 的**两处**：①尚未睡眠——`lock_wait_suspend_thread()` 的 RUNNING 快路径；②已睡眠——`lock_wait_release_thread_if_suspended()`。
+> ★ **没有** `Deadlock_checker::rollback()`，也不调 `trx_rollback_to_savepoint`——整事务回滚由上层按 `DB_DEADLOCK` 决定。
+
+**⑦ 后台线程：1 秒轮询 + 事件唤醒（两者都有）**（`:1435`）：
+
+```cpp
+void lock_wait_timeout_thread() {
+  auto last_checked_for_timeouts_at = std::chrono::steady_clock::now();
+  do {
+    auto current_time = std::chrono::steady_clock::now(); /* Calling this more
+    often than once a second isn't needed, as lock timeouts are specified with
+    one second resolution, so probably nobody cares if we wake up after T or
+    T+0.99, when T itself can't be precise. */
+    if (std::chrono::seconds(1) <= current_time - last_checked_for_timeouts_at) {
+      last_checked_for_timeouts_at = current_time;
+      lock_wait_check_slots_for_timeouts();     // ①超时检查：严格 1 秒节流
+    }
+
+    lock_wait_update_schedule_and_check_for_deadlocks();  // ②死锁检测：每轮都做，不节流
+
+    os_event_wait_time_low(event, std::chrono::seconds{1}, sig_count);
+    //                          ★ 最多睡 1 秒，但可被 os_event_set 提前唤醒
+    sig_count = os_event_reset(event);
+  } while (srv_shutdown_state.load() < SRV_SHUTDOWN_CLEANUP);
+}
+```
+
+> ★★ **纠正一个流传说法**：不是"精确闹钟"，也不是"纯 1 秒轮询"——**超时判定**才被 1 秒节流（精度 ≈ 1s）；**死锁检测每轮都跑**，且任何新 wait-for 边都会 `lock_wait_request_check_for_cycles()` → `os_event_set(lock_sys->timeout_event)` 立刻踢醒线程。
+> ★ `innodb_deadlock_detect=OFF` 只跳过**找环**，**权重计算仍然每轮都做**。且从 OFF 改回 ON 时必须踢一脚（`innobase_deadlock_detect_update()`）——否则可能永远不检测。
+
+**⑧ 输出**（`lock0lock.cc:6435`）：
+
+```cpp
+void Deadlock_notifier::notify(const ut::vector<const trx_t *> &trxs_on_cycle,
+                               const trx_t *victim_trx) {
+  start_print();
+  const auto n = trxs_on_cycle.size();
+  for (size_t i = 0; i < n; ++i) {
+    const trx_t *trx = trxs_on_cycle[i];
+    const trx_t *blocked_trx = trxs_on_cycle[0 < i ? i - 1 : n - 1];  // ★ 环上"前一个"
+    const lock_t *blocking_lock =
+        lock_has_to_wait_in_queue(blocked_trx->lock.wait_lock, trx);
+    ut_a(blocking_lock);
+
+    print_title(i, "TRANSACTION");
+    print(trx, 3000);                                   // ★ 最多打印 3000 字符 SQL
+    print_title(i, "HOLDS THE LOCK(S)");
+    print(blocking_lock);
+    print_title(i, "WAITING FOR THIS LOCK TO BE GRANTED");
+    print(trx->lock.wait_lock);
+  }
+  ...
+  buff << "*** WE ROLL BACK TRANSACTION (" << (victim_pos + 1) << ")\n";   // ★★ 日志里那行
+  print(buff.str().c_str());
+  lock_deadlock_found = true;   // ★ 置位，SHOW ENGINE INNODB STATUS 才显示
+}
+```
+
 `lock_wait_update_schedule_and_check_for_deadlocks` 每轮四步：
 
 ```cpp
@@ -1932,6 +3271,123 @@ semi-consistent read 的做法：rec 被锁加不了锁（要改得等），但 
 
 #### 半一致性读与 gap lock 的边界
 
+**启用条件的真身**（`include/trx0trx.h:1151`）——只有一行：
+
+```cpp
+  bool allow_semi_consistent() const { return (skip_gap_locks()); }
+```
+
+> ★★ **半一致性读只在 READ COMMITTED 下启用**——因为 RC 下本来就不加 gap lock，才敢"跳过被锁的行，回读其旧版本"。**这是它和 gap lock 的边界所在**：一旦涉及 gap lock（RR），就不能半一致。
+
+**四个判定条件**（`row0sel.cc:5266`）：
+
+```cpp
+    /* in case of semi-consistent read, we use SELECT_SKIP_LOCKED, so we don't
+    waste time on creating a WAITING lock, as we won't wait on it anyway */
+    const bool use_semi_consistent =
+        prebuilt->row_read_type == ROW_READ_TRY_SEMI_CONSISTENT &&
+        !unique_search &&          // ① 非唯一搜索（唯一搜索本来就至多一行）
+        index == clust_index &&    // ② 必须是聚簇索引
+        !trx_is_high_priority(trx);
+                                   // ③ 高优先级事务不走（它不该被跳过）
+    err = sel_set_rec_lock(
+        pcur, rec, index, offsets,
+        use_semi_consistent ? SELECT_SKIP_LOCKED : prebuilt->select_mode,
+        //                    ★★ 关键：用 SKIP_LOCKED 代替 SELECT_ORDINARY
+        prebuilt->select_lock_type, lock_type, thr, &mtr);
+```
+
+> ★★ **核心机制**：半一致性读把加锁模式**临时改成 `SELECT_SKIP_LOCKED`**——这样遇到冲突时 `lock_rec_lock_slow()` 直接返回 `DB_SKIP_LOCKED`，**根本不入等待队列、不建 WAITING 锁**。上层拿到 `DB_SKIP_LOCKED` 后就回退到"读该行的前一个版本"。
+
+**gap 继承与 RC 的交互**（`lock0lock.cc:2559`）——★ 这条注释解释了 RC 为什么仍能保住约束检查：
+
+```cpp
+  /* If session is using READ COMMITTED or READ UNCOMMITTED isolation
+  level, we do not want locks set by an UPDATE or a DELETE to be
+  inherited as gap type locks.  But we DO want S-locks/X-locks(taken for
+  replace) set by a consistency constraint to be inherited also then. */
+
+  /* We also dont inherit these locks as gap type locks for DD tables
+  because the serialization is guaranteed by MDL on DD tables. */
+
+  /* Constraint checks place LOCK_S or (in case of INSERT ... ON DUPLICATE
+  UPDATE... or REPLACE INTO..) LOCK_X on records.
+  If such a record is delete-marked, it may then become purged, and
+  lock_rec_inheirt_to_gap will be called to decide the fate of each lock on it:
+  either it will be inherited as gap lock, or discarded.
+  In READ COMMITTED and less restricitve isolation levels we generally avoid gap
+  locks, but we make an exception for precisely this situation: we want to
+  inherit locks created for constraint checks.
+  ...
+  What we do, is we use a heuristic: whenever a trx requests a lock with
+  lock_duration_t::AT_LEAST_STATEMENT we set trx->lock.inherit_all, meaning that
+  locks of this trx need to be inherited.
+  And we clear trx->lock.inherit_all on statement end. */
+
+  for (lock = lock_rec_get_first(lock_sys->rec_hash, block, heap_no);
+       lock != nullptr; lock = lock_rec_get_next(heap_no, lock)) {
+    /* Skip inheriting lock if set */
+    if (lock->trx->skip_lock_inheritance) continue;
+
+    if (!lock_rec_get_insert_intention(lock) &&                    // ① II 锁不继承
+        !lock->index->table->skip_gap_locks() &&                    // ② 表级禁用 gap（DD 表）
+        (!lock->trx->skip_gap_locks() || lock->trx->lock.inherit_all.load())) {
+                                   //           ③ RC 下除非 inherit_all
+      lock_rec_add_to_queue(LOCK_REC | LOCK_GAP | lock_get_mode(lock),
+                            //              ★★ 继承后一律降级为 GAP 锁
+                            heir_block, heir_heap_no, lock->index, lock->trx);
+    }
+  }
+```
+
+**插入时只继承"确实是 gap 的"锁**（`:2623`）：
+
+```cpp
+    if (!lock_rec_get_insert_intention(lock) &&
+        (heap_no == PAGE_HEAP_NO_SUPREMUM || !lock_rec_get_rec_not_gap(lock))) {
+        //  ★ 只继承：supremum 上的锁（天然 gap）或 非 REC_NOT_GAP 的锁（next-key / gap）
+      lock_rec_add_to_queue(LOCK_REC | LOCK_GAP | lock_get_mode(lock), block,
+                            heir_heap_no, lock->index, lock->trx);
+    }
+```
+
+**删除时的两步**（`lock_update_delete()` `:3359`）：
+
+```cpp
+  /* Let the next record inherit the locks from rec, in gap mode */
+  lock_rec_inherit_to_gap(block, block, next_heap_no, heap_no);   // ①后继继承为 gap
+
+  /* Reset the lock bits on rec and release waiting transactions */
+  lock_rec_reset_and_release_wait(block, heap_no);                // ②清 bit + 取消等待者
+```
+
+```cpp
+static void lock_rec_reset_and_release_wait_low(hash_table_t *hash,
+                                                const buf_block_t *block,
+                                                ulint heap_no) {
+  for (lock = lock_rec_get_first(hash, block, heap_no); lock != nullptr;
+       lock = lock_rec_get_next(heap_no, lock)) {
+    if (lock_get_wait(lock)) {
+      lock_rec_cancel(lock);                 // ★ 等待中的请求 → 直接取消（记录没了，等也没意义）
+    } else {
+      lock_rec_reset_nth_bit(lock, heap_no); // ★ 已授予 → 只清这一位（锁对象保留）
+    }
+  }
+}
+```
+
+> ⚠️ **`lock_update_insert()` / `lock_update_delete()` 本身不做授予**（不调 `lock_rec_grant`）——它们是**锁的迁移（inherit）与位图重置**。真正"取消等待者"的是上面的 `lock_rec_cancel()`，它内部同样走 `lock_rec_dequeue_from_page()` → 授予传播。
+>
+> ★ **页重组时的临时搬运**：`lock_rec_store_on_page_infimum()` 把锁临时搬到 `PAGE_HEAP_NO_INFIMUM`（heap_no=0），等记录搬完再 `lock_rec_restore_from_page_infimum()` 搬回来。infimum 在这里当"哑载体"。
+
+**`skip_gap_locks()` 的三条来源**（汇总）：
+
+| 来源 | 场景 |
+|---|---|
+| `trx->skip_gap_locks()` | RC / RU 隔离级别 |
+| `table->skip_gap_locks()` | DD 表（`RecLock::create()` 里 `ut_ad(lock_rec_get_rec_not_gap(lock))` 断言 DD 表上不允许 GAP 锁） |
+| `lock->trx->skip_lock_inheritance` | 显式跳过继承 |
+
 `row_compare_row_to_range` 在加锁路径上判断"当前记录 vs 扫描范围"、决定加 `LOCK_ORDINARY`/`LOCK_REC_NOT_GAP`/`LOCK_GAP` 哪种锁。
 
 `row0sel.cc` 一处注释 + 断言（`ut_ad(!trx->skip_gap_locks())`、`ut_ad(row_read_type == ROW_READ_WITH_LOCKS)`）的含义：
@@ -2026,7 +3482,7 @@ MySQL 8.0 观测锁有**三套并存、互不隶属**的体系，混淆它们是
 
 ### InnoDB Monitor 输出（锁段怎么读）
 
-Monitor 是 **InnoDB 全局的可观测基础设施，不是锁专属**：三个 monitor 类后台线程、输出组织与临时文件中转机制、SHOW 的完整路径见 [`../../innodb/monitor.md`](../../../innodb/monitor.md)。这里只交代**与锁相关**的三点。
+Monitor 是 **InnoDB 全局的可观测基础设施，不是锁专属**：三个 monitor 类后台线程、输出组织与临时文件中转机制、SHOW 的完整路径见 [`../../innodb/monitor.md`](../../observability/innodb_monitor.md)。这里只交代**与锁相关**的三点。
 
 **① 锁段在输出里的位置**：`TRANSACTIONS` 段由 `srv_printf_locks_and_transactions` 单独抽出（因为它需要持 `lock_sys` 全局排他 latch），内部先嵌 `LATEST DETECTED DEADLOCK`（用 `ut_copy_file` 从 `lock_latest_err_file` 拷出），再是 `LIST OF TRANSACTIONS FOR EACH SESSION`。
 
@@ -2069,7 +3525,7 @@ Monitor 是 **InnoDB 全局的可观测基础设施，不是锁专属**：三个
 
 ### lock 子系统计数器（INNODB_METRICS）
 
-monitor counter 是 **InnoDB 全局的计数器体系**（位图开关、无锁累加、`MONITOR_EXISTING` 复用），完整机制见 [`../../innodb/monitor.md`](../../../innodb/monitor.md)。`lock` 子系统共 22 个计数器，**默认开 13 个**（含 5 个 EXISTING），与本文直接相关的：
+monitor counter 是 **InnoDB 全局的计数器体系**（位图开关、无锁累加、`MONITOR_EXISTING` 复用），完整机制见 [`../../innodb/monitor.md`](../../observability/innodb_monitor.md)。`lock` 子系统共 22 个计数器，**默认开 13 个**（含 5 个 EXISTING），与本文直接相关的：
 
 | NAME | 默认 | 说明 / 埋点位置 |
 |---|---|---|
@@ -2088,6 +3544,259 @@ monitor counter 是 **InnoDB 全局的计数器体系**（位图开关、无锁�
 两个易混的"等待次数"：`lock_rec_lock_waits` 是**入队次数**，而 `Innodb_row_lock_waits` 是**实际挂起次数**（`lock0wait.cc` 真正睡下去才计，且只计行锁）——超时场景两者明显不一致。9 个默认关闭项需 `SET GLOBAL innodb_monitor_enable='module_lock'` 才会计数，查到 0 是"没开"不是"没发生"。
 
 ### 系统变量与状态变量
+
+⚠️ **勘误**：**`innodb_lock_wait_timeout` 与 `innodb_table_locks` 都是 `MYSQL_THDVAR_`（SESSION 级），不是 `MYSQL_SYSVAR_`/全局**。
+
+```cpp
+// storage/innobase/handler/ha_innodb.cc:1092
+static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
+                          "Timeout in seconds an InnoDB transaction may wait "
+                          "for a lock before being rolled back. Values above "
+                          "100000000 disable the timeout.",
+                          nullptr, nullptr, 50, 1, 1024 * 1024 * 1024, 0);
+//                                          ★  默认50s 最小1 最大1073741824 block_size=0
+
+// storage/innobase/handler/ha_innodb.cc:1079
+static MYSQL_THDVAR_BOOL(table_locks, PLUGIN_VAR_OPCMDARG,
+                         "Enable InnoDB locking in LOCK TABLES",
+                         nullptr, nullptr, true);   // ★ session 级！
+
+// storage/innobase/handler/ha_innodb.cc:22470
+static MYSQL_SYSVAR_BOOL(
+    deadlock_detect, innobase_deadlock_detect, PLUGIN_VAR_NOCMDARG,
+    "Enable/disable InnoDB deadlock detector (default ON)."
+    " if set to OFF, deadlock detection is skipped,"
+    " and we rely on innodb_lock_wait_timeout in case of deadlock.",
+    nullptr, innobase_deadlock_detect_update, true);
+
+// storage/innobase/handler/ha_innodb.cc:23044
+static MYSQL_SYSVAR_BOOL(
+    print_all_deadlocks, srv_print_all_deadlocks, PLUGIN_VAR_OPCMDARG,
+    "Print all deadlocks to MySQL error log (off by default)", nullptr, nullptr,
+    false);
+
+// storage/innobase/handler/ha_innodb.cc:23033
+static MYSQL_SYSVAR_BOOL(status_output, srv_print_innodb_monitor,
+                         PLUGIN_VAR_OPCMDARG,
+                         "Enable InnoDB monitor output to the error log.",
+                         nullptr, nullptr, false);
+static MYSQL_SYSVAR_BOOL(status_output_locks, srv_print_innodb_lock_monitor,
+                         PLUGIN_VAR_OPCMDARG,
+                         "Enable InnoDB lock monitor output to the error log."
+                         " Requires innodb_status_output=ON.",
+                         nullptr, nullptr, false);
+
+// storage/innobase/handler/ha_innodb.cc:22184
+static MYSQL_SYSVAR_BOOL(rollback_on_timeout, innobase_rollback_on_timeout,
+                         PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,
+                         "Roll back the complete transaction on lock wait "
+                         "timeout, for 4.x compatibility (disabled by default)",
+                         nullptr, nullptr, false);
+```
+
+**★ `innodb_deadlock_detect` 的 update 回调必须"踢一脚"**（`ha_innodb.cc:20606`）：
+
+```cpp
+static void innobase_deadlock_detect_update(THD *, SYS_VAR *, void *,
+                                            const void *save) {
+  innobase_deadlock_detect = *(bool *)save;
+  /* In case deadlock detection was disabled for a long time it could happen
+  that all clients have deadlocked with each other and thus they stopped
+  changing the wait-for graph, which in turn causes deadlock detection to not
+  observe any action and thus it will not search for deadlocks. So if we now
+  change from OFF to ON we need to "kick-start" the process. It never hurts to
+  do so, so we do it even if we check from ON to OFF */
+  lock_wait_request_check_for_cycles();
+}
+```
+
+**★ 超时后回滚"语句"还是"事务"** —— 默认**只回滚语句**（`row0mysql.cc:695`）：
+
+```cpp
+    case DB_LOCK_WAIT_TIMEOUT:
+      if (row_rollback_on_timeout) {                  // ★ innodb_rollback_on_timeout=ON
+        trx_rollback_to_savepoint(trx, nullptr);      // nullptr = 回滚到事务起点 = 整事务
+        break;
+      }
+      [[fallthrough]];                                // ★★ 默认直接 fallthrough
+    case DB_DUPLICATE_KEY:
+    case DB_FOREIGN_DUPLICATE_KEY:
+    ...
+      if (savept) {
+        /* Roll back the latest, possibly incomplete insertion or update */
+        trx_rollback_to_savepoint(trx, savept);
+      }
+      /* MySQL will roll back the latest SQL statement */
+      break;
+
+    case DB_DEADLOCK:
+    case DB_LOCK_TABLE_FULL:
+      /* Roll back the whole transaction; this resolution was added
+      to version 3.23.43 */
+      trx_rollback_to_savepoint(trx, nullptr);        // ★★ 死锁 = 整事务回滚
+      break;
+```
+
+```cpp
+// ha_innodb.cc:2163 —— server 层落地
+    case DB_DEADLOCK:
+      /* Since we rolled back the whole transaction, we must tell it also to
+      MySQL so that MySQL knows to empty the cached binlog for this transaction */
+      if (thd != nullptr) thd_mark_transaction_to_rollback(thd, 1);   // 1 = 整事务
+      return (HA_ERR_LOCK_DEADLOCK);
+
+    case DB_LOCK_WAIT_TIMEOUT:
+      /* Starting from 5.0.13, we let MySQL just roll back the latest SQL
+      statement in a lock wait timeout. Previously, we rolled back the whole
+      transaction. */
+      if (thd) thd_mark_transaction_to_rollback(thd, (int)row_rollback_on_timeout);
+      //                                              ★ 默认 0 = 只回滚语句
+      return (HA_ERR_LOCK_WAIT_TIMEOUT);
+```
+
+> ⚠️ **不存在 `LOCK_WAIT_TIMEOUT` 错误码**（那是 server 层的 `ER_LOCK_WAIT_TIMEOUT`）。InnoDB 侧是 `DB_LOCK_WAIT`（需睡等）/ `DB_LOCK_WAIT_TIMEOUT`（超时）/ `DB_DEADLOCK`（死锁）。
+
+**状态变量：只有 5 个 `Innodb_row_lock_*`**（`ha_innodb.cc:1257`）——⚠️ **没有 `Innodb_lock_*` 前缀项**：
+
+```cpp
+    {"row_lock_current_waits",
+     (char *)&export_vars.innodb_row_lock_current_waits, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+    {"row_lock_time", (char *)&export_vars.innodb_row_lock_time, SHOW_LONGLONG,
+     SHOW_SCOPE_GLOBAL},
+    {"row_lock_time_avg", (char *)&export_vars.innodb_row_lock_time_avg,
+     SHOW_LONG, SHOW_SCOPE_GLOBAL},
+    {"row_lock_time_max", (char *)&export_vars.innodb_row_lock_time_max,
+     SHOW_LONG, SHOW_SCOPE_GLOBAL},
+    {"row_lock_waits", (char *)&export_vars.innodb_row_lock_waits, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+```
+
+```cpp
+// include/srv0srv.h:1188 —— 字段定义
+  ulint innodb_row_lock_waits;          /*!< srv_stats.n_lock_wait_count */
+  ulint innodb_row_lock_current_waits;  /*!< srv_stats.n_lock_wait_current_count */
+  int64_t innodb_row_lock_time;         /*!< srv_stats.n_lock_wait_time / 1000 */
+  ulint innodb_row_lock_time_avg;       /*!< / srv_stats.n_lock_wait_count */
+  ulint innodb_row_lock_time_max;       /*!< lock_sys->n_lock_max_wait_time / 1000 */
+```
+
+```cpp
+// srv/srv0srv.cc:1682 —— 赋值点（srv_export_innodb_status）
+  export_vars.innodb_row_lock_waits = srv_stats.n_lock_wait_count;
+  export_vars.innodb_row_lock_current_waits = srv_stats.n_lock_wait_current_count;
+  export_vars.innodb_row_lock_time = srv_stats.n_lock_wait_time / 1000;
+  if (srv_stats.n_lock_wait_count > 0) {
+    export_vars.innodb_row_lock_time_avg =
+        (ulint)(srv_stats.n_lock_wait_time / 1000 / srv_stats.n_lock_wait_count);
+  } else {
+    export_vars.innodb_row_lock_time_avg = 0;
+  }
+  export_vars.innodb_row_lock_time_max =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          lock_sys->n_lock_max_wait_time).count();
+```
+
+> ★★ **只有行锁统计**（`thr->lock_state == QUE_THR_LOCK_ROW` 才计数）——**表锁等待完全不计入 `Innodb_row_lock_*`**。这是排查"锁等待很多但 row_lock_waits 不涨"的根因。
+> ★ `n_lock_max_wait_time` 类型是 `std::chrono::steady_clock::duration`，**不是 ulint**。
+> ⚠️ **不存在 `lock_timeout_cnt`**——超时计数走 `MONITOR_TIMEOUT`。
+> ⚠️ **自增点不在 `lock_rec_lock()`**——在 `lock_wait_suspend_thread()`（`lock0wait.cc:245`）。
+
+**★ `data_locks` / `data_lock_waits` 的行从哪来**（⚠️ **不在 `i_s.cc`**）：
+
+```
+performance_schema.data_locks
+  → storage/perfschema/table_data_locks.cc  rnd_next()
+  → g_data_lock_inspector[index]->create_data_lock_iterator()
+  → storage/innobase/handler/p_s.cc  Innodb_data_lock_iterator::scan()
+  → ★ locksys::Global_exclusive_latch_guard   ← 全局排他 latch！
+  → 遍历 trx_sys->rw_trx_list + mysql_trx_list，每把 lock_t 生成一行
+```
+
+```cpp
+bool Innodb_data_lock_iterator::scan(PSI_server_data_lock_container *container,
+                                     bool with_lock_data) {
+  ...
+  /* We want locks reported in a single scan to be a consistent snapshot. */
+  locksys::Global_exclusive_latch_guard guard{UT_LOCATION_HERE};   // ★★ 代价高昂
+  IB_mutex_guard trx_sys_mutex_guard{&trx_sys->mutex, UT_LOCATION_HERE};
+  size_t found = 0;
+  while (found == 0) {
+    m_scan_state.prepare_scan();
+    switch (m_scan_state.get_pass()) {
+      case SCANNING_RW_TRX_LIST:
+        found = scan_trx_list(container, with_lock_data, &trx_sys->rw_trx_list);
+        break;
+      case SCANNING_MYSQL_TRX_LIST:
+        found = scan_trx_list(container, with_lock_data, &trx_sys->mysql_trx_list);
+        break;
+      ...
+```
+
+> ⚠️ **不存在 `i_s_innodb_data_locks_fill()`**。`i_s.cc` 里与 data_locks 相关的**只有一句过期注释**（`i_s.cc:801`，指向已被删除的 `innodb_locks` / `innodb_lock_waits`）。
+> ★★ **实战警告**：`SELECT * FROM performance_schema.data_locks` **会拿全局排他 lock_sys latch**——在锁争用严重的实例上查这张表本身就会加剧阻塞。
+
+**PFS 埋点的真身**（⚠️ **不存在 `pfs_lock_begin()`**）：
+
+```cpp
+  PSI_THREAD_CALL(get_current_thread_event_id)
+  (&lock->m_psi_internal_thread_id, &lock->m_psi_event_id);
+```
+> 两处：`lock0lock.cc:1331`（行锁，`RecLock::lock_add()` 内）与 `:3481`（表锁）。
+
+**`lock_sys_t` 完整定义**（`include/lock0lock.h:1024`）：
+
+```cpp
+struct lock_sys_t {
+  /** The latches protecting queues of record and table locks */
+  locksys::Latches latches;      // ★★ 8.0 的分片 latch，取代 5.7 的 lock_sys->mutex
+
+  /** The hash table of the record (LOCK_REC) locks, except for predicate
+  (LOCK_PREDICATE) and predicate page (LOCK_PRDT_PAGE) locks */
+  hash_table_t *rec_hash;        // ★ 行锁：key = page_id
+
+  /** The hash table of predicate (LOCK_PREDICATE) locks */
+  hash_table_t *prdt_hash;       // ★ R-tree 谓词锁
+  /** The hash table of the predicate page (LOCK_PRD_PAGE) locks */
+  hash_table_t *prdt_page_hash;  // ★ R-tree 页面锁
+
+  /** Padding to avoid false sharing of wait_mutex field */
+  char pad2[ut::INNODB_CACHE_LINE_SIZE];   // ★ cache line padding，防伪共享
+
+  /** The mutex protecting the next two fields */
+  Lock_mutex wait_mutex;         // ★ 保护 waiting_threads / last_slot
+
+  /** Array of user threads suspended while waiting for locks within InnoDB. */
+  srv_slot_t *waiting_threads;
+  /** The highest slot ever used in the waiting_threads array. */
+  srv_slot_t *last_slot;         // ★ 扫描上界，避免全表遍历
+
+  bool rollback_complete;
+  /** Max lock wait time observed, for innodb_row_lock_time_max reporting. */
+  std::chrono::steady_clock::duration n_lock_max_wait_time;
+  /** Set to the event that is created in the lock wait monitor thread. */
+  os_event_t timeout_event;
+};
+```
+
+> ⚠️ **不存在 `lock_sys->mutex` / `lock_sys->table_mutex` / `dict_operation_lock`（在 lock_sys_t 内）**——8.0 已改为 `locksys::Latches latches` 分片。
+> ⚠️ `lock_sys_t` 定义在 **`include/lock0lock.h:1024`**，**不在 `lock0priv.h`**。
+
+**monitor 线程是 15 秒一轮**（不是 1 秒，`srv0srv.cc:1781`）：
+
+```cpp
+void srv_monitor_thread() {
+  const auto sleep_interval = std::chrono::seconds{15};
+  while (0 != os_event_wait_time(srv_monitor_event, sleep_interval)) {
+    if (srv_print_innodb_monitor || 0 < srv_innodb_needs_monitoring.load()) {
+      ...
+      if (!srv_printf_innodb_monitor(stderr, MUTEX_NOWAIT(mutex_skipped),
+                                     nullptr, nullptr)) {
+        mutex_skipped++;      // ★ 拿不到 latch 就跳过，不阻塞
+      }
+```
+
+> ★ `innodb_status_output_locks` 的**唯一真正读点**是 `lock0lock.cc:5014` 的 `bool monitor = srv_print_innodb_lock_monitor;`。代码里**并没有**强制检查 `innodb_status_output=ON`——但 `srv_monitor_thread` 只在 `srv_print_innodb_monitor || srv_innodb_needs_monitoring` 时才调 `srv_printf_innodb_monitor()`，所以实际效果依赖它。
 
 | 变量名 | 默认值 | 作用域 | 说明 |
 |--------|--------|--------|------|

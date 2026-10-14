@@ -35,6 +35,117 @@ MySQL 对子查询的判定不是"语法形态"单维度，而是**（形态 × 
 
 ### 相关 vs 不相关：为什么是关键分野
 
+**"相关"在代码里就是一个位**（`UNCACHEABLE_DEPENDENT`）。真正的判定者是左表达式注入后的 `Item_ref`：
+
+```cpp
+// sql/item.h:5826
+  table_map used_tables() const override {
+    if (depended_from != nullptr) return OUTER_REF_TABLE_BIT;   // ★ 相关子查询的标志位
+    const table_map map = ref_item()->used_tables();
+    if (map != 0) return map;
+    // rollup constant: ensure it is non-constant by returning RAND_TABLE_BIT
+    if (has_rollup_expr()) return RAND_TABLE_BIT;
+    return 0;
+  }
+```
+
+```cpp
+// sql/item_subselect.cc:376 —— 什么情况下左列必须被标成"外引用"
+bool Item_in_subselect::mark_as_outer(Item *left_row, size_t col) {
+  const Item *left_col = left_row->element_index(col);
+  return !left_col->const_item() ||
+         (!abort_on_null && left_col->is_nullable()) ||
+         (left_row->type() == SUBSELECT_ITEM && !left_col->basic_const_item());
+}
+```
+
+> ★ 注意第二条：**即使左列是常量，只要可能为 NULL 且我们要区分 NULL/FALSE，也必须标成 outer**——否则优化器会把 `trig_cond` 常量折叠掉。
+
+**IN2EXISTS 会"制造"相关性，物化时要能区分**（`item_subselect.cc:1848`）：
+
+```cpp
+    assert(in2exists_info == nullptr);
+    in2exists_info = new (thd->mem_root) In2exists_info;
+    in2exists_info->dependent_before =
+        unit->uncacheable & UNCACHEABLE_DEPENDENT;      // ★ 改写【前】是否相关
+    if (!left_expr->const_item()) unit->uncacheable |= UNCACHEABLE_DEPENDENT;
+    in2exists_info->dependent_after =
+        unit->uncacheable & UNCACHEABLE_DEPENDENT;      // ★ 改写【后】是否相关
+```
+
+```cpp
+  /// Is reliable only if IN->EXISTS has been done.
+  bool dependent_before_in2exists() const {
+    return in2exists_info->dependent_before;
+  }
+```
+
+> ★★ 这就是物化可行性判定"⑦ correlated" 用的 `dependent_before_in2exists()`——**IN2EXISTS 自己造成的相关不算数**，因为选物化时会把注入条件摘掉。
+>
+> ★ 物化路线的"去相关"（`finalize_materialization_transform`）：
+> ```cpp
+>   join->query_block->uncacheable &= ~UNCACHEABLE_DEPENDENT;
+>   unit->uncacheable &= ~UNCACHEABLE_DEPENDENT;
+>   //  ★ 子查询重新变成非相关，才能一次性物化
+> ```
+
+**非确定性是另一条独立判据**（`UNCACHEABLE_RAND`）——它在代价比较里被单独降级：
+
+```cpp
+// sql_optimizer.cc:11132
+  if (allowed_strategies == Subquery_strategy::CANDIDATE_FOR_IN2EXISTS_OR_MAT &&
+      (query_expression()->uncacheable & UNCACHEABLE_RAND))
+    allowed_strategies = Subquery_strategy::SUBQ_EXISTS;   // ★ 非确定性 → 强制 EXISTS
+```
+
+**最终决策由优化期的 `JOIN::decide_subquery_strategy()` 拍板**（`sql/sql_optimizer.cc:11061`）：
+
+```cpp
+bool JOIN::decide_subquery_strategy() {
+  assert(query_expression()->item);
+
+  switch (query_expression()->item->substype()) {
+    case Item_subselect::IN_SUBS:
+    case Item_subselect::ALL_SUBS:
+    case Item_subselect::ANY_SUBS:
+      // All of those are children of Item_in_subselect and may use EXISTS
+      break;
+    default:
+      return false;
+  }
+
+  Item_in_subselect *const in_pred =
+      static_cast<Item_in_subselect *>(query_expression()->item);
+
+  Subquery_strategy chosen_method = in_pred->strategy;
+  // Materialization does not allow UNION so this can't happen:
+  assert(chosen_method != Subquery_strategy::SUBQ_MATERIALIZATION);
+
+  if ((chosen_method == Subquery_strategy::CANDIDATE_FOR_IN2EXISTS_OR_MAT) &&
+      compare_costs_of_subquery_strategies(&chosen_method))
+    return true;
+
+  switch (chosen_method) {
+    case Subquery_strategy::SUBQ_EXISTS:
+      if (query_block->m_windows.elements > 0)  // grep for WL#10431
+      {
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "the combination of this ALL/ANY/SOME/IN subquery with this"
+                 " comparison operator and with contained window functions");
+        return true;
+      }
+      return in_pred->finalize_exists_transform(thd, query_block);
+    case Subquery_strategy::SUBQ_MATERIALIZATION:
+      return in_pred->finalize_materialization_transform(thd, this);
+    default:
+      assert(false);
+      return true;
+  }
+}
+```
+
+> ★★ **物化不在 resolver 里选**。resolver 阶段（`select_in_like_transformer`）**无条件先把 IN→EXISTS 做掉**，只置"候选"状态 `CANDIDATE_FOR_IN2EXISTS_OR_MAT`；真正的 EXISTS / 物化二选一在**优化期**这里，选中物化后再用 `remove_in2exists_conds()` **反悔撤销**。
+
 **"相关性"在 MySQL 里不是一个标记，而是一个参与所有 `used_tables()` 位运算的伪表位。**
 
 `table_map` 是 64 位位图，其中 3 位被"子查询属性"占用：
@@ -262,6 +373,109 @@ bool Item_subselect::exec(THD *thd) {
 
 ### 2.1 半连接 16 条件（:1527-1567）
 
+⚠️ **勘误**：`resolve_subquery` 定义在 **`sql/sql_resolver.cc:1368`**（含 `:1348-1366` 的 doxygen）；`:1527` 只是函数体内 `SecondaryEngineFlags engine_flags = 0;` 那一行。三段的行号应为：**① 1532–1567 ② 1605–1627 ③ 1629–1632**。
+
+**条件清单的真实源码**（注释编号 0–16，其中 3x 并入 3，代码里恰为 **16 个 `&&` 合取项**）：
+
+```cpp
+  /*
+    Check if we're in subquery that is a candidate for flattening into a
+    semi-join (which is done in flatten_subqueries()). The requirements are:
+      0. Semi-join is enabled (cf. hints)
+      1. Subquery predicate is an IN/=ANY or EXISTS predicate
+      2. Subquery is a simple query block (not a set operation or a
+         parenthesized query expression).
+      3. Subquery is not grouped (explicitly or implicitly)
+         3x: outer aggregated expression are not accepted
+      4. Subquery does not use HAVING
+      5. Subquery does not use windowing functions
+      6. Subquery predicate is (a) in an ON/WHERE clause,
+         and (b) at the AND-top-level of that clause. Note for 6a:
+         Semijoin transformations of subqueries in ON cause the
+         join nests to no longer be acceptable as a join tree, which
+         disturbs the hypergraph optimizer, so we disable them
+         for that case (6x). ...
+      7. Parent query block accepts semijoins (i.e we are not in a subquery of
+      a single table UPDATE/DELETE ...)
+      8. We're not in a confluent table-less subquery, like "SELECT 1".
+      9. No execution method was already chosen (by a prepared statement)
+      10. Parent query block is not a confluent table-less query block.
+      11. Neither parent nor child query block has straight join.
+      12. Parent query block does not prohibit semi-join.
+      13. LHS of IN predicate is deterministic
+      14. The surrounding truth test, and the nullability of expressions,
+      are compatible with the conversion.
+      15. Antijoins are supported, or it's not an antijoin (it's a semijoin).
+      16. OFFSET starts from the first row and LIMIT is not 0.
+  */
+  SecondaryEngineFlags engine_flags = 0;
+  if (const handlerton *secondary_engine = SecondaryEngineHandlerton(thd);
+      secondary_engine != nullptr) {
+    engine_flags = secondary_engine->secondary_engine_flags;
+  }
+  if (semijoin_enabled(thd) &&                                     // 0
+      predicate != nullptr &&                                      // 1
+      is_simple_query_block() &&                                   // 2
+      no_aggregates &&                                             // 3,3x,4,5
+      (outer->resolve_place == Query_block::RESOLVE_CONDITION ||   // 6a
+       (outer->resolve_place == Query_block::RESOLVE_JOIN_NEST &&  // 6a
+        (!thd->lex->using_hypergraph_optimizer() ||
+         (thd->secondary_engine_optimization() ==
+              Secondary_engine_optimization::SECONDARY &&
+          !Overlaps(engine_flags,
+              MakeSecondaryEngineFlags(
+                  SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN)))))) &&  // 6x
+      outer->condition_context == enum_condition_context::ANDS &&          // 6b
+      outer->sj_candidates &&                                              // 7
+      leaf_table_count > 0 &&                                              // 8
+      predicate->strategy == Subquery_strategy::UNSPECIFIED &&             // 9
+      outer->leaf_table_count > 0 &&                                       // 10
+      !((active_options() | outer->active_options()) &
+        SELECT_STRAIGHT_JOIN) &&                                           // 11
+      !(outer->active_options() & SELECT_NO_SEMI_JOIN) &&                  // 12
+      deterministic &&                                                     // 13
+      predicate->choose_semijoin_or_antijoin() &&                          // 14
+      (!cannot_do_antijoin || !predicate->can_do_aj) &&                    // 15
+      is_row_count_valid_for_semi_join()) {                                // 16
+    DBUG_PRINT("info", ("Subquery is semi-join conversion candidate"));
+
+    /* Notify in the subquery predicate where it belongs in the query graph */
+    predicate->embedding_join_nest = outer->resolve_nest;
+
+    /* Register the subquery for further processing in flatten_subqueries() */
+    predicate->strategy = Subquery_strategy::CANDIDATE_FOR_SEMIJOIN;
+    outer->sj_candidates->push_back(predicate);
+    choice_made = true;
+  }
+```
+
+> ★ 命中后**只是登记候选**（`CANDIDATE_FOR_SEMIJOIN` + push 进 `outer->sj_candidates`），真正的展平在 `flatten_subqueries()` → `convert_subquery_to_semijoin()`（`sql_resolver.cc:2992`）。
+
+**条件 16 的委托函数**（`sql_resolver.cc:1327`）：
+
+```cpp
+bool Query_block::is_row_count_valid_for_semi_join() {
+  if (offset_limit != nullptr &&
+      (!offset_limit->const_item() || offset_limit->val_int() != 0))
+    return false;
+  if (select_limit != nullptr &&
+      (!select_limit->const_item() || select_limit->val_int() == 0))
+    return false;
+  return true;
+}
+```
+
+**条件 0 的委托函数**（`sql_lex.cc:4551`）：
+
+```cpp
+bool Query_block::semijoin_enabled(const THD *thd) const {
+  return opt_hints_qb ? opt_hints_qb->semijoin_enabled(thd)
+                      : thd->optimizer_switch_flag(OPTIMIZER_SWITCH_SEMIJOIN);
+}
+```
+
+> ⚠️ **不存在**独立的 `Item_subselect::is_convertible_to_semijoin()`——候选判定就是上面这一个内联的 16 项 `&&` 表达式。
+
 ```cpp
 if (semijoin_enabled(thd) &&                                     // 0
     predicate != nullptr &&                                      // 1
@@ -308,6 +522,79 @@ if (semijoin_enabled(thd) &&                                     // 0
 | 16 | LIMIT/OFFSET 合法 |
 
 ### 2.2 derived-table 候选（:1605-1627）
+
+```cpp
+  /*
+    If semijoin failed, try a transformation to a derived table:
+    FROM ot WHERE ot.x IN (SELECT y FROM it1, it2)
+    =>
+    FROM ot LEFT JOIN (SELECT DISTINCT y FROM it1, it2) AS derived
+            ON ot.x=derived.y
+    WHERE derived.y IS NOT NULL.
+
+    Applicability constraints have numbers which are the same as in the list of
+    the previous block. Reasons may be different though.
+      1. Subquery predicate is an IN/=ANY or EXISTS predicate
+      2. Subquery is a simple query block ...
+      3. If this is [NOT] EXISTS, there is no aggregation
+      6. Subquery predicate is
+        6a. in WHERE clause (we have not implemented the transformation for the
+        ON clause)
+        6b. linked to the root of that clause with ANDs or ORs.
+      7. Parent query block accepts semijoins ...
+      9. No execution method was already chosen (by a prepared statement)
+      10. Parent select has tables, as we'll link to them with LEFT JOIN
+      12. Parent query block does not prohibit semi-join.
+      13. LHS of IN predicate is deterministic
+      14. The surrounding truth test, and the nullability of expressions,
+      are compatible with the conversion.
+      16. The left argument isn't a row (multi-column) subquery; it would lead
+      to creating conditions like WHERE (outer_subq) =
+      ROW(derived.col1,derived.col2), which would complicate code.
+      17. Certain other subquery transformations, incompatible with this one,
+      have not been done.
+  */
+
+  if (!choice_made && try_convert_to_derived && predicate != nullptr &&  // 1
+      is_simple_query_block() &&                                         // 2
+      (in_predicate != nullptr || no_aggregates) &&                      // 3
+      outer->resolve_place == Query_block::RESOLVE_CONDITION &&          // 6a
+      outer->condition_context != enum_condition_context::NEITHER &&     // 6b
+      outer->sj_candidates &&                                            // 7
+      predicate->strategy == Subquery_strategy::UNSPECIFIED &&           // 9
+      outer->leaf_table_count &&                                         // 10
+      !(outer->active_options() & SELECT_NO_SEMI_JOIN) &&                // 12
+      deterministic &&                                                   // 13
+      predicate->choose_semijoin_or_antijoin() &&                        // 14
+      !(in_predicate != nullptr &&                                       // 16
+        in_predicate->left_expr->type() == Item::SUBSELECT_ITEM &&
+        in_predicate->left_expr->cols() > 1) &&
+      !thd->lex->m_subquery_to_derived_is_impossible) {                  // 17
+    assert(outer->resolve_nest == nullptr);
+    /* Register the subquery for further processing in flatten_subqueries() */
+    outer->sj_candidates->push_back(predicate);
+    predicate->strategy = Subquery_strategy::CANDIDATE_FOR_DERIVED_TABLE;
+    predicate->outer_condition_context = outer->condition_context;
+    choice_made = true;
+  }
+```
+
+> ★ 条件 17 `m_subquery_to_derived_is_impossible` 是**互斥闸门**：`single_value_in_to_exists_transformer()` 与 MIN/MAX 改写末尾都会 `thd->lex->m_subquery_to_derived_is_impossible = true;`，表示"已经做了别的改写，不能再转 derived"。
+>
+> ★ 条件 6b 与半连接不同：这里是 `!= NEITHER`（**AND 或 OR 都行**），而半连接要求 `== ANDS`。
+
+**开关 `try_convert_to_derived`**：
+
+```cpp
+  const bool try_convert_to_derived =
+      (thd->optimizer_switch_flag(OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED) ||
+       // a certain secondary engine doesn't support subqueries
+       (thd->lex->m_sql_cmd != nullptr &&
+        thd->secondary_engine_optimization() ==
+            Secondary_engine_optimization::SECONDARY));
+```
+
+> ⚠️ **`subquery_to_derived` 默认是 off**——它**不在** `OPTIMIZER_SWITCH_DEFAULT` 里（`sql/sys_vars.cc:197-211`）。
 
 不满足 semi-join 时，若 `subquery_to_derived` 开关允许（**默认 OFF**，见第九节），再试 derived 转换——把子查询变成 `LEFT JOIN derived ON ...`。**注意：derived 候选用的是同一套 `sj_candidates` 登记，但判定条件不同**（注释里编号与 semi-join 那 16 条对齐，缺的编号就是"不适用/未校验"的）：
 
@@ -356,6 +643,100 @@ if (!choice_made && try_convert_to_derived && predicate != nullptr &&  // 1  IN/
 **为什么 derived 条件"有的更严、有的更松"**：两者转换目标不同——semi-join 是"拍平成 nest 塞进 join tree"（需要 AND 顶层、无聚合，才能保证去重语义）；derived 是"物化成 derived 表 LEFT JOIN"（LEFT JOIN 天然能表达 OR、能带聚合，但 6a 只实现了 WHERE、16 多列会生成复杂条件）。所以 6b 更松（OR 也行）、3 更松（IN 可带聚合）、但 6a/16 更严（ON 没实现、多列不支持）。
 
 ### 2.3 兜底 select_transformer（:1629）
+
+```cpp
+  if (!choice_made) {
+    return subq_predicate->select_transformer(thd, this);
+  }
+  return false;
+}
+```
+
+**`select_transformer` 是纯虚函数**（`item_subselect.h:195`），四个子类的实分派表：
+
+| 类 | `substype()` | `select_transformer` | 位置 |
+|---|---|---|---|
+| `Item_subselect` | `UNKNOWN_SUBS` | **纯虚 `= 0`** | `item_subselect.h:191,195` |
+| `Item_singlerow_subselect` | `SINGLEROW_SUBS` | 标量子查询常量折叠 / 直接替换为 SELECT list 项 | `item_subselect.cc:1116` |
+| `Item_maxmin_subselect` | 继承 `SINGLEROW_SUBS` | **无覆盖**，继承上者 | `item_subselect.h:374` |
+| `Item_exists_subselect` | `EXISTS_SUBS` | **内联**，仅置 `strategy = SUBQ_EXISTS` | `item_subselect.h:461` |
+| `Item_in_subselect` | `IN_SUBS` | `select_in_like_transformer(…, &eq_creator)` | `item_subselect.cc:2384` |
+| `Item_allany_subselect` | `ALL_SUBS` / `ANY_SUBS` | `select_in_like_transformer(…, func)` | `item_subselect.cc:2723` |
+
+```cpp
+// item_subselect.h:461 —— EXISTS 的最简实现
+  bool select_transformer(THD *, Query_block *) override {
+    strategy = Subquery_strategy::SUBQ_EXISTS;
+    return false;
+  }
+
+// item_subselect.cc:2384
+bool Item_in_subselect::select_transformer(THD *thd, Query_block *select) {
+  return select_in_like_transformer(thd, select, &eq_creator);
+  //                                              ★ IN 语义即 =ANY
+}
+
+// item_subselect.cc:2723
+bool Item_allany_subselect::select_transformer(THD *thd, Query_block *select) {
+  if (upper_item) upper_item->show = true;
+  return select_in_like_transformer(thd, select, func);
+  //  ★ func = > < >= <= 对应的 Comp_creator*
+}
+```
+
+**`Subquery_strategy` 完整状态机**（`item_subselect.h:392`，9 个值）：
+
+```cpp
+enum class Subquery_strategy : int {
+  UNSPECIFIED,                        /// Nothing decided yet
+  CANDIDATE_FOR_IN2EXISTS_OR_MAT,     /// 待定：EXISTS 或物化
+  CANDIDATE_FOR_SEMIJOIN,             /// 半连接候选
+  CANDIDATE_FOR_DERIVED_TABLE,        /// derived 候选
+  SEMIJOIN,                           /// 已定型：半连接
+  DERIVED_TABLE,                      /// 已定型：derived
+  SUBQ_EXISTS,                        /// 已定型：EXISTS
+  SUBQ_MATERIALIZATION,               /// 已定型：物化（HASH_SJ_ENGINE）
+  DELETED,                            /// 子查询被删（恒假）
+};
+```
+
+```
+UNSPECIFIED
+  ├─(resolve_subquery 16 条件)→ CANDIDATE_FOR_SEMIJOIN →(flatten)→ SEMIJOIN →(convert_subquery_to_semijoin)
+  ├─(derived 段)→ CANDIDATE_FOR_DERIVED_TABLE → DERIVED_TABLE
+  └─(兜底 select_in_like_transformer:2445)→ CANDIDATE_FOR_IN2EXISTS_OR_MAT
+        └─(优化期 decide_subquery_strategy)→ SUBQ_EXISTS 或 SUBQ_MATERIALIZATION
+              └─(cleanup)→ 回到 CANDIDATE_FOR_IN2EXISTS_OR_MAT   ★ PS 二次执行可重选
+```
+
+```cpp
+// item_subselect.cc:480 —— PS 重执行能重选的秘密
+void Item_in_subselect::cleanup() {
+  ...
+  switch (strategy) {
+    case Subquery_strategy::SUBQ_MATERIALIZATION:
+      if (in2exists_info->dependent_after) {
+        unit->first_query_block()->uncacheable |= UNCACHEABLE_DEPENDENT;
+        unit->uncacheable |= UNCACHEABLE_DEPENDENT;
+      }
+      [[fallthrough]];
+    case Subquery_strategy::SUBQ_EXISTS:
+      /*
+        Back to EXISTS_OR_MAT, so that next execution of this statement can
+        choose between the two.
+      */
+      unit->global_parameters()->select_limit = nullptr;
+      strategy = Subquery_strategy::CANDIDATE_FOR_IN2EXISTS_OR_MAT;
+      break;
+    default: break;
+  }
+  Item_subselect::cleanup();
+}
+```
+
+> ⚠️ **`strategy` 不在 `Item_subselect`**，在 `Item_exists_subselect`（`item_subselect.h:432`）——所以 `Item_singlerow_subselect` 没有 `strategy`。
+>
+> ⚠️ **8.0.39 不存在 `exec_method` / `SubqueryExecMethod`**——只出现在 `resolve_subquery` 的一条 TODO 注释里（`sql_resolver.cc:1412`）。
 
 ```cpp
 if (!choice_made) {
@@ -458,6 +839,196 @@ if (!select->source_table_is_one_row() || select->where_cond() != nullptr) {
 
 ### 3.3 NULL/FALSE 区分（三值逻辑陷阱）
 
+⚠️ **勘误**：`Item_in_optimizer` **没有 `m_cond` 成员**，只有两个私有字段；`pushed_cond_guards` 也不在它那里，而在 `Item_in_subselect`（`item_subselect.h:611`）。
+
+```cpp
+// sql/item_cmpfunc.h:492
+class Item_in_optimizer final : public Item_bool_func {
+ private:
+  Item_cache *cache{nullptr};
+  /**
+    Stores the value of "NULL IN (SELECT ...)" for uncorrelated subqueries:
+      UNKNOWN - "NULL in (SELECT ...)" has not yet been evaluated
+      FALSE   - result is FALSE
+      TRUE    - result is NULL
+  */
+  int result_for_null_param{UNKNOWN};      // ★ 三值记忆化
+ public:
+  Item_in_optimizer(Item_in_subselect *item)
+      : Item_bool_func(pointer_cast<Item *>(item)) { set_subquery(); }
+  bool fix_left(THD *thd, Item **ref);
+  longlong val_int() override;
+  Item_cache **get_cache() { return &cache; }   // ★ 注入点拿的就是这个地址
+};
+```
+
+**`val_int()` 全文**（`item_cmpfunc.cc:2338`）——三值逻辑的落点：
+
+```cpp
+longlong Item_in_optimizer::val_int() {
+  assert(fixed);
+  Item_in_subselect *const subqpred = down_cast<Item_in_subselect *>(args[0]);
+
+  cache->store(subqpred->left_expr);      // ★ 惰性：只登记要缓存的表达式
+  cache->cache_value();                   // ★ 真正求值一次，之后子查询里所有 Item_ref 读同一份快照
+
+  if (cache->null_value) {
+    /*
+      We're evaluating
+      "<outer_value_list> [NOT] IN (SELECT <inner_value_list>...)"
+      where one or more of the outer values is NULL.
+    */
+    if (subqpred->abort_on_null) {
+      /*
+        We're evaluating a top level item, e.g.
+        "<outer_value_list> IN (SELECT <inner_value_list>...)",
+        and in this case a NULL value in the outer_value_list means
+        that the result shall be NULL/FALSE (makes no difference for
+        top level items). ...
+      */
+      null_value = true;                  // ★ 顶层谓词：UNKNOWN 与 FALSE 等价 → 直接判 NULL
+    } else {
+      /*
+        We're evaluating an item where a NULL value in either the
+        outer or inner value list does not automatically mean that we
+        can return NULL/FALSE. An example of such a query is
+        "<outer_value_list> NOT IN (SELECT <inner_value_list>...)"
+        ... The result when there is at least one NULL value in
+        <outer_value_list> is: NULL if the SELECT evaluated over the
+        non-NULL values produces at least one row, FALSE otherwise
+      */
+      bool all_left_cols_null = true;
+      const uint ncols = cache->cols();
+
+      /*
+        Turn off the predicates that are based on column compares for
+        which the left part is currently NULL
+      */
+      for (uint i = 0; i < ncols; i++) {
+        if (cache->element_index(i)->null_value)
+          subqpred->set_cond_guard_var(i, false);   // ★★ 关掉对应列的 trig_cond
+        else
+          all_left_cols_null = false;
+      }
+
+      if (all_left_cols_null && result_for_null_param != UNKNOWN &&
+          !subqpred->dependent_before_in2exists()) {
+        /*
+           This subquery was originally not correlated. ... All values in the
+           left expression are NULL, and we have already evaluated the
+           subquery for all NULL values: return the same result we did last
+           time without evaluating the subquery.
+        */
+        null_value = result_for_null_param;         // ★ 三值记忆化生效
+      } else {
+        /* The subquery has to be evaluated */
+        (void)subqpred->val_bool_naked();
+        if (!subqpred->value)
+          null_value = subqpred->null_value;        // 没找到行
+        else
+          null_value = true;                        // ★ 找到行 + 左值有 NULL → 部分匹配 → UNKNOWN
+        if (all_left_cols_null) result_for_null_param = null_value;
+      }
+
+      /* Turn all predicates back on */
+      for (uint i = 0; i < ncols; i++) subqpred->set_cond_guard_var(i, true);
+    }
+    cache->store(subqpred->left_expr);
+    return subqpred->translate(null_value, false);
+  }
+  bool result = subqpred->val_bool_naked();         // ★ 左值无 NULL → 直接转发
+  null_value = subqpred->null_value;
+  cache->store(subqpred->left_expr);
+  return subqpred->translate(null_value, result);
+}
+```
+
+> ★★ **三层协同**：`set_cond_guard_var(i, false)` 关掉左值为 NULL 的那些列的 `Item_func_trig_cond` → 注入的 `ic_k = oc_k` 条件**整条消失** → 子查询退化成"只查剩下非 NULL 列的部分匹配"→ 若仍能产出一行，说明存在部分匹配 ⇒ UNKNOWN。
+
+**注入体为什么是 `Item_ref` 而不是直接 `Item_cache*`**：
+
+```cpp
+// item_subselect.cc:1834（single_value_transformer 内）
+    Item_ref *const left = new Item_ref(
+        &select->context, (Item **)optimizer->get_cache(), in_left_expr_name);
+    //                     ★★ 二级指针：指向 &Item_in_optimizer::cache
+    if (mark_as_outer(left_expr, 0))
+      left->depended_from = select->outer_query_block();
+    m_injected_left_expr = left;
+```
+
+> ★ 三个理由：① `Item_ref` 有 `depended_from`，能把 `used_tables()` 变成 `OUTER_REF_TABLE_BIT`，**让子查询正式变成相关**；② `Item_ref` 持有 `Item**`，子查询里多处引用同一个指针槽，`Item_in_optimizer` 换 `cache` 指向时自动同步；③ 行情形 `Item_cache_row::addr(i)` 给出每列独立槽位。
+>
+> ⚠️ **`Item_direct_ref` 在 8.0.39 已不存在**（全仓 0 命中）——常见说法过时。
+
+**`Item_cache` 由 `fix_left()` 按类型造**（`item_cmpfunc.cc:2156`）：
+
+```cpp
+bool Item_in_optimizer::fix_left(THD *thd, Item **) {
+  Item *left = down_cast<Item_in_subselect *>(args[0])->left_expr;
+  if (left->propagate_type(thd, MYSQL_TYPE_VARCHAR)) return true;
+  assert(cache == nullptr);
+  cache = Item_cache::get_cache(left);   // ★ 按 result_type 造 int/real/decimal/str/datetime/json/row
+  if (cache == nullptr) return true;
+  cache->setup(left);
+  used_tables_cache = left->used_tables();
+  ...
+  if (const_item()) cache->store(left);
+  return false;
+}
+```
+
+```cpp
+Item_cache *Item_cache::get_cache(const Item *item, const Item_result type) {
+  switch (type) {
+    case INT_RESULT:
+      if (item->data_type() == MYSQL_TYPE_BIT) return new Item_cache_bit(...);
+      return new Item_cache_int(item->data_type());
+    case REAL_RESULT:   return new Item_cache_real();
+    case DECIMAL_RESULT: return new Item_cache_decimal();
+    case STRING_RESULT:
+      if (item->is_temporal()) return new Item_cache_datetime(item->data_type());
+      if (item->data_type() == MYSQL_TYPE_JSON) return new Item_cache_json();
+      return new Item_cache_str(item);
+    case ROW_RESULT: return new Item_cache_row();   // ★ 行 IN
+    default: assert(0); return nullptr;
+  }
+}
+```
+
+**`translate()`：把裸 IN 的三值翻成 IS TRUE/FALSE/NOT 的二值**（`item_subselect.cc:1364`）：
+
+```cpp
+bool Item_exists_subselect::translate(bool &null_v, bool v) {
+  if (null_v) {                       // Naked IN returns UNKNOWN
+    assert(substype() != EXISTS_SUBS);
+    switch (value_transform) {
+      case BOOL_IDENTITY:
+      case BOOL_NEGATED:  return false;
+      case BOOL_IS_TRUE:
+      case BOOL_IS_FALSE: null_v = false; return false;
+      case BOOL_NOT_TRUE:
+      case BOOL_NOT_FALSE: null_v = false; return true;
+      default: assert(false); return false;
+    }
+  }
+  // Naked IN returns 'v'
+  switch (value_transform) {
+    case BOOL_IDENTITY: case BOOL_IS_TRUE: case BOOL_NOT_FALSE: ...
+  }
+}
+```
+
+> ⚠️ **`Item_in_subselect::val_bool()` 永远走不到**——函数体是 `assert(false); my_error(ER_INTERNAL_ERROR...)`。真正入口是 **`val_bool_naked()`**（`:1647`）：
+> ```cpp
+> bool Item_in_subselect::val_bool_naked() {
+>   if (exec(current_thd)) { reset(); return false; }
+>   if (was_null && !value) null_value = true;
+>   assert(optimizer);   // 取反 / IS TRUE 一律留给 Item_in_optimizer
+>   return value;
+> }
+> ```
+
 SQL 里 `oe IN (subq)` 有 UNKNOWN，`EXISTS` 只有 TRUE/FALSE。还原三值语义的两件武器：
 
 **`Item_func_trig_cond` 的三种触发类型（item_cmpfunc.h:814）**：
@@ -543,6 +1114,169 @@ subquery_executions *= parent_fanout;               // 逐层累乘
 
 ### 4.4 物化可行性（subquery_allows_materialization，sql_resolver.cc:984）
 
+⚠️ **勘误**：它**不检查 LIMIT**（LIMIT 已在 `select_in_like_transformer` 的 `#ifndef NDEBUG` 里被 assert 排除）。真实拒绝条件共 **10 条**，每条都带 `cause` 字符串（会写进 optimizer trace）：
+
+```cpp
+bool Item_in_subselect::subquery_allows_materialization(
+    THD *thd, Query_block *query_block, const Query_block *outer) {
+  const uint elements = unit->first_query_block()->num_visible_fields();
+  assert(elements >= 1);
+  assert(left_expr->cols() == elements);
+
+  OPT_TRACE_TRANSFORM(&thd->opt_trace, trace_wrapper, trace_mat,
+                      query_block->select_number, "IN (SELECT)",
+                      "materialization");
+
+  const char *cause = nullptr;
+  if (substype() != Item_subselect::IN_SUBS) {
+    // Subq-mat cannot handle 'outer_expr > {ANY|ALL}(subq)'...
+    cause = "not an IN predicate";                                     // ① 必须是 IN
+  } else if (m_subquery_used_tables & RAND_TABLE_BIT) {
+    // Subquery with a random function cannot be materalized.
+    // But random function in left expression is OK
+    cause = "non-deterministic";                                       // ② 非确定性
+  } else if (!query_block->is_simple_query_block()) {
+    cause = "in set operation or a parenthesized query expression";    // ③ UNION / 带括号
+  } else if (!query_block->master_query_expression()
+                  ->first_query_block()->leaf_tables) {
+    cause = "no inner tables";                                         // ④ 无内表
+  } else if (!outer->join) {
+    /*
+      Maybe this is a subquery of a single table UPDATE/DELETE (TODO:
+      handle this by switching to multi-table UPDATE/DELETE).
+    */
+    cause = "parent query has no JOIN";                                // ⑤ 父无 JOIN
+  } else if (!outer->leaf_tables) {
+    // The upper query is SELECT ... FROM DUAL. No gain in materializing.
+    cause = "no tables in outer query";                                // ⑥ 父无表
+  } else if (dependent_before_in2exists()) {
+    /*
+      Subquery should not be correlated; the correlation due to predicates
+      injected by IN->EXISTS does not count as we will remove them if we
+      choose materialization.
+      TODO: This is an overly restrictive condition. It can be extended to:
+         (Subquery is non-correlated ||
+          Subquery is correlated to any query outer to IN predicate ||
+          (Subquery is correlated to the immediate outer query &&
+           Subquery !contains {GROUP BY, ORDER BY [LIMIT],
+           aggregate functions}) && subquery predicate is not under "NOT IN"))
+    */
+    cause = "correlated";                                              // ⑦ 原生相关
+  } else {
+    /*
+      Check that involved expression types allow materialization.
+      This is a temporary fix for BUG#36752; ...
+    */
+    assert(left_expr->fixed);
+    bool has_nullables = left_expr->is_nullable();
+
+    uint i = 0;
+    for (Item *const inner_item : unit->first_query_block()->visible_fields()) {
+      Item *const outer_item = left_expr->element_index(i++);
+      if (!types_allow_materialization(outer_item, inner_item)) {
+        cause = "type mismatch";                                       // ⑧ 类型不允许
+        break;
+      }
+      if (inner_item->is_blob_field()) {
+        cause = "inner blob";                                          // ⑨ 内层 BLOB
+        break;
+      }
+      has_nullables |= inner_item->is_nullable();
+    }
+
+    if (!cause) {
+      trace_mat.add("has_nullable_expressions", has_nullables);
+      /*
+        Subquery materialization cannot handle NULLs partial matching
+        properly, yet. If the outer or inner values are NULL, the
+        subselect_hash_sj_engine may reply FALSE when it should reply UNKNOWN.
+        So, we must limit it to those three cases:
+        - when FALSE and UNKNOWN are equivalent answers. I.e. this is a
+        top-level predicate (this implies it is not negated).
+        - when outer and inner values cannot be NULL.
+        - when there is a single inner column (because for this we have a
+        limited implementation of NULLs partial matching).
+      */
+      trace_mat.add("treat_UNKNOWN_as_FALSE", abort_on_null);
+
+      if (!abort_on_null && has_nullables && (elements > 1))
+        cause = "cannot_handle_partial_matches";                       // ⑩ NULL 部分匹配
+      else {
+        trace_mat.add("possible", true);
+        return true;
+      }
+    }
+  }
+  assert(cause != nullptr);
+  trace_mat.add("possible", false).add_alnum("cause", cause);
+  return false;
+}
+```
+
+**物化的"反悔"：`remove_in2exists_conds()`**（`item_subselect.cc:406`）：
+
+```cpp
+Item *remove_in2exists_conds(Item *conds) {
+  bool modified = false;
+  List<Item> new_conds;
+  if (WalkConjunction(conds, [&modified, &new_conds](Item *cond) {
+        if (cond->created_by_in2exists()) {
+          modified = true;
+          return false;      // ★ 丢弃带 created_by_in2exists 标记的合取项
+        } else {
+          return new_conds.push_back(cond);
+        }
+      })) {
+    return nullptr;
+  }
+  return modified ? CreateConjunction(&new_conds) : conds;
+}
+```
+
+> ★ 所有 IN2EXISTS 注入的条件都打了 `set_created_by_in2exists()` 标记——这就是"能精确撤销"的前提。
+
+**两条路线的最终落地对比**：
+
+```cpp
+// EXISTS 路线（item_subselect.cc:383）—— 加 LIMIT 1
+bool Item_in_subselect::finalize_exists_transform(THD *thd, Query_block *qb) {
+  if (!(unit->global_parameters()->select_limit = new Item_int(1))) return true;
+  unit->global_parameters()->m_internal_limit = true;
+  if (unit->set_limit(thd, unit->global_parameters())) return true;
+  if (unit->finalize(thd)) return true;
+  qb->join->allow_outer_refs = true;      // for JOIN::set_prefix_tables()
+  strategy = Subquery_strategy::SUBQ_EXISTS;
+  return false;
+}
+
+// 物化路线（item_subselect.cc:422）—— 撤销 in2exists + 去相关 + 挂引擎
+bool Item_in_subselect::finalize_materialization_transform(THD *thd, JOIN *join) {
+  assert(unit->global_parameters()->select_limit == nullptr);
+  strategy = Subquery_strategy::SUBQ_MATERIALIZATION;
+
+  if (join->where_cond)  join->where_cond  = remove_in2exists_conds(join->where_cond);
+  if (join->having_cond) join->having_cond = remove_in2exists_conds(join->having_cond);
+  unit->change_to_access_path_without_in2exists(thd);   // ★ hypergraph 专用
+  assert(!in2exists_info->dependent_before);
+  if (unit->finalize(thd)) return true;
+
+  join->query_block->uncacheable &= ~UNCACHEABLE_DEPENDENT;
+  unit->uncacheable &= ~UNCACHEABLE_DEPENDENT;          // ★ 去相关
+
+  subselect_hash_sj_engine *const new_engine =
+      new (thd->mem_root) subselect_hash_sj_engine(this, unit);
+  if (!new_engine) return true;
+  if (new_engine->setup(thd, *unit->get_unit_column_types())) {
+    new_engine->cleanup(); destroy(new_engine); return true;
+  }
+  indexsubquery_engine = new_engine;                    // ★★ 引擎挂载点
+  join->allow_outer_refs = false;
+  return false;
+}
+```
+
+> ⚠️ **不存在** `Item_in_subselect::setup_engine()` / `create_engine()`。引擎挂载就上面这一处（物化），加 `sql_optimizer.cc:1446` 的 `set_indexsubquery_engine()`（index lookup）。
+
 不能物化的清单：
 
 | 条件 | 原因 |
@@ -573,6 +1307,186 @@ indexsubquery_engine = new_engine;
 `remove_in2exists_conds`（item_subselect.cc:406）按 `created_by_in2exists` 标记删除所有注入谓词。
 
 ### 4.6 subselect_hash_sj_engine 执行期原理
+
+⚠️ **勘误**：**不存在 `subselect_uniquesubquery_engine`**（8.0.39 已删除，全仓 0 命中）。只剩两个引擎，枚举是三项（`item_subselect.h:120`）：
+
+```cpp
+  enum enum_engine_type { OTHER_ENGINE, INDEXSUBQUERY_ENGINE, HASH_SJ_ENGINE };
+```
+
+**类声明**（`item_subselect.h:874`）——注意 `mat_table_has_nulls` 三态：
+
+```cpp
+class subselect_hash_sj_engine final : public subselect_indexsubquery_engine {
+ private:
+  /* true if the subquery was materialized into a temp table. */
+  bool is_materialized;
+  // true if we know for sure that there are zero rows in the table.
+  bool has_zero_rows = false;
+  /**
+     Existence of inner NULLs in materialized table:
+     By design, other values than IRRELEVANT_OR_FALSE are possible only if the
+     subquery has only one inner expression.
+  */
+  enum nulls_exist {
+    NEX_IRRELEVANT_OR_FALSE = 0,   /// none, or they don't matter
+    NEX_UNKNOWN = 1,               /// they matter, and we don't know yet
+    NEX_TRUE = 2                   /// they matter, and we know there exists one
+  };
+  enum nulls_exist mat_table_has_nulls;
+  Query_expression *const unit;
+  unique_ptr_destroy_only<RowIterator> m_iterator;
+  AccessPath *m_root_access_path;
+  Query_result_interceptor *saved_result{nullptr};
+
+ public:
+  bool setup(THD *thd, const mem_root_deque<Item *> &tmp_columns);
+  void cleanup() override;
+  bool exec(THD *thd) override;
+  enum_engine_type engine_type() const override { return HASH_SJ_ENGINE; }
+};
+```
+
+**`setup()`：去重的落点**（`item_subselect.cc:3248`，节选）：
+
+```cpp
+  if (!(tmp_result_sink = new (thd->mem_root) Query_result_union()))
+    return true;
+  if (tmp_result_sink->create_result_table(
+          thd, tmp_columns,
+          true,  // Eliminate duplicates          ★★ 去重就在这里
+          thd->variables.option_bits | TMP_TABLE_ALL_COLUMNS,
+          "<materialized_subquery>", true, true))
+    return true;
+  //  ★ 临时表在最左前缀上建唯一（或 hash）索引，重复行插入时被拒
+
+  tmp_table = tmp_result_sink->table;
+  tmp_key = tmp_table->key_info;
+  ...
+  type = (tmp_table->key_info[0].flags & HA_NOSAME) ? JT_EQ_REF : JT_REF;
+  ...
+  ref.items[part_no] = item->left_expr->element_index(part_no);
+  //  ★ 探测用的 key 直接来自外层 left_expr（不经过 Item_cache）
+  ...
+    if (nullable &&  // nullable column in tmp table,
+                     // and UNKNOWN should not be interpreted as FALSE
+        !item->abort_on_null) {
+      assert(tmp_key_parts == 1);   // 必须是单列
+      ref.null_ref_key = cur_ref_buff;      // ★ 准备"搜 NULL"的 key buffer
+      mat_table_has_nulls = NEX_UNKNOWN;    // ★ "可能有内 NULL，还不知道"
+    } else {
+      ref.null_ref_key = nullptr;
+      mat_table_has_nulls = NEX_IRRELEVANT_OR_FALSE;
+    }
+```
+
+**`exec()`：懒物化 + NULL 处理**（`item_subselect.cc:3531`，节选）：
+
+```cpp
+bool subselect_hash_sj_engine::exec(THD *thd) {
+  if (!is_materialized) {
+    thd->lex->set_current_query_block(unit->first_query_block());
+    assert(unit->first_query_block()->master_query_expression()->is_optimized());
+
+    // Init() triggers materialization.
+    bool error = m_iterator->Init();       // ★★ 第一次执行才物化（懒物化）
+    if (error || thd->is_fatal_error()) return true;
+    is_materialized = true;
+
+    // See if we have zero rows or not.
+    table->file->info(HA_STATUS_VARIABLE);
+    if (table->file->ha_table_flags() & HA_STATS_RECORDS_IS_EXACT) {
+      has_zero_rows = (table->file->stats.records == 0);
+    } else {
+      if (table->file->inited) table->file->ha_index_or_rnd_end();
+      TableScanIterator scan(thd, table, /*expected_rows=*/-1.0, nullptr);
+      int ret = scan.Read();
+      if (ret == 1 || thd->is_error()) return true;
+      has_zero_rows = (ret == -1);
+    }
+  }
+
+  if (has_zero_rows) { item->value = false; return false; }   // 正确答案为 FALSE
+
+  if (item->left_expr->element_index(0)->null_value) {
+    /*
+      The first outer expression oe1 is NULL. ... Do as if searching with all
+      triggered conditions disabled: this would surely find a row. The caller
+      will translate this to UNKNOWN.
+    */
+    assert(item->left_expr->cols() == 1);
+    item->value = true;     // ★★ 谎报"找到了行"，交由 Item_in_optimizer 翻译成 UNKNOWN
+    return false;
+  }
+
+  hash = 0;
+  bool found;
+  if (ExecuteExistsQuery(thd, item->unit, m_iterator.get(), &found)) return true;
+  item->value = found;
+  item->assigned(true);
+
+  if (!found &&  // no exact match
+      mat_table_has_nulls != NEX_IRRELEVANT_OR_FALSE) {
+    if (mat_table_has_nulls == NEX_UNKNOWN) {   // We do not know yet
+      *ref.null_ref_key = 1;                    // ★ 把 NULL 标志字节置 1
+      if (!table->file->inited &&
+          table->file->ha_index_init(ref.key, false)) return true;
+      if (safe_index_read(table, ref) == 1) return true;
+      *ref.null_ref_key = 0;                    // prepare for next searches
+      mat_table_has_nulls =
+          table->has_row() ? NEX_TRUE : NEX_IRRELEVANT_OR_FALSE;
+      //                     ★ "有没有内 NULL"只查一次，之后记忆化
+    }
+    if (mat_table_has_nulls == NEX_TRUE) {
+      /*
+        There exists an inner NULL. The correct answer is UNKNOWN.
+        Do as if searching with all triggered conditions enabled; that
+        would not find any match, but Item_is_not_null_test would notice a
+        NULL:
+      */
+      item->value = false;
+      item->was_null = true;   // ★★ value=FALSE + was_null=TRUE → 上层读成 UNKNOWN
+    }
+  }
+  return false;
+}
+```
+
+> ★★ **去重 + NULL 的小结（源码级）**：
+> - **去重** = `create_result_table(..., /*Eliminate duplicates=*/true, ...)`，靠临时表上的唯一 / hash 索引。
+> - **NULL** 只在**单列 + 可为 NULL + 需要区分 NULL/FALSE** 时才处理：`ref.null_ref_key` 指向 key buffer 的 NULL 标志字节，`exec()` 在未命中时把它置 1 做一次"搜 NULL"，命中则 `was_null = true`。**多列情形根本进不了物化**（`subquery_allows_materialization` 的 `cannot_handle_partial_matches`）。
+
+**`cleanup()` 与生命周期**（`:3484`）：
+
+```cpp
+void subselect_hash_sj_engine::cleanup() {
+  is_materialized = false;
+  if (result != nullptr) result->cleanup();   // Resets the temp table as well
+  m_root_access_path = nullptr;
+  m_iterator.reset();
+  if (table != nullptr) {
+    if (table->file->inited) table->file->ha_index_end();
+    close_tmp_table(table);
+    free_tmp_table(table);
+    table = nullptr;
+  }
+  if (unit->is_executed()) unit->reset_executed();
+}
+```
+
+> ★ `Item_subselect::exec()`（`:634`）里有句注释说明了分派：`subselect_hash_sj_engine` **自建迭代器，不走 `subquery->exec()`**：
+> ```cpp
+>   bool should_create_iterators =
+>       !(indexsubquery_engine != nullptr &&
+>         indexsubquery_engine->engine_type() ==
+>             subselect_indexsubquery_engine::HASH_SJ_ENGINE);
+>   ...
+>   if (indexsubquery_engine != nullptr) {
+>     return indexsubquery_engine->exec(thd);
+>   } else {
+>     return subquery->exec(thd);
+>   }
+> ```
 
 - **建表（一次）**：`Query_result_union::create_result_table(..., true /*distinct*/)` 建带唯一索引的临时表，`m_iterator->Init()` 执行子查询并去重写入。
 - **探测**：`ExecuteExistsQuery` 用基于 `NewRefAccessPath` 的迭代器做索引查找，配合等值 post-filter 过滤假阳性。
@@ -856,6 +1770,112 @@ replace_subcondition(thd, tree, subq_item, truth_item, false);
 > ⚠️ **关键纠正**：`subquery_to_derived` 默认是 **OFF**，不是常见误解的"默认 on"。这意味着第七节的标量→derived、第二节的 IN→derived 在默认会话下**不会走**（除非 secondary engine 要求）。默认 ON 的只有 `subquery_materialization_cost_based` 和 `derived_merge`。
 
 三个开关的位定义在 `sql/sql_const.h:214/217/221`，名字数组在 `sql/sys_vars.cc:3463/3466/3470`，默认集合在 `sql/sys_vars.cc:197-211`。
+
+**`optimizer_switch` 的完整名称数组**（`sql/sys_vars.cc:3447`）——⚠️ 它是 `Sys_var_flagset`，**没有每个 flag 独立的 `Sys_var_*` 定义**；"定义处"= 数组条目（外部名）+ `sql_const.h` 位常量（内部名），两者顺序必须一致：
+
+```cpp
+/**
+  @note
+  @b BEWARE! These must have the same order as the \#defines in sql_const.h!
+*/
+static const char *optimizer_switch_names[] = {
+    "index_merge", "index_merge_union", "index_merge_sort_union",
+    "index_merge_intersection", "engine_condition_pushdown",
+    "index_condition_pushdown", "mrr", "mrr_cost_based",
+    "block_nested_loop", "batched_key_access",
+    "materialization",                          // ← bit 10
+    "semijoin",                                 // ← bit 11
+    "loosescan",                                // ← bit 12
+    "firstmatch",                               // ← bit 13
+    "duplicateweedout",                         // ← bit 14
+    "subquery_materialization_cost_based",      // ← bit 15
+    "use_index_extensions", "condition_fanout_filter", "derived_merge",
+    "use_invisible_indexes", "skip_scan", "hash_join",
+    "subquery_to_derived",                      // ← bit 22
+    "prefer_ordering_index", "hypergraph_optimizer",
+    "derived_condition_pushdown", "default", NullS};
+```
+
+**位常量**（`sql/sql_const.h:196`）：
+
+```cpp
+constexpr const uint64_t OPTIMIZER_SWITCH_MATERIALIZATION{1ULL << 10};
+constexpr const uint64_t OPTIMIZER_SWITCH_SEMIJOIN{1ULL << 11};
+constexpr const uint64_t OPTIMIZER_SWITCH_LOOSE_SCAN{1ULL << 12};
+constexpr const uint64_t OPTIMIZER_SWITCH_FIRSTMATCH{1ULL << 13};
+constexpr const uint64_t OPTIMIZER_SWITCH_DUPSWEEDOUT{1ULL << 14};
+constexpr const uint64_t OPTIMIZER_SWITCH_SUBQ_MAT_COST_BASED{1ULL << 15};
+constexpr const uint64_t OPTIMIZER_SWITCH_DERIVED_MERGE{1ULL << 18};
+constexpr const uint64_t OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED{1ULL << 22};
+constexpr const uint64_t OPTIMIZER_SWITCH_PREFER_ORDERING_INDEX{1ULL << 23};
+constexpr const uint64_t OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER{1ULL << 24};
+constexpr const uint64_t OPTIMIZER_SWITCH_DERIVED_CONDITION_PUSHDOWN{1ULL << 25};
+constexpr const uint64_t OPTIMIZER_SWITCH_LAST{1ULL << 26};
+```
+
+> ⚠️ **`subquery_materialization_cost_based` 的内部宏名是 `OPTIMIZER_SWITCH_SUBQ_MAT_COST_BASED`**（缩写 SUBQ_MAT）——按外部名去找宏会找不到。
+
+**默认集合**（`sql/sys_vars.cc:197`）——注意 **bit 22 不在里面**：
+
+```cpp
+// Including the switch in this set, makes its default 'on'
+static constexpr const unsigned long long OPTIMIZER_SWITCH_DEFAULT{
+    OPTIMIZER_SWITCH_INDEX_MERGE | OPTIMIZER_SWITCH_INDEX_MERGE_UNION |
+    OPTIMIZER_SWITCH_INDEX_MERGE_SORT_UNION |
+    OPTIMIZER_SWITCH_INDEX_MERGE_INTERSECT |
+    OPTIMIZER_SWITCH_ENGINE_CONDITION_PUSHDOWN |
+    OPTIMIZER_SWITCH_INDEX_CONDITION_PUSHDOWN | OPTIMIZER_SWITCH_MRR |
+    OPTIMIZER_SWITCH_MRR_COST_BASED | OPTIMIZER_SWITCH_BNL |
+    OPTIMIZER_SWITCH_MATERIALIZATION | OPTIMIZER_SWITCH_SEMIJOIN |
+    OPTIMIZER_SWITCH_LOOSE_SCAN | OPTIMIZER_SWITCH_FIRSTMATCH |
+    OPTIMIZER_SWITCH_DUPSWEEDOUT | OPTIMIZER_SWITCH_SUBQ_MAT_COST_BASED |
+    OPTIMIZER_SWITCH_USE_INDEX_EXTENSIONS |
+    OPTIMIZER_SWITCH_COND_FANOUT_FILTER | OPTIMIZER_SWITCH_DERIVED_MERGE |
+    OPTIMIZER_SKIP_SCAN | OPTIMIZER_SWITCH_HASH_JOIN |
+    OPTIMIZER_SWITCH_PREFER_ORDERING_INDEX |
+    OPTIMIZER_SWITCH_DERIVED_CONDITION_PUSHDOWN};
+    //  ★ 没有 OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED（→ off）
+    //  ★ 没有 OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER（→ off）
+```
+
+**逐个核实表**：
+
+| 外部名 | 是否存在 | 位 | 默认 | 与子查询改写的关系 |
+|---|---|---|---|---|
+| `semijoin` | ✅ | 11 | **on** | 半连接候选准入（`sql_resolver.cc:1532`） |
+| `materialization` | ✅ | 10 | **on** | 允许走物化 |
+| `subquery_materialization_cost_based` | ✅ | 15 | **on** | 物化 vs EXISTS 走代价比较；off 则强制物化 |
+| `loosescan` | ✅ | 12 | **on** | 半连接执行策略之一 |
+| `firstmatch` | ✅ | 13 | **on** | 半连接执行策略之一 |
+| `duplicateweedout` | ✅ | 14 | **on** | 半连接执行策略之一 |
+| `subquery_to_derived` | ✅ | 22 | **off** | 标量→derived / IN→joined derived |
+| `derived_merge` | ✅ | 18 | **on** | 派生表合并（与子查询改写无关） |
+| `derived_condition_pushdown` | ✅ | 25 | **on** | 派生表条件下推（无关） |
+| `prefer_ordering_index` | ✅ | 23 | **on** | ORDER BY 优化（无关） |
+| `hypergraph_optimizer` | ✅ | 24 | **off** | 影响半连接条件 6x |
+
+> ⚠️ 常见误称：**不存在** `Query_block::semijoin_candidates`；真名 `sj_candidates`（`sql_lex.h`）。也**不存在** `Item_allany_subselect::l_op()`——`l_op()` 是 `Comp_creator` 的方法（`func->l_op()`），在 `single_value_transformer:1766` 被用来决定 MAX 还是 MIN。
+
+**`check_optimizer_switch` 的一个反直觉行为**（`sql/sys_vars.cc:3413`）：
+
+```cpp
+  if (current_hypergraph_optimizer && !want_hypergraph_optimizer) {
+    // Don't turn off the hypergraph optimizer on set optimizer_switch=DEFAULT.
+    // This is so that mtr --hypergraph should not be easily cancelled in the
+    // middle of a test, unless the test explicitly meant it.
+    if (var->value == nullptr) {
+      var->save_result.ulonglong_value |= OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER;
+    }
+  }
+```
+
+> ★ `SET optimizer_switch = DEFAULT` **不会**关掉已开启的 hypergraph 位。
+
+**读取点速查**：
+- `Query_block::semijoin_enabled()` 声明 `sql/sql_lex.h:1597`，定义 `sql_lex.cc:4551`
+- `Query_block::subquery_strategy()` 声明 `sql/sql_lex.h:1582`，定义 `sql_lex.cc:4525`
+- `transform_scalar_subqueries_to_join_with_derived()` 唯一调用点 `sql/sql_resolver.cc:471`
+- `flatten_subqueries()` 调用点：`sql_resolver.cc:549`、`sql_delete.cc:872`、`sql_update.cc:1787`
 
 ---
 

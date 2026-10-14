@@ -200,7 +200,7 @@ InnoDB 旁支（不挂主干的独立原语）：
 
 | 域 | 锁实例 | 详细机制文档 |
 |----|--------|------------|
-| **全局 DDL 闸门** | ★ `dict_operation_lock`（**rw_lock_t**：DDL 拿 X，正常操作拿 S——`debug_lock_order.cc` 里叫 "sxlock/innodb/dict_operation_lock"） | `innodb/ddl.md` |
+| **全局 DDL 闸门** | ★ `dict_operation_lock`（**rw_lock_t**：DDL 拿 X，正常操作拿 S——`debug_lock_order.cc` 里叫 "sxlock/innodb/dict_operation_lock"） | `feat/ddl/ddl.md` |
 | **lock_sys（锁系统自身）** | `lock_sys_table_mutex`、`lock_sys_page_mutex`（8.0.35+ 分片）、`lock_wait_mutex`、`lock_sys_global_rw_lock` | `innodb_trx_lock.md` |
 | **redo log（log_sys）** | ★ `log_checkpointer_mutex`、`log_writer_mutex`、`log_flusher_mutex`、`log_write_notifier_mutex`、`log_flush_notifier_mutex`、`log_closer_mutex`、`log_limits_mutex`、`log_files_mutex`、`log_cmdq_mutex`、`log_sn_mutex` + `log_sn_lock`（LSN 序号锁）、`log_sys_arch_mutex` | `innodb/redo_log.md` |
 | **buffer pool** | ★ `LRU_list_mutex`、`free_list_mutex`、`flush_state_mutex`、`zip_mutex`/`zip_hash`、`chunks_mutex`、per-block `buffer_block_mutex`、per-page `buf_block_lock`（rwlock） | `innodb/buffer_pool.md` |
@@ -212,7 +212,7 @@ InnoDB 旁支（不挂主干的独立原语）：
 | **AHI** | `btr_search_latch`（AHI 分片 rwlock）、`ahi_enabled_mutex` | `index/ahi.md` |
 | **dict / DD 引擎侧** | `dict_sys_mutex`、`dict_table_mutex`、`dict_persist_dirty_tables`、`dict_table_stats`（rwlock）、`index_online_log`（online DDL row log） | `innodb/dd.md` |
 | **dblwr** | `dblwr_mutex` | `innodb/dblwr.md` |
-| **FTS** | `fts_bg_threads`/`fts_delete`/`fts_optimize`/`fts_doc_id`/`fts_pll_tokenize` + `fts_cache_rw_lock`/`fts_cache_init_rw_lock` | `innodb/fts.md` |
+| **FTS** | `fts_bg_threads`/`fts_delete`/`fts_optimize`/`fts_doc_id`/`fts_pll_tokenize` + `fts_cache_rw_lock`/`fts_cache_init_rw_lock` | `feat/fts.md` |
 | **change buffer** | `ibuf_mutex`、`ibuf_bitmap`、`ibuf_pessimistic_insert` | `index/ibuf.md` |
 | **undo/rseg** | `undo_spaces_lock`（rwlock）、`rsegs_lock`（rwlock）、`trx_sys_rseg`、`undo_space_rseg`、`temp_space_rseg` | `innodb/undo_log.md` |
 | **autoinc** | `autoinc_mutex`、`autoinc_persisted_mutex`、`ddl_autoinc_mutex` | `feat/auto_increment.md` |
@@ -379,7 +379,7 @@ lock/
 ## 七、归属判据（本目录与相邻目录的边界）
 
 - **锁/同步机制本身** → 本目录（同步原语进 `primitives/`，事务锁进 `transactional/`）
-- **无锁容器/数据结构本身** → [`../infra/structure/`](../structure/)（按类型一篇一主题：`hash.md`、`list.md`、`link_buf.md` 等，不分层）——**锁原语目录只放锁原语**（2026-09-20 用户拍板的组织原则）
+- **无锁容器/数据结构本身** → [`../infra/structure/`](../structure/)（按类型一篇一主题：`hash.md`、`list.md`、`link_buf.md` 等，不分层）——**锁原语目录只放锁原语**（本目录的组织原则）
 - **用锁实现的机制，但不是"锁"本身** → 各模块目录：Buffer Pool 的 latch 协议 → `innodb/buffer_pool.md`；`LOCK_open` 只是 table cache 的一个实现细节 → `server/table.md`
 - **跨层特性里用到锁** → `feat/`（如 AUTOINC 锁），本篇从锁的视角链接过去
 - **锁的实例清单**（A2/A3 的全局 mutex/latch）→ 本篇盘点 + 指向各自模块文档，不复制详细机制

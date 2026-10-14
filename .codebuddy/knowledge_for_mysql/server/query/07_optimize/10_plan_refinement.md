@@ -67,6 +67,239 @@ PostgreSQL 没有这样独立的"精化"阶段——它的计划生成与代价�
 
 ## 零、执行顺序与三条依赖链
 
+**先看一份"与常见说法不符"的纠正表**（5.7 口径在 8.0 大量改号/改名/删函数）：
+
+| 常见说法 | 8.0.39 真相 |
+|---|---|
+| `choose_plan()` 在 `sql/sql_planner.cc` | **已删除**；内容被摊进 `JOIN::make_join_plan()`，join order 由 `Optimize_table_order::choose_table_order()` 负责 |
+| `make_join_readinfo()` 在 `sql/sql_executor.cc` | 在 **`sql/sql_select.cc:3282`** |
+| `make_tmp_tables_info()` 是自由函数 | 是 **`JOIN::make_tmp_tables_info()`**，`sql/sql_select.cc:4354` |
+| `test_if_skip_sort_order()` 改名成 `is_ordering_satisfied_by_key()` | **没有这个函数**；仍是 `test_if_skip_sort_order()`（`sql_optimizer.cc:2193`）+ `JOIN::test_skip_sort()`（`:1642`） |
+| `create_root_access_path()` | 改名 **`JOIN::create_root_access_path_for_join()`**，`sql/sql_executor.cc:2970` |
+| `ConnectJoins()` 在 `join_optimizer/` | 在 **`sql/sql_executor.cc:2356`**；`join_optimizer/` 下的是 hypergraph 的 `FindBestQueryPlan()`，两套并行实现 |
+| join buffer 用 `calc_used_blob_length()` | **已删除**；BNL 在运行期被 hash join 取代，只有 BKA 还保留真正 join buffer（`BKAIterator`） |
+| `JOIN_CACHE` 是带 `init()/put_record()` 的大类 | **退化成只有一个 enum 的空壳**（`sql/sql_join_buffer.h:27`） |
+| `Window::setup_windows()` | 是 **`setup_windows2()`**（`sql/window.cc:1308`），几乎什么都不做；refinement 阶段的窗口临时表全在 `make_tmp_tables_info()` |
+
+**`JOIN::optimize()` 中 `make_join_plan()` 之后的完整源码**（`sql/sql_optimizer.cc:585-1105`，按执行顺序，略去纯错误清理）：
+
+```cpp
+  // ...（前置：常量折叠 / 零结果早退 / derived / optimize_aggregated_query）
+  if (thd->lex->using_hypergraph_optimizer()) {
+    // ★ hypergraph 走 FindBestQueryPlan() 后直接 return —— 完全不进入本主题的任何代码
+  }
+
+  assert(!thd->lex->using_hypergraph_optimizer());
+
+  // Set up join order and initial access paths
+  THD_STAGE_INFO(thd, stage_statistics);
+  if (make_join_plan()) {                       // ★① 选 join order + 访问方法（含 get_best_combination）
+    if (thd->killed) thd->send_kill_message();
+    return true;
+  }
+
+  ASSERT_BEST_REF_IN_JOIN_ORDER(this);
+
+  if (zero_result_cause != nullptr) {           // Can be set by make_join_plan()
+    create_access_paths_for_zero_rows();
+    goto setup_subq_exit;
+  }
+
+  if (rollup_state == RollupState::NONE) {
+    /* Remove distinct if only const tables */
+    select_distinct &= !plan_is_const();
+  }
+  ...
+  /*
+    Among the equal fields belonging to the same multiple equality
+    choose the one that is to be retrieved first and substitute
+    all references to these in where condition for a reference for
+    the selected field.
+  */
+  if (where_cond) {
+    where_cond =
+        substitute_for_best_equal_field(thd, where_cond, cond_equal, map2table);   // ★②
+    ...
+  }
+
+  /* Perform the same optimization on field evaluation for all join conditions */
+  for (uint i = const_tables; i < tables; ++i) {
+    JOIN_TAB *const tab = best_ref[i];
+    if (tab->position() && tab->join_cond()) {
+      tab->set_join_cond(substitute_for_best_equal_field(
+          thd, tab->join_cond(), tab->cond_equal, map2table));
+      ...
+    }
+  }
+
+  if (init_ref_access()) { error = 1; return true; }
+
+  // Update table dependencies after assigning ref access fields
+  update_depend_map();
+
+  THD_STAGE_INFO(thd, stage_preparing);
+
+  if (make_join_query_block(this, where_cond)) {   // ★③ 读常量表 + 二次 range 重估
+    if (thd->is_error()) return true;
+    zero_result_cause = "Impossible WHERE noticed after reading const tables";
+    create_access_paths_for_zero_rows();
+    goto setup_subq_exit;
+  }
+
+  error = -1; /* if goto err */
+
+  if (optimize_distinct_group_order()) return true;   // ★④ DISTINCT/GROUP/ORDER 合并处理
+
+  // ★ join buffer 总开关：SQL_NO_CACHE / FULLTEXT 一律禁用
+  if ((query_block->active_options() & SELECT_NO_JOIN_CACHE) ||
+      query_block->ftfunc_list->elements)
+    no_jbuf_after = 0;
+
+  if (query_block->has_ft_funcs() && optimize_fts_query()) return true;
+
+  /* ... HAVING 的 const 部分化简、cast 注入、replace_index_subquery() ... */
+
+  {
+    /*
+      If the hint FORCE INDEX FOR ORDER BY/GROUP BY is used for the first
+      table (it does not make sense for other tables) then we cannot do join
+      buffering.
+    */
+    if (!plan_is_const()) {
+      const TABLE *const first = best_ref[const_tables]->table();
+      if ((first->force_index_order && !order.empty()) ||
+          (first->force_index_group && !group_list.empty()))
+        no_jbuf_after = 0;
+    }
+
+    bool simple_sort = true;
+    Table_map_restorer deps_lateral(&deps_of_remaining_lateral_derived_tables);
+    // Check whether join cache could be used
+    for (uint i = const_tables; i < tables; i++) {          // ★⑤ join buffer 决策循环
+      JOIN_TAB *const tab = best_ref[i];
+      if (!tab->position()) continue;
+      if (setup_join_buffering(tab, this, no_jbuf_after)) return true;
+      if (tab->use_join_cache() != JOIN_CACHE::ALG_NONE) simple_sort = false;
+      assert(tab->type() != JT_FT ||
+             tab->use_join_cache() == JOIN_CACHE::ALG_NONE);
+      ...
+    }
+    if (!simple_sort) {
+      /*
+        A join buffer is used for this table. We here inform the optimizer
+        that it should not rely on rows of the first non-const table being in
+        order thanks to an index scan; indeed join buffering of the present
+        table subsequently changes the order of rows.
+      */
+      simple_order = simple_group = false;   // ★★ 任一表用 buffer ⇒ 整条"首表有序"假设作废
+    }
+  }
+
+  if (!plan_is_const() && !order.empty()) {
+    /* Force using of tmp table if sorting by a SP or UDF function ... */
+    for (ORDER *tmp_order = order.order; tmp_order; tmp_order = tmp_order->next) {
+      Item *item = *tmp_order->item;
+      if (item->is_expensive()) {
+        simple_order = simple_group = false;   // ★ 排 UDF ⇒ 强制临时表（不排序）
+        break;
+      }
+    }
+  }
+
+  /*
+    ★⑥ need_tmp_before_win 判定（8 条，见 make_tmp_tables_info 一节）
+    (1) ROLLUP + (DISTINCT|windows|ORDER BY)
+    (2) !plan_is_const()
+    (3) GROUP BY 且 !simple_group
+    (4)(5) DISTINCT 或 ORDER BY 且 !simple_order
+    (6) 有 GROUP BY 又有 ORDER BY（不看是否各自能用索引！）
+    (7) SQL_BUFFER_RESULT
+    (8) 首个窗口步骤需要排序且非单表
+  */
+  if (rollup_state != RollupState::NONE &&  // (1)
+      (select_distinct || has_windows || !order.empty()))
+    need_tmp_before_win = true;
+
+  if (!need_tmp_before_win && implicit_grouping &&
+      contains_non_aggregated_fts()) {
+    need_tmp_before_win = true;   // 全文列参与聚合 ⇒ 必须物化
+  }
+
+  if (!plan_is_const())  // (2)
+  {
+    if ((!group_list.empty() && !simple_group) ||                       // (3)
+        (!has_windows && (select_distinct ||                            // (4)
+                          (!order.empty() && !simple_order) ||          // (5)
+                          (!group_list.empty() && !order.empty()))) ||  // (6)
+        ((query_block->active_options() & OPTION_BUFFER_RESULT) &&
+         !has_windows && !(query_expression()->derived_table &&
+                           query_expression()->derived_table->uses_materialization())) ||  // (7)
+        (has_windows && (primary_tables - const_tables) > 1 &&          // (8)
+         m_windows[0]->needs_sorting() && !group_optimized_away))
+      need_tmp_before_win = true;
+  }
+
+  DBUG_EXECUTE("info", TEST_join(this););
+
+  if (alloc_qep(tables)) return (error = 1);   // ★⑦ JOIN_TAB → QEP_TAB
+
+  if (!plan_is_const()) {
+    // Test if we can use an index instead of sorting
+    test_skip_sort();                          // ★⑧ 能否用索引免排序
+    if (finalize_table_conditions(thd)) return true;   // ★⑨ 条件最终化
+  }
+
+  if (make_join_readinfo(this, no_jbuf_after)) return true;   // ★⑩ keyread / ICP / semijoin 标记
+
+  if (make_tmp_tables_info()) return true;                    // ★⑪ 临时表 + filesort
+
+  /*
+    If we decided to not sort after all, update the cost of the JOIN.
+  */
+  if (sort_cost > 0.0 &&
+      !explain_flags.any(ESP_USING_FILESORT, ESC_WINDOWING)) {
+    best_read -= sort_cost;   // ★ 才发现不用 filesort ⇒ 把排序代价从 best_read 减回去
+    sort_cost = 0.0;
+  }
+
+  // ★ make_tmp_tables_info() 可能改过 precomputed_group_by ⇒ 必须重算
+  count_field_types(query_block, &tmp_table_param, *fields, false, false);
+
+  create_access_paths();                       // ★⑫ QEP → AccessPath 树
+
+  if (thd->is_error()) return true;            // 建 Iterator 可能求值常量 hash join 条件失败
+
+  /*
+    At this stage, we have set up an AccessPath 'plan'. Traverse the
+    AccessPath structures and find components which may be offloaded to
+    the engines. This process is allowed to modify the AccessPath itself.
+    ... Thus no Iterators should be set up until after push_to_engines()
+    has completed.
+  */
+  if (push_to_engines()) return true;          // ★⑬ 下推到引擎（可改 AccessPath）
+
+  // Make plan visible for EXPLAIN
+  set_plan_state(PLAN_READY);                  // ★⑭ 冻结
+
+  DEBUG_SYNC(thd, "after_join_optimize");
+  return false;
+
+setup_subq_exit:
+  // 零结果路径：也要造出 ZeroRows / ZeroRowsAggregated 的 AccessPath
+  assert(zero_result_cause != nullptr);
+  assert(m_root_access_path != nullptr);
+  ...
+  if (!qep_tab && best_ref) {
+    if (alloc_qep(tables)) return true;
+    unplug_join_tabs();
+  }
+  set_plan_state(ZERO_RESULT);
+  return false;
+}
+```
+
+**调用顺序一句话**：`make_join_plan()` → `substitute_for_best_equal_field` → `make_join_query_block()` → `optimize_distinct_group_order()` → `setup_join_buffering()` 循环 → `need_tmp_before_win` 判定 → `alloc_qep()` → `test_skip_sort()` → `finalize_table_conditions()` → `make_join_readinfo()` → `make_tmp_tables_info()` → `count_field_types()` → `create_access_paths()` → `push_to_engines()`。
+
 | # | 行号 | 调用 | 阶段 |
 |---|---|---|---|
 | 0 | `:696` | `make_join_plan()` | ③（前置） |
@@ -318,7 +551,207 @@ if (!is_force_index && (select_limit >= table_records) &&
 
 **② `cache_const_expr`**——用 `Item::compile()` 的 analyzer+transformer 双遍机制，把常量子表达式包进 `Item_cache`，只在首次求值时算一次。同时作用于每个表条件和 HAVING。
 
-### 2.2 make_join_readinfo（`sql_select.cc:3282`）
+### 2.2 make_join_readinfo（`sql/sql_select.cc:3282`，**不在 sql_executor.cc**）
+
+**完整源码**：
+
+```cpp
+/**
+  Plan refinement stage: do various setup things for the executor
+  @param join          Join being processed
+  @param no_jbuf_after Don't use join buffering after table with this number.
+*/
+bool make_join_readinfo(JOIN *join, uint no_jbuf_after) {
+  const bool statistics = !join->thd->lex->is_explain();
+  const bool prep_for_pos = join->need_tmp_before_win ||
+                            join->select_distinct ||
+                            !join->group_list.empty() || !join->order.empty() ||
+                            join->m_windows.elements > 0;
+
+  ASSERT_BEST_REF_IN_JOIN_ORDER(join);
+  Opt_trace_context *const trace = &join->thd->opt_trace;
+  Opt_trace_object wrapper(trace);
+  Opt_trace_array trace_refine_plan(trace, "refine_plan");   // ★ trace: refine_plan
+
+  // ★ semijoin 去重执行标记（LooseScan / FirstMatch jump / Weedout 临时表）在这里落定
+  if (setup_semijoin_dups_elimination(join, no_jbuf_after))
+    return true;
+
+  for (uint i = join->const_tables; i < join->tables; i++) {
+    QEP_TAB *const qep_tab = &join->qep_tab[i];
+    if (!qep_tab->position()) continue;
+
+    JOIN_TAB *const tab = join->best_ref[i];
+    TABLE *const table = qep_tab->table();
+    Table_ref *const table_ref = qep_tab->table_ref;
+    /*
+     Need to tell handlers that to play it safe, it should fetch all
+     columns of the primary key of the tables: this is because MySQL may
+     build row pointers for the rows ...
+    */
+    if (prep_for_pos) table->prepare_for_position();   // ★ 要建临时表/去重 ⇒ 必须能定位行
+
+    Opt_trace_object trace_refine_table(trace);
+    trace_refine_table.add_utf8_table(table_ref);
+
+    if (tab->use_join_cache() != JOIN_CACHE::ALG_NONE)
+      qep_tab->init_join_cache(tab);       // ★ join buffer 落地（ALG_BNL→OT_BNL / ALG_BKA→OT_BKA）
+
+    switch (qep_tab->type()) {
+      case JT_EQ_REF:
+      case JT_REF_OR_NULL:
+      case JT_REF:
+      case JT_SYSTEM:
+      case JT_CONST:
+        if (table->covering_keys.is_set(qep_tab->ref().key) &&
+            !table->no_keyread)
+          table->set_keyread(true);         // ★ 覆盖索引 ⇒ 只读索引
+        else
+          qep_tab->push_index_cond(tab, qep_tab->ref().key,
+                                   &trace_refine_table);   // ★ ICP 下推
+        break;
+
+      case JT_ALL:
+        join->thd->set_status_no_index_used();
+        qep_tab->using_dynamic_range = (tab->use_quick == QS_DYNAMIC_RANGE);
+        [[fallthrough]];
+      case JT_INDEX_SCAN:
+        if (tab->position()->filter_effect != COND_FILTER_STALE_NO_CONST &&
+            !tab->sj_mat_exec()) {
+          /*
+            rows_w_const_cond is # of rows which will be read by the access
+            method, minus those which will not pass the constant condition;
+            ... Such number is useful inside the planner, but obscure to the
+            reader of EXPLAIN; so we put the real count of read rows into
+            rows_fetched, and move the constant condition's filter to
+            filter_effect.
+          */
+          double rows_w_const_cond = qep_tab->position()->rows_fetched;
+          table_ref->fetch_number_of_rows();
+          tab->position()->rows_fetched =
+              static_cast<double>(table->file->stats.records);
+          if (tab->position()->filter_effect != COND_FILTER_STALE) {
+            // Constant condition moves to filter_effect:
+            if (tab->position()->rows_fetched == 0)
+              tab->position()->filter_effect = 0.0f;
+            else
+              tab->position()->filter_effect *= static_cast<float>(
+                  rows_w_const_cond / tab->position()->rows_fetched);
+          }
+        }
+        if (qep_tab->using_dynamic_range) {
+          join->thd->set_status_no_good_index_used();
+          if (statistics) join->thd->inc_status_select_range_check();
+        } else {
+          if (statistics) {
+            if (i == join->const_tables)
+              join->thd->inc_status_select_scan();
+            else
+              join->thd->inc_status_select_full_join();
+          }
+        }
+        break;
+
+      case JT_RANGE:
+      case JT_INDEX_MERGE:
+        qep_tab->using_dynamic_range = (tab->use_quick == QS_DYNAMIC_RANGE);
+        if (statistics) {
+          if (i == join->const_tables)
+            join->thd->inc_status_select_range();
+          else
+            join->thd->inc_status_select_full_range_join();
+        }
+        if (!table->no_keyread && qep_tab->type() == JT_RANGE) {
+          if (table->covering_keys.is_set(used_index(qep_tab->range_scan()))) {
+            assert(used_index(qep_tab->range_scan()) != MAX_KEY);
+            table->set_keyread(true);
+          }
+          if (!table->key_read)
+            qep_tab->push_index_cond(tab, used_index(qep_tab->range_scan()),
+                                     &trace_refine_table);
+        }
+        if (tab->position()->filter_effect != COND_FILTER_STALE_NO_CONST) {
+          double rows_w_const_cond = qep_tab->position()->rows_fetched;
+          // ★ range 的最终形态：rows_fetched 换成 range_scan 估算的输出行数
+          qep_tab->position()->rows_fetched =
+              tab->range_scan()->num_output_rows();
+          if (tab->position()->filter_effect != COND_FILTER_STALE) {
+            if (tab->position()->rows_fetched == 0)
+              tab->position()->filter_effect = 0.0f;
+            else
+              tab->position()->filter_effect *= static_cast<float>(
+                  rows_w_const_cond / tab->position()->rows_fetched);
+          }
+        }
+        break;
+
+      case JT_FT:
+        if (tab->join()->fts_index_access(tab)) {
+          table->set_keyread(true);
+          table->covering_keys.set_bit(tab->ft_func()->key);
+        }
+        break;
+      default:
+        assert(0);
+        break;
+    }
+
+    if (tab->position()->filter_effect <= COND_FILTER_STALE) {
+      /*
+        Give a proper value for EXPLAIN.
+        For performance reasons, we do not recalculate the filter for
+        non-EXPLAIN queries; thus, EXPLAIN CONNECTION may show 100%
+        for a query.
+      */
+      tab->position()->filter_effect =
+          (join->thd->lex->is_explain() || need_cost_update ||
+           (join->m_select_limit != HA_POS_ERROR &&
+            !Overlaps(join->thd->variables.option_bits, OPTION_BIG_SELECTS)))
+              ? calculate_condition_filter(
+                    tab,
+                    (tab->ref().key != -1) ? tab->position()->key : nullptr,
+                    tab->prefix_tables() & ~table_ref->map(),
+                    tab->position()->rows_fetched, false, false,
+                    trace_refine_table)
+              : COND_FILTER_ALLPASS;   // ★★ 非 EXPLAIN 时直接拍成 100%：refinement 后的代价是"近似"的
+      ...
+    }
+
+    qep_tab->set_reversed_access(tab->reversed_access);   // ★ DESC 索引扫描标记
+
+    // Materialize derived tables prior to accessing them.
+    if (table_ref->is_table_function()) {
+      qep_tab->materialize_table = QEP_TAB::MATERIALIZE_TABLE_FUNCTION;
+      if (tab->dependent) qep_tab->rematerialize = true;
+    } else if (table_ref->uses_materialization()) {
+      qep_tab->materialize_table = QEP_TAB::MATERIALIZE_DERIVED;
+    }
+    if (qep_tab->sj_mat_exec())
+      qep_tab->materialize_table = QEP_TAB::MATERIALIZE_SEMIJOIN;
+
+    if (table_ref->is_derived() &&
+        table_ref->derived_query_expression()->m_lateral_deps) {
+      // ★ LATERAL 派生表：找到它最后一个依赖表，由那张表的读取触发重新物化
+      auto deps = table_ref->derived_query_expression()->m_lateral_deps;
+      plan_idx last = NO_PLAN_IDX;
+      for (JOIN_TAB **tab2 = join->map2table; deps; tab2++, deps >>= 1) {
+        if (deps & 1) last = std::max(last, (*tab2)->idx());
+      }
+      if (last != NO_PLAN_IDX) {
+        QEP_TAB &t = join->qep_tab[last];
+        t.lateral_derived_tables_depend_on_me |= TableBitmap(i);
+        trace_refine_table.add_utf8("rematerialized_for_each_row_of",
+                                    t.table()->alias);
+      }
+    }
+  }
+  return false;
+}
+```
+
+⇒ **三个反直觉点**：① `keyread` 与 `ICP` 是**互斥**的（覆盖索引就只读索引，不再下推）；② `rows_fetched` 在 refinement 里被**换成真实读行数**，把常量条件的过滤效果搬到 `filter_effect`，纯为 EXPLAIN 可读性；③ 非 EXPLAIN 时 `filter_effect` 直接置 `COND_FILTER_ALLPASS`——**refinement 之后的代价数字是近似的**。
+
+### 2.2.1 本文档对 2.2 的小结
 
 按 `QEP_TAB::type()` 分派：
 
@@ -449,7 +882,337 @@ for (Table_ref *tl = query_block->leaf_tables; tl; tl = tl->next_leaf) {
 
 ## 五、临时表与排序 make_tmp_tables_info
 
-`sql_select.cc:4354`。七个阶段：
+`JOIN::make_tmp_tables_info()`，`sql/sql_select.cc:4354`（**是 JOIN 成员函数，不是自由函数**）。关键源码：
+
+```cpp
+bool JOIN::make_tmp_tables_info() {
+  assert(!join_tab);
+  mem_root_deque<Item *> *curr_fields = fields;
+  bool materialize_join = false;
+  uint curr_tmp_table = const_tables;
+  TABLE *exec_tmp_table = nullptr;
+
+  auto cleanup_tmp_tables_on_error =
+      create_scope_guard([this, &curr_tmp_table] { ... });   // 出错时关掉已建的临时表
+
+  /*
+    If the plan is constant, we will not do window tmp table processing
+    cf. special code path for handling const plans.
+  */
+  m_windowing_steps = m_windows.elements > 0 && !plan_is_const() &&
+                      !implicit_grouping && !group_optimized_away;   // ★ 窗口步骤开关
+  ...
+  Opt_trace_array trace_tmp(trace, "considering_tmp_tables");   // ★ trace: considering_tmp_tables
+
+  /*
+    In this function, we may change having_cond into a condition on a
+    temporary sort/group table, so we have to assign having_for_explain now:
+  */
+  having_for_explain = having_cond;
+
+  /*
+    The loose index scan access method guarantees that all grouping or
+    duplicate row elimination (for distinct) is already performed
+    during data retrieval, and that all MIN/MAX functions are already
+    computed for each group. ...
+  */
+  if (qep_tab && qep_tab[0].range_scan() &&
+      is_loose_index_scan(qep_tab[0].range_scan()))
+    tmp_table_param.precomputed_group_by =
+        !is_agg_loose_index_scan(qep_tab[0].range_scan());   // ★ LIS 已完成分组
+
+  /*
+    Create the first temporary table if distinct elimination is requested or
+    if the sort is too complicated to be evaluated as a filesort.
+  */
+  if (need_tmp_before_win) {
+    curr_tmp_table = primary_tables;
+    tmp_tables++;
+    ...
+    // ★ 备份 base slice，因为后续步骤会覆盖它（1-3 号 slice）
+    if (alloc_ref_item_slice(thd, REF_SLICE_SAVED_BASE)) return true;
+    copy_ref_item_slice(REF_SLICE_SAVED_BASE, REF_SLICE_ACTIVE);
+    current_ref_item_slice = REF_SLICE_SAVED_BASE;
+
+    ORDER_with_src tmp_group;
+    if (!simple_group && !(test_flags & TEST_NO_KEY_GROUP) && !with_json_agg)
+      tmp_group = group_list;   // ★ GROUP BY 只有 !simple_group 时才做进临时表唯一键
+
+    tmp_table_param.hidden_field_count = CountHiddenFields(*fields);
+
+    if (create_intermediate_table(&qep_tab[curr_tmp_table], *fields, tmp_group,
+                                  !group_list.empty() && simple_group))
+      return true;
+    exec_tmp_table = qep_tab[curr_tmp_table].table();
+
+    if (exec_tmp_table->s->is_distinct) optimize_distinct();
+
+    if (alloc_ref_item_slice(thd, REF_SLICE_TMP1)) return true;
+
+    // Change sum_fields reference to calculated fields in tmp_table
+    if (streaming_aggregation || qep_tab[curr_tmp_table].table()->group ||
+        tmp_table_param.precomputed_group_by) {
+      if (change_to_use_tmp_fields(fields, thd, ref_items[REF_SLICE_TMP1],
+                                   &tmp_fields[REF_SLICE_TMP1], ...))
+        return true;
+    } else {
+      if (change_to_use_tmp_fields_except_sums(...)) return true;
+    }
+    curr_fields = &tmp_fields[REF_SLICE_TMP1];
+    set_ref_item_slice(REF_SLICE_TMP1);
+    qep_tab[curr_tmp_table].ref_item_slice = REF_SLICE_TMP1;
+    setup_tmptable_write_func(&qep_tab[curr_tmp_table], &trace_this_outer);
+    // ★ 决定 op_type：OT_AGGREGATE_INTO_TMP_TABLE / OT_AGGREGATE_THEN_MATERIALIZE / OT_MATERIALIZE
+
+    /*
+      If having is not handled here, it will be checked before the row is sent
+      to the client. ...
+      NOTE : We cannot apply having after distinct. If columns of having are
+             not part of select distinct, then distinct may remove rows
+             which can satisfy having.
+    */
+    if (having_cond &&
+        (streaming_aggregation ||
+         (exec_tmp_table->s->is_distinct && group_list.empty()))) {
+      if ((!select_distinct && rollup_state == RollupState::NONE) &&
+          add_having_as_tmp_table_cond(curr_tmp_table))
+        return true;
+      qep_tab[curr_tmp_table].having = having_cond;
+      having_cond = nullptr;   // ★★ HAVING 被搬走（后面 create_root_access_path_for_join 再取回）
+    }
+    ...
+    if (exec_tmp_table->group) {   // Already grouped
+      /* Check if group by has to respect ordering. If true, move group by to order by. */
+      if (order.empty() && !skip_sort_order) {
+        for (ORDER *group = group_list.order; group; group = group->next) {
+          if (group->direction != ORDER_NOT_RELEVANT) {
+            order = group_list; /* order by group */
+            break;
+          }
+        }
+      }
+      group_list.clean();
+    }
+
+    /*
+      ★ 第二张临时表：GROUP BY 与 ORDER BY 不一致 / DISTINCT 带 rollup / 有窗口步骤
+      If we have different sort & group then we must sort the data by group
+      and copy it to a second temporary table.
+    */
+    if ((!group_list.empty() &&
+         (!test_if_subpart(group_list.order, order.order) || select_distinct ||
+          m_windowing_steps || rollup_state != RollupState::NONE)) ||
+        (select_distinct && (tmp_table_param.using_outer_summary_function ||
+                             rollup_state != RollupState::NONE))) {
+      ...
+      curr_tmp_table++;
+      tmp_tables++;
+      trace_this_tbl.add("adding_tmp_table_in_plan_at_position", curr_tmp_table)
+          .add_alnum("cause", "sorting_to_make_groups");
+
+      ORDER_with_src dummy;
+      if (create_intermediate_table(&qep_tab[curr_tmp_table], *curr_fields,
+                                    dummy, true))
+        return true;
+
+      if (!group_list.empty()) {
+        explain_flags.set(group_list.src, ESP_USING_TMPTABLE);
+        if (!plan_is_const())   // No need to sort a single row
+        {
+          // ★ filesort 挂在"上一张表"上（filesort 只能排单表）
+          if (add_sorting_to_table(curr_tmp_table - 1, &group_list,
+                                   /*sort_before_group=*/true))
+            return true;
+        }
+        if (make_group_fields(this, this)) return true;
+      }
+      ...
+      if (alloc_ref_item_slice(thd, REF_SLICE_TMP2)) return true;
+      ...
+      setup_tmptable_write_func(&qep_tab[curr_tmp_table], &trace_this_tbl);
+    }
+
+    if (qep_tab[curr_tmp_table].table()->s->is_distinct)
+      select_distinct = false; /* Each row is unique */
+
+    if (select_distinct && group_list.empty() && !m_windowing_steps) {
+      if (having_cond) {
+        qep_tab[curr_tmp_table].having = having_cond;
+        having_cond->update_used_tables();
+        having_cond = nullptr;
+      }
+      // ★★ 8.0 迭代器模型下 DISTINCT = "去重 filesort"，不是在临时表里删行
+      qep_tab[curr_tmp_table].needs_duplicate_removal = true;
+      trace_this_outer.add("reading_from_table_eliminates_duplicates", true);
+      explain_flags.set(ESC_DISTINCT, ESP_DUPS_REMOVAL);
+      select_distinct = false;
+    }
+    ...
+  }
+
+  /*
+    ★ 不需要临时表的"流式聚合"路径（AggregateIterator）
+    Set up structures for a temporary table but do not actually create
+    the temporary table if ... implicitly grouped / simple grouping / LIMIT 1 / ROLLUP
+  */
+  if ((grouped || implicit_grouping) && !m_windowing_steps) {
+    if (make_group_fields(this, this)) return true;
+    if (make_sum_func_list(*curr_fields, true, true)) return true;
+    const bool need_distinct =
+        !(qep_tab && qep_tab[0].range_scan() &&
+          is_agg_loose_index_scan(qep_tab[0].range_scan()));
+    if (prepare_sum_aggregators(sum_funcs, need_distinct)) return true;
+    if (setup_sum_funcs(thd, sum_funcs) || thd->is_fatal_error()) return true;
+  }
+
+  if (qep_tab && (!group_list.empty() ||
+                  (!order.empty() && !m_windowing_steps /* [1] */))) {
+    /*
+      [1] above: too early to do query ORDER BY if we have windowing; must
+      wait till after window processing.
+    */
+    if (having_cond && group_list.empty() && !streaming_aggregation &&
+        rollup_state == RollupState::NONE) {
+      if (add_having_as_tmp_table_cond(curr_tmp_table)) return true;
+    }
+    if (grouped)
+      m_select_limit = HA_POS_ERROR;
+    else if (!need_tmp_before_win) {
+      /*
+        We can abort sorting after thd->select_limit rows if there are no
+        filter conditions for any tables after the sorted one. ...
+      */
+      for (uint i = const_tables + 1; i < primary_tables; i++) {
+        QEP_TAB *const tab = qep_tab + i;
+        if (tab->condition() ||                                  // 1
+            (best_ref[tab->idx()]->keyuse() &&                   // 2
+             tab->first_inner() == NO_PLAN_IDX)) {
+          /* We have to sort all rows */
+          m_select_limit = HA_POS_ERROR;
+          break;
+        }
+      }
+    }
+    ORDER_with_src order_arg = group_list.empty() ? order : group_list;
+    // ★ 只有 m_ordered_index_usage 未覆盖所需 clause，才真的加 filesort
+    if (qep_tab &&
+        m_ordered_index_usage != (group_list.empty()
+                                      ? ORDERED_INDEX_ORDER_BY
+                                      : ORDERED_INDEX_GROUP_BY) &&
+        !m_windowing_steps) {
+      QEP_TAB *const sort_tab = &qep_tab[curr_tmp_table];
+      if (need_tmp_before_win && !materialize_join && !exec_tmp_table->group)
+        explain_flags.set(order_arg.src, ESP_USING_TMPTABLE);
+
+      if (add_sorting_to_table(curr_tmp_table, &order_arg,
+                               /*sort_before_group=*/false))
+        return true;
+      /*
+        filesort_limit: Return only this many rows from filesort().
+        We can use select_limit_cnt only if we have no group_by and 1 table.
+        This allows us to use Bounded_queue for queries like:
+          "select * from t1 order by b desc limit 1;"
+      */
+      if (sort_tab->filesort)
+        sort_tab->filesort->limit =
+            (has_group_by || (primary_tables > curr_tmp_table + 1) ||
+             calc_found_rows)
+                ? m_select_limit
+                : query_expression()->select_limit_cnt;
+    }
+  }
+
+  // ★ 每个 window 一张临时表 + REF_SLICE_WIN_wn
+  if (qep_tab && m_windowing_steps) {
+    for (uint wno = 0; wno < m_windows.elements; wno++) {
+      tmp_table_param.m_window = m_windows[wno];
+      ...
+      if (create_intermediate_table(tab, *curr_fields, dummy, false)) return true;
+      if (alloc_ref_item_slice(thd, widx)) return true;
+      ...
+      if (m_windows[wno]->needs_buffering()) {
+        if (CreateFramebufferTable(thd, tmp_table_param, *query_block,
+                                   *orig_fields, *curr_fields,
+                                   tab->tmp_table_param->items_to_copy,
+                                   m_windows[wno]))
+          return true;    // ★ 窗口帧缓冲临时表
+      }
+      ORDER_with_src w_partition(m_windows[wno]->sorting_order(), ESC_WINDOWING);
+      if (w_partition.order != nullptr) {
+        // ★ PARTITION BY/ORDER BY 的排序挂在"上一张"表上
+        if (add_sorting_to_table(curr_tmp_table - 1, &w_partition,
+                                 /*sort_before_group=*/false))
+          return true;
+      }
+      if (m_windows[wno]->is_last()) {
+        ...
+        if (!tab->filesort && !tab->table()->s->keys && ...) {
+          /*
+            Last tmp table of execution; no sort, no duplicate elimination, ...
+            hence any row needn't be written to tmp table's storage; send it out
+            to query's result instead:
+          */
+          m_windows[wno]->set_short_circuit(true);   // ★ 最后一张窗口表可不落盘
+        }
+      }
+      if (having_cond != nullptr) {
+        tab->having = having_cond;
+        having_cond = nullptr;
+      }
+    }
+  }
+
+  refresh_base_slice();
+  fields = curr_fields;
+  set_ref_item_slice(REF_SLICE_SAVED_BASE);
+  if (qep_tab) {
+    qep_tab[primary_tables + tmp_tables].op_type = get_end_select_func();
+  }
+  grouped = has_group_by;
+  unplug_join_tabs();   // ★ 此后 JOIN_TAB 与 QEP_TAB 分离
+  ...
+  return false;
+}
+```
+
+**`count_field_types()`**（`sql/sql_select.cc:3910`）——它决定 `sum_func_count` 与 `allow_group_via_temp_table`，进而影响 `test_skip_sort()`：
+
+```cpp
+void count_field_types(const Query_block *query_block, Temp_table_param *param,
+                       const mem_root_deque<Item *> &fields,
+                       bool reset_with_sum_func, bool save_sum_fields) {
+  param->sum_func_count = 0;
+  param->func_count = fields.size();
+  param->hidden_field_count = 0;
+  param->outer_sum_func_count = 0;
+  save_sum_fields |= param->precomputed_group_by;
+
+  for (Item *field : fields) {
+    Item *real = field->real_item();
+    Item::Type real_type = real->type();
+
+    if (real_type == Item::SUM_FUNC_ITEM && !real->m_is_window_function) {
+      if (!field->const_item()) {
+        Item_sum *sum_item = down_cast<Item_sum *>(field->real_item());
+        if (sum_item->aggr_query_block == query_block) {
+          if (!sum_item->allow_group_via_temp_table)
+            param->allow_group_via_temp_table = false;   // ★ UDF 聚合 ⇒ 禁止"临时表分组"
+          param->sum_func_count++;
+          param->func_count += sum_item->argument_count();
+        }
+      } else if (save_sum_fields) { ... }
+    } else if (real_type == Item::SUM_FUNC_ITEM) {
+      assert(real->m_is_window_function);
+      param->func_count += down_cast<Item_sum *>(real)->argument_count();
+    } else {
+      if (reset_with_sum_func) field->reset_aggregation();
+      if (field->has_aggregation()) param->outer_sum_func_count++;
+    }
+  }
+}
+```
+
+七个阶段：
 
 | 阶段 | 行号 | 关键决策 |
 |---|---|---|

@@ -3,6 +3,8 @@
 > 基于 MySQL 8.0.39 源码，涵盖事务在 server/InnoDB 间的传递、事务分配与启动、状态机、事务提交（undo 序列化 / trx->no / 放锁 / 可见性）、事务与 binlog 的 2PC、事务与 BGC 协同、回滚机制。
 >
 > **边界**：本篇讲 InnoDB 侧事务对象 `trx_t` 的生命周期与提交/回滚；binlog 侧的 `ordered_commit` 三阶段流水线见 [`../server/replication/binlog.md`](../server/replication/binlog.md)，GTID 持久化见 [`../server/replication/gtid.md`](../server/replication/gtid.md)。
+>
+> 交叉：ReadView 与可见性判定见 [`mvcc.md`](mvcc.md)；undo 存储与 purge 执行见 [`undo_log.md`](undo_log.md)；事务与**索引**的交叉地带（回表、delete-mark 两阶段、唯一性加锁、purge 判定接口）见 [`../index/transaction.md`](../index/transaction.md)。
 
 - [概述](#概述)
 - [理论基础](#理论基础)
@@ -23,7 +25,7 @@
     - [2PC 与 BGC 中的锁](#2pc-与-bgc-中的锁)
   - 并发设计
     - [整体并发设计](#整体并发设计)
-- [相关的系统变量/状态变量](#相关的系统变量/状态变量)
+- [相关的系统变量/状态变量](#相关的系统变量状态变量)
 - [Misc](#Misc)
 - [参考](#参考)
 
@@ -71,6 +73,143 @@ InnoDB 的事务启动被推迟到第一条真正需要它的 DML。带来的收
 代价：**"事务是否活跃"不能只看 `BEGIN`**，要看 `trx->state`。这给状态判断带来额外的分支复杂度，`trx_start_low` 里那一堆 `read_only` / `auto_commit` / `will_lock` 的组合判断就是代价的体现。
 
 #### ② `trx->id` 与 `trx->no` 分离：两个正交的"序"
+
+⚠️ **勘误**：`trx->no` 在 `trx0trx.h` 里**只有 7 行注释**（`:752-758`），不是常说的一段长注释。真正解释"no 用于 purge 序"的在 `trx_sys_t::next_trx_id_or_no`（`trx0sys.h:489`）与 `trx0sys.cc:485`。
+
+```cpp
+// trx0trx.h:735-758
+  bool abort; /*!< if this flag is set then
+              this transaction must abort when
+              it can */
+
+  trx_id_t id; /*!< transaction id */
+
+  // xxxx: 只有事务产生undate_undo时才有trx no，用于purge操作！！！！
+  // trx_no 主要用于 purge 系统判断旧版本数据何时可以被清理
+  trx_id_t no; /*!< transaction serialization number:
+               max trx id shortly before the
+               transaction is moved to
+               COMMITTED_IN_MEMORY state.
+               Protected by trx_sys_t::mutex
+               when trx->in_rw_trx_list. Initially
+               set to TRX_ID_MAX. */
+```
+
+> ★★ `id` 与 `no` **类型相同**（都是 `trx_id_t` = `ib_id_t` = `uint64_t`），但语义正交：
+> - `id` —— 事务**开始时**分配的"谁写的"，写进行头 `DB_TRX_ID`，供 **MVCC 可见性**判断；
+> - `no` —— 事务**提交时**分配的"何时序列化"，只用于 **purge 排序**与 `ReadView` 上界。
+>
+> 初值 `TRX_ID_MAX`（= `UINT64_MAX`）表示"尚未序列化"。未提交事务的 `no` 一律是最大值，因为 purge 必须跳过它们。
+> 每次 `trx_start_low()` 都会把 `no` 复位为 `TRX_ID_MAX`（`trx0trx.cc:1405`），因为它是"提交时才赋"的字段。
+
+**一个计数器，两种用途**（`trx0sys.ic:229`）——⚠️ **不存在 `trx_sys_get_new_trx_id()`**，真名 `trx_sys_allocate_trx_id()`：
+
+```cpp
+inline trx_id_t trx_sys_allocate_trx_id_or_no() {
+  ut_ad(trx_sys_mutex_own() || trx_sys_serialisation_mutex_own());
+
+  trx_id_t trx_id = trx_sys->next_trx_id_or_no.fetch_add(1);
+
+  if (trx_id % trx_sys_get_trx_id_write_margin() == 0) {
+    /* Reserve the next range of trx_id values. This thread has acquired
+    either the trx_sys_mutex or the trx_sys_serialisation_mutex. ... */
+    trx_sys_write_max_trx_id();
+  }
+  return trx_id;
+}
+
+inline trx_id_t trx_sys_allocate_trx_id() {
+  ut_ad(trx_sys_mutex_own());                    // ★ 发 id 持 trx_sys_mutex
+  return trx_sys_allocate_trx_id_or_no();
+}
+
+inline trx_id_t trx_sys_allocate_trx_no() {
+  ut_ad(trx_sys_serialisation_mutex_own());      // ★ 发 no 持 serialisation_mutex
+  return trx_sys_allocate_trx_id_or_no();
+}
+
+/** Reads trx->no up to which all transactions have been serialised. */
+static inline trx_id_t trx_get_serialisation_min_trx_no(void) {
+  return (trx_sys->serialisation_min_trx_no.load());
+}
+
+inline trx_id_t trx_sys_get_next_trx_id_or_no() {
+  return trx_sys->next_trx_id_or_no.load();      // ★ 纯读，不分配
+}
+```
+
+> ★★ **两条发号流可真并发**：`next_trx_id_or_no` 是唯一的 64 位发号器，但 id 分配与 no 分配由**两个不同的 mutex** 串行化，互不阻塞。这正是启动时初始化要 `+2 * MARGIN` 的原因。
+
+**落盘节流 `TRX_SYS_TRX_ID_WRITE_MARGIN = 256`**（`trx0sys.h:602`）：
+
+```cpp
+/** When a trx id which is zero modulo this number (which must be a power of
+two) is assigned, the field TRX_SYS_TRX_ID_STORE on the transaction system
+page is updated */
+constexpr trx_id_t TRX_SYS_TRX_ID_WRITE_MARGIN = 256;
+```
+
+```cpp
+// trx0sys.cc:485 —— 启动时：为什么是 +2*MARGIN
+  /* VERY important: after the database is started, next_trx_id_or_no value
+  needs to be set to a higher value than the maximum of values that have ever
+  been used for either trx->id or trx->no. ...
+
+  Note, that the factor 2 in 2 * TRX_SYS_TRX_ID_WRITE_MARGIN is required,
+  because the next_trx_id_or_no might be increased concurrently in two
+  threads:
+    - one that has acquired trx_sys_mutex,
+    - and one that has acquired the trx_sys_serialisation_mutex.
+  If you decreased the factor 2, the test innodb.max_trx_id should fail. */
+
+  trx_sys->next_trx_id_or_no.store(max_trx_id +
+                                   2 * trx_sys_get_trx_id_write_margin());
+  trx_sys->serialisation_min_trx_no.store(trx_sys->next_trx_id_or_no.load());
+```
+
+**`trx->no` 的真正分配点**（`trx0trx.cc:1496`，在 `serialisation_mutex` 下）：
+
+```cpp
+static inline bool trx_add_to_serialisation_list(trx_t *trx) {
+  trx_sys_serialisation_mutex_enter();
+
+  trx->no = trx_sys_allocate_trx_no();      // ★★ trx->no 就在这里诞生
+  ut_d(trx_sys->rw_max_trx_no = trx->no);
+
+  if (trx->read_only) {                     // ★ 只读事务也拿 no，但不入链表
+    trx_sys_serialisation_mutex_exit();
+    return false;
+  }
+
+  UT_LIST_ADD_LAST(trx_sys->serialisation_list, trx);
+
+  if (UT_LIST_GET_LEN(trx_sys->serialisation_list) == 1) {
+    trx_sys->serialisation_min_trx_no.store(trx->no);   // ★ ReadView 的 m_low_limit_no 来源
+  }
+  trx_sys_serialisation_mutex_exit();
+  return true;
+}
+```
+
+```cpp
+// trx0trx.cc:1542 —— no 与 purge 的衔接点
+  /* If the rollack segment is not empty then the new trx_t::no can't be less
+  than any trx_t::no already in the rollback segment. */
+  if ((redo_rseg != nullptr && redo_rseg->last_page_no == FIL_NULL) ||
+      (temp_rseg != nullptr && temp_rseg->last_page_no == FIL_NULL)) {
+    TrxUndoRsegs elem;
+    ... elem.insert(redo_rseg); ...
+    mutex_enter(&purge_sys->pq_mutex);
+    added_trx_no = trx_add_to_serialisation_list(trx);
+    elem.set_trx_no(trx->no);
+    purge_sys->purge_queue->push(std::move(elem));   // ★★ 压进 purge 优先队列
+    mutex_exit(&purge_sys->pq_mutex);
+  } else {
+    added_trx_no = trx_add_to_serialisation_list(trx);
+  }
+```
+
+> ★ `trx_serialisation_number_get()` 必须在**持有 rseg mutex** 时调用——这保证"no 的分配顺序 == undo 头挂进 history list 的顺序"，purge 优先队列才能正确排序。
 
 这是 InnoDB 事务模型最核心的设计决策：
 
@@ -264,40 +403,39 @@ THD
 
 ```cpp
 [[nodiscard]] innodb_session_t *&thd_to_innodb_session(THD *thd) {
+  // 取出 InnoDB 引擎在 THD 中的私有槽位并强转
+  // ⇒ 这就是 server↔引擎的边界：server 只知道 void*，由 InnoDB 自己解释
   innodb_session_t *&innodb_session =
       *(innodb_session_t **)thd_ha_data(thd, innodb_hton_ptr);
 
+  // ★ 返回值是指针的引用（*&）⇒ 调用方可直接给它赋值（thd_to_trx(thd) = new_trx）
+  //   下面 check_trx_exists 的 trx_t *&trx = thd_to_trx(thd); trx = ... 就依赖这个特性
   if (innodb_session != nullptr) {
     return (innodb_session);
   }
 
+  // 惰性创建 ⇒ 从未碰过 InnoDB 的连接，连 innodb_session_t 都不会分配
   innodb_session = ut::new_withkey<innodb_session_t>(UT_NEW_THIS_FILE_PSI_KEY);
   return (innodb_session);
 }
 ```
-
-**逐段解释**：
-
-- 返回值是 **指针的引用**（`*&`），这是关键技巧——调用方可以直接给它赋值（`thd_to_trx(thd) = new_trx`），`check_trx_exists` 里的 `trx_t *&trx = thd_to_trx(thd); trx = ...` 就依赖这个特性。
-- `thd_ha_data(thd, innodb_hton_ptr)` 取出 InnoDB 引擎在 THD 中的私有槽位，强转成 `innodb_session_t**`。这就是 server↔引擎的边界：server 只知道 `void*`，InnoDB 自己解释。
-- **惰性创建**：`innodb_session` 为空时才 new。所以一个从未碰过 InnoDB 的连接，连 `innodb_session_t` 都不会分配。
 
 ```cpp
 [[nodiscard]] trx_t *&thd_to_trx(THD *thd) {
   innodb_session_t *&innodb_session = thd_to_innodb_session(thd);
   ut_ad(innodb_session != nullptr);
 
+  // 同样返回引用，直接暴露 m_trx 成员
+  // ⇒ 全代码库 20 余处 thd_to_trx 调用，是获取事务的标准方式
   return (innodb_session->m_trx);
 }
 ```
-
-同样返回引用，直接暴露 `m_trx` 成员。全代码库有 20 余处 `thd_to_trx` 调用，是获取事务的标准方式。
 
 #### check_trx_exists：每个 DML 的必经之门
 
 ```cpp
 trx_t *check_trx_exists(THD *thd) {
-  trx_t *&trx = thd_to_trx(thd);
+  trx_t *&trx = thd_to_trx(thd);   // 取引用；为空说明这是该连接第一次碰 InnoDB
 
   ut_ad(EQ_CURRENT_THD(thd));
 
@@ -306,24 +444,20 @@ trx_t *check_trx_exists(THD *thd) {
 
     /* User trx can be forced to rollback,
     so we unset the disable flag. */
+    // ★ 新分配的 trx 默认带 TRX_FORCE_ROLLBACK_DISABLE（在 trx_allocate_for_background 中设置）
+    //   这里把它清掉——因为用户事务必须允许被强制回滚（高优先级事务的异步 kill 依赖它）
+    //   ⇒ "新对象默认不可异步回滚" 与 "用户事务必须可回滚" 这对矛盾的解法
     ut_ad(trx->in_innodb & TRX_FORCE_ROLLBACK_DISABLE);
     trx->in_innodb &= TRX_FORCE_ROLLBACK_MASK;
   } else {
-    ut_a(trx->magic_n == TRX_MAGIC_N);
+    ut_a(trx->magic_n == TRX_MAGIC_N);   // 校验 magic number 防内存踩踏
 
-    innobase_trx_init(thd, trx);
+    innobase_trx_init(thd, trx);         // 重新同步 THD 上的会话级设置
   }
 
   return (trx);
 }
 ```
-
-**逐段解释**：
-
-1. 取 THD 对应的 `trx_t` 引用。为空说明这是该连接第一次碰 InnoDB。
-2. **首次**：`innobase_trx_allocate` 分配新事务对象。
-3. **关键细节**：新分配的 trx 默认带 `TRX_FORCE_ROLLBACK_DISABLE` 标志（在 `trx_allocate_for_background` 中设置），这里用 `trx->in_innodb &= TRX_FORCE_ROLLBACK_MASK` 把它清掉——**因为用户事务必须允许被强制回滚**（高优先级事务的异步 kill 机制依赖它）。这是"新对象默认不可异步回滚、但用户事务必须可回滚"这对矛盾的解法。
-4. **非首次**：校验 magic number 防内存踩踏，然后 `innobase_trx_init` 重新同步 THD 上的会话级设置。
 
 ```cpp
 static void innobase_trx_init(THD *thd, trx_t *trx) {
@@ -341,6 +475,50 @@ static void innobase_trx_init(THD *thd, trx_t *trx) {
 - **下游**：`trx_start_low` 分配 id 与 rseg → 执行期用 `trx->id` 写 `DB_TRX_ID` → 提交/回滚收尾。
 - **边界**：`THD` 与 `trx_t` 的绑定是"每连接一个"，**XA 事务 detach 时会被替换**（`innodb_replace_trx_in_thd`），这是唯一的例外。
 
+#### 语句级与事务级双 scope（Transaction_ctx）
+
+传递链条之外，server 层事务上下文还有一个关键设计：**每个 THD 的事务上下文是"语句级 + 事务级"两份**（`Transaction_ctx::m_scope_info[2]`）：
+
+```cpp
+class Transaction_ctx {
+ public:
+  enum enum_trx_scope { STMT = 0, SESSION };
+
+  struct THD_TRANS {
+    bool m_no_2pc;
+    int m_rw_ha_count;
+    Ha_trx_info *m_ha_list;              // 本 scope 已注册的引擎链表
+    unsigned int m_unsafe_rollback_flags;
+  };
+
+ private:
+  THD_TRANS m_scope_info[2];             // [STMT] + [SESSION]
+```
+
+- `m_scope_info[STMT]`：**当前语句**涉及的引擎与状态，语句结束即清空；
+- `m_scope_info[SESSION]`：**整个用户事务**涉及的引擎与状态。
+
+**驱动入口 `ha_commit_trans(thd, all)`**：`all=true`（显式 COMMIT / DDL 隐式提交）走 SESSION scope；`all=false`（每条语句结束）走 STMT scope。
+
+**关键判定 `is_real_trans`**：
+
+```cpp
+bool is_real_trans = all || !trn_ctx->is_active(Transaction_ctx::SESSION);
+```
+
+- 多语句事务内（SESSION 活跃）的语句收尾：`is_real_trans = false`——只释放语句资源，**不真提交**；
+- autocommit 语句（SESSION 空）：`is_real_trans = true`——语句结束 = 事务结束，**真提交**。
+
+同一条 `ha_commit_trans(thd, false)` 代码路径，靠这一个布尔值区分"语句收尾"和"autocommit 真提交"。InnoDB 侧对应的判定是 `innobase_commit` 的 `will_commit = commit_trx || !(OPTION_NOT_AUTOCOMMIT|OPTION_BEGIN)`。
+
+**为什么必须双 scope**（三个理由）：
+
+1. **语句错误恢复**：`BEGIN; UPDATE A; UPDATE B（失败）`——B 失败时只调 `ha_rollback_trans(thd, all=false)`。单 scope 要么整事务回滚（毁掉 A），要么不回滚（留下 B 的半截修改）。双 scope 下 InnoDB 用 `last_sql_stat_start` 只回退本语句的 undo 区间（见「SAVEPOINT 与语句级回滚」）。
+2. **autocommit 的"语句即事务"**：autocommit=1 时每条语句结束都要真提交，但提交路径只有一条（语句结束回调）。`is_real_trans` 让同一条路径在两种语义间切换。
+3. **不可安全回滚操作的传播**：STMT 级的 `m_unsafe_rollback_flags`（改了非事务表 / 建删临时表）在语句末 `merge_unsafe_rollback_flags()` 并入 SESSION 级，保证"任一语句改了非事务表 ⇒ 整个事务都不能安全回滚"的告警语义。
+
+> ★ 版本纠正：`handlerton::start_stmt` 回调在 8.0 已不存在。InnoDB 感知语句边界的职能由 `ha_innobase::external_lock()` 的 `TrxInInnoDB::begin_stmt/end_stmt` 承担（LOCK TABLES 场景由 `ha_innobase::start_stmt()` 补位）。
+
 ---
 
 ### 事务的分配与启动
@@ -351,8 +529,11 @@ static void innobase_trx_init(THD *thd, trx_t *trx) {
 trx_t *trx_allocate_for_mysql(void) {
   trx_t *trx;
 
-  trx = trx_allocate_for_background();
+  trx = trx_allocate_for_background();   // 后台/用户事务共用分配逻辑
 
+  // 在 trx_sys->mutex 保护下挂到 mysql_trx_list 链表头 ⇒ 保证遍历者看到一致视图
+  // ⇒ 该链表让 SHOW ENGINE INNODB STATUS / lock_print_info_all_transactions 能遍历所有事务
+  //   注意它与 rw_trx_list 不同：前者包含所有（含只读）事务，后者只有读写事务
   trx_sys_mutex_enter();
 
   ut_d(trx->in_mysql_trx_list = true);
@@ -364,15 +545,9 @@ trx_t *trx_allocate_for_mysql(void) {
 }
 ```
 
-**逐段解释**：
-
-- 先走通用的 `trx_allocate_for_background()`（后台/用户事务共用分配逻辑），再挂到 `mysql_trx_list` 链表头。
-- `mysql_trx_list` 的作用是让 `SHOW ENGINE INNODB STATUS` / `lock_print_info_all_transactions` 能遍历所有事务。注意它与 `rw_trx_list` 不同：前者包含所有（含只读）事务，后者只有读写事务。
-- 链表插入在 `trx_sys->mutex` 保护下进行，注释解释了原因：保证遍历者看到一致视图。
-
 #### 启动：trx_start_low
 
-这是事务真正"活过来"的函数。分段剖析：
+这是事务真正"活过来"的函数。按段剖析，注释就近标在代码行旁：
 
 **第一段：前置断言与版本递增**
 
@@ -385,14 +560,14 @@ static void trx_start_low(trx_t *trx, bool read_write) {
   ut_ad(trx_state_eq(trx, TRX_STATE_NOT_STARTED));
   ut_ad(UT_LIST_GET_LEN(trx->lock.trx_locks) == 0);
   ...
+  // ★ 异步回滚机制用它判断"事务是否已经结束"（version 变化说明走完一轮生命周期）
   ++trx->version;
 ```
-
-`++trx->version` 很重要：异步回滚机制用它判断"事务是否已经结束"（`version` 变化说明事务已经走完一轮生命周期）。
 
 **第二段：判定 auto_commit 与 read_only**
 
 ```cpp
+  // auto_commit 与 read_only 均从 THD 反查 ⇒ server 语义向引擎的传递
   trx->auto_commit = (trx->api_trx && trx->api_auto_commit) ||
                      thd_trx_is_auto_commit(trx->mysql_thd);
 
@@ -401,18 +576,14 @@ static void trx_start_low(trx_t *trx, bool read_write) {
                    srv_read_only_mode;
 
   if (!trx->auto_commit) {
-    ++trx->will_lock;
+    ++trx->will_lock;                  // 非 autocommit 事务预期会加锁
   } else if (trx->will_lock == 0) {
+    // ★ AC-NL-RO 的判定入口：autocommit 且不需要加锁 → 强制 read_only
+    //   一条 autocommit 的只读 SELECT 就是在这里被标记为只读的
     trx->read_only = true;
   }
   trx->persists_gtid = false;
 ```
-
-**逐段解释**：
-
-- `auto_commit` 与 `read_only` 从 THD 反查（`thd_trx_is_auto_commit` / `thd_trx_is_read_only`），体现 server 语义向引擎的传递。
-- `++trx->will_lock`：非 autocommit 事务预期会加锁，递增计数器。
-- **关键推导**：autocommit 且 `will_lock == 0`（不需要加锁）→ 强制 `read_only = true`。这就是 **AC-NL-RO** 的判定入口——一条 autocommit 的只读 SELECT 在这里被标记为只读。
 
 **第三段：trx->no 的哨兵值**
 
@@ -425,54 +596,52 @@ static void trx_start_low(trx_t *trx, bool read_write) {
 
   /* The initial value for trx->no: TRX_ID_MAX is used in
   read_view_open_now */
+  // ★ MVCC 的基石：运行期取最大值 ⇒ 任何 read view 都认为它"还没提交"
+  //   这也是 SHOW ENGINE INNODB STATUS 里未提交事务的 trx->no 显示为一堆 F 的原因
   trx->no = TRX_ID_MAX;
 ```
-
-`trx->no = TRX_ID_MAX` 是 MVCC 的基石：运行期取最大值，任何 read view 都认为它"还没提交"。这也是为什么 `SHOW ENGINE INNODB STATUS` 里未提交事务的 `trx->no` 显示为一堆 F。
 
 **第四段：读写事务——分配 rseg、trx_id、入链表**
 
 ```cpp
   if (!trx->read_only &&
       (trx->mysql_thd == nullptr || read_write || trx->ddl_operation)) {
+    // 分配持久化回滚段（m_redo.rseg）；临时表的 rseg（m_noredo.rseg）是另一条路径，
+    // 只在真正改临时表时才分配——又一处惰性
     trx_assign_rseg_durable(trx);
 
     trx_sys_mutex_enter();
 
-    trx->id = trx_sys_allocate_trx_id();
+    trx->id = trx_sys_allocate_trx_id();      // ★ 全局单调递增；这是 trx->id 唯一的分配点
 
-    trx_sys->rw_trx_ids.push_back(trx->id);
+    trx_sys->rw_trx_ids.push_back(trx->id);   // 加入活跃事务 id 集合，供 read view 创建时快照
 
-    trx_add_to_rw_trx_list(trx);
+    trx_add_to_rw_trx_list(trx);              // 加入读写事务链表（purge 扫描用）
 
+    // 状态迁移在 trx_sys->mutex 内完成 ⇒ lock_print_info_all_transactions() 需要看到一致视图
     trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);
 
     trx_sys_mutex_exit();
 
+    // 8.0 分片注册：把 trx 加入对应 Trx_shard 的 active_rw_trxs
+    // ⇒ 在 mutex 外调用，因为分片有自己的锁
     trx_sys_rw_trx_add(trx);
 
   } else {
 ```
 
-**逐段解释**：
-
-1. `trx_assign_rseg_durable(trx)`：分配**持久化**回滚段（`m_redo.rseg`）。临时表的 rseg（`m_noredo.rseg`）是另一条路径，只在真正改临时表时才分配——又一处惰性。
-2. `trx_sys_allocate_trx_id()`：全局单调递增分配 `trx->id`。**这是 `trx->id` 唯一的分配点**。
-3. `rw_trx_ids.push_back(trx->id)`：加入活跃事务 id 集合，供 read view 创建时快照。
-4. `trx_add_to_rw_trx_list`：加入读写事务链表（purge 扫描用）。
-5. **状态迁移在 `trx_sys->mutex` 内完成**：注释解释了原因——`lock_print_info_all_transactions()` 需要看到一致视图。
-6. `trx_sys_rw_trx_add(trx)`：8.0 的分片注册，把 trx 加入对应 `Trx_shard` 的 `active_rw_trxs`。注意它在 mutex 外调用，因为分片有自己的锁。
-
 **第五段：只读事务——AC-NL-RO 的三种分支**
 
 ```cpp
-    trx->id = 0;
+    trx->id = 0;   // 只读事务默认不分配 trx id
 
     if (!trx_is_autocommit_non_locking(trx)) {
       /* If this is a read-only transaction that is writing
       to a temporary table then it needs a transaction id
       to write to the temporary table. */
 
+      // ★ 最容易忽略的分支：只读事务写临时表也要分配 trx->id
+      //   ⇒ 因为临时表的修改也要在 undo 里记录、也要走 MVCC
       if (read_write) {
         trx_sys_mutex_enter();
 
@@ -487,25 +656,22 @@ static void trx_start_low(trx_t *trx, bool read_write) {
         trx_sys_rw_trx_add(trx);
 
       } else {
-        trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);
+        trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);   // 显式只读事务
       }
     } else {
       ut_ad(!read_write);
+      // ★ 纯粹的 AC-NL-RO：trx->id = 0、不入任何链表、提交时走简化路径
       trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);
     }
 ```
 
-**逐段解释**——只读路径有三个分支，区分的关键是"是否要写临时表"：
+**三个分支对比**（区分的关键是"是否要写临时表"）：
 
 | 分支 | 条件 | `trx->id` | 是否进 rw_trx_list |
 |------|------|-----------|-------------------|
 | 显式只读事务（如 `START TRANSACTION READ ONLY`） | `!trx_is_autocommit_non_locking` 且 `!read_write` | 0 | 否 |
 | 只读但写临时表 | `!AC-NL-RO` 且 `read_write` | **分配** | 是 |
 | AC-NL-RO | `trx_is_autocommit_non_locking` | 0 | 否 |
-
-第二分支是最容易忽略的：**只读事务写临时表也要分配 `trx->id`**（注释明说），因为临时表的修改也要在 undo 里记录、也要 MVCC。
-
-第三分支就是纯粹的 AC-NL-RO：`trx->id = 0`、不入任何链表、提交时走简化路径。
 
 ---
 
@@ -552,6 +718,111 @@ ACTIVE ──异步回滚──> FORCED_ROLLBACK ──> NOT_STARTED
 
 #### 与 undo 段状态的协同
 
+`trx->state` 是**内存**的；`trx_undo_t::state` 是**持久化**的（写入 undo segment header 的 `TRX_UNDO_STATE`，`MLOG_2BYTES`）——**崩溃恢复判定 trx 命运的唯一依据是后者**。
+
+```cpp
+// trx0undo.h:309
+/* States of an undo log segment */
+/** contains an undo log of an active  transaction */
+constexpr uint32_t TRX_UNDO_ACTIVE = 1;
+/** cached for quick reuse */
+constexpr uint32_t TRX_UNDO_CACHED = 2;
+/** insert undo segment can be freed */
+constexpr uint32_t TRX_UNDO_TO_FREE = 3;
+/** update undo segment will not be reused: it can be freed in purge when all
+ undo data in it is removed */
+constexpr uint32_t TRX_UNDO_TO_PURGE = 4;
+/** contains an undo log of an prepared transaction for a server version older
+ * than 8.0.29 */
+constexpr uint32_t TRX_UNDO_PREPARED_80028 = 5;
+/** contains an undo log of an prepared transaction */
+constexpr uint32_t TRX_UNDO_PREPARED = 6;
+/* contains an undo log of a prepared transaction that has been processed by the
+ * transaction coordinator */
+constexpr uint32_t TRX_UNDO_PREPARED_IN_TC = 7;
+```
+
+**两者协同关系**：
+
+| `trx->state` | `undo->state` | 说明 |
+|---|---|---|
+| ACTIVE | `TRX_UNDO_ACTIVE`(1) | 正常读写中 |
+| PREPARED | `TRX_UNDO_PREPARED`(6) / `_80028`(5) / `_IN_TC`(7) | XA PREPARE，XID 写入 undo header |
+| COMMITTED_IN_MEMORY | `CACHED`(2) / `TO_FREE`(3) / `TO_PURGE`(4) | 由 `trx_undo_set_state_at_finish()` 三选一 |
+| 崩溃恢复 | `PREPARED*`→PREPARED；`ACTIVE`→ACTIVE；其余→COMMITTED_IN_MEMORY | `trx_resurrect_*()` |
+
+**提交时的状态迁移**（`trx_undo_set_state_at_finish()`，`trx0undo.cc:1806`）：
+
+```cpp
+page_t *trx_undo_set_state_at_finish(trx_undo_t *undo, mtr_t *mtr) {
+  undo_page = trx_undo_page_get(page_id_t(undo->space, undo->hdr_page_no),
+                                undo->page_size, mtr);
+  seg_hdr = undo_page + TRX_UNDO_SEG_HDR;
+  page_hdr = undo_page + TRX_UNDO_PAGE_HDR;
+
+  // undo page list的复用
+  if (undo->size == 1 && mach_read_from_2(page_hdr + TRX_UNDO_PAGE_FREE) <
+                             TRX_UNDO_PAGE_REUSE_LIMIT) {
+    state = TRX_UNDO_CACHED;      // ★① 只占 1 页 且 已用 < 3/4 页 → 挂回 rseg cache 复用
+  } else if (undo->type == TRX_UNDO_INSERT) {
+    state = TRX_UNDO_TO_FREE;     // ★② insert undo：commit 后数据已无用，段可直接释放
+  } else {
+    state = TRX_UNDO_TO_PURGE;    // ★③ update undo：必须等 purge 清完 history list
+  }
+
+  undo->state = state;
+  mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, state, MLOG_2BYTES, mtr);  // ★★ 持久化
+  return (undo_page);
+}
+```
+
+**XA PREPARE / ROLLBACK 的状态迁移**（`trx_undo_set_state_at_prepare()`，`trx0undo.cc:1843`）：
+
+```cpp
+  if (rollback) {
+    ut_ad(undo->is_prepared());
+    /* Write GTID information if there. */
+    trx_undo_gtid_write(trx, undo_header, undo, mtr, !rollback);
+
+    mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, TRX_UNDO_ACTIVE, MLOG_2BYTES, mtr);
+    //  ★★ XA ROLLBACK：PREPARED → ACTIVE
+    //     目的就是"如果此刻宕机，恢复时按 ACTIVE 走回滚"
+    return (undo_page);
+  }
+
+  ut_ad(undo->state == TRX_UNDO_ACTIVE);
+  undo->set_prepared(trx->xid);   // ★ 内存态 → TRX_UNDO_PREPARED(6)
+
+  mlog_write_ulint(seg_hdr + TRX_UNDO_STATE, undo->state, MLOG_2BYTES, mtr);
+  mlog_write_ulint(undo_header + TRX_UNDO_FLAGS, undo->flag, MLOG_1BYTE, mtr);
+  trx_undo_write_xid(undo_header, &undo->xid, mtr);   // ★★ XID 落盘
+```
+
+> ★★ **XA ROLLBACK 先把 undo 改回 ACTIVE 再回滚**，这是一个"用持久化状态为回滚上保险"的技巧：万一回滚中途宕机，重启后 undo 仍是 ACTIVE，恢复流程会继续回滚。
+>
+> ★ `TRX_UNDO_PREPARED_IN_TC`(7)（`trx_undo_set_prepared_in_tc()`，`trx0undo.cc:1892`）表示 **TC（binlog）已接管**，此后可走"一阶段提交"——这是 8.0.29+ 的 XA 优化。
+
+**InnoDB 侧 `trx->state` 全部 23 个赋值点**里，与 undo 相关的关键几处：
+
+```cpp
+// trx0trx.cc:1949 —— trx_release_impl_and_expl_locks() 内
+  state_transition = [&](trx_state_t new_state) { ... trx->state.store(new_state, ...); };
+  ... → COMMITTED_IN_MEMORY   // ★ 隐式锁释放的那一刻
+
+// trx0trx.cc:2179 —— trx_commit_in_memory() 尾部，★ 唯一产生 FORCED_ROLLBACK 的地方
+  if (trx->abort) {
+    trx->abort = false;
+    trx->state.store(TRX_STATE_FORCED_ROLLBACK, std::memory_order_relaxed);
+  } else {
+    trx->state.store(TRX_STATE_NOT_STARTED, std::memory_order_relaxed);
+  }
+
+// trx0trx.cc:3071 —— trx_prepare()（受 trx_sys->mutex 保护）
+  trx->state.store(TRX_STATE_PREPARED, ...);
+```
+
+> ⚠️ 所有这些点都用 `std::memory_order_relaxed`——正确性靠 `trx->mutex` / `trx_sys->mutex` 与"只有属主线程能改"的约定保证，**不靠原子序**。
+
 `trx->state` 是**内存态**，`undo segment state` 是**文件态**（持久化在 undo 页头，随 redo 落盘）。两者必须同步推进——内存态决定并发行为，文件态决定崩溃恢复行为。
 
 undo 段状态（`trx0undo.h`）：
@@ -577,6 +848,145 @@ undo 段状态（`trx0undo.h`）：
 
 **`PREPARED` 与 `PREPARED_IN_TC` 的区别**（8.0.29 引入）：后者表示该 prepared 事务的 XID 已被事务协调器（binlog）写入。崩溃恢复时靠这个标记判断"binlog 是否已经写过这个事务"，避免重复写或漏写。旧的 `PREPARED_80028`(5) 只为兼容升级路径保留。
 
+#### XA 状态机：XID_STATE 的另一套状态
+
+⚠️ **勘误**：**不存在 `enum enum_xa_state_flags`**（`sql/xa.h` 与全仓 0 命中）。`XID_STATE` 里承担"标志位"职责的是 `m_is_detached` 与 `m_is_binlogged` 两个独立 bool。
+
+```cpp
+// sql/xa.h:295
+class XID_STATE {
+ public:
+  enum xa_states {
+    XA_NOTR = 0,          // ★ 无 XA 事务（普通事务也停在这里）
+    XA_ACTIVE,            // ★ XA START 后、XA END 前
+    XA_IDLE,              // ★ XA END 后（已 detach，但未 PREPARE）
+    XA_PREPARED,          // ★ XA PREPARE 后
+    XA_ROLLBACK_ONLY      // ★ RM 单边回滚过，只能 XA ROLLBACK
+  };
+
+ private:
+  static const char *xa_state_names[];
+
+  XID m_xid;
+  /**
+    This mutex used for eliminating a possibility to run two
+    XA COMMIT/XA ROLLBACK statements concurrently against the same xid value.
+    m_xa_lock is used on handling XA COMMIT/XA ROLLBACK and acquired only for
+    external XA branches. */
+  std::mutex m_xa_lock;
+
+  /// Used by external XA only
+  xa_states xa_state;
+  bool m_is_detached = false;
+  uint rm_error;              // RM 报告给 TM 的错误
+  bool m_is_binlogged;        // ★ XA-prepare 的 binlog 二次记录标记
+  ...
+  void start_normal_xa(const XID *xid) {
+    assert(m_xid.is_null());
+    xa_state = XA_ACTIVE;
+    m_xid.set(xid);
+    m_is_detached = false;
+    rm_error = 0;
+  }
+
+  void start_detached_xa(const XID *xid, bool binlogged_arg = false) {
+    xa_state = XA_PREPARED;   // ★★ 恢复出来的 XA 直接落 PREPARED，跳过 ACTIVE/IDLE
+    m_xid.set(xid);
+    m_is_detached = true;
+    rm_error = 0;
+    m_is_binlogged = binlogged_arg;
+  }
+};
+
+// sql/xa.cc:86
+const char *XID_STATE::xa_state_names[] = {"NON-EXISTING", "ACTIVE", "IDLE",
+                                           "PREPARED", "ROLLBACK ONLY"};
+```
+
+**★ 两套状态完全独立，不可混为一谈**：
+
+| Server `xa_state` | InnoDB `trx->state` | InnoDB `undo->state` |
+|---|---|---|
+| `XA_NOTR` | `NOT_STARTED` / `ACTIVE` | 无 / `ACTIVE` |
+| `XA_ACTIVE` | `ACTIVE` | `ACTIVE` |
+| `XA_IDLE` | **`ACTIVE`**（不是 PREPARED！） | `ACTIVE` |
+| `XA_PREPARED` | `PREPARED` | `PREPARED`(6) 或 `PREPARED_IN_TC`(7) |
+| `XA_ROLLBACK_ONLY` | `PREPARED` 或已 `NOT_STARTED` | `PREPARED` → `ACTIVE` |
+
+> ★★ **`XA END` 只改 Server 状态（→`XA_IDLE`），完全不触碰 InnoDB**。只有 `XA PREPARE` 才通过 `trx_prepare()`（`trx0trx.cc:3071`）把 `trx->state` 推到 `PREPARED`。所以"XA END 之后 InnoDB 还以为是 ACTIVE"是正常状态，不是 bug。
+
+**`trx_disconnect_prepared()`：XA 断开但保留 trx 对象**（`trx0trx.cc:666`）：
+
+```cpp
+inline void trx_disconnect_from_mysql(trx_t *trx, bool prepared) {
+  trx_sys_mutex_enter();
+  UT_LIST_REMOVE(trx_sys->mysql_trx_list, trx);
+
+  if (trx->read_view != nullptr) {
+    trx_sys->mvcc->view_close(trx->read_view, true);
+  }
+
+  if (prepared) {
+    ut_ad(trx_state_eq(trx, TRX_STATE_PREPARED));
+    /* During disconnection there is a short period when the server layer
+    already believes this XID is detached from this connection, and thus another
+    connection may try to XA COMMIT/ROLLBACK it, yet InnoDB is still processing
+    the trx object ... We use trx->mysql_thd field, under protection of
+    trx_sys->mutex to synchronize with trx_get_trx_by_xid() ... */
+    trx->mysql_thd = nullptr;    // ★★ 断开连接但 trx 对象留在 rw_trx_list
+  }
+  trx_sys_mutex_exit();
+}
+```
+
+> ★ 这就是"一个会话 PREPARE 后断开，另一个会话可以用同一个 XID 接管提交"的实现基础。
+
+> 注意：InnoDB 的 `trx_state_t` 之外，**server 层还有一套 XA 协议状态机** `XID_STATE::xa_states`（xa.h:297）。两套并存、各管各的，容易混淆。
+
+```cpp
+enum xa_states {
+  XA_NOTR = 0,        // 没有 XA 事务
+  XA_ACTIVE,          // XA START 之后、XA END 之前
+  XA_IDLE,            // XA END 之后、XA PREPARE/COMMIT 之前
+  XA_PREPARED,        // 已 prepare
+  XA_ROLLBACK_ONLY    // 出错时标记只回滚
+};
+```
+
+**转换由 XA 命令驱动**（对应 `sql/xa/sql_xa_*.cc` 的 `set_state` 调用）：
+
+```
+XA_NOTR ──XA START──> ACTIVE ──XA END──> IDLE ──XA PREPARE──> PREPARED
+   ▲                    │                   │                     │
+   │                    │ XA ROLLBACK       │ XA COMMIT ONE PHASE │ XA COMMIT / ROLLBACK
+   │                    └───────────────────┴─────────────────────┘
+   └─────────────────────────────────────────────────────────────
+IDLE ──XA START (RESUME)──> ACTIVE          （同一事务继续执行）
+```
+
+**与 InnoDB `trx_state_t` 的两层映射**——关键洞察是**两层不同步**：
+
+| 时刻 | `XID_STATE` | `trx->state` | 说明 |
+|------|-----------|-------------|------|
+| XA START 后 | ACTIVE | NOT_STARTED | 引擎惰性，还没碰数据 |
+| 执行 DML | ACTIVE | ACTIVE | 两层都活跃 |
+| XA END 后 | IDLE | ACTIVE（不变） | **引擎事务仍活着** |
+| XA PREPARE 后 | PREPARED | PREPARED | ★ 唯一两层一致的态 |
+| XA COMMIT 后 | NOTR | NOT_STARTED | 都结束 |
+
+XA_ACTIVE 期间引擎可能还没启动事务（惰性启动）；XA_IDLE 期间引擎事务仍是 ACTIVE（还没 prepare）。**只有 PREPARED 状态两层语义完全对齐**——这正是 detach 以 PREPARED 为界的深层原因。
+
+还有一个微妙的中间态（`ha_commit_trans` 里）：
+
+```cpp
+if (!error && all && xid_state->has_state(XID_STATE::XA_IDLE)) {
+  ...
+  xid_state->set_state(XID_STATE::XA_PREPARED);   // ONE PHASE 的中间态
+}
+```
+
+`XA COMMIT ONE PHASE` 时先**短暂置 PREPARED**（让 binlog 写 `XA_prepare_log_event`），commit 完成后立刻回 NOTR——XA_IDLE 直通 NOTR 的路径中间借道 PREPARED。
+
 ---
 
 ### read view 的生命周期
@@ -588,13 +998,15 @@ undo 段状态（`trx0undo.h`）：
 ```cpp
 ReadView *trx_assign_read_view(trx_t *trx) {
   ut_ad(trx_can_be_handled_by_current_thread_or_is_hp_victim(trx));
-  ut_ad(trx->state.load(std::memory_order_relaxed) == TRX_STATE_ACTIVE);
+  ut_ad(trx->state.load(std::memory_order_relaxed) == TRX_STATE_ACTIVE);  // view 只能挂在活跃事务上
 
   if (srv_read_only_mode) {
     ut_ad(trx->read_view == nullptr);
-    return (nullptr);
+    return (nullptr);                    // 只读模式不需要 MVCC 快照
 
   } else if (!MVCC::is_view_active(trx->read_view)) {
+    // ★ 已有关联 view 就不重复创建——这是复用的第一层
+    //   ⇒ 同一事务内多条语句（RR 下）共用一个 view
     trx_sys->mvcc->view_open(trx->read_view, trx);
   }
 
@@ -602,18 +1014,188 @@ ReadView *trx_assign_read_view(trx_t *trx) {
 }
 ```
 
-**逐段解释**：
-
-- 断言 `state == TRX_STATE_ACTIVE`——read view 只能挂在活跃事务上。
-- 只读模式直接返回 nullptr（不需要 MVCC 快照）。
-- `!MVCC::is_view_active(trx->read_view)`：**已有关联 view 就不重复创建**。这是复用的第一层——同一事务内多条语句（RR 下）共用一个 view。
-
 **何时被调用**取决于隔离级别：
 
 - **REPEATABLE READ**：事务内第一条一致性读时创建，之后整个事务复用。`innobase_start_trx_and_assign_read_view` 对 RR 显式调用它。
 - **READ COMMITTED**：**每条语句**重新创建，语句结束即关闭——这就是 RC 能看到其他事务新提交修改的原因。
 
 #### view_open：两条路径与指针 LSB 技巧
+
+⚠️ **勘误**：
+- **`ReadView` 在 `include/read0types.h:56`**，不在 `read0read.h`（后者是 `MVCC`）；**不存在 `storage/innobase/mvcc/` 目录**
+- **不存在 `ReadView::view_open()`**（真名 `MVCC::view_open()`）、**不存在 `complete()` / `copy()` / `m_cloned`**
+- **不存在 `ReadView::complete()`**——被 `copy_prepare()` + `copy_complete()` 取代
+- **不存在 `m_free_views`**（真名 `m_free`）
+
+**★ `MVCC::view_open()` 全文**（`read0read.cc:527`）——LSB 技巧第一处：
+
+```cpp
+void MVCC::view_open(ReadView *&view, trx_t *trx) {
+  ut_ad(!srv_read_only_mode);
+
+  /** If no new RW transaction has been started since the last view
+  was created then reuse the the existing view. */
+  if (view != nullptr) {
+    // 利用指针最低位（LSB）作为标志位（closed 标记）
+    uintptr_t p = reinterpret_cast<uintptr_t>(view);
+    view = reinterpret_cast<ReadView *>(p & ~1);
+    //  ★★★ LSB 技巧：ReadView 对象按 8/16 字节对齐 ⇒ 指针 LSB 恒为 0，可借用当标志位
+    //       LSB=1 表示"这个 view 已关闭但对象还在"，trx->read_view 是这种 dual representation
+
+    ut_ad(view->m_closed);
+
+    /* NOTE: This can be optimised further, for now we only
+    reuse the view if there are no active RW transactions.
+
+    There is an inherent race here between purge and this
+    thread. Purge will skip views that are marked as closed.
+    Therefore we must set the low limit id after we reset the
+    closed status after the check. ... */
+
+    if (trx_is_autocommit_non_locking(trx) && view->empty()) {
+      // 注意这里没持有 trx_sys_t::mutex     ★★ 快路径完全无锁
+      view->m_closed = false;
+
+      if (view->m_low_limit_id == trx_sys_get_next_trx_id_or_no()) {
+        return;      // ★★★ 快路径命中：自上次关闭以来没新 RW 事务 ⇒ 直接复用，不碰 trx_sys mutex
+      } else {
+        view->m_closed = true;    // 有新事务了 → 回滚，落到下面的慢路径
+      }
+    }
+  }
+
+  // 慢路径：SCN 优化热点 —— trx_sys_mutex
+  trx_sys_mutex_enter();
+
+  if (view != nullptr) {
+    UT_LIST_REMOVE(m_views, view);      // 复用旧 view
+  } else {
+    view = get_view();                  // 从 m_free 取或 new
+  }
+
+  if (view != nullptr) {
+    view->prepare(trx->id);
+    UT_LIST_ADD_FIRST(m_views, view);   // ★ 头插 ⇒ m_views 按 m_low_limit_no 递减（新在前）
+    ut_ad(!view->is_closed());
+    ut_ad(validate());
+  }
+  trx_sys_mutex_exit();
+}
+```
+
+**`ReadView::prepare()`**（`read0read.cc:444`）——`m_ids` 的唯一填充入口：
+
+```cpp
+void ReadView::prepare(trx_id_t id) {
+  ut_ad(trx_sys_mutex_own());           // ★ 必须在 trx_sys mutex 下
+
+  m_creator_trx_id = id;
+
+  m_low_limit_no = trx_get_serialisation_min_trx_no();
+  //  ★ purge 边界 = 当前已串行化最小 trx_no
+
+  m_low_limit_id = trx_sys_get_next_trx_id_or_no();
+  //  ★ 高水位 = 下一个将分配的 trx_id（"未来事务"）
+
+  if (!trx_sys->rw_trx_ids.empty()) {
+    copy_trx_ids(trx_sys->rw_trx_ids);
+  } else {
+    m_ids.clear();
+  }
+
+  /* The first active transaction has the smallest id. */
+  m_up_limit_id = !m_ids.empty() ? m_ids.front() : m_low_limit_id;
+
+  m_closed = false;
+}
+```
+
+```cpp
+// read0read.cc:352 —— copy_trx_ids 用两段 memmove 剔除 creator 自己
+void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
+  ulint size = trx_ids.size();
+  if (m_creator_trx_id > 0) { ut_ad(size > 0); --size; }   // ★ 剔除自己
+  ...
+    trx_ids_t::const_iterator it =
+        std::lower_bound(trx_ids.begin(), trx_ids.end(), m_creator_trx_id);
+    ::memmove(p, &trx_ids[0], i * sizeof(...));            // 段1：creator 之前
+    ::memmove(p + i, &trx_ids[i + 1], n);                  // 段2：creator 之后，前移一格
+  ...
+  m_up_limit_id = m_ids.front();   // ★ rw_trx_ids 有序 ⇒ front() 即最小活跃 id
+}
+```
+
+**`view_close` 的三条路径**：
+
+```cpp
+// read0read.cc:769 —— 慢/快两条
+void MVCC::view_close(ReadView *&view, bool own_mutex) {
+  uintptr_t p = reinterpret_cast<uintptr_t>(view);
+
+  if (!own_mutex) {
+    /* Sanitise the pointer first. */
+    ReadView *ptr = reinterpret_cast<ReadView *>(p & ~1);
+    ptr->m_closed = true;                    // ★ 路径 A（AC-NL-RO 快路径）：无锁，只置标记
+    view = reinterpret_cast<ReadView *>(p | 0x1);
+    //                                  ★★★ LSB 技巧第二处：打 closed 标记
+    //      view 仍留在 m_views 链表里等待下次复用，不释放内存
+  } else {
+    view = reinterpret_cast<ReadView *>(p & ~1);
+    view->close();                           // ★ 路径 B（RW trx）：m_creator_trx_id = TRX_ID_MAX
+    UT_LIST_REMOVE(m_views, view);
+    UT_LIST_ADD_LAST(m_free, view);          // ★★ 真正回收回空闲链表
+    view = nullptr;
+  }
+}
+```
+
+```cpp
+// read0read.cc:499 —— 第三条：view_release
+void MVCC::view_release(ReadView *&view) {
+  ut_ad(trx_sys_mutex_own());
+  uintptr_t p = reinterpret_cast<uintptr_t>(view);
+  ut_a(p & 0x1);                             // ★★ 断言：只回收"已关闭但仍挂链表"的 view
+  view = reinterpret_cast<ReadView *>(p & ~1);
+  ut_ad(view->m_closed);
+  ut_ad(view->m_creator_trx_id == 0);        // ★ 非 RW 事务的 view
+  UT_LIST_REMOVE(m_views, view);
+  UT_LIST_ADD_LAST(m_free, view);
+  view = nullptr;
+}
+```
+
+**LSB 技巧的"读端"**（`read0read.h:89` / `trx0trx.ic:238`）：
+
+```cpp
+  /** @return true if the view is active and valid */
+  static bool is_view_active(ReadView *view) {
+    ut_a(view != reinterpret_cast<ReadView *>(0x1));
+    return (view != nullptr && !(intptr_t(view) & 0x1));   // ★★ LSB=1 ⇒ 已关闭
+  }
+
+static inline ReadView *trx_get_read_view(trx_t *trx) {
+  return (!MVCC::is_view_active(trx->read_view) ? nullptr : trx->read_view);
+}
+```
+
+```cpp
+// trx0trx.cc:2351
+ReadView *trx_assign_read_view(trx_t *trx) {
+  if (srv_read_only_mode) {
+    ut_ad(trx->read_view == nullptr);
+    return (nullptr);
+  } else if (!MVCC::is_view_active(trx->read_view)) {
+    trx_sys->mvcc->view_open(trx->read_view, trx);   // ★ 同一事务内后续一致读走 else，复用同一个 view
+  }
+  return (trx->read_view);
+}
+```
+
+> ⚠️ **`m_closed` 不是 atomic**，就是裸 `bool`（`read0types.h:323`）。快路径 `view->m_closed = false`（`:597`）**完全无锁**——源码注释明确承认与 purge 线程存在 data race，后果是 purge view 可能偏保守（`m_low_limit_no` 偏小，purge 少清理一点），**不会出错**。
+>
+> ★ LSB 标记本身无 race：它写在 `trx->read_view` 里，而该字段只被拥有该 trx 的线程读写。
+>
+> ★ purge view 的来源（`clone_oldest_view()`，`read0read.cc:720`）：`copy_prepare()`（**锁内**，含 `m_ids` memmove）→ `copy_complete()`（**锁外**，`m_ids.insert` 可能 realloc）。`copy_complete()` 还会把 `m_creator_trx_id` 重新 `insert` 回 `m_ids` 并置 0——因为 purge view 是"旁观者"，oldest view 的 creator 对它同样不可见。
 
 ```cpp
 void MVCC::view_open(ReadView *&view, trx_t *trx) {
@@ -767,25 +1349,24 @@ void trx_commit_low(trx_t *trx, mtr_t *mtr) {
 
   bool serialised;
 
+  // ★ mtr != nullptr 表示事务确实修改过数据（trx_commit 中按 trx_is_rseg_updated 决定是否创建 mtr）
+  //   ⇒ 没改过数据的事务 mtr == nullptr，跳过整个序列化阶段——空事务快速提交的路径
   if (mtr != nullptr) {
     mtr->set_sync();
     serialised = trx_write_serialisation_history(trx, mtr);
 
-    mtr_commit(mtr);
+    mtr_commit(mtr);   // ★ "文件世界提交"的分界点
 
   } else {
     serialised = false;
   }
 
+  // serialised 表示"是否分配了 trx->no 并进入 serialisation_list"
+  // ⇒ 只有产生 update undo 的事务才为 true；该布尔值一路传到 trx_release_impl_and_expl_locks，
+  //   决定要不要处理 GTID 和 serialisation_list
   trx_commit_in_memory(trx, mtr, serialised);
 }
 ```
-
-**逐段解释**：
-
-- `mtr != nullptr` 表示事务确实修改过数据（`trx_commit` 中根据 `trx_is_rseg_updated` 决定是否创建 mtr）。**没改过数据的事务 `mtr == nullptr`，跳过整个序列化阶段**——这是空事务快速提交的路径。
-- `serialised` 返回值表示"是否分配了 `trx->no` 并进入 serialisation_list"。**只有产生 update undo 的事务 `serialised` 才为 true**，这个布尔值一路传到 `trx_release_impl_and_expl_locks` 决定要不要处理 GTID 和 serialisation_list。
-- `mtr_commit(mtr)` 是"文件世界提交"的分界点。
 
 #### 第二层：trx_write_serialisation_history（文件世界的核心）
 
@@ -915,6 +1496,8 @@ static bool trx_serialisation_number_get(
   new trx_t::no can't be less than any trx_t::no
   already in the rollback segment. User threads only
   produce events when a rollback segment is empty. */
+  // ★ 关键优化：last_page_no == FIL_NULL 表示这个 rseg 当前是空的
+  //   ⇒ 只有 rseg 从空变为非空时才需要往 purge_queue push 新元素
   if ((redo_rseg != nullptr && redo_rseg->last_page_no == FIL_NULL) ||
       (temp_rseg != nullptr && temp_rseg->last_page_no == FIL_NULL)) {
     TrxUndoRsegs elem;
@@ -930,20 +1513,14 @@ static bool trx_serialisation_number_get(
     mutex_exit(&purge_sys->pq_mutex);
 
   } else {
-    added_trx_no = trx_add_to_serialisation_list(trx);
+    added_trx_no = trx_add_to_serialisation_list(trx);   // 非空 rseg：只分配 no，不 push
   }
 
   return (added_trx_no);
 }
 ```
 
-**逐段解释——这里有一个关键优化**：
-
-`last_page_no == FIL_NULL` 表示这个 rseg **当前是空的**。只有当 rseg 从空变为非空时，才需要往 `purge_queue` 里 push 一个新元素。
-
-**为什么**？因为同一个 rseg 上后续的事务，其 undo 会串到已有 history list 尾部，`trx->no` 一定比已有的大（注释明说："the new trx_t::no can't be less than any trx_t::no already in the rollback segment"）。purge 只需要知道每个 rseg 的**起始位置**即可，后续按链表顺序扫就行。
-
-这个优化把 `purge_queue` 的 push 频率从"每事务一次"降到"每 rseg 从空变非空一次"，大幅减少 `pq_mutex` 竞争。
+**★ 为什么可以这样优化**：同一 rseg 上后续事务的 undo 会串到已有 history list 尾部，`trx->no` 一定比已有的大（见上方源码注释）。purge 只需知道每个 rseg 的**起始位置**，后续按链表顺序扫即可。⇒ 把 `purge_queue` 的 push 频率从"每事务一次"降到"每 rseg 从空变非空一次"，大幅减少 `pq_mutex` 竞争。
 
 `trx_add_to_serialisation_list` 本身：
 
@@ -1193,6 +1770,49 @@ group commit algorithm to work. */
 
 代码上体现为两个近乎相同的函数：`trx_prepare_low`（写 `PREPARED`）与 `trx_set_prepared_in_tc_low`（写 `PREPARED_IN_TC`），后者供 `innobase_set_prepared_in_tc` / `innobase_set_prepared_in_tc_by_xid` 调用。
 
+**"标记 prepared in TC" 到底做了什么**——往下拆一层会发现它**不只是改状态**，还要顺带把 GTID 持久化：
+
+```cpp
+// trx0trx.cc:3714
+dberr_t trx_set_prepared_in_tc_for_mysql(trx_t *trx) {
+  ut_a(trx->state.load(std::memory_order_relaxed) == TRX_STATE_PREPARED);   // ① 前置：必须已 PREPARED
+
+  /* For GTID persistence we need update undo segment. */
+  auto db_err = trx_undo_gtid_add_update_undo(trx, true, false);            // ② ★ 为 GTID 写一条 undo
+  if (db_err != DB_SUCCESS) return (db_err);
+
+  trx->op_info = "marking transaction as prepared in TC";
+  trx_set_prepared_in_tc(trx);                                              // ③ 真正标记
+  trx->op_info = "";
+  return (DB_SUCCESS);
+}
+
+// trx0trx.cc:3145
+static void trx_set_prepared_in_tc(trx_t *trx) {
+  ut_a(trx->state.load(std::memory_order_relaxed) == TRX_STATE_PREPARED);
+
+  lsn_t lsn = trx_set_prepared_in_tc_low(trx, &trx->rsegs.m_redo);          // 写 undo 段状态 → PREPARED_IN_TC
+
+  /* Check and get GTID to be persisted. Do it outside trx_sys mutex. */
+  auto &gtid_persistor = clone_sys->get_gtid_persistor();
+  Gtid_desc gtid_desc;
+  gtid_persistor.get_gtid_info(trx, gtid_desc);                             // ★ 锁外取 GTID
+
+  /* Add GTID to be persisted to disk table, if needed. */
+  if (gtid_desc.m_is_set) {
+    /* The gtid_persistor.add() might release and re-acquire the mutex. */
+    trx_sys_serialisation_mutex_enter();                                    // ★ 才加串行化锁
+    ...
+```
+
+三条都是看调用名看不出来的：
+
+1. ★ **XA PREPARE 会额外写一条 undo**——`trx_undo_gtid_add_update_undo` 的目的写在注释里：*"For GTID persistence we need update undo segment"*。GTID 要跟着这条 prepared 事务**落到 undo 段里**，这样崩溃恢复时才能知道这个悬而未决的 prepared 事务对应哪个 GTID（否则恢复后无法与 binlog/从库对齐）。
+2. ★ **锁顺序是刻意安排的**：先写 undo 段状态（持 rseg latch），然后**在 `trx_sys` mutex 之外**取 GTID（注释明说 *"Do it outside trx_sys mutex"*），最后才加 `trx_sys_serialisation` mutex 去持久化。把"查 GTID 信息"这种相对重的操作挪到锁外，是为了缩短全局锁持有时间。
+3. ★ **`gtid_persistor.add()` 可能释放并重获取 mutex**——源码注释专门警告这一点（`might release and re-acquire the mutex`），所以调用点不能假设"进了临界区就一直持有"，前后的状态都要重新确认。
+
+⇒ 这也解释了 `TRX_UNDO_PREPARED_IN_TC` 这个段状态为什么存在：它比 `PREPARED` 多记录了一层"TC 已经处理过、GTID 已持久化"的信息，恢复时据此走确定路径（见上文 1212 行）。
+
 #### 阶段一：prepare 逐行剖析
 
 调用链：`MYSQL_BIN_LOG::prepare` → `ha_prepare_low` → `innobase_xa_prepare` → `trx_prepare_for_mysql` → `trx_prepare` → `trx_prepare_low`。逐个看：
@@ -1256,19 +1876,24 @@ int ha_prepare_low(THD *thd, bool all) {
 static int innobase_xa_prepare(handlerton *hton, THD *thd, bool prepare_trx) {
   trx_t *trx = check_trx_exists(thd);
 
+  // ★ 把 server 层的 XID 写进 trx->xid——这是崩溃恢复的钥匙
+  //   ⇒ 恢复时靠 XID 在 binlog 里查找这个事务
   thd_get_xid(thd, (MYSQL_XID *)trx->xid);
 
+  // 注意这里没有传 disable=true（对比 innobase_commit / innobase_rollback 都传 true）
+  // ⇒ prepare 后事务还可能被回滚，不能设 TRX_FORCE_ROLLBACK_DISABLE（那会禁止异步回滚）
   TrxInInnoDB trx_in_innodb(trx);
 
   if (trx_in_innodb.is_aborted() || ...) {
     innobase_rollback(hton, thd, prepare_trx);
-    return (convert_error_code_to_mysql(DB_FORCED_ABORT, 0, thd));
+    return (convert_error_code_to_mysql(DB_FORCED_ABORT, 0, thd));   // abort → 转回滚
   }
 
   if (!trx_is_registered_for_2pc(trx) && trx_is_started(trx)) {
     log_errlog(ERROR_LEVEL, ER_INNODB_UNREGISTERED_TRX_ACTIVE);
   }
 
+  // ★ 分支：显式要求 prepare 整个事务，或 autocommit 模式 → 真正 trx_prepare_for_mysql
   if (prepare_trx ||
       (!thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))) {
     ut_ad(trx_is_registered_for_2pc(trx));
@@ -1276,23 +1901,18 @@ static int innobase_xa_prepare(handlerton *hton, THD *thd, bool prepare_trx) {
     dberr_t err = trx_prepare_for_mysql(trx);
 
     if (err == DB_FORCED_ABORT) {
-      innobase_rollback(hton, thd, prepare_trx);
+      innobase_rollback(hton, thd, prepare_trx);                     // prepare 失败 = 事务失败
       return (convert_error_code_to_mysql(DB_FORCED_ABORT, 0, thd));
     }
   } else {
+    // 语句结束但事务还在继续 ⇒ 只释放 autoinc 锁 + trx_mark_sql_stat_end
+    //   （后者记录语句边界，供语句级回滚）
     lock_unlock_table_autoinc(trx);
     trx_mark_sql_stat_end(trx);
   }
   ...
 }
 ```
-
-**逐段解释**：
-
-- `thd_get_xid(thd, (MYSQL_XID *)trx->xid)`：**把 server 层的 XID 写进 `trx->xid`**。这是崩溃恢复的钥匙——恢复时靠 XID 在 binlog 里查找这个事务。
-- 注意 `TrxInInnoDB trx_in_innodb(trx)` **没有传 `disable=true`**（对比 `innobase_commit` / `innobase_rollback` 都传 true）。因为 prepare 后事务还可能被回滚，不能设置 `TRX_FORCE_ROLLBACK_DISABLE`（那会禁止异步回滚）。
-- **分支**：`prepare_trx`（显式要求 prepare 整个事务）或 autocommit 模式 → 真正 `trx_prepare_for_mysql`；否则（语句结束但事务还在继续）只释放 autoinc 锁 + `trx_mark_sql_stat_end`（记录语句边界，供语句级回滚）。
-- abort 与 `DB_FORCED_ABORT` 都转成回滚——prepare 失败等于事务失败。
 
 **④ `trx_prepare_low`——文件态落地**
 
@@ -1303,6 +1923,7 @@ static lsn_t trx_prepare_low(trx_t *trx, trx_undo_ptr_t *undo_ptr,
     mtr_t mtr;
     mtr_start_sync(&mtr);
 
+    // 临时表 rseg（m_noredo）走 MTR_LOG_NO_REDO——临时表不需要 redo
     if (noredo_logging) {
       mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
     }
@@ -1312,6 +1933,8 @@ static lsn_t trx_prepare_low(trx_t *trx, trx_undo_ptr_t *undo_ptr,
     the transaction as prepared in the file-based world, at the serialization
     point of lsn. */
 
+    // 持 rseg latch 改 undo 段头状态：TRX_UNDO_ACTIVE → TRX_UNDO_PREPARED
+    // ⇒ 必须串行化，否则同 rseg 并发写段头会互相破坏
     rseg->latch();
 
     if (undo_ptr->insert_undo != nullptr) {
@@ -1319,6 +1942,9 @@ static lsn_t trx_prepare_low(trx_t *trx, trx_undo_ptr_t *undo_ptr,
     }
 
     if (undo_ptr->update_undo != nullptr) {
+      // ★ insert 与 update 都改状态，但只有 update undo 在非 noredo 时才写 GTID
+      //   ⇒ GTID 在 prepare 阶段就已写进 update undo header
+      //     （第三个参数 true 表示 prepare 场景，对应提交时的 false）
       if (!noredo_logging) {
         trx_undo_gtid_set(trx, undo_ptr->update_undo, true);
       }
@@ -1328,6 +1954,9 @@ static lsn_t trx_prepare_low(trx_t *trx, trx_undo_ptr_t *undo_ptr,
     rseg->unlatch();
 
     /* This mtr commit makes the transaction prepared in file-based world. */
+    // ★ 语义：这个 mtr_commit 让事务在"文件世界"成为 prepared——呼应"文件态先行"
+    //   返回的 commit_lsn 最终传给 trx_flush_logs(trx, lsn)
+    //   （但因 HA_IGNORE_DURABILITY 不 fsync）
     mtr_commit(&mtr);
 
     if (!noredo_logging) {
@@ -1337,14 +1966,6 @@ static lsn_t trx_prepare_low(trx_t *trx, trx_undo_ptr_t *undo_ptr,
   return 0;
 }
 ```
-
-**逐段解释**：
-
-- 持 **rseg latch** 修改 undo 段头状态：`TRX_UNDO_ACTIVE` → `TRX_UNDO_PREPARED`。必须串行化，否则同 rseg 并发写段头会互相破坏。
-- **insert 与 update 都写**，但只有 update undo 在非 noredo 时才 `trx_undo_gtid_set(trx, ..., true)` 写 GTID——即 **GTID 在 prepare 阶段就已写进 update undo header**（第三个参数 `true` 表示 prepare 场景，对应提交时的 `false`）。
-- 临时表 rseg（`m_noredo`）走 `MTR_LOG_NO_REDO`——临时表不需要 redo。
-- `mtr_commit` 返回 `commit_lsn`，这个 lsn 最终传给 `trx_flush_logs(trx, lsn)`（但因 `HA_IGNORE_DURABILITY` 不 fsync）。
-- 注释强调语义："This mtr commit makes the transaction prepared in **file-based world**"——呼应前面"文件态先行"的原则。
 
 **⑤ `trx_prepare` 收尾——内存态跟进**
 
@@ -1452,9 +2073,141 @@ if (!error && all && is_xa_prepare(thd)) return this->commit(thd, true);
 
 借 `commit` 走 BGC 流水线写事件，但 `skip_commit` 为真，引擎层不提交。
 
-**差异二：事务与连接解绑（detach）**
+**差异二：detach / attach 的三层机制**
 
-外部 XA 事务可以在一个连接 prepare、另一个连接 commit，连接断开后事务仍存在。这靠 detach/attach 实现：`innodb_replace_trx_in_thd` 把 `trx_t` 从 THD 摘下或换上，其注释说明"ptr_trx_arg 为 NULL 表示恢复之前保存的关联，此时要把当前 trx 从 THD 解除"。这也是 `innobase_xa_prepare` 里 `TrxInInnoDB` **不传 `disable=true`** 的原因之一——detached 事务不能禁止异步回滚。
+外部 XA 的 prepared 事务可以在**另一个连接**（甚至崩溃重启后）被 COMMIT/ROLLBACK。为此，prepared 事务必须能与原连接**解绑**（detach），并能在新连接**重新绑定**（attach）。
+
+**为什么需要 detach——根本原因是生命周期跨越连接边界**：普通事务的 prepare→commit 在 `ha_commit_trans` 内连续执行（两次调用之间没有"等待外部决定"的窗口），事务从生到死都在同一 THD 上，提交完即释放，不存在"保留 prepared 等别人"的状态。外部 XA 则不然——prepare 与 commit 之间可以隔**任意长时间、任意连接、甚至一次重启**：
+
+1. **跨连接裁决**：`XA COMMIT xid` 按 xid 指定事务，可在任意连接执行。而 THD 只有一个 trx 槽位（`thd_to_trx`），不 detach 原连接就无法开始新事务。
+2. **连接复用**：`xa_detach_on_prepare=ON` 时 PREPARE 后立即释放连接（连接池 / 应用层长事务管理的刚需）。这个参数的存在本身就说明 detach 是 XA 释放连接的机制。
+3. **跨重启裁决**：detach 后事务留在引擎 2PC 注册表（prepared 状态 + XID）+ Server 层 Transaction_cache（XID_STATE）。崩溃恢复时 resurrect，由 binlog 裁决（见「崩溃恢复的提交与回滚」）。
+
+这在三层各有一个对应物：
+
+| 层 | 机制 | 动作 |
+|----|------|------|
+| Server 层 `XID_STATE` | `m_is_detached` 标志（xa.h） | 协调器按此分流 commit/rollback 路径 |
+| Server 层 `Transaction_cache` | 按 xid 存 detached 事务上下文 | `find_trn_for_recover_and_check_its_state` 查找 |
+| InnoDB 层 `trx_t` | `trx->mysql_thd = nullptr` | 切断 trx 与连接的关联 |
+
+**InnoDB 层：`innodb_replace_trx_in_thd` 的三种模式**
+
+```cpp
+static void innodb_replace_trx_in_thd(THD *thd, void *new_trx_arg,
+                                      void **ptr_trx_arg) {
+  trx_t *&trx = thd_to_trx(thd);
+
+  if (ptr_trx_arg) {
+    *ptr_trx_arg = trx;                      // 模式一：备份
+  } else if (trx != nullptr) {
+    if (trx->state.load(...) == TRX_STATE_NOT_STARTED) {
+      trx_free_for_mysql(trx);               // 无状态，直接释放
+    } else {
+      ut_ad(trx_state_eq(trx, TRX_STATE_PREPARED));
+      /* The choice not to disconnect transaction when
+      trx_is_redo_rseg_updated(trx) is false is copied from
+      the existing detach logic for prepared XA
+      transactions in innobase_close_connection().
+      If transaction did not modify anything, rolling it back doesn't modify
+      the db, but lets us deregister and free the trx object to conserve
+      resources, while still allowing XA COMMIT it in the future, as it
+      succeeds on missing xids. */
+      if (trx_is_redo_rseg_updated(trx)) {
+        trx_disconnect_prepared(trx);        // 模式二：断开但保留 prepared
+      } else {
+        trx_rollback_for_mysql(trx);         // 空事务：回滚 + 释放
+        trx_deregister_from_2pc(trx);
+        trx_free_for_mysql(trx);
+      }
+    }
+  }
+  trx = static_cast<trx_t *>(new_trx_arg);   // 模式三：装回
+}
+```
+
+**三种模式**（代码内已就近标注，此处只补模式层面的语义）：
+
+- **模式一（备份，`ptr_trx_arg != nullptr`）**：把当前 trx 存进备份缓冲（server 层的 `ha_ptr_backup`），函数末尾 THD 的 trx 被置为 `new_trx_arg`（nullptr）。这是 `XA START` 时的"临时摘下"——把连接之前的普通事务保存起来让位给 XA 事务，XA 结束后再装回。
+- **模式二（断开，两个参数都 null）**：`xa_detach_on_prepare` 时真正 detach，三种情况见代码内注释。★ 值得单独强调的：PREPARED 但**没改过数据** → 回滚 + deregister + free——空事务回滚不修改 db，且未来 `XA COMMIT` 对 missing xid 也返回成功，不必保留对象，省资源。
+- **模式三（装回）**：`reattach_native_trx` 调用，把备份的 trx 重新挂回 THD。
+
+**断开的竞态同步：`trx_disconnect_from_mysql`**
+
+```cpp
+inline void trx_disconnect_from_mysql(trx_t *trx, bool prepared) {
+  trx_sys_mutex_enter();
+  UT_LIST_REMOVE(trx_sys->mysql_trx_list, trx);
+  if (trx->read_view != nullptr) {
+    trx_sys->mvcc->view_close(trx->read_view, true);
+  }
+  if (prepared) {
+    ut_ad(trx_state_eq(trx, TRX_STATE_PREPARED));
+    /* During disconnection there is a short period when the server layer
+    already believes this XID is detached from this connection, and thus another
+    connection may try to XA COMMIT/ROLLBACK it, yet InnoDB is still processing
+    the trx object - another client can be executing innobase_commit_by_xid() in
+    parallel to our trx_disconnect_from_mysql(). We use trx->mysql_thd field,
+    under protection of trx_sys->mutex to synchronize with trx_get_trx_by_xid()
+    and convey if this trx is still attached to this thd or not. */
+    trx->mysql_thd = nullptr;
+  }
+  trx_sys_mutex_exit();
+}
+```
+
+★ **这里有一个注释点破的竞态窗口**：断开期间，server 层已认为 XID detached（另一个连接可以开始 `XA COMMIT`），但 InnoDB 还在处理 trx 对象——另一个客户端可能正并行执行 `innobase_commit_by_xid()`。同步手段是 `trx->mysql_thd` 字段 + `trx_sys->mutex`：`trx_get_trx_by_xid()` 通过检查该字段判断"这个 trx 是否还 attached 到某个连接"。
+
+**Server 层：协调器按 `is_detached()` 分流**
+
+```cpp
+bool trx_coordinator::commit_in_engines(THD *thd, bool all, ...) {
+  if (thd->get_transaction()->xid_state()->is_detached())
+    return trx_coordinator::commit_detached_by_xid(thd, run_after_commit);
+  else
+    return ha_commit_low(thd, all, run_after_commit);
+}
+```
+
+detached 事务 → `ht->commit_by_xid`（按 xid 提交，不依赖 trx 挂在 THD）；正常事务 → `ha_commit_low`。`commit_detached_by_xid` 用 RAII 守卫在结束时 `xs->reset()` 清掉 detached 标记。
+
+**XID_STATE 的 detached 初始化**（xa.h）：
+
+```cpp
+void start_detached_xa(const XID *xid, bool binlogged_arg = false) {
+  xa_state = XA_PREPARED;
+  m_xid.set(xid);
+  m_is_detached = true;      // ★ detached 标记
+  rm_error = 0;
+  m_is_binlogged = binlogged_arg;
+}
+```
+
+处理 detached 事务的 `XA COMMIT/ROLLBACK` 时，XID_STATE 以 `XA_PREPARED + detached` 初始化，协调器据此走 by_xid 路径。
+
+**完整生命周期**：
+
+```
+XA START
+  → detach_native_trx                       把普通事务备份到 ha_ptr_backup，THD trx 置空
+DML ... / XA END
+XA PREPARE
+  → process_xa_prepare                      引擎 prepare（undo → PREPARED）
+  → xa_detach_on_prepare=ON → detach_xa_transaction → disconnect_native_trx
+      → innodb_replace_trx_in_thd(thd, nullptr, nullptr)
+          → trx_disconnect_prepared → trx->mysql_thd = nullptr
+      → Transaction_cache 登记（XID_STATE::start_detached_xa）
+连接继续（THD 无 trx 关联，可开新事务）
+
+另一个连接: XA COMMIT xid
+  → find_and_initialize_xa_context          从 Transaction_cache 找 detached 上下文
+  → acquire_locks（m_xa_lock 防并发 + 双重检查）
+  → commit_in_engines → is_detached → commit_detached_by_xid → ht->commit_by_xid
+      → innobase_commit_by_xid（无 THD，按 xid 提交）
+  → Transaction_cache::remove
+```
+
+`xa_detach_on_prepare` 参数：OFF（默认）→ PREPARE 后事务仍 attached（旧行为）；ON → PREPARE 后立即 detach，连接释放。这也是 `innobase_xa_prepare` 里 `TrxInInnoDB` **不传 `disable=true`** 的原因之一——detached 事务不能禁止异步回滚。
 
 **差异三：按 xid 操作的 by_xid 接口**
 
@@ -1761,6 +2514,60 @@ struct Trx_shard {
 | 高优先级事务杀阻塞者 | `trx_kill_blocking` → `trx_rollback_for_mysql` | killer 线程（异步） |
 | 崩溃恢复 | `trx_recovery_rollback_thread` → `trx_rollback_active` | 后台线程 |
 
+**崩溃恢复这条路径与正常回滚最大的不同**，藏在 `trx_recovery_rollback`（trx0roll.cc:784）——它在真正回滚之前，先做了一整套"加锁 + 复活"：
+
+```cpp
+void trx_recovery_rollback(THD *thd) {
+  std::vector<MDL_ticket *> shared_mdl_list;
+  ut_ad(!srv_read_only_mode);
+
+  // Take MDL locks
+  /* During this stage the server is not open for external connections, and
+   * there will not be any concurrent threads requesting MDL, hence we don't
+   * have risk of hitting a deadlock.
+   * TODO: We can improvize code by following some order while taking MDL locks. */
+  for (const auto &element : to_rollback_trx_tables) {
+    trx_id_t trx_id = element.first;
+    table_id_t table_id = element.second;
+
+    /* Passing false as we only intend to validate if the transaction is
+     * already committed/rolled back during other stages of recovery. */
+    auto trx = trx_rw_is_active(trx_id, false);
+    if (trx == nullptr) { ut_ad(false); continue; }      // 恢复期不该已结束
+
+    auto table = dd_table_open_on_id(table_id, nullptr, nullptr, false, true);
+    if (table == nullptr) continue;                      // 表已被删 → 跳过
+
+    table->get_table_name(schema_name, table_name);
+    MDL_ticket *mdl_ticket;
+    if (dd_mdl_acquire(thd, &mdl_ticket, schema_name.data(), table_name.data())) {
+      ut_error;                                          // ★ 恢复期拿 MDL 失败 = 致命
+    }
+    shared_mdl_list.push_back(mdl_ticket);
+
+    lock_table_ix_resurrect(table, trx);                 // ★ 复活表级 IX 锁
+    ib::info(ER_IB_RESURRECT_ACQUIRE_TABLE_LOCK, ulong(table->id), table->name.m_name);
+    dd_table_close(table, nullptr, nullptr, false);
+  }
+
+  /* Let the startup thread proceed now */
+  os_event_set(recovery_lock_taken);                     // ★ 放行启动线程
+
+  trx_rollback_or_clean_recovered(true);                 // 真正回滚
+
+  for (auto mdl_ticket : shared_mdl_list) dd_release_mdl(mdl_ticket);
+}
+```
+
+四点决定了"为什么恢复期回滚要这么绕"：
+
+1. ★ **崩溃前持有的表锁会丢失，必须"复活"**：`lock_table_ix_resurrect(table, trx)` 重新为这些待回滚事务加上**表级 IX 锁**。没有这一步，恢复期间的回滚操作与后续进入的 DML/DDL 就少了互斥依据。日志里对应 `ER_IB_RESURRECT_ACQUIRE_TABLE_LOCK`（"resurrect" 一词即由此而来）。
+2. ★ **必须先拿 MDL 才放行启动**：`os_event_set(recovery_lock_taken)` 是一个**同步点**——所有表的 MDL 拿到之前，启动线程一直等在这里。否则可能出现"表还没加锁就被外部访问"。
+3. ★ **此阶段不会死锁**：源码注释给了理由——*"the server is not open for external connections, and there will not be any concurrent threads requesting MDL"*。所以这里可以放心地无序批量加锁（注释还留了 TODO：未来可以按固定顺序加锁以进一步改进）。反过来说，**这条"无死锁"的前提一旦不成立（比如以后允许恢复期接受连接），这段代码就要重写**。
+4. **`dd_mdl_acquire` 失败是 `ut_error`（直接崩溃）而非跳过**：恢复期拿不到 MDL 意味着无法保证互斥，继续跑会破坏数据，所以选择立即失败；而表已被删（`dd_table_open_on_id` 返回 nullptr）则只是 `continue` 跳过——那张表上已没有什么可回滚的。
+
+⇒ 于是完整顺序是：**复活表锁 + 拿 MDL → 放行启动 → 回滚 → 释放 MDL**。这也是为什么启动日志里会先看到一批 "resurrect" 信息，然后才继续启动流程。
+
 #### 执行路径
 
 ```
@@ -1794,11 +2601,12 @@ static dberr_t trx_rollback_low(trx_t *trx) {
   switch (trx->state.load(std::memory_order_relaxed)) {
     case TRX_STATE_FORCED_ROLLBACK:
     case TRX_STATE_NOT_STARTED:
-      trx->will_lock = 0;
+      trx->will_lock = 0;              // 回滚已经做过了，只清 will_lock
       return (DB_SUCCESS);
 
     case TRX_STATE_ACTIVE:
       /* Check an validate that undo is available for GTID. */
+      // 确保 GTID 有 undo 可写（回滚时要把 GTID 的回滚信息也记进 undo）
       trx_undo_gtid_add_update_undo(trx, false, true);
       return (trx_rollback_for_mysql_low(trx));
 
@@ -1813,6 +2621,8 @@ static dberr_t trx_rollback_low(trx_t *trx) {
         mtr.start();
         trx->rsegs.m_redo.rseg->latch();
 
+        // ★ WAL 协议第 1 步：把 undo 段状态从 TRX_UNDO_PREPARED 改回 TRX_UNDO_ACTIVE
+        //   （第三个参数 true 表示"从 PREPARED 变回 ACTIVE"，对比 prepare 时的 false）
         if (undo_ptr->insert_undo != nullptr) {
           trx_undo_set_state_at_prepare(trx, undo_ptr->insert_undo, true, &mtr);
         }
@@ -1825,12 +2635,14 @@ static dberr_t trx_rollback_low(trx_t *trx) {
         /* Persist the XA ROLLBACK, so that crash
         recovery will replay the rollback in case
         the redo log gets applied past this point. */
+        // ★ WAL 协议第 2 步：立即持久化这个状态变更，然后才执行真正的回滚
         mtr.commit();
       }
+      // ★ WAL 协议第 3 步：真正的回滚
       return (trx_rollback_for_mysql_low(trx));
 
     case TRX_STATE_COMMITTED_IN_MEMORY:
-      check_trx_state(trx);
+      check_trx_state(trx);            // 走到这里是逻辑错误（已提交不该再回滚），断言兜底
       break;
   }
 
@@ -1838,18 +2650,7 @@ static dberr_t trx_rollback_low(trx_t *trx) {
 }
 ```
 
-**逐段解释**：
-
-- **无锁读状态**：注释解释了三类合法调用者（当前线程的活跃事务 / recovered 事务 / HP 事务的 victim）。victim 场景由 `TRX_FORCE_ROLLBACK` + `TrxInInnoDB::wait()` 保证原属主线程已不在 InnoDB。
-- **NOT_STARTED / FORCED_ROLLBACK**：直接返回——回滚已经做过了，只清 `will_lock`。
-- **ACTIVE**：先 `trx_undo_gtid_add_update_undo(trx, false, true)` **确保 GTID 有 undo 可写**（回滚时要把 GTID 的回滚信息也记进 undo），再进 `trx_rollback_for_mysql_low`。
-- ★ **PREPARED 回滚的 WAL 协议**（最关键的一段）：
-  1. **先把 undo 段状态从 `TRX_UNDO_PREPARED` 改回 `TRX_UNDO_ACTIVE`**（`trx_undo_set_state_at_prepare` 第三个参数 `true` 表示"从 PREPARED 变回 ACTIVE"，对比 prepare 时的 `false`）；
-  2. **`mtr.commit()` 立即持久化这个状态变更**（注释 "Persist the XA ROLLBACK"）；
-  3. 然后才执行真正的回滚。
-
-  **为什么要先改状态再回滚**？回滚可能很长，中途崩溃：若状态仍是 PREPARED，恢复时会被当"等待裁决的 prepared"搁置（不处理）；若已改回 ACTIVE 并落盘，恢复时看到 ACTIVE 就**继续回滚**。回滚动作本身被做成了 WAL 可重放的。
-- **COMMITTED_IN_MEMORY**：走到这里是逻辑错误（已提交不该再回滚），`check_trx_state` 断言兜底。
+**★ 为什么要先改状态再回滚**（PREPARED 分支的 WAL 协议）：回滚可能很长，中途崩溃——若状态仍是 PREPARED，恢复时会被当"等待裁决的 prepared"搁置（不处理）；若已改回 ACTIVE 并落盘，恢复时看到 ACTIVE 就**继续回滚**。⇒ 回滚动作本身被做成 WAL 可重放的。
 
 `trx_rollback_step` 是回滚 query graph 的 step 函数，驱动一个两态状态机：
 
@@ -1861,34 +2662,31 @@ que_thr_t *trx_rollback_step(que_thr_t *thr) {
     node->state = ROLL_NODE_SEND;    // 重新进入则重置状态
   }
 
+  // ★ 两态状态机：SEND 做初始化并启动 undo，WAIT 表示已跑完
   if (node->state == ROLL_NODE_SEND) {
     trx_t *trx = thr_get_trx(thr);
 
     trx_mutex_enter(trx);
     node->state = ROLL_NODE_WAIT;
 
+    // savepoint 回滚的边界是 savepoint 记录的 undo_no；完整回滚是 0（回到事务起点）
     roll_limit = node->partial ? node->savept.least_undo_no : 0;
 
-    trx_commit_or_rollback_prepare(trx);
+    trx_commit_or_rollback_prepare(trx);   // 处理"NOT_STARTED 需先 start"等边界
 
+    // 设 trx->roll_limit、in_rollback = true，然后 trx_roll_graph_build 构建回滚
+    // query graph、que_state = TRX_QUE_ROLLING_BACK，返回首个 thr 开始执行
     node->undo_thr = trx_rollback_start(trx, roll_limit, node->partial);
 
     trx_mutex_exit(trx);
   } else {
     ut_ad(node->state == ROLL_NODE_WAIT);
-    thr->run_node = que_node_get_parent(node);   // undo 完成，回到父节点
+    thr->run_node = que_node_get_parent(node);   // undo_thr 执行完，回到父节点，回滚结束
   }
 
   return (thr);
 }
 ```
-
-**逐段解释**：
-
-- **SEND → WAIT**：首次进入做初始化——`roll_limit = partial ? savept.least_undo_no : 0`：savepoint 回滚的边界是 savepoint 记录的 `undo_no`；完整回滚是 0（回到事务起点）。
-- `trx_commit_or_rollback_prepare(trx)`：处理"NOT_STARTED 需先 start"等边界。
-- `trx_rollback_start` 设 `trx->roll_limit`、`in_rollback = true`，然后 `trx_roll_graph_build` 构建回滚 query graph，`que_state = TRX_QUE_ROLLING_BACK`，返回首个 thr 开始执行。
-- **WAIT → 回父节点**：undo_thr 执行完（真正逐行撤销）后，`run_node` 指回父节点，回滚结束。
 
 ★ **最反直觉的一行——回滚的收尾是"提交"**：
 
@@ -1933,7 +2731,63 @@ static que_t *trx_roll_graph_build(trx_t *trx, bool partial_rollback) {
 }
 ```
 
-`row_undo_node_create` 创建 `QUE_NODE_UNDO` 节点挂到 thr 下，这就是逐行撤销的执行体。
+`row_undo_node_create`（row0undo.cc:129）创建 `QUE_NODE_UNDO` 节点挂到 thr 下，这就是逐行撤销的执行体。它的一步初始化里已经定好了状态机初态：
+
+```cpp
+  undo->common.type = QUE_NODE_UNDO;
+  undo->common.parent = parent;
+  undo->state = UNDO_NODE_FETCH_NEXT;      // ★ 初态：先去取下一条 undo 记录
+  undo->trx = trx;
+  undo->partial = partial_rollback;        // ★ 部分回滚标记（ROLLBACK TO SAVEPOINT 复用同一张图）
+  undo->pcur.init();                       // 持久游标（撤销 update 时要定位聚簇记录）
+  undo->heap = mem_heap_create(256, UT_LOCATION_HERE);
+```
+
+★ **往下拆一步才是回滚的真正骨架**——`row_undo_step`（row0undo.cc:255 起）用一个三态状态机驱动整条撤销链：
+
+```cpp
+  if (node->state == UNDO_NODE_FETCH_NEXT) {
+    node->undo_rec = trx_roll_pop_top_rec_of_trx(trx, trx->roll_limit,
+                                                 &roll_ptr, node->heap);   // ① 弹栈顶
+
+    if (!node->undo_rec) {
+      /* Rollback completed for this query thread */
+      thr->run_node = que_node_get_parent(node);   // 回到父节点 = 结束
+      /* Mark any partial rollback completed, so that if the transaction
+      object is committed and reused later, the roll_limit will remain
+      at 0. trx->roll_limit will be nonzero during a partial rollback only. */
+      trx->roll_limit = 0;
+      ut_d(trx->in_rollback = false);
+      return (DB_SUCCESS);
+    }
+
+    node->roll_ptr = roll_ptr;
+    node->undo_no = trx_undo_rec_get_undo_no(node->undo_rec);
+
+    if (trx_undo_roll_ptr_is_insert(roll_ptr)) {  // ② 按 undo 种类分派
+      node->state = UNDO_NODE_INSERT;
+    } else {
+      node->state = UNDO_NODE_MODIFY;
+    }
+  }
+
+  if (node->state == UNDO_NODE_INSERT) {
+    err = row_undo_ins(node, thr);
+    node->state = UNDO_NODE_FETCH_NEXT;            // ③ 立刻回到取下一条
+  } else {
+    ut_ad(node->state == UNDO_NODE_MODIFY);
+    err = row_undo_mod(node, thr);                 // ④ ★ 不立刻回
+  }
+```
+
+状态只有三个（`row0undo.h`）：`UNDO_NODE_FETCH_NEXT` → `UNDO_NODE_INSERT` / `UNDO_NODE_MODIFY`。四个点决定了对错：
+
+1. **LIFO**：`trx_roll_pop_top_rec_of_trx` 弹的是**栈顶**——即最后做的修改最先撤销。这是事务回滚"逆序"语义的直接实现。
+2. ★ **`roll_limit` 是部分回滚的边界**：它作为参数传给 pop，只弹到该 undo_no 为止；`ROLLBACK TO SAVEPOINT` 与全回滚**共用同一张图、同一个状态机**，区别只在 `roll_limit`（0 = 全回滚）和 `node->partial`。弹完后 `trx->roll_limit = 0` 必须复位——注释说得很清楚：为的是 trx 对象提交后被**复用**时 roll_limit 保持 0。
+3. **`is_insert` 决定撤销方式**：insert 产生的 undo 只需把行删掉（`row_undo_ins`），update/delete 的 undo 要恢复旧版本（`row_undo_mod`），两者的代价完全不同（后者还要处理二级索引、BLOB、可能的 rebuild）。
+4. ★ **状态回环是不对称的**：`UNDO_NODE_INSERT` 撤销完**立即**回到 `FETCH_NEXT`；而 `UNDO_NODE_MODIFY` **不立即回**——因为 `row_undo_mod` 可能一次做不完（要逐个二级索引地撤销，中途要让出），状态机允许它停在 MODIFY 继续。这就是"一次 rollback 可能跨多次 step 调用"的原因。
+
+另外这段的注释还交代了一条并发前提：回滚期间 trx 至少持有各被修改表的 `LOCK_IX`（可能还有 MDL），因此**并发 DROP/ALTER 不可能**——那需要同时拿到 `LOCK_X` 与 `MDL_EXCLUSIVE`。
 
 **fork type 的区分**（que0que.h 的注释是关键证据）：
 
@@ -1968,6 +2822,179 @@ no signal-sending roll_node in this graph */
 
 **设计收益**：正向操作（DML）和逆向操作（回滚）被统一在"编译成 graph → 解释执行"的模型下，只是 node 类型和 fork type 不同。回滚不需要单独写一套执行引擎，复用 `que_run_threads` 即可。这是 query graph 模型超越"普通函数调用"的价值所在——它能承载任意有状态、可挂起/恢复的操作。
 
+#### SAVEPOINT 与语句级回滚
+
+⚠️ **勘误**：**不存在 `trx_rollback_last()`**（真名 `trx_rollback_last_sql_stat_for_mysql()`）、**不存在 `trx_rollback()`**（是 `trx_rollback_for_mysql()` → `trx_rollback_low()` → `trx_rollback_for_mysql_low()` → `trx_rollback_to_savepoint_low()`）。
+
+**savepoint 只有一个字段**（`trx0roll.cc:563`）：
+
+```cpp
+trx_savept_t trx_savept_take(trx_t *trx) {
+  trx_savept_t savept;
+  savept.least_undo_no = trx->undo_no;   // ★★ 就这一个 undo_no
+  return (savept);
+}
+```
+
+**语句级回滚**（`trx0roll.cc:282`）：
+
+```cpp
+dberr_t trx_rollback_last_sql_stat_for_mysql(trx_t *trx) {
+  switch (trx->state.load(std::memory_order_relaxed)) {
+    case TRX_STATE_FORCED_ROLLBACK:
+    case TRX_STATE_NOT_STARTED:
+      return (DB_SUCCESS);              // ★ 没启动就没什么可回滚
+
+    case TRX_STATE_ACTIVE:
+      trx->op_info = "rollback of SQL statement";
+      err = trx_rollback_to_savepoint(trx, &trx->last_sql_stat_start);
+      //                          ★★★ 语句级 = 回滚到"上一条语句起点"这个隐式 savepoint
+      if (trx->fts_trx != nullptr) fts_savepoint_rollback_last_stmt(trx);
+      trx_mark_sql_stat_end(trx);
+      return (err);
+
+    case TRX_STATE_PREPARED:
+    case TRX_STATE_COMMITTED_IN_MEMORY:
+      /* The statement rollback is only allowed on an ACTIVE transaction */
+      break;
+  }
+  ut_error;
+}
+```
+
+**`last_sql_stat_start` 在哪被刷新**（`trx_mark_sql_stat_end()`，`trx0trx.cc:2551`）——⚠️ **不存在 `trx_release_locks_at_end_of_statement()`**：
+
+```cpp
+void trx_mark_sql_stat_end(trx_t *trx) {
+  lock_on_statement_end(trx);
+  //  ★ 语句结束唯一与锁相关的动作（见下一行），★ 不释放任何锁
+
+  switch (trx->state.load(std::memory_order_relaxed)) {
+    case TRX_STATE_NOT_STARTED:
+    case TRX_STATE_FORCED_ROLLBACK:
+      trx->undo_no = 0;
+      trx->undo_rseg_space = 0;
+      [[fallthrough]];
+    case TRX_STATE_ACTIVE:
+      trx->last_sql_stat_start.least_undo_no = trx->undo_no;
+      //  ★★★ 这就是下一次语句级回滚的 savepoint
+      return;
+  }
+}
+```
+
+```cpp
+// lock0lock.cc:2549 —— 就一行！
+void lock_on_statement_end(trx_t *trx) { trx->lock.inherit_all.store(false); }
+//   ★ 只是"停止 GAP 锁继承"，真正的锁释放在事务提交/回滚时
+```
+
+**回滚的两段式执行**（`trx_rollback_to_savepoint_low()`，`trx0roll.cc:78`）：
+
+```cpp
+  roll_node = roll_node_create(heap);          // ★ 构建 QUE_NODE_ROLLBACK 节点
+
+  if (savept != nullptr) {
+    roll_node->partial = true;                 // ★ 部分回滚：带 savepoint
+    roll_node->savept = *savept;
+  }
+
+  if (trx_is_rseg_updated(trx)) {              // ★ 没有 undo 就一行都不用回
+    thr = pars_complete_graph_for_exec(roll_node, trx, heap, nullptr);
+    ut_a(thr == que_fork_start_command(
+                    static_cast<que_fork_t *>(que_node_get_parent(thr))));
+
+    que_run_threads(thr);                      // ★ 第 1 段：建 undo graph（trx_rollback_step）
+    ut_a(roll_node->undo_thr != nullptr);
+    que_run_threads(roll_node->undo_thr);      // ★★ 第 2 段：跑真正的 row_undo graph
+    que_graph_free(static_cast<que_t *>(roll_node->undo_thr->common.parent));
+  }
+
+  if (savept == nullptr) {
+    trx_rollback_finish(trx);                  // ★ 全量回滚才 trx_commit() 收尾（释放锁、改 state）
+  } else {
+    trx->lock.que_state = TRX_QUE_RUNNING;     // ★ 部分回滚：不提交、不释放锁
+  }
+```
+
+**回滚前必须先解除锁等待**（`trx_commit_or_rollback_prepare()`，`trx0trx.cc:2372`）：
+
+```cpp
+      /* If the trx is in a lock wait state, moves the waiting
+      query thread to the suspended state */
+      if (trx->lock.que_state == TRX_QUE_LOCK_WAIT) {
+        ut_a(trx->lock.wait_thr != nullptr);
+        trx->lock.wait_thr->state = QUE_THR_SUSPENDED;   // ★ 挂起卡在锁等待的 query thread
+        trx->lock.wait_thr = nullptr;
+        trx->lock.que_state = TRX_QUE_RUNNING;           // ★★ 否则回滚无法推进
+      }
+```
+
+**回滚的"双栈合并"**（`trx_roll_pop_top_rec_of_trx_low()`，`trx0roll.cc:905`）：
+
+```cpp
+  ins_undo = undo_ptr->insert_undo;
+  upd_undo = undo_ptr->update_undo;
+
+  if (!ins_undo || ins_undo->empty) {
+    undo = upd_undo;
+  } else if (!upd_undo || upd_undo->empty) {
+    undo = ins_undo;
+  } else if (upd_undo->top_undo_no > ins_undo->top_undo_no) {
+    undo = upd_undo;      // ★★ insert/update 两个 undo 合成"一个按 undo_no 排序的栈"
+  } else {                //    谁 top_undo_no 大先弹谁
+    undo = ins_undo;
+  }
+
+  if (!undo || undo->empty || limit > undo->top_undo_no) {
+    //  ★★ 触到 roll_limit（部分回滚的下界）→ 停止
+    trx_roll_try_truncate(trx, undo_ptr);
+    return (nullptr);
+  }
+```
+
+> ★ 边回滚边 truncate：`if (trx->pages_undone >= TRX_ROLL_TRUNC_THRESHOLD) trx_roll_try_truncate(...)`,`TRX_ROLL_TRUNC_THRESHOLD = 1`——每跨页就试一次，防止 undo 空间暴涨。
+>
+> ★ 崩溃恢复时的进度打印（`Progress in percents: ...`）就在这个函数里，条件是 `trx == trx_roll_crash_recv_trx && trx_roll_max_undo_no > 1000`。
+
+savepoint 是"回滚"的轻量版——把事务回退到中间某点，而非起点。它的核心数据结构极简，`trx_savept_t` 只记一个数：
+
+```cpp
+struct trx_savept_t {
+  undo_no_t least_undo_no; /*!< least undo number to undo */
+};
+```
+
+**为什么一个 undo_no 就够**：`trx->undo_no` 是事务内单调递增的 undo 记录编号。事务的两条 undo 链（insert_undo / update_undo）按 `top_undo_no` 合成一个逻辑栈；savepoint 之后的记录编号必然大于 savepoint 时刻的 `trx->undo_no`。所以记录一个编号就足以标记回滚边界——回滚时弹出所有 `top_undo_no > least_undo_no` 的记录。
+
+**server 层与引擎层各存各的游标**：
+
+| 层 | 存什么 | 作用 |
+|----|--------|------|
+| server 层 `SAVEPOINT` 结构 | 名字、引擎列表、`mdl_savepoint`、binlog cache 字节位置 | 名字查找、MDL 回滚、binlog 截断 |
+| InnoDB `trx_named_savept_t` | 名字、`savept`（undo_no）、`mysql_binlog_cache_pos` | undo 回滚边界 |
+
+**为什么两个游标缺一不可**：回滚要同时恢复两套独立状态机，它们之间没有任何换算关系——undo_no 管"数据页修改的撤销边界"（InnoDB 内部编号），binlog cache pos 管"复制日志的字节流截断边界"（server 层字节流）。undo_no 与字节偏移没有映射，必须各自独立记录、分别恢复，否则数据侧回滚了而 binlog 里还留着这些语句，从库重放出不一致数据。
+
+**InnoDB 的一个巧妙实现**：`innobase_savepoint` 不用 server 层给的 `SAVEPOINT` 结构存数据（注释 "TODO: use provided savepoint data area"），而是把 **savepoint 指针本身**用 `longlong2str((ulint)savepoint, name, 36)` 转成 36 进制字符串当名字，之后回滚/释放时按这个名字查——同一进程内指针唯一，免去额外映射表。
+
+**roll_limit 的语义**（`trx_rollback_step`）：
+
+```cpp
+roll_limit = node->partial ? node->savept.least_undo_no : 0;
+```
+
+- `partial = true`（回滚到 savepoint）→ `roll_limit = least_undo_no`，只回滚编号更大的记录；
+- `partial = false`（完整回滚）→ `roll_limit = 0`，回滚到事务起点。
+
+边界判定在 `trx_roll_pop_top_rec_of_trx_low`：两个 undo 栈（insert/update）按 `top_undo_no` 大者优先弹出，栈顶编号 <= limit 时停止。
+
+**语句级隐式 savepoint**：每条语句的边界就是一个隐式 savepoint。`trx_mark_sql_stat_end` 在语句结束时把 `trx->last_sql_stat_start.least_undo_no = trx->undo_no`（推进边界）；语句失败时 `trx_rollback_last_sql_stat_for_mysql` 以 `last_sql_stat_start` 为 savept 调 `trx_rollback_to_savepoint`，只撤销本语句的修改，然后重新锚定边界。**语句级回滚完全复用 partial rollback 机制**，没有第二条实现路径。
+
+**binlog cache 的处理**（`binlog_savepoint_rollback`）：纯事务表 → `trx_cache.restore_savepoint(pos)` 直接截断 cache 到 savepoint 位置；动过非事务表 → 不能截断，补写一条 "ROLLBACK TO name" 语句让从库重放。
+
+> ★ 8.0.39 现状：`trx_named_savept_t::mysql_binlog_cache_pos` 是历史接口残留——InnoDB 侧 `trx_savepoint_for_mysql` 传的是 0，binlog cache 位置实际由 binlog 引擎存在 server 层 `SAVEPOINT` 的私有区里，截断由 `binlog_savepoint_rollback` 自己完成。
+
 #### 回滚不可被 kill 中断
 
 **结论：回滚一旦开始，不能被 kill 中断。** kill 只能在回滚开始前生效（把事务"逼进"回滚）。
@@ -1981,6 +3008,82 @@ no signal-sending roll_node in this graph */
 **设计原因**：回滚必须完整做完，否则 undo 处于半撤销状态，崩溃恢复无法重建一致性。
 
 #### KILL 的作用时机
+
+**KILL 的全部"本地"效果只是置一个标志位**（`THD::awake()`，`sql/sql_class.cc:1489`）：
+
+```cpp
+  if (this->m_server_idle && state_to_set == KILL_QUERY) { /* nothing */
+  } else {
+    killed = state_to_set;      // ★★ 就这一行
+  }
+  ...
+  /* Interrupt target waiting inside a storage engine. */
+  if (state_to_set != THD::NOT_KILLED) ha_kill_connection(this);
+  //                                    ★★ 唯一进入存储引擎的钩子
+  ...
+  if (is_killable) {
+    mysql_mutex_lock(&LOCK_current_cond);
+    if (current_cond.load() && current_mutex.load()) {
+      mysql_mutex_lock(current_mutex);
+      mysql_cond_broadcast(current_cond);   // ★ 唤醒正在 cond_wait 的 victim
+      mysql_mutex_unlock(current_mutex);
+    }
+    mysql_mutex_unlock(&LOCK_current_cond);
+  }
+```
+
+**InnoDB 端只做一件事**（`ha_innodb.cc:6227`）：
+
+```cpp
+/** Cancel any pending lock request associated with the current THD. */
+static void innobase_kill_connection(handlerton *hton, THD *thd) {
+  trx_t *trx = thd_to_trx(thd);
+  if (trx != nullptr) {
+    /* Cancel a pending lock request if there are any */
+    lock_cancel_if_waiting_and_release({trx});   // ★★ 只取消正在等待的锁请求
+  }
+}
+```
+
+> ★★ **为什么 KILL 只在锁等待时可中断**：`THD::awake()` 不打断任何执行流。若事务正在跑 row 操作（不在锁等待），没有任何强制抢占机制——只能等它走到下一个 `thd->killed` 检查点。
+>
+> ⚠️ 还有一条"免疫"路径：`if (kill_immunizer && kill_immunizer->is_active())` —— **DD 操作期间 KILL 被攒着**，等退出免疫区再补发。
+
+**另一条路：高优先级事务（CATs）代跑回滚**（`trx_kill_blocking()`，`trx0trx.cc:3522`）：
+
+```cpp
+void trx_kill_blocking(trx_t *trx) {
+  if (!trx_is_high_priority(trx)) return;   // ★ 只有 CATs 高优先级事务才有"杀别人"的权利
+
+  hit_list_t hit_list;
+  lock_make_trx_hit_list(trx, hit_list);    // ★ 按锁获取顺序 old→new 造受害者名单
+  ...
+  for (hit_list_t::reverse_iterator it = hit_list.rbegin(); it != end; ++it) {
+    trx_t *victim_trx = it->m_trx;
+
+    if (lock_cancel_if_waiting_and_release(*it)) continue;   // ① 正在锁等待 → 直接取消
+
+    /* Check that the transaction isn't active inside InnoDB code. We have to
+    wait while it is executing in the InnoDB context. */
+    while ((victim_trx->in_innodb & TRX_FORCE_ROLLBACK_MASK) > 0 &&
+           victim_trx->version == version) {
+      //  ★★ 自旋等 victim 退出 InnoDB 临界区（in_innodb==0）
+      //     退避：20us → 1ms → 100ms
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_time));
+    }
+    ...
+    ut_ad(victim_trx->in_innodb & TRX_FORCE_ROLLBACK);       // victim 已打异步回滚标记
+    ut_ad(victim_trx->killed_by == std::this_thread::get_id());
+    ...
+    trx_rollback_for_mysql(victim_trx);
+    //  ★★★ killer 线程替 victim 跑完整回滚
+    victim_trx->killed_by.store(std::thread::id{});          // 清 killer 标记
+    victim_trx->in_innodb &= TRX_FORCE_ROLLBACK_MASK;        // 清 bit31 / bit29
+  }
+}
+```
+
+> ★★ 这是"KILL 能立刻生效"的唯一场景：**不是被打断，而是被另一个线程代跑完回滚**。等 victim 回到自己的执行流时，会发现事务已经是 `TRX_STATE_FORCED_ROLLBACK`。
 
 | 时机 | 能否生效 | 结果 |
 |------|---------|------|
@@ -2022,6 +3125,103 @@ trx_kill_blocking
 
 #### 澄清：没有"异步提交"，只有"异步回滚"
 
+**两个标志位**（`trx0types.h:60`）：
+
+```cpp
+/** If this flag is set then the transaction cannot be rolled back
+asynchronously. */
+static const uint32_t TRX_FORCE_ROLLBACK_DISABLE = 1 << 29;   // ★ bit29：已进入 COMMIT/ROLLBACK，禁止再被异步回滚
+
+/** Mark the transaction for forced rollback */
+static const uint32_t TRX_FORCE_ROLLBACK = 1U << 31;          // ★ bit31：已被标记强制(异步)回滚
+
+/** For masking out the above flags */
+static const uint32_t TRX_FORCE_ROLLBACK_MASK = 0x1FFFFFFF;   // ★ 清掉 bit29/bit31，只留 in_innodb 计数
+```
+
+**★ "没有异步提交"的实现处**（`TrxInInnoDB::enter()`，`trx0trx.h:1495`）：
+
+```cpp
+  static void enter(trx_t *trx, bool disable) {
+    /* If it hasn't already been marked for async rollback.
+    and it will be committed/rolled back. */
+    if (disable) {
+      trx_mutex_enter(trx);
+      if (!is_forced_rollback(trx) && is_started(trx) &&
+          !trx_is_autocommit_non_locking(trx)) {
+        ut_ad(trx->killed_by == std::thread::id{});
+        /* This transaction has crossed the point of
+        no return and cannot be rolled back
+        asynchronously now. It must commit or rollback
+        synchronously. */
+        trx->in_innodb |= TRX_FORCE_ROLLBACK_DISABLE;
+        //  ★★★ 进入 COMMIT/ROLLBACK 就钉死 —— 这就是"没有异步提交"的全部实现
+      }
+      trx_mutex_exit(trx);
+    }
+    ++trx->in_depth;
+    if (trx->in_depth > 1) return;
+    trx_mutex_enter(trx);
+    wait(trx);                 // ★ 若别人正在对我做异步回滚，这里阻塞等它做完
+    ++trx->in_innodb;
+    trx_mutex_exit(trx);
+  }
+```
+
+> ★ `trx_rollback_for_mysql()`（`trx0roll.cc:159`）正是这样调的：
+> ```cpp
+>   if (TrxInInnoDB::is_async_rollback(trx)) {
+>     return (trx_rollback_low(trx));          // ★ 本线程就是 killer → 免计数
+>   } else {
+>     TrxInInnoDB trx_in_innodb(trx, true);    // ★ disable=true → 打 DISABLE 位
+>     return (trx_rollback_low(trx));
+>   }
+> ```
+
+**唯一产生 `FORCED_ROLLBACK` 的地方**（`trx_commit_in_memory()` 尾部，`trx0trx.cc:2169`）：
+
+```cpp
+  /* Because we can rollback transactions asynchronously, we change
+  the state at the last step. trx_t::abort cannot change once commit
+  or rollback has started because we will have released the locks by
+  the time we get here. */
+  if (trx->abort) {
+    trx->abort = false;
+    trx->state.store(TRX_STATE_FORCED_ROLLBACK, std::memory_order_relaxed);  // ★★ trx0trx.cc:2179
+  } else {
+    trx->state.store(TRX_STATE_NOT_STARTED, std::memory_order_relaxed);
+  }
+  ...
+  trx_init(trx);      // ★ 这里 ++version 并把 id 归零、no 复位 TRX_ID_MAX
+```
+
+> ★ `FORCED_ROLLBACK` 与 `NOT_STARTED` **在 `trx_start_if_not_started_xa_low()` 里一视同仁**（`trx0trx.cc:3391`）：两者都直接 `trx_start_low()`。所以"被异步回滚过的事务对象"可以立刻被复用。
+>
+> ⚠️ `trx_init()` 里还有一句：`trx->in_innodb |= TRX_FORCE_ROLLBACK_DISABLE;`（背景/池化初始状态），随后 `check_trx_exists()` 对用户事务会 `trx->in_innodb &= TRX_FORCE_ROLLBACK_MASK;` 清掉它——**背景事务不能被异步回滚，用户事务可以**。
+
+**`version` 字段的作用**（`trx0trx.h:1132`）：
+
+```cpp
+  /** Version of this instance. It is incremented each time the
+  instance is re-used in trx_start_low(). It is used to track
+  whether a transaction has been restarted since it was tagged
+  for asynchronous rollback. */
+  std::atomic_uint64_t version;
+```
+
+> ★★ `trx_kill_blocking()` 里 `ut_ad(version <= victim_trx->version)` + 自旋条件 `victim_trx->version == version`：如果 victim 在等待期间自己完成并重新开始了新事务（version 变了），killer 就放弃 —— 避免杀错"新一代"事务。
+
+**handler 层抹平**（`ha_innodb.cc:5975`）：
+
+```cpp
+    error = trx_rollback_for_mysql(trx);
+    if (trx->state.load(std::memory_order_relaxed) == TRX_STATE_FORCED_ROLLBACK) {
+      ib::info(ER_IB_MSG_548) << "Forced rollback : " << thd_security_context(...);
+      trx->state.store(TRX_STATE_NOT_STARTED, std::memory_order_relaxed);
+    }
+    trx_deregister_from_2pc(trx);
+```
+
 一个容易混淆的点：**InnoDB 没有真正的"异步提交"**——所有提交都是同步的，用户线程必须等 `ordered_commit` 三阶段跑完。但有几个"异步"表象：
 
 | 概念 | 是否真异步 | 本质 |
@@ -2057,6 +3257,228 @@ void trx_commit_complete_for_mysql(trx_t *trx) {
 ### 崩溃恢复的提交与回滚
 
 崩溃恢复处理三类事务，分三幕进行。
+
+#### 前置：事务对象的重建（trx_resurrect）
+
+⚠️ **勘误**：**不存在 `trx_resurrect_table_locks()`**（真名 `trx_resurrect_locks(bool all)`，`trx0trx.cc:806`）；另有 `trx_resurrect_table_ids()`（`:728`）。
+
+**`trx_resurrect_insert()` 的状态判定**（`trx0trx.cc:862`）——★ 崩溃恢复判定 trx 命运的唯一依据是 `undo->state`：
+
+```cpp
+  trx = trx_allocate_for_background();
+  rseg->trx_ref_count++;
+  trx->rsegs.m_redo.rseg = rseg;
+  *trx->xid = undo->xid;
+  trx->id = undo->trx_id;        // ★ id 从 undo 段头里回填
+  trx_sys_rw_trx_add(trx);
+  trx->rsegs.m_redo.insert_undo = undo;
+  trx->is_recovered = true;      // ★★ 复活标记
+
+  /* This is single-threaded startup code, we do not need the
+  protection of trx->mutex or trx_sys->mutex here. */
+
+  if (undo->state != TRX_UNDO_ACTIVE) {
+    /* Prepared transactions are left in the prepared state
+    waiting for a commit or abort decision from MySQL */
+    if (undo->is_prepared()) {
+      ib::info(ER_IB_MSG_1204) << "Transaction " << trx_get_id_for_print(trx)
+                               << " was in the XA prepared state.";
+      if (srv_force_recovery == 0) {
+        trx->state.store(TRX_STATE_PREPARED, std::memory_order_relaxed);   // ★:896
+        ++trx_sys->n_prepared_trx;
+      } else {
+        ib::info(ER_IB_MSG_1205) << "Since innodb_force_recovery"
+                                    " > 0, we will force a rollback.";
+        trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);     // ★:902 force_recovery>0 时 prepared 也强制回滚
+      }
+    } else {
+      trx->state.store(TRX_STATE_COMMITTED_IN_MEMORY, ...);                // ★:905 CACHED/TO_FREE/TO_PURGE ⇒ 已提交
+    }
+    trx->no = trx->id;      // ★ 已提交事务给个 dummy no（purge 不关心）
+  } else {
+    trx->state.store(TRX_STATE_ACTIVE, std::memory_order_relaxed);         // ★:918
+    trx->no = TRX_ID_MAX;   // ★ 未提交事务的 no 一律最大值
+  }
+
+  /* trx_start_low() is not called with resurrect, so need to initialize
+  start time here.*/
+  if (trx->state... == TRX_STATE_ACTIVE || ... == TRX_STATE_PREPARED) {
+    trx->start_time.store(std::chrono::system_clock::from_time_t(time(nullptr)), ...);
+  }
+
+  if (!undo->empty) {
+    trx->undo_no = undo->top_undo_no + 1;      // ★ 回滚起点从 undo 栈顶恢复
+    trx->undo_rseg_space = undo->rseg->space_id;
+  }
+```
+
+> ★★ **注意 `trx_start_low()` 不参与复活**——所以 `id` 从 `undo->trx_id` 回填（不新分配），`start_time` 要手工设，`no` 由状态决定。这是"重建"而非"启动"。
+
+**`trx_resurrect()`：同一个 trx 可能既有 insert undo 又有 update undo**（`trx0trx.cc:1047`）：
+
+```cpp
+  /* Resurrect transactions that were doing inserts. */
+  for (auto undo : rseg->insert_undo_list) {
+    auto trx = trx_resurrect_insert(undo, rseg);
+    trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+  }
+
+  /* Ressurrect transactions that were doing updates. */
+  for (auto undo : rseg->update_undo_list) {
+    /* Check the active_rw_trxs.by_id first. */
+    trx_t *trx = trx_sys->latch_and_execute_with_active_trx(
+        undo->trx_id, [](trx_t *trx) { return trx; }, UT_LOCATION_HERE);
+    //  ★★ 先按 trx_id 在 256 分片哈希表里找已建对象复用
+    if (trx == nullptr) {
+      trx = trx_allocate_for_background();
+    }
+    trx_resurrect_update(trx, undo, rseg);
+    trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+  }
+```
+
+**`trx_resurrect_table_ids()`：逆序遍历 undo 收集涉及的表**（`trx0trx.cc:724`，用于给复活事务补 IX 表锁）：
+
+```cpp
+  do {
+    trx_undo_rec_get_pars(undo_rec, &type, &cmpl_info, &updated_extern,
+                          &undo_no, &table_id, type_cmpl);
+    if (tables.insert(table_id).second == true) {   // ★ 去重
+      ib::info(ER_IB_RESURRECT_IDENTIFY_TABLE_TO_LOCK, ulong(table_id));
+    }
+    undo_rec = trx_undo_get_prev_rec(undo_rec, undo->hdr_page_no,
+                                     undo->hdr_offset, false, &mtr);
+    //  ★★ 逆序遍历整条 undo 链
+    ...  // 每 30s 打一次进度（DBUG "resurrect_logs" 时 1s）
+  } while (undo_rec);
+```
+
+**`trx_lists_init_at_db_start()`**（`trx0trx.cc:1110`）——最后一步：
+
+```cpp
+  for (auto rseg : trx_sys->rsegs) trx_resurrect(rseg);
+  undo::spaces->s_lock();
+  for (auto undo_space : undo::spaces->m_spaces) {
+    for (auto rseg : *undo_space->rsegs()) trx_resurrect(rseg);
+  }
+  undo::spaces->s_unlock();
+
+  /* 从 256 分片里捞出所有 trx，按 id 排序后重建 rw_trx_ids / rw_trx_list */
+  ut::vector<trx_t *> trxs;
+  for (auto &shard : trx_sys->shards) {
+    shard.active_rw_trxs.latch_and_execute([&](const Trx_by_id_with_min &m) {
+      for (const auto &t : m.by_id()) trxs.emplace_back(t.second);
+    }, UT_LOCATION_HERE);
+  }
+  std::sort(trxs.begin(), trxs.end(), [](trx_t *a, trx_t *b) { return a->id < b->id; });
+
+  for (trx_t *trx : trxs) {
+    if (trx->state... == TRX_STATE_ACTIVE || ... == TRX_STATE_PREPARED) {
+      trx_sys->rw_trx_ids.push_back(trx->id);   // ★ 只有 ACTIVE/PREPARED 才进 rw_trx_ids
+    }
+    trx_add_to_rw_trx_list(trx);
+  }
+```
+
+> ★ 必须先排序再 `push_back`——因为 `rw_trx_ids` 是**有序 vector**，`ReadView::copy_trx_ids()` 依赖 `front()` 是最小活跃 id，`trx_erase_lists()` 用 `std::lower_bound` 定位。
+
+**恢复后的回滚跑在独立后台线程**（⚠️ **不存在 `trx_rollback_or_clean_all_recovered()`**，真名 `trx_rollback_or_clean_recovered(bool all)`，`trx0roll.cc:708`）：
+
+```cpp
+static bool trx_rollback_or_clean_resurrected(trx_t *trx, bool all) {
+  switch (state) {
+    case TRX_STATE_COMMITTED_IN_MEMORY:
+      trx_sys_mutex_exit();
+      ib::info(ER_IB_MSG_1188) << "Cleaning up trx with id " << ...;
+      trx_cleanup_at_db_startup(trx);
+      trx_free_resurrected(trx);
+      return true;
+    case TRX_STATE_ACTIVE:
+      if (all || trx->ddl_operation) {
+        trx_sys_mutex_exit();
+        trx_rollback_active(trx);          // ★ 真正回滚
+        trx_free_for_background(trx);
+        return true;
+      }
+      return false;
+    case TRX_STATE_PREPARED:
+      return false;                        // ★★ PREPARED 一律不动，交给 MySQL 层 XA COMMIT/ROLLBACK
+  }
+}
+```
+
+```cpp
+void trx_recovery_rollback(THD *thd) {
+  /* Take MDL locks ... 期间不对外服务，无死锁风险 */
+  for (const auto &element : to_rollback_trx_tables) { ... dd_mdl_acquire(...); lock_table_ix_resurrect(table, trx); }
+  os_event_set(recovery_lock_taken);       // ★ 放行启动线程
+  trx_rollback_or_clean_recovered(true);
+  ...
+}
+
+void trx_recovery_rollback_thread() {
+  THD *thd = create_internal_thd();
+  trx_recovery_rollback(thd);
+  destroy_internal_thd(thd);
+}
+```
+
+> ★★ **`trx_rollback_active()` 里用的 fork 类型是 `QUE_FORK_RECOVERY`**（`trx0roll.cc:589`），与 MySQL 接口的 `QUE_FORK_MYSQL_INTERFACE`、回滚图的 `QUE_FORK_ROLLBACK` 区分开。
+
+三幕之前有个前置步骤常被忽略：**崩溃后内存里的 `trx_t` 对象全部丢失，恢复的第一步是把它们从 undo 段重建出来**。入口 `trx_lists_init_at_db_start`（由 `trx_sys_init_at_db_start` 调用）：
+
+1. 遍历所有 rseg（系统表空间 + 各 undo 表空间），对每个 rseg 的 `insert_undo_list` / `update_undo_list` 调 `trx_resurrect_insert` / `trx_resurrect_update`；
+2. 从 256 个 shard 的 `active_rw_trxs` 收集全部重建事务，按 trx id 排序，加入 `rw_trx_list`，ACTIVE/PREPARED 的 id 进 `rw_trx_ids`。
+
+**状态映射**——undo 段头的 `TRX_UNDO_STATE` 编码了崩溃瞬间事务所处阶段，重建时据此定态：
+
+| undo 段状态 | 重建后 trx->state | 后续处理 |
+|-------------|------------------|----------|
+| `TRX_UNDO_ACTIVE` | ACTIVE | 第二幕后回滚 |
+| prepared（xid 有效） | PREPARED（`n_prepared_trx++`） | **保留不动**，等第三幕 binlog 裁决 |
+| 其他（已提交） | COMMITTED_IN_MEMORY | `trx_cleanup_at_db_startup` 清理 |
+
+`trx_resurrect_insert` 的核心：
+
+```cpp
+trx = trx_allocate_for_background();     // 不是 trx_allocate_for_mysql!
+trx->id = undo->trx_id;                  // 沿用崩溃前的 trx id
+trx_sys_rw_trx_add(trx);                 // 只进 shard 的 active_rw_trxs
+trx->is_recovered = true;                // 关键标记
+if (undo->state != TRX_UNDO_ACTIVE) {
+  if (undo->is_prepared()) { trx->state = TRX_STATE_PREPARED; ++n_prepared_trx; }
+  else { trx->state = TRX_STATE_COMMITTED_IN_MEMORY; }
+  trx->no = trx->id;                     // dummy 值，purge 以磁盘 undo 头为准
+} else {
+  trx->state = TRX_STATE_ACTIVE;         // 需要回滚
+  trx->no = TRX_ID_MAX;                  // 运行中事务 no 恒为 TRX_ID_MAX
+}
+```
+
+**resurrect 事务与正常事务的关键差异**（这些差异必须存在）：
+
+| 维度 | 正常事务 | resurrect 事务 |
+|------|----------|---------------|
+| 分配函数 | `trx_allocate_for_mysql` | `trx_allocate_for_background` |
+| `mysql_trx_list` | 加入 | **永不加入** |
+| `rw_trx_list` | 仅 rw 且未提交时 | **恒在列** |
+| `is_recovered` | false | **true** |
+| `mysql_thd` | 关联真实 THD | null（`sess = trx_dummy_sess`） |
+| 释放路径 | `trx_free_for_mysql` | `trx_free_resurrected` |
+
+原因：
+
+1. **不进 mysql_trx_list**：该链表语义是"MySQL 层创建、可能尚未 start 的事务"，供 INNODB_TRX 等以 THD 为锚点的接口遍历。崩溃瞬间旧连接已不存在、无 THD，硬塞进去会导致按 THD 解引用悬空；而回滚线程和 purge 需要看到它们，所以只进 rw_trx_list。
+2. **is_recovered 是差异化处理的判别位**：`trx_cleanup_at_db_startup`、`trx_free_prepared_or_active_recovered` 都 `ut_a(trx->is_recovered)`，防止正常流程误入恢复专用清理路径。
+3. **PREPARED 必须原样保留**：XA 协议要求 prepare 之后由用户/MySQL 决定 commit 还是 rollback，InnoDB 不能擅自处理。
+
+**next_trx_id_or_no 的恢复**（trx0sys.cc）：读 TRX_SYS 页持久化的 max_trx_id，`next_trx_id_or_no = max_trx_id + 2 * TRX_SYS_TRX_ID_WRITE_MARGIN`——**factor 2 是因为 id 和 no 可能被两个线程并发自增**，必须留双倍余量防重启后 id 复用。
+
+**trx_commit_or_rollback_prepare 的作用**（trx0trx.cc:2372）：commit 和 rollback 共用的前置状态机——
+
+- NOT_STARTED / FORCED_ROLLBACK → 先 `trx_start_low(trx, true)` 完成 start（否则后续例程缺 undo 段等未初始化字段）；
+- `TRX_QUE_LOCK_WAIT` → 把等待线程置 SUSPENDED、清 wait_thr（**解除锁等待**，否则 commit/rollback 会死锁在锁上）；
+- COMMITTED_IN_MEMORY → `ut_error`（已提交事务不应再进提交/回滚流程）。
 
 #### 第一幕：DD 事务同步回滚（单线程启动阶段）
 
@@ -2146,7 +3568,11 @@ prepared 事务在第二幕被**刻意跳过**，因为它的命运取决于 bin
 void recover_one_internal_trx(xarecover_st const &info, handlerton &ht,
                               XA_recover_txn const &xa_trx, my_xid xid,
                               ::recovery_statistics &stats) {
+  // info.commit_list = binlog 恢复扫描出的、所有已写 Xid_log_event 的 XID 集合
+  // ★ 最终裁决：XID 在 commit_list 中 → 提交；不在 → 回滚 ⇒ binlog 说了算
   if (info.commit_list ? info.commit_list->count(xid) != 0
+                       // tc_heuristic_recover 是 --tc-heuristic-recover=COMMIT 的兜底——
+                       // binlog 损坏/缺失、无法确定时，管理员手动指定"全部按提交处理"
                        : tc_heuristic_recover == TC_HEURISTIC_RECOVER_COMMIT) {
     exec_status = ht.commit_by_xid(&ht, const_cast<XID *>(&xa_trx.id));
     ...
@@ -2156,12 +3582,6 @@ void recover_one_internal_trx(xarecover_st const &info, handlerton &ht,
   }
 }
 ```
-
-**逐段解释**：
-
-- `info.commit_list` 是 binlog 恢复扫描出的、所有已写 `Xid_log_event` 的 XID 集合。
-- **XID 在 commit_list 中 → `commit_by_xid`（提交）；不在 → `rollback_by_xid`（回滚）**。这就是 2PC 崩溃恢复的最终裁决：**binlog 说了算**。
-- `tc_heuristic_recover == TC_HEURISTIC_RECOVER_COMMIT` 是 `--tc-heuristic-recover=COMMIT` 的兜底——binlog 损坏/缺失、无法确定时，管理员手动指定"全部按提交处理"。
 
 外部 XA 用更复杂的状态机（`recover_one_external_trx`）：
 
@@ -2179,17 +3599,19 @@ void recover_one_internal_trx(xarecover_st const &info, handlerton &ht,
 
 ```cpp
 static xa_status_code innobase_commit_by_xid(handlerton *hton, XID *xid) {
-  trx_t *trx = trx_get_trx_by_xid(xid);
+  trx_t *trx = trx_get_trx_by_xid(xid);   // 按 XID 查 prepared 事务（与 by_xid 系列共用查找路径）
 
   if (trx != nullptr) {
     {
       TrxInInnoDB trx_in_innodb(trx);
 
+      // ★ 与正常提交同一套引擎内部提交（undo 标记 COMMITTED、分配 trx->no、放锁），
+      //   但不经过 BGC 三阶段——binlog 早在崩溃前就写好了 Xid_log_event，恢复只需补齐引擎侧
       innobase_commit_low(trx);
     }
     /* use cases are: disconnected xa, slave xa, recovery */
-    trx_deregister_from_2pc(trx);
-    trx_free_for_background(trx);
+    trx_deregister_from_2pc(trx);         // 从 2PC 注册表摘除
+    trx_free_for_background(trx);         // 恢复出的事务对象走 background 释放路径
 
     return (XA_OK);
   } else {
@@ -2197,13 +3619,6 @@ static xa_status_code innobase_commit_by_xid(handlerton *hton, XID *xid) {
   }
 }
 ```
-
-**逐段解释**：
-
-- `trx_get_trx_by_xid(xid)` 按 XID 查 prepared 事务（与 by_xid 系列共用查找路径）。
-- `innobase_commit_low(trx)` → `trx_commit_for_mysql`：**与正常提交同一套引擎内部提交**（undo 标记 COMMITTED、分配 `trx->no`、放锁），但**不经过 BGC 三阶段**——binlog 早在崩溃前就写好了 `Xid_log_event`，恢复只需把引擎侧补齐。
-- 注释点明三个使用场景："disconnected xa, slave xa, recovery"。
-- `trx_deregister_from_2pc` 从 2PC 注册表摘除 + `trx_free_for_background` 释放（恢复出的事务对象走 background 释放路径）。
 
 回滚版对称，走 `innobase_rollback_trx`（引擎内部回滚），同样 deregister + free，失败返回 `XAER_RMERR`：
 
@@ -2274,6 +3689,43 @@ static xa_status_code innobase_rollback_by_xid(handlerton *hton, XID *xid) {
 ---
 
 ## Misc
+
+### 事务的诊断接口：INNODB_TRX 与 SHOW ENGINE INNODB STATUS
+
+**两个链表的并集**：观察接口需要同时遍历 `rw_trx_list`（MVCC 核心，含系统/恢复事务）和 `mysql_trx_list`（会话视角，含未开始/只读事务），再按 `trx->id` / `read_only` 去重：
+
+- INNODB_TRX（`trx0i_s.cc`）：先扫 rw_trx_list，再扫 mysql_trx_list 时用 `trx->id != 0 && !trx->read_only` 过滤已处理的 RW 事务；
+- SHOW ENGINE INNODB STATUS（`lock_print_info_all_transactions`）：mysql_trx_list 只取 NOT_STARTED（输出 `---`），rw_trx_list 取其余。
+
+**两个易忽略的细节**：
+
+1. **trx_id 列不是裸 `trx->id`**，而是 `trx_get_id_for_print`：`trx->id == 0`（只读事务）时用"trx 对象地址 | 2^48"构造伪 ID（第 49 位置 1）：
+
+```cpp
+return (trx->id != 0
+            ? trx->id
+            : trx_id_t{reinterpret_cast<uintptr_t>(trx)} | (max_trx_id + 1));
+```
+
+动机：INNODB_TRX、P_S data_locks、SHOW STATUS 各接口必须打印**同一个值**才能 JOIN；只读事务的伪 ID 可以复用，仅用于打印、无 MVCC 语义。
+
+2. **INNODB_TRX 的 trx_state 列取的是 `trx->lock.que_state`**（RUNNING / LOCK WAIT / ROLLING BACK / COMMITTING），**不是** `trx->state`（状态机五态）。
+
+**trx_rw_is_active 的查询优化**（trx0sys.ic）：无锁快路径 + 持锁慢路径：
+
+```cpp
+static inline trx_t *trx_rw_is_active(trx_id_t trx_id, bool do_ref_count) {
+  auto &shard = trx_sys->get_shard_by_trx_id(trx_id);
+  if (trx_id < shard.active_rw_trxs.peek().min_id()) {   // 无锁：atomic min_id
+    return nullptr;
+  }
+  return trx_sys->latch_and_execute_with_active_trx(...); // 持 shard mutex 慢路径
+}
+```
+
+`min_id()` 无锁短路是安全的：insert/erase 在同一 shard mutex 临界区内同时维护 map 与 min_id，若读到的 min_id > trx_id，该 trx 必然已不在 map 中。★ 注意 8.0.39 已无 `trx_rw_is_active_low`（老版本函数，现重构为快/慢双路径）。
+
+
 
 ### 易混淆概念对比
 

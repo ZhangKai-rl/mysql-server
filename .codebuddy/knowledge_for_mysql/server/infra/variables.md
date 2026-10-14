@@ -31,6 +31,58 @@
 | 状态变量 | `Com_select`、`Innodb_buffer_pool_reads` | 只能读 | `System_status_var` 计数器块 | `SHOW [GLOBAL\|SESSION] STATUS` / `performance_schema.global_status` |
 | 用户变量 | `SET @a := 1` | 任何用户随时 | `THD::user_vars`（per-connection hash） | 直接 `SELECT @a` |
 
+**★ 三类的"载体"完全不同**（★ 这是理解全篇的骨架）：
+
+| 类别 | 描述符 / 载体 | 真名与位置 |
+|---|---|---|
+| 系统变量 | C++ 类 `sys_var`（有继承树、双 hash 索引） | `sql/set_var.h:107` |
+| 状态变量 | **C 结构体 `SHOW_VAR`**（4 字段，无 hash，就是数组） | ⚠️ 不在 `sql/set_var.h`，在 **`include/mysql/status_var.h:80`** |
+| 用户变量 | `user_var_entry` + **没有 `sys_var` 对象** | `sql/item_func.h:2953` |
+
+```cpp
+/* include/mysql/status_var.h:80 —— 状态变量没有"注册表类"，就是个 4 字段 C 结构 */
+/**
+  SHOW STATUS Server status variable
+*/
+struct SHOW_VAR {
+  const char *name;
+  char *value;          /* ★ 语义随 type 变化：绝对指针 / offsetof 偏移 / 函数指针 / 子数组指针 */
+  enum enum_mysql_show_type type;
+  enum enum_mysql_show_scope scope;
+};
+
+#define SHOW_VAR_MAX_NAME_LEN 64
+#define SHOW_VAR_FUNC_BUFF_SIZE 1024
+typedef int (*mysql_show_var_func)(MYSQL_THD, SHOW_VAR *, char *);
+```
+```cpp
+/* sql/set_var.h:1025 —— 用户变量没有 sys_var 对象 */
+/* User variables like @my_own_variable */
+class set_var_user : public set_var_base {
+  Item_func_set_user_var *user_var_item;
+ public:
+  set_var_user(Item_func_set_user_var *item) : user_var_item(item) {}
+  int resolve(THD *thd) override;
+  int check(THD *thd) override;
+  int update(THD *thd) override;
+  ...
+};
+```
+> ★ 用户变量**唯一不走 `system_variables` hash** 的一类——`set_var_user` 只是把它塞进同一条 SET 执行管线（resolve/check/update）而已。
+
+**★ enum_var_type：8.0 新增的两个作用域**（`sql/set_var.h:88`）：
+
+```cpp
+enum enum_var_type {
+  OPT_DEFAULT,      /* [GLOBAL|LOCAL|SESSION].name */
+  OPT_SESSION,      /* [SESSION|LOCAL].name */
+  OPT_GLOBAL,       /* GLOBAL.name */
+  OPT_PERSIST,      /* PERSIST.name */
+  OPT_PERSIST_ONLY  /* PERSIST_ONLY.name */
+};
+```
+> ★ `OPT_PERSIST` / `OPT_PERSIST_ONLY` 是 8.0 新增（5.7 只有前三个），与 GLOBAL/SESSION **平级**——这是变量体系在 8.0 最大的结构性扩展。
+
 ### 版本演进
 
 | 版本 | 变化 |
@@ -178,6 +230,78 @@ session 值用快照（PFS 的 `set_status_vars()` 优先用 `initial_status_var
 | 变更权限粒度 | 按操作拆动态权限 | 按参数 context + 参数级 GRANT | 系统权限 |
 
 演进动机：8.0 前"改全局变量跨重启生效"只能手工改 my.cnf，而 my.cnf 与运行值可能不一致——这是 `SET PERSIST` 的直接动机。`SESSION_VARIABLES_ADMIN`（WL#12217）的动机是**最小化权限 footprint**（之前为改受限会话变量只能给 SUPER，顺带获得改所有全局变量的能力）。8.0 把 SHOW STATUS 投靠 PFS，动机是**一套实现服务两种接口**（SHOW 兼容 + SQL 表查询）并消灭双份实现的分歧。
+
+**★ 官方立场原文**（`storage/perfschema/pfs.cc:298`，★ "变量/状态归 PFS、元数据归 I_S"的分工声明）：
+
+```cpp
+  @section PFS_MAIN_INTRO Introduction
+  The PERFORMANCE_SCHEMA is a way to introspect the internal execution of
+  the server at runtime.
+  The performance schema focuses primarily on performance data,
+  as opposed to the INFORMATION_SCHEMA whose purpose is to inspect metadata.
+```
+
+**★ 8.0 新增的三个 flag**（`sql/set_var.h:128`，★ 都是为 `SET PERSIST` 加的）：
+
+```cpp
+  enum flag_enum {
+    GLOBAL = 0x0001,
+    SESSION = 0x0002,
+    ONLY_SESSION = 0x0004,
+    SCOPE_MASK = 0x03FF,  // 1023
+    READONLY = 0x0400,    // 1024
+    ALLOCATED = 0x0800,   // 2048
+    INVISIBLE = 0x1000,   // 4096
+    TRI_LEVEL = 0x2000,   // 8192 - default is neither GLOBAL nor SESSION
+    NOTPERSIST = 0x4000,
+    HINT_UPDATEABLE = 0x8000,  // Variable is updateable using SET_VAR hint
+    PERSIST_AS_READ_ONLY = 0x10000,
+    /**
+      Sensitive variable. If keyring is available, the variable will be
+      persisted in mysqld-auto.cnf in encrypted format
+    */
+    SENSITIVE = 0x20000
+  };
+```
+```cpp
+/* sql/set_var.h:280 —— "动态 vs 只读"就是一行位测试 */
+  bool is_readonly() const { return flags & READONLY; }
+  bool not_visible() const { return flags & INVISIBLE; }
+  bool is_trilevel() const { return flags & TRI_LEVEL; }
+  bool is_persist_readonly() const { return flags & PERSIST_AS_READ_ONLY; }
+  bool is_sensitive() const { return flags & SENSITIVE; }
+```
+> ★ 两个易混概念：`READONLY` = 运行期不可改；`PERSIST_AS_READ_ONLY` = **本身可动态改，但不允许被 PERSIST 持久化**。
+
+**★ `DEPRECATED_VAR` 是个恒等宏**（`sql/sys_vars.h:155`，★ 常见误解）：
+
+```cpp
+#define DEPRECATED_VAR(X) X
+```
+> ★ 它**不做任何运行时行为**，只是在构造参数列表里占一个位置，把"替代名"字符串传给 `sys_var` 的 `deprecation_substitute` 成员。8.0.39 中 `sql/sys_vars.cc` 共出现 **35 处**。
+```cpp
+/* sql/set_var.cc:479 —— 告警触发点（★ 解析期，不是执行期） */
+void sys_var::do_deprecated_warning(THD *thd) {
+  if (deprecation_substitute != nullptr) {
+    char buf1[NAME_CHAR_LEN + 3];
+    strxnmov(buf1, sizeof(buf1) - 1, "@@", name.str, 0);
+    /*
+       if deprecation_substitute is an empty string,
+       there is no replacement for the syntax
+    */
+    uint errmsg = deprecation_substitute[0] == '\0'
+                      ? ER_DEPRECATE_MSG_NO_REPLACEMENT
+                      : ER_DEPRECATE_MSG_WITH_REPLACEMENT;
+    if (thd)
+      push_warning_printf(thd, Sql_condition::SL_WARNING, ER_WARN_DEPRECATED_SYNTAX, ...);
+    else
+      LogErr(WARNING_LEVEL, errmsg, buf1, deprecation_substitute);   /* 启动期写 error log */
+  }
+}
+```
+> ★ 参数甚至可以是"转到某张表"这种非变量名说明（`sys_vars.cc:6042`：`DEPRECATED_VAR("performance_schema.tls_channel_status table")`）。
+
+**⚠️ WL#8688 澄清**：`sql/persisted_variable.cc` 中 grep `WL#` / `8688` → **0 命中**。SET PERSIST 的 WL 编号**不在源码注释里**。持久化缓存类的注释在 `sql/persisted_variable.h:110`（中文注释）。
 
 ---
 
@@ -434,6 +558,116 @@ mysqld 读的 group：`load_default_groups = { "mysql_cluster"(仅NDB), "mysqld"
 - **无环境变量展开**：8.0.39 的 my.cnf 解析里 `$` 只出现在注释中——`$MYSQL_HOME` 这类写法**不支持**。
 - 解析出的每个选项统一组装成 `--name=value`，经 `handle_default_option` 判 group 后 push 进 `my_args`，同时调 `update_variable_source(option, cnf_file)` 登记来源文件。
 
+**★ 源码实证**（`mysys/my_default.cc:926`）：
+
+```cpp
+  const int max_recursion_level = 10;   /* ★ !include 递归深度硬上限 10 层 */
+  ...
+  while (true) {
+    auto fileline = mysql_file_getline(buff, sizeof(buff), fp, is_login_file);
+    char *linebuff = fileline.get();
+    if (linebuff == nullptr) break;     /* ★ 一次只读一行 → 没有"行尾 \ 续行" */
+
+    line++;
+    /* Ignore comment and empty lines */
+    for (ptr = linebuff; my_isspace(&my_charset_latin1, *ptr); ptr++) {}
+    if (*ptr == '#' || *ptr == ';' || !*ptr) continue;   /* ★ 行首 # 和 ; 都整行跳过 */
+```
+
+**① 组名与"选项必须在组之后"**：
+
+```cpp
+    if (*ptr == '[') /* Group name */
+    {
+      found_group = true;
+      if (!(end = strchr(++ptr, ']'))) {
+        my_message_local(ERROR_LEVEL,
+                         EE_INCORRECT_GRP_DEFINITION_IN_CONFIG_FILE, name, line);
+        goto err;
+      }
+      /* Remove end space */
+      for (; my_isspace(&my_charset_latin1, end[-1]); end--) {}
+      end[0] = 0;
+      strmake(curr_gr, ptr, std::min<size_t>((end - ptr) + 1, sizeof(curr_gr) - 1));
+      opt_handler(handler_ctx, curr_gr, nullptr, nullptr);   /* signal new group */
+      continue;
+    }
+    if (!found_group) {                    /* ★ 选项出现在 [group] 之前 = 致命错误 */
+      my_message_local(ERROR_LEVEL, EE_OPTION_WITHOUT_GRP_IN_CONFIG_FILE, name, line);
+      goto err;
+    }
+```
+
+**② 行尾注释只认 `#`，且必须在引号外**（`:1154`）：
+
+```cpp
+static char *remove_end_comment(char *ptr) {
+  char quote = 0;  /* we are inside quote marks */
+  char escape = 0; /* symbol is protected by escape chagacter */
+
+  for (; *ptr; ptr++) {
+    if ((*ptr == '\'' || *ptr == '\"') && !escape) {
+      if (!quote) quote = *ptr;
+      else if (quote == *ptr) quote = 0;
+    }
+    /* We are not inside a string */
+    if (!quote && *ptr == '#') { *ptr = 0; return ptr; }
+    escape = (quote && *ptr == '\\' && !escape);
+  }
+  return ptr;
+}
+```
+> ★ 注意调用条件：`if (!is_login_file) end = remove_end_comment(ptr);` —— **login 文件（`mylogin.cnf`）不支持注释**。
+
+**③ 等号两侧空格 + 成对引号剥离**（`:1078`）：
+
+```cpp
+    if ((value = strchr(ptr, '='))) end = value; /* Option without argument */
+    for (; my_isspace(&my_charset_latin1, end[-1]); end--) {}
+    /* ★ end 回退吃掉 '=' 左侧尾部空白 → "key  = v" 与 "key= v" 等价 */
+
+    if (!value) {
+      /* 无 '=' 的写法：key value 或裸 key —— 统一加 "--" 前缀 */
+      strmake(my_stpcpy(option, "--"), ptr, (size_t)(end - ptr));
+      if (opt_handler(handler_ctx, curr_gr, option, name)) goto err;
+    } else {
+      for (value++; my_isspace(&my_charset_latin1, *value); value++) {}  /* 吃掉右侧前导空白 */
+      value_end = strend(value);
+      for (; my_isspace(&my_charset_latin1, value_end[-1]); value_end--) {} /* 吃掉值尾部空白 */
+
+      /* remove quotes around argument */
+      if ((*value == '\"' || *value == '\'') && (value + 1 < value_end) &&
+          *value == value_end[-1]) {      /* ★ 只剥"首尾成对"且长度 > 1 的引号 */
+        value++; value_end--;
+      }
+
+      ptr = my_stpnmov(my_stpcpy(option, "--"), ptr, (size_t)(end - ptr));
+      *ptr++ = '=';                       /* ★ 最终拼成 "--key=value" */
+```
+
+**④ 转义只在值内部生效**（`:1116`）：
+
+```cpp
+      for (; value != value_end; value++) {
+        if (*value == '\\' && value != value_end - 1) {
+          switch (*++value) {
+            case 'n': *ptr++ = '\n'; break;
+            case 't': *ptr++ = '\t'; break;
+            case 'r': *ptr++ = '\r'; break;
+            case 'b': *ptr++ = '\b'; break;
+            case 's': *ptr++ = ' '; break;  /* space */
+            case '\"': *ptr++ = '\"'; break;
+            case '\'': *ptr++ = '\''; break;
+            case '\\': *ptr++ = '\\'; break;
+            default: /* Unknown; Keep '\' */
+              *ptr++ = '\\'; *ptr++ = *value; break;
+          }
+        } else
+          *ptr++ = *value;
+      }
+```
+> ★ 未知转义**原样保留反斜杠**——所以 `\d` 会变成字面的 `\d`。
+
 #### B.5 `!include` / `!includedir`
 
 在 `search_default_file_with_ext` 里行首 `!` 开头解析：`!include` 递归读指定文件、`!includedir` 遍历目录中扩展名匹配的文件（Unix `.cnf`），**递归上限 10 层**（超限 WARNING 跳过）。被 include 的文件**继承当前 group 状态**，其选项按"include 处的位置"插入 argv（同 group 内仍是 last-wins）。include 的文件路径会登记进 `default_paths`（source 追踪用）。目录打不开是 fatal。
@@ -446,6 +680,82 @@ mysqld 读的 group：`load_default_groups = { "mysql_cluster"(仅NDB), "mysqld"
 - `--maximum-x=N` → 写 `my_option::u_max_value`（`max_system_variables` 的对应偏移，即 `--maximum-max_connections` 这类软上限）。
 - `--loose-x` → 未知选项降级为 WARNING 且不退出（`--loose-` 剥掉后重查表）。**persisted 变量全部以 `--loose_` 前缀生成**——保证 mysqld-auto.cnf 里有过时变量时服务器不至于起不来。
 - 前缀可叠加（`--loose-skip-innodb`），剥离循环 `i = -1` 重启。
+
+**★ 前缀表定义**（`mysys/my_getopt.cc:76`，★ 三个数组/枚举必须同序）：
+
+```cpp
+/*
+  The following three variables belong to same group and the number and
+  order of their arguments must correspond to each other.
+*/
+static const char *special_opt_prefix[] = {"skip",    "disable", "enable",
+                                           "maximum", "loose",   nullptr};
+static const uint special_opt_prefix_lengths[] = {4, 7, 6, 7, 5, 0};
+enum enum_special_opt { OPT_SKIP, OPT_DISABLE, OPT_ENABLE, OPT_MAXIMUM, OPT_LOOSE };
+
+char *disabled_my_option = const_cast<char *>("0");
+static char enabled_my_option[] = "1";
+```
+> ★ 分隔符接受 `-` 或 `_`，所以 `--skip_xxx` 与 `--skip-xxx` 都行。
+
+**★ 语义处理**（`mysys/my_getopt.cc:397`）：
+
+```cpp
+            for (int i = 0; special_opt_prefix[i]; i++) {
+              if (!getopt_compare_strings(special_opt_prefix[i], opt_str,
+                                          special_opt_prefix_lengths[i]) &&
+                  (opt_str[special_opt_prefix_lengths[i]] == '-' ||
+                   opt_str[special_opt_prefix_lengths[i]] == '_')) {
+                opt_str += special_opt_prefix_lengths[i] + 1;
+                length -= special_opt_prefix_lengths[i] + 1;
+                if (i == OPT_LOOSE) option_is_loose = true;   /* ★ 只置标志，宽容在下面生效 */
+
+                if ((opt_found = findopt(opt_str, length, &optp))) {
+                  switch (i) {
+                    case OPT_SKIP:
+                    case OPT_DISABLE:
+                      /*
+                        double negation is actually enable again,
+                        for example: --skip-option=0 -> option = true
+                      */
+                      optend = (optend && *optend == '0' && !(*(optend + 1)))
+                                   ? enabled_my_option : disabled_my_option;
+                      break;
+                    case OPT_ENABLE:
+                      optend = (optend && *optend == '0' && !(*(optend + 1)))
+                                   ? disabled_my_option : enabled_my_option;
+                      break;
+                    case OPT_MAXIMUM:
+                      set_maximum_value = true;
+                      must_be_var = true;
+                      break;
+                  }
+                  break;
+                }
+                i = -1;   /* ★ 一个前缀匹配不到就重启扫描 → 允许 --skip-loose-xxx 叠加 */
+              }
+            }
+```
+
+**★ `--loose-` 的精确语义**（`mysys/my_getopt.cc:457`）：
+
+```cpp
+            if (must_be_var) {
+              if (my_getopt_print_errors)
+                my_getopt_error_reporter(
+                    option_is_loose ? WARNING_LEVEL : ERROR_LEVEL,
+                    EE_UNKNOWN_VARIABLE, cur_arg);
+              if (!option_is_loose) return EXIT_UNKNOWN_VARIABLE;   /* ★ 降级为 WARNING 且不退出 */
+            } else {
+              ...
+              if (!(option_is_loose || ignore_unknown_option))
+                return EXIT_UNKNOWN_OPTION;
+            }
+            if (option_is_loose || ignore_unknown_option) {
+              (*argc)--;    /* ★ 把该参数从 argv 里剔除 */
+              continue;
+            }
+```
 
 #### B.7 首参选项：`--no-defaults` / `--defaults-file` / `--print-defaults`
 
@@ -600,6 +910,154 @@ GLOBAL 拿**两把锁**（`PLock_global_system_variables` + 变量自己的 `gua
 4. 包装成 `sys_var_pluginvar` 注册进 dynamic hash。
 
 插件侧读值一行宏：`THDVAR(thd, name)` 展开为 `*(ulong*)(thd->variables.dynamic_variables_ptr + offset)`（若会话未分配动态块，先增量 COW）。注意 `sys_var_pluginvar` 给基类传的 offset 是 **0**——插件变量完全不走 `sys_var::offset`，走 `plugin_var + 1` 私有区。
+
+**★ 宏本体：`-1` 是占位符**（`include/mysql/plugin.h:463`，⚠️ **不在 `sql/set_var.h`**，那里 grep `THDVAR` 0 命中）：
+
+```cpp
+#define MYSQL_THDVAR_BOOL(name, opt, comment, check, update, def)      \
+  DECLARE_MYSQL_THDVAR_BASIC(name, bool) = {                           \
+      PLUGIN_VAR_BOOL | PLUGIN_VAR_THDLOCAL | ((opt)&PLUGIN_VAR_MASK), \
+      #name, comment, check, update,                                   \
+      -1,          /* ★ offset 占位符：运行时回填 */                      \
+      def,                                                             \
+      NULL};       /* ★ resolve 占位符：运行时赋值 */
+
+#define MYSQL_THDVAR_INT(name, opt, comment, check, update, def, min, max, blk) \
+  DECLARE_MYSQL_THDVAR_SIMPLE(name, int) = {                                    \
+      PLUGIN_VAR_INT | PLUGIN_VAR_THDLOCAL | ((opt)&PLUGIN_VAR_MASK),           \
+      #name, comment, check, update, -1, def, min, max, blk, NULL};
+```
+```cpp
+/* 对照 GLOBAL 版：第 6 项是 &varname（直接地址），不是 -1 */
+#define MYSQL_SYSVAR_BOOL(name, varname, opt, comment, check, update, def) \
+  DECLARE_MYSQL_SYSVAR_BASIC(name, bool) = {                                \
+      PLUGIN_VAR_BOOL | ((opt)&PLUGIN_VAR_MASK),                            \
+      #name, comment, check, update, &varname, def}
+```
+```cpp
+/* :238 —— ★ 根源差异：GLOBAL 存"指针"，THD 存"offset" */
+/*
+  for global variables, the value pointer is the first
+  element after the header, the default value is the second.
+  for thread variables, the value offset is the first
+  element after the header, the default value is the second.
+*/
+#define DECLARE_MYSQL_THDVAR_BASIC(name, type) \
+  struct {                                     \
+    MYSQL_PLUGIN_VAR_HEADER;                   \
+    int offset;                                \
+    const type def_val;                        \
+    DECLARE_THDVAR_FUNC(type);                 \
+  } MYSQL_SYSVAR_NAME(name)
+
+#define DECLARE_THDVAR_FUNC(type) type *(*resolve)(MYSQL_THD thd, int offset)
+```
+
+**★ 访问器宏**（`include/mysql/plugin.h:617`，⚠️ 不是"取偏移算地址"）：
+
+```cpp
+#define SYSVAR(name) (*(MYSQL_SYSVAR_NAME(name).value))
+
+/* when thd == null, result points to global value */
+#define THDVAR(thd, name) \
+  (*(MYSQL_SYSVAR_NAME(name).resolve(thd, MYSQL_SYSVAR_NAME(name).offset)))
+
+#define THDVAR_SET(thd, name, value)                 \
+  plugin_thdvar_safe_update(thd, MYSQL_SYSVAR(name), \
+                            (char **)&THDVAR(thd, name), (const char *)value);
+```
+> ★ `THDVAR` 是**调用运行时装好的 resolve 函数指针** + 运行时回填的 offset。字符串型必须走 `THDVAR_SET`（处理 `MEMALLOC` 的内存释放）。
+
+**★ 运行时回填**（`sql/sql_plugin.cc:3276`）：
+
+```cpp
+  for (plugin_option = tmp->plugin->system_vars;
+       plugin_option && *plugin_option; plugin_option++, index++) {
+    opt = *plugin_option;
+    if (!(opt->flags & PLUGIN_VAR_THDLOCAL)) continue;
+    if (!(register_var(plugin_name_ptr, opt->name, opt->flags))) continue;
+    /* ★ register_var 在这里把 offset 从 -1 改成真实偏移 */
+    switch (opt->flags & PLUGIN_VAR_TYPEMASK) {
+      case PLUGIN_VAR_BOOL:   ((thdvar_bool_t *)opt)->resolve = mysql_sys_var_bool; break;
+      case PLUGIN_VAR_LONG:   ((thdvar_ulong_t *)opt)->resolve = mysql_sys_var_ulong; break;
+      case PLUGIN_VAR_STR:    ((thdvar_str_t *)opt)->resolve = mysql_sys_var_str; break;
+      case PLUGIN_VAR_DOUBLE: ((thdvar_double_t *)opt)->resolve = mysql_sys_var_double; break;
+      default:
+        LogErr(ERROR_LEVEL, ER_PLUGIN_UNKNOWN_VARIABLE_TYPE, opt->flags, plugin_name);
+        return -1;
+    };
+  }
+```
+```cpp
+/* sql/sql_plugin.cc:2986 —— 每种标量一个 resolve 回调 */
+static unsigned long *mysql_sys_var_ulong(THD *thd, int offset) {
+  return (unsigned long *)intern_sys_var_ptr(thd, offset, true);
+}
+```
+
+**★★ 惰性 COW 的三步**（`sql/sql_plugin.cc:2907`）：
+
+```cpp
+  thd->variables.dynamic_variables_ptr = (char *)my_realloc(
+      key_memory_THD_variables, thd->variables.dynamic_variables_ptr,
+      global_variables_dynamic_size, MYF(MY_WME | MY_FAE | MY_ALLOW_ZERO_PTR));
+  /* ① 扩到与全局同样大（首次调用时 ptr 为 NULL） */
+
+  memcpy(thd->variables.dynamic_variables_ptr +
+             thd->variables.dynamic_variables_size,
+         global_system_variables.dynamic_variables_ptr +
+             thd->variables.dynamic_variables_size,
+         global_system_variables.dynamic_variables_size -
+             thd->variables.dynamic_variables_size);
+  /* ② ★ 只 memcpy "新增的那一段"，老段保持本线程已改过的值 —— 增量 COW */
+
+  for (const auto &key_and_value : *malloced_string_type_sysvars_bookmark_hash) {
+    ...
+    varoff = *(int *)(pi->plugin_var + 1);   /* ★ plugin_var + 1 正是 int offset */
+    thdvar = (char **)(thd->variables.dynamic_variables_ptr + varoff);
+    sysvar = (char **)(global_system_variables.dynamic_variables_ptr + varoff);
+    *thdvar = nullptr;
+    plugin_var_memalloc_session_update(thd, nullptr, thdvar, *sysvar);
+    /* ③ ★ MEMALLOC 的字符串型必须逐条 strdup，否则共享指针会 double free */
+  }
+```
+```cpp
+/* sql/sql_plugin_var.cc:184 —— 惰性入口 */
+uchar *intern_sys_var_ptr(THD *thd, int offset, bool global_lock) {
+  if (!thd)
+    return (uchar *)global_system_variables.dynamic_variables_ptr + offset;
+  if (!thd->variables.dynamic_variables_ptr ||
+      (uint)offset > thd->variables.dynamic_variables_head) {
+    /* Current THD only. Don't trigger resync on remote THD. */
+    if (current_thd == thd)
+      alloc_and_copy_thd_dynamic_variables(thd, global_lock);
+    else
+      return (uchar *)global_system_variables.dynamic_variables_ptr + offset;
+  }
+  return (uchar *)thd->variables.dynamic_variables_ptr + offset;
+}
+```
+> ★★ "惰性"就在最后一处：**第一次访问某个插件 THDVAR 时才 realloc**；查**别的 THD** 的会话值时不触发扩容（直接退化为读全局值）。
+
+**★ `PLUGIN_VAR_*` 标志**（⚠️ 真值在 `include/mysql/components/services/bits/system_variables_bits.h:63`，`plugin.h` 只是引用）：
+
+```cpp
+#define PLUGIN_VAR_UNSIGNED 0x0080  /**< The variable is unsigned */
+#define PLUGIN_VAR_THDLOCAL 0x0100  /**< Variable is per-connection */
+#define PLUGIN_VAR_READONLY 0x0200  /**< Server variable is read only */
+#define PLUGIN_VAR_NOSYSVAR 0x0400  /**< Not a server variable */
+#define PLUGIN_VAR_NOCMDOPT 0x0800  /**< Not a command line option */
+#define PLUGIN_VAR_NOCMDARG 0x1000  /**< No argument for cmd line */
+#define PLUGIN_VAR_RQCMDARG 0x0000  /**< Argument required for cmd line */
+#define PLUGIN_VAR_OPCMDARG 0x2000  /**< Argument optional for cmd line */
+#define PLUGIN_VAR_NODEFAULT 0x4000 /**< SET DEFAULT is prohibited */
+#define PLUGIN_VAR_MEMALLOC 0x8000  /**< String needs memory allocated */
+#define PLUGIN_VAR_NOPERSIST 0x10000
+#define PLUGIN_VAR_PERSIST_AS_READ_ONLY 0x20000
+#define PLUGIN_VAR_INVISIBLE 0x40000
+#define PLUGIN_VAR_SENSITIVE 0x80000
+```
+> ★ `RQCMDARG = 0x0000` 是"默认"——不加 `OPCMDARG` 就是必带参数。
 
 #### 存储引擎（InnoDB）实例
 
@@ -819,6 +1277,82 @@ int set_var::resolve(THD *thd) {
 
 实现：`set_var::resolve` 里 `OPT_GLOBAL/OPT_PERSIST` 走 `check_priv(thd, false)`（SUPER 或 SYSTEM_VARIABLES_ADMIN），`OPT_PERSIST_ONLY` 走 `check_priv(thd, true)`（双权限，报 `ER_PERSIST_ONLY_ACCESS_DENIED_ERROR`）。
 
+**★ `check_priv()` 原文**（`sql/set_var.cc:195`）：
+
+```cpp
+bool check_priv(THD *thd, bool static_variable) {
+  Security_context *sctx = thd->security_context();
+  /* for dynamic variables user needs SUPER_ACL or SYSTEM_VARIABLES_ADMIN */
+  if (!static_variable) {
+    if (!sctx->check_access(SUPER_ACL) &&
+        !(sctx->has_global_grant(STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN")).first)) {
+      my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+               "SUPER or SYSTEM_VARIABLES_ADMIN");
+      return true;
+    }
+  } else {
+    /*
+     for static variables user needs both SYSTEM_VARIABLES_ADMIN and
+     PERSIST_RO_VARIABLES_ADMIN
+    */
+    if (!(sctx->has_global_grant(STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN")).first &&
+          sctx->has_global_grant(STRING_WITH_LEN("PERSIST_RO_VARIABLES_ADMIN")).first)) {
+      my_error(ER_PERSIST_ONLY_ACCESS_DENIED_ERROR, MYF(0),
+               "SYSTEM_VARIABLES_ADMIN and PERSIST_RO_VARIABLES_ADMIN");
+      return true;
+    }
+  }
+  return false;
+}
+```
+> ★★ 注意：**`PERSIST_ONLY` 只认动态权限，SUPER 不够**（这是 8.0 权限细化的关键点）。
+
+**★★ "SET SESSION 通常不需要权限"的源码证据**（`sql/set_var.cc:1580`）：
+
+```cpp
+int set_var::resolve(THD *thd) {
+  ...
+    var->do_deprecated_warning(thd);
+    if (var->is_readonly()) {
+      if (type != OPT_PERSIST_ONLY) {
+        my_error(ER_INCORRECT_GLOBAL_LOCAL_VAR, MYF(0), var->name.str, "read only");
+        return -1;
+      }
+      /* ★ 只读变量唯一可写的口子就是 SET PERSIST_ONLY */
+    }
+    if (!var->check_scope(type)) { ... }
+    if (type == OPT_GLOBAL || type == OPT_PERSIST) {
+      if (check_priv(thd, false)) return -1;
+    }
+    if (type == OPT_PERSIST_ONLY) {
+      if (check_priv(thd, true)) return -1;
+    }
+    /* ★★ OPT_SESSION / OPT_DEFAULT 分支根本不调 check_priv */
+```
+> ★ 例外：挂了 `ON_CHECK(check_session_admin*)` 的**敏感会话变量**仍需权限。
+
+**★ 敏感会话变量的三档检查**（`sql/sys_vars.cc:300`）：
+
+```cpp
+static bool check_session_admin_or_replication_applier(sys_var *, THD *thd, set_var *setv) {
+  assert(self->scope() != sys_var::GLOBAL);
+  Security_context *sctx = thd->security_context();
+  if ((setv->type == OPT_SESSION || setv->type == OPT_DEFAULT) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("REPLICATION_APPLIER")).first &&
+      !sctx->has_global_grant(STRING_WITH_LEN("SESSION_VARIABLES_ADMIN")).first &&
+      !sctx->has_global_grant(STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN")).first &&
+      !sctx->check_access(SUPER_ACL)) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "SUPER, SYSTEM_VARIABLES_ADMIN, SESSION_VARIABLES_ADMIN or "
+             "REPLICATION_APPLIER");
+    return true;
+  }
+  return false;
+}
+```
+> ⚠️ **真名核查**：`SESSION_VARIABLES_ADMIN` 确实存在，但它**不是 C enum**，而是**字符串型动态权限**（`has_global_grant(STRING_WITH_LEN(...))`），注册点 `sql/auth/dynamic_privileges_impl.cc:223`。
+> ★ 三档：`check_session_admin_or_replication_applier`（最宽松，含 SUPER）、`check_session_admin_privileges_only`、`check_session_admin_no_super`（最严，只认两个 ADMIN）。
+
 ### E. 用户变量（@x）
 
 `THD::user_vars` 是 `collation_unordered_map<std::string, unique_ptr_with_deleter<user_var_entry>>`，`LOCK_thd_data` 保护。
@@ -841,6 +1375,124 @@ class user_var_entry {
 2. **`Item_func_get_user_var::const_item()` 返回 true**（继承 `used_tables()==0`，它无参数）——优化器把它当常量折叠，但值每次执行动态读 entry（类里有 `is_non_const_over_literals()=true` 兜底）。
 
 **用户变量会写 binlog**（常被误认为不写）：`get_var_with_binlog()` 在 `(binlog 打开 && sql_log_bin) && (is_update_query || thd->in_sub_stmt)` 时构造 `Binlog_user_var_event` 进 `thd->user_var_events`，语句写 binlog 前先写 `User_var_log_event`；同语句刚赋值的（`m_used_query_id == thd->query_id`）不重复记录。
+
+**★ `user_var_entry` 完整定义**（`sql/item_func.h:2953`，⚠️ **不在 `sql_class.h`**，那里只是前向声明）：
+
+```cpp
+class user_var_entry {
+  ...
+  /**
+    Position inside a user_var_entry where small values are stored:
+    double values, longlong values and string values with length
+    up to extra_size (should be 8 bytes on all platforms).
+    String values with length longer than 8 are stored in a separate
+    memory buffer, which is allocated when needed using the method realloc().
+  */
+  char *internal_buffer_ptr() {
+    return pointer_cast<char *>(this) + ALIGN_SIZE(sizeof(user_var_entry));
+  }
+  char *name_ptr() { return internal_buffer_ptr() + extra_size; }
+
+  static const size_t extra_size = sizeof(double);   /* ★ 8 字节内联阈值 */
+  char *m_ptr;         ///< Value
+  size_t m_length;     ///< Value length
+  Item_result m_type;  ///< Value type
+  THD *m_owner;
+  /**
+    Set to the id of the most recent query that has used the variable.
+    Used in binlogging: When set, there is no need to add a reference to this
+    variable to the binlog. Imagine it is this:
+
+        INSERT INTO t SELECT @a:=10, @a:=@a+1.
+
+    Then we have a Item_func_get_user_var (because of the `@a+1`) so we
+    think we have to write the value of `@a` to the binlog. But before that,
+    we have a Item_func_set_user_var to create `@a` (`@a:=10`), in this we mark
+    the variable as "already logged" so that it won't be logged
+    by Item_func_get_user_var (because that's not necessary).
+  */
+  query_id_t m_used_query_id;
+
+ public:
+  Simple_cstring entry_name;  // Variable name
+  DTCollation collation;
+  bool unsigned_flag;
+
+  void set_used_query_id(query_id_t query_id) { m_used_query_id = query_id; }
+  query_id_t used_query_id() const { return m_used_query_id; }
+
+  void destroy() {
+    assert_locked();
+    free_value();   // Free the external value buffer
+    my_free(this);  // Free the instance itself
+  }
+  void lock();
+  void unlock();
+};
+```
+> ⚠️ **真名核查**：只有 **`m_used_query_id`** 一个字段 + 两个 accessor，**`update_query_id` 在 8.0.39 不存在**。
+> ★★ 一个重要提醒：该字段**只记录"最近一次用过它的 query_id"，服务于 binlog 去重**，**不是**求值顺序标记——所以不能说"它保证了 `@a:=@a+1` 的求值顺序"（顺序由 Item 树求值保证）。
+
+**★ 小值内联优化**（`sql/item_func.cc:6006`）：
+
+```cpp
+bool user_var_entry::mem_realloc(size_t length) {
+  if (length <= extra_size) {
+    /* Enough space to store value in value struct */
+    free_value();
+    m_ptr = internal_buffer_ptr();      /* ★ ≤8 字节存对象尾部，零额外分配 */
+  } else {
+    /* Allocate an external buffer */
+    if (m_length != length) {
+      if (m_ptr == internal_buffer_ptr()) m_ptr = nullptr;
+      if (!(m_ptr = (char *)my_realloc(key_memory_user_var_entry_value, m_ptr,
+                                       length, MYF(MY_ALLOW_ZERO_PTR | MY_WME |
+                                                   ME_FATALERROR))))
+        return true;
+    }
+  }
+  return false;
+}
+```
+
+**★ 查找真名是 `get_variable()` 不是 `get_var()`**（`sql/item_func.cc:5869`）：
+
+```cpp
+static user_var_entry *get_variable(THD *thd, const Name_string &name,
+                                    const CHARSET_INFO *cs) {
+  const std::string key(name.ptr(), name.length());
+  mysql_mutex_assert_owner(&thd->LOCK_thd_data);
+  user_var_entry *entry = find_or_nullptr(thd->user_vars, key);
+  if (entry == nullptr && cs != nullptr) {     /* ★ cs==nullptr = 只读查找，不创建 */
+    entry = user_var_entry::create(thd, name, cs);
+    if (entry == nullptr) return nullptr;
+    thd->user_vars.emplace(key, unique_ptr_with_deleter<user_var_entry>(
+                                    entry, &free_user_var));
+  }
+  return entry;
+}
+```
+> ★ 用 `collation_unordered_map` 而非 `HASH`，因为**用户变量名大小写不敏感**（`system_charset_info` 的 collation hasher）。
+> ⚠️ **8.0 已废弃 `HASH hash_user_variables`**。
+
+**★ 为什么用户变量要自带锁**（`sql/item_func.cc:6062`）：
+
+```cpp
+void user_var_entry::assert_locked() const {
+  mysql_mutex_assert_owner(&m_owner->LOCK_thd_data);
+}
+```
+> ★ 用户变量是会话私有的，但 PFS 的 `user_variables_by_thread` 会**从别的线程窥探**——所以每次读写都要 `LOCK_thd_data`。
+
+**★ `@` 与 `@@` 在 token 层就分开了**（`sql/sql_yacc.yy:11554`，★ 不存在同名歧义）：
+
+```cpp
+          '@' ident_or_text
+          { $$ = NEW_PTN PTI_user_variable(@$, $2); }
+        | '@' '@' opt_rvalue_system_variable_type rvalue_system_variable
+          { $$ = NEW_PTN PTI_get_system_variable(@$, $3, @4, $4.prefix, $4.name); }
+```
+> ★ 所以 `@max_connections` 永远是用户变量，`@@max_connections` 永远是系统变量。但**保留字不能做用户变量名**（`sql/item_func.cc:157` `check_reserved_words()`）。
 
 ### F. 特殊 SET 分支与 `SET_VAR` hint
 
@@ -930,6 +1582,115 @@ struct SHOW_VAR { const char *name; char *value; enum enum_mysql_show_type type;
 
 偏移量型解引用点：`value = (char*)status_var + (size_t)value;`（加基址）——对比 `SHOW_LONG` 不加基址。`SHOW_LONG` 与 `SHOW_LONG_NOFLUSH` 唯一差别是 `FLUSH STATUS` 是否清零。
 
+**★ 完整类型枚举**（`include/mysql/status_var.h:30`，★ 共 **23** 个取值）：
+
+```cpp
+enum enum_mysql_show_type {
+  SHOW_UNDEF, SHOW_BOOL, SHOW_INT, SHOW_LONG, SHOW_LONGLONG,
+  SHOW_CHAR, SHOW_CHAR_PTR, SHOW_ARRAY, SHOW_FUNC, SHOW_DOUBLE,
+  /* ↓ 以下 server-only，插件不可用 */
+  SHOW_KEY_CACHE_LONG, SHOW_KEY_CACHE_LONGLONG, SHOW_LONG_STATUS,
+  SHOW_DOUBLE_STATUS, SHOW_HAVE, SHOW_MY_BOOL, SHOW_HA_ROWS, SHOW_SYS,
+  SHOW_LONG_NOFLUSH, SHOW_LONGLONG_STATUS, SHOW_LEX_STRING,
+  /* ↓ 有符号版，为插件扩展 */
+  SHOW_SIGNED_INT, SHOW_SIGNED_LONG, SHOW_SIGNED_LONGLONG
+};
+
+/**
+  Status variable scope.
+  Only GLOBAL status variable scope is available in plugins.
+*/
+enum enum_mysql_show_scope {
+  SHOW_SCOPE_UNDEF, SHOW_SCOPE_GLOBAL,
+  /* Server-only values. Not supported in plugins. */
+  SHOW_SCOPE_SESSION, SHOW_SCOPE_ALL
+};
+```
+
+> ⚠️ **两点纠错**：① `SHOW_VAR` **不在 `sql/set_var.h`**（那里只有 `typedef enum enum_mysql_show_type SHOW_TYPE;`），真身在 **`include/mysql/status_var.h:80`**；② `SHOW_SCOPE_*` 是**独立的第二个枚举**，作为 `SHOW_VAR` 的第 4 个**独立字段**——**不存在任何"位或"宏**（常见说法 `SHOW_LONG|SHOW_SCOPE_GLOBAL` 是错的）。
+
+**★ 三重身份的三处实据**：
+
+**① 状态变量导出表**（`sql/mysqld.cc:9690`，★ 同一张表里四种 `value` 语义并存）：
+
+```cpp
+SHOW_VAR status_vars[] = {
+    {"Aborted_clients", (char *)&aborted_threads, SHOW_LONG, SHOW_SCOPE_GLOBAL},
+    {"Bytes_received", (char *)offsetof(System_status_var, bytes_received),
+     SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
+    {"Com", (char *)com_status_vars, SHOW_ARRAY, SHOW_SCOPE_ALL},
+    {"Connections", (char *)&show_thread_id_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Flush_commands", (char *)&refresh_version, SHOW_LONG_NOFLUSH,
+     SHOW_SCOPE_GLOBAL},
+    {"Compression", (char *)&show_net_compression, SHOW_FUNC,
+     SHOW_SCOPE_SESSION},
+};
+```
+
+**② 系统变量导出**（`storage/perfschema/pfs_variable.cc:176`，★ 临时包装）：
+
+```cpp
+        const SHOW_VAR show_var{sysvar->name.str, pointer_cast<char *>(sysvar),
+                                SHOW_SYS, SHOW_SCOPE_UNDEF};
+```
+> ★ 系统变量**不走** `status_vars[]`，而是在 PFS 侧把 `sys_var*` 塞进 `SHOW_VAR.value`，`type = SHOW_SYS`；scope 字段对系统变量无意义（`SHOW_SCOPE_UNDEF`）。
+
+**③ PFS 表的行定义源**（`storage/perfschema/pfs_variable.cc:1042`）：
+
+```cpp
+  for (auto show_var : all_status_vars) {
+    if (filter_show_var(&show_var, strict)) continue;
+    if (show_var.type == SHOW_ARRAY) {
+      /* Expand nested sub array. The name is used as a prefix. */
+      expand_show_var_array((SHOW_VAR *)show_var.value, show_var.name, strict);
+    } else {
+      show_var.name = make_show_var_name(nullptr, show_var.name);
+      m_show_var_array.push_back(show_var);
+    }
+  }
+  m_show_var_array.push_back(SHOW_VAR());   /* Last element is NULL. */
+```
+
+**★ `SHOW_LONG_STATUS` 为什么必须存在**（`storage/perfschema/pfs_variable.cc:954`，★ PFS 靠类型判断是否可聚合）：
+
+```cpp
+bool PFS_status_variable_cache::can_aggregate(
+    enum_mysql_show_type variable_type) {
+  switch (variable_type) {
+    /*
+      All server status counters that are totaled across threads are defined in
+      system_status_var as either SHOW_LONGLONG_STATUS or SHOW_LONG_STATUS.
+      These data types are not available to plugins.
+    */
+    case SHOW_LONGLONG_STATUS:
+    case SHOW_LONG_STATUS:
+      return true;
+    ...
+    default:
+      return false;
+```
+> ★★ 所以 `Com_xxx` 用 `SHOW_LONG_STATUS` 不是风格问题——**PFS 靠这个类型判断"能否跨线程求和"**，插件不可用这些类型，所以插件状态变量永远不参与聚合。
+
+**★ `SHOW_LONG` vs `SHOW_LONG_STATUS` 的源码级差别**（`sql/sql_show.cc:3593`）：
+
+```cpp
+    case SHOW_LONG_STATUS:
+      value = (char *)status_var + reinterpret_cast<size_t>(value);
+      end = longlong10_to_str(*pointer_cast<const ulong *>(value), buff, 10);
+      break;
+      /* ★ 先把 value（其实是 offsetof 出来的整数）加上 status_var 基址
+         → 同一条目在 SESSION 与 GLOBAL 下读的是不同内存 */
+
+    case SHOW_LONG:
+      /* the difference lies in refresh_status() */
+    case SHOW_LONG_NOFLUSH:
+      end = longlong10_to_str(*pointer_cast<const ulong *>(value), buff, 10);
+      break;
+      /* ★ 源码注释原话：差别"在于 refresh_status()"
+         → SHOW_LONG 是绝对指针（全局裸变量），无 SESSION 语义，且 FLUSH STATUS 会清零 */
+```
+
 #### 聚合：GLOBAL = global_status_var + ΣTHD
 
 `PFS_status_variable_cache::do_materialize_global()` 分两阶段：
@@ -958,9 +1719,171 @@ struct SHOW_VAR { const char *name; char *value; enum enum_mysql_show_type type;
 
 `PFS_account::aggregate_status()` 的注释："Never aggregate to global_status_var, because of the parallel THD -> global_status_var flow."——account/user/host 维度与全局是**两条平行通道**，不交叉，否则双倍计数。`PFS_status_stats`（`ulonglong m_stats[COUNT_GLOBAL_STATUS_VARS]`）是断开会话的"遗留账本"：线程断开折进 account，account 清理折进 user/host。
 
+**★★ 隔离的运行时守卫：`status_var_aggregated`**（`sql/sql_class.cc:1399`）：
+
+```cpp
+  mysql_mutex_lock(&LOCK_status);
+  /* Add thread status to the global totals. */
+  add_to_status(&global_status_var, &status_var);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  /* Aggregate thread status into the Performance Schema. */
+  if (m_psi != nullptr) {
+    PSI_THREAD_CALL(aggregate_thread_status)(m_psi);
+  }
+#endif
+  /* Ensure that the thread status is not re-aggregated to the global totals. */
+  status_var_aggregated = true;
+  mysql_mutex_unlock(&LOCK_status);
+```
+> ★ 同一个 `status_var` 被"双花"到两个账本，靠 `status_var_aggregated` 保证只花一次。
+
+```cpp
+/* sql/handler.cc:1937 —— 一旦 aggregated 就不许再写，否则增量永久丢失 */
+      assert(!thd->status_var_aggregated);
+      thd->status_var.ha_commit_count++;
+```
+```cpp
+/* sql/sql_class.cc:2379 —— 每个计数器都是"server + PFS"双写 */
+void THD::inc_status_created_tmp_disk_tables() {
+  assert(!status_var_aggregated);
+  status_var.created_tmp_disk_tables++;
+#ifdef HAVE_PSI_STATEMENT_INTERFACE
+  PSI_STATEMENT_CALL(inc_statement_created_tmp_disk_tables)(m_statement_psi, 1);
+#endif
+}
+```
+
+**★★ "观测者效应"的经典解法**（`sql/sql_show.cc:754`，★ SHOW STATUS 不能污染自己的统计）：
+
+```cpp
+bool Sql_cmd_show_status::execute(THD *thd) {
+  System_status_var old_status_var = thd->status_var;
+  thd->initial_status_var = &old_status_var;
+
+  bool status = Sql_cmd_show::execute(thd);
+
+  // Don't log SHOW STATUS commands to slow query log
+  thd->server_status &=
+      ~(SERVER_QUERY_NO_INDEX_USED | SERVER_QUERY_NO_GOOD_INDEX_USED);
+  // Restore status variables, as we don't want 'show status' to cause changes
+  mysql_mutex_lock(&LOCK_status);
+  add_diff_to_status(&global_status_var, &thd->status_var, &old_status_var);
+  thd->status_var = old_status_var;
+  thd->initial_status_var = nullptr;
+  mysql_mutex_unlock(&LOCK_status);
+
+  return status;
+}
+```
+> ★★ 自指问题：`SHOW STATUS` 本身会消耗 `Bytes_sent` / `Com_show_status` / `Questions`。解法是**先快照、后只补差值**（`add_diff_to_status`）、最后还原。所以 `SHOW STATUS` 不会让 `Questions` 自己 +1。
+
+**★ `add_to_status()`：把结构体当数组用**（`sql/system_variables.cc:28`）：
+
+```cpp
+void add_to_status(System_status_var *to_var, System_status_var *from_var) {
+  int c;
+  ulonglong *end = (ulonglong *)((uchar *)to_var +
+                                 offsetof(System_status_var, LAST_STATUS_VAR) +
+                                 sizeof(ulonglong));
+  ulonglong *to = (ulonglong *)to_var, *from = (ulonglong *)from_var;
+
+  while (to != end) *(to++) += *(from++);   /* ★ 连续块指针遍历求和 */
+
+  to_var->com_other += from_var->com_other;
+  for (c = 0; c < SQLCOM_END; c++)          /* ★ com_stat 是 ulong 数组，不在 ulonglong 块里 */
+    to_var->com_stat[(uint)c] += from_var->com_stat[(uint)c];
+}
+```
+```cpp
+/* sql/system_variables.h:590 —— 连续块的首尾哨兵 */
+#define LAST_STATUS_VAR secondary_engine_execution_count
+#define FIRST_STATUS_VAR created_tmp_disk_tables
+const int COUNT_GLOBAL_STATUS_VARS =
+    ((offsetof(System_status_var, LAST_STATUS_VAR) -
+      offsetof(System_status_var, FIRST_STATUS_VAR)) / sizeof(ulonglong)) + 1;
+```
+> ★★ 这就是为什么 `System_status_var` 开头必须是一段**连续同类型的 ulonglong**——注释明说 *"Must be long/ulong up to last_system_status_var so that add_to_status/add_diff_to_status can work"*。任何在中间插入非 ulonglong 成员的改动都会静默破坏聚合。
+
+**★ 老实现的调用者只剩一个**（`sql/sql_show.cc:3736`）：
+
+```cpp
+class Add_status : public Do_THD_Impl {
+ public:
+  Add_status(System_status_var *value) : m_stat_var(value) {}
+  void operator()(THD *thd) override {
+    if (!thd->status_var_aggregated)
+      add_to_status(m_stat_var, &thd->status_var);
+  }
+ private:
+  System_status_var *m_stat_var;
+};
+
+void calc_sum_of_all_status(System_status_var *to) {
+  mysql_mutex_assert_owner(&LOCK_status);
+  *to = global_status_var;                    /* ★ 全局值作基线 */
+  Add_status add_status(to);
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(&add_status);
+}
+```
+
 #### `Com_xxx` 计数器
 
 存储 `System_status_var::com_stat[(uint)SQLCOM_END]`，名字表 `com_status_vars[]`（`sql/mysqld.cc:3984`）。主计数点 `mysql_execute_command` 的 `thd->status_var.com_stat[lex->sql_command]++`（readonly 检查后、执行前）——**语法错误不计数、执行失败也计数**（官方：`Com_stmt_*` 对应"request issued"而非"successfully completed"）。协议命令（COM_PING 等）在 `dispatch_command` 手工 ++，复制 applier 也有手工补计数。
+
+**★ 注册表：名字 ↔ 枚举靠 offsetof 一一对应**（`sql/mysqld.cc:3984`）：
+
+```cpp
+SHOW_VAR com_status_vars[] = {
+    {"admin_commands", (char *)offsetof(System_status_var, com_other),
+     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
+    {"assign_to_keycache",
+     (char *)offsetof(System_status_var,
+                      com_stat[(uint)SQLCOM_ASSIGN_TO_KEYCACHE]),
+     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
+    {"alter_db",
+     (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_ALTER_DB]),
+     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
+    {"commit",
+     (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_COMMIT]),
+     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
+    ...
+};
+```
+```cpp
+/* sql/sql_parse.cc:3205 —— 统一主写入点 */
+  thd->status_var.com_stat[lex->sql_command]++;
+```
+> ★ 外层 `status_vars[]` 用 `{"Com", (char*)com_status_vars, SHOW_ARRAY, SHOW_SCOPE_ALL}` 挂进来，所以显示名是 `"Com" + "_" + "alter_db"` = `Com_alter_db`——**子数组里的名字必须小写**。
+
+**★ 7 个"走不到主入口"的特例写入点**（★ 在到达 3205 前就 return / 走快捷分支）：
+
+```cpp
+      thd->status_var.com_stat[SQLCOM_CHANGE_DB]++;        // sql_parse.cc:1818
+      thd->status_var.com_stat[SQLCOM_SHOW_FIELDS]++;      // :2176
+      thd->status_var.com_stat[SQLCOM_FLUSH]++;            // :2295
+      thd->status_var.com_stat[SQLCOM_SHOW_STATUS]++;      // :2340
+      thd->status_var.com_stat[SQLCOM_SHOW_PROCESSLIST]++; // :2378
+      thd->status_var.com_stat[SQLCOM_KILL]++;             // :2401
+      thd->status_var.com_stat[SQLCOM_SET_OPTION]++;       // :2408
+```
+> ★ 复制线程侧的 REPLICA 命令走 `com_other` 而非 `com_stat`（`sql/rpl_source.cc:942` / `:1004`：`thd->status_var.com_other++;`）——所以**从库上 `Com_slave_start` 永远是 0**。
+
+**★★ 一个很多人踩过的坑：直查 PFS 表看不到任何 `Com_xxx`**（`storage/perfschema/pfs_variable.cc:939`）：
+
+```cpp
+bool PFS_status_variable_cache::filter_by_name(const SHOW_VAR *show_var) {
+  if (show_var->type == SHOW_ARRAY) {
+    /* The SHOW_ARRAY name is the prefix for the variables in the sub array. */
+    const char *prefix = show_var->name;
+    /* Exclude COM counters if not a SHOW STATUS command. */
+    if (!my_strcasecmp(system_charset_info, prefix, "Com") && !m_show_command) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+> ★★ `SELECT * FROM performance_schema.global_status` **看不到 Com_xxx 行**——只有真的发了 `SHOW STATUS` 命令（`m_show_command=true`）才展开 `Com` 子数组。这是纯兼容性 hack。
 
 #### 存储引擎状态变量：InnoDB 双通道
 
@@ -978,11 +1901,134 @@ all_status_vars 只有一条 {"Innodb", &show_innodb_vars, SHOW_FUNC, GLOBAL}
 
 `export_var_t export_vars` 是 InnoDB 内部计数器的对外镜像，`innodb_status_variables[]` 逐项 `(char*)&export_vars.xxx`。
 
+**★ 通道二的数组与"根"**（`ha_innodb.cc:1126` / `:21956`）：
+
+```cpp
+static SHOW_VAR innodb_status_variables[] = {
+    {"buffer_pool_dump_status",
+     (char *)&export_vars.innodb_buffer_pool_dump_status, SHOW_CHAR,
+     SHOW_SCOPE_GLOBAL},
+    {"buffer_pool_pages_data",
+     (char *)&export_vars.innodb_buffer_pool_pages_data, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+    {"buffer_pool_read_requests",
+     (char *)&export_vars.innodb_buffer_pool_read_requests, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+    ...
+};
+```
+```cpp
+/* :21956 —— ★ 对外的"根"只有一条 */
+static SHOW_VAR innodb_status_variables_export[] = {
+    {"Innodb", (char *)&show_innodb_vars, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};   /* {NullS,...} 是哨兵 */
+```
+```cpp
+/* :21526 —— ★ 为什么要包一层 SHOW_FUNC */
+static int show_innodb_vars(THD *, SHOW_VAR *var, char *) {
+  innodb_export_status();                    /* ★ 读之前先刷新计数器快照 */
+  var->type = SHOW_ARRAY;
+  var->value = (char *)&innodb_status_variables;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  return (0);
+}
+```
+> ★★ `SHOW_FUNC` 在这里的用途是**延迟计算 + 副作用刷新**：不包这一层，`SHOW STATUS` 读到的永远是 `export_vars` 里的旧值。
+
+**★ 通道一的挂载点**（`ha_innodb.cc:5168`）：
+
+```cpp
+  innobase_hton->show_status = innobase_show_status;
+```
+```cpp
+/* sql/handler.h:932 */
+enum ha_stat_type { HA_ENGINE_STATUS, HA_ENGINE_LOGS, HA_ENGINE_MUTEX };
+```
+```cpp
+/* sql/handler.cc:7677 —— ★ 走 (Type, Name, Status) 三列自由文本协议 */
+bool ha_show_status(THD *thd, handlerton *db_type, enum ha_stat_type stat) {
+  mem_root_deque<Item *> field_list(thd->mem_root);
+  field_list.push_back(new Item_empty_string("Type", 10));
+  field_list.push_back(new Item_empty_string("Name", FN_REFLEN));
+  field_list.push_back(new Item_empty_string("Status", 10));
+```
+> ★★ **这就是"双通道"**：通道一 = 非结构化大文本（`SHOW ENGINE ... STATUS`，完全不经过 `SHOW_VAR`/`all_status_vars`）；通道二 = 结构化数值（`SHOW STATUS` / PFS 表）。**两者互不可见**——所以 `SHOW STATUS` 里永远看不到 `SHOW ENGINE INNODB STATUS` 的事务列表。
+> ⚠️ 真名核查：`show_innodb_vars` 是**回调函数**不是数组；数组真名 `innodb_status_variables[]`（`:1126`）与 `innodb_status_variables_export[]`（`:21956`）。
+
 #### `FLUSH STATUS` 的精确语义
 
 `refresh_status()`（**不存在** `mysql_reset_status`）干五件事：① 每个活跃 THD 先 `add_to_status(&global_status_var, ...)` 再清零（session 归零、增量保留）；② `reset_pfs_status_stats()`（account 先汇入 user/host 再清零）；③ `reset_status_vars()` 清 `SHOW_LONG`/`SHOW_SIGNED_LONG`（指针型全局变量），**`SHOW_LONG_NOFLUSH`（PFS `*_lost`）故意不清**；④ 清 key cache；⑤ `Max_used_connections` 重置为**当前连接数**（不是 0）。
 
 关键事实：`refresh_status()` **并不 `memset(&global_status_var, 0)`**——全仓库对它的写只有启动初始化与 `add_to_status` 累加。手册只写一句 "Many status variables are reset to 0" 且**无完整清单**，这本身是坑。`TRUNCATE TABLE performance_schema.global_status` 与 `FLUSH STATUS` 等价。权限 `RELOAD` 或 `FLUSH_STATUS`。
+
+**★ 完整实现**（`sql/mysqld.cc:11753`，⚠️ 真名不是 `reset_status_var()`）：
+
+```cpp
+/**
+  Reset status for all threads.
+*/
+class Reset_thd_status : public Do_THD_Impl {
+ public:
+  void operator()(THD *thd) override {
+    /* Update the global status if not done so already. */
+    if (!thd->status_var_aggregated) {
+      add_to_status(&global_status_var, &thd->status_var);
+    }
+    reset_system_status_vars(&thd->status_var);
+  }
+};
+
+void refresh_status() {
+  mysql_mutex_lock(&LOCK_status);
+  /* For all threads, add status to global status and then reset. */
+  Reset_thd_status reset_thd_status;
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(&reset_thd_status);
+#ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
+  /* Reset aggregated status counters. */
+  reset_pfs_status_stats();          /* ★★ 平行账本必须单独清，否则 PFS 表不归零 */
+#endif
+  /* Reset some global variables. */
+  reset_status_vars();
+  /* Reset the counters of all key caches (default and named). */
+  process_key_caches(reset_key_cache_counters);
+  flush_status_time = time((time_t *)nullptr);
+  mysql_mutex_unlock(&LOCK_status);
+
+  /*
+    Set max_used_connections to the number of currently open
+    connections.  Do this out of LOCK_status to avoid deadlocks.
+    Status reset becomes not atomic, but status data is not exact anyway.
+  */
+  Connection_handler_manager::reset_max_used_connections();
+}
+```
+> ★★ **FLUSH STATUS 是"全局 + 所有会话"一起重置，不只是 SESSION**。顺序：① 每个活跃 THD 先并入 global 防丢增量 → ② 清零自己的 `status_var` → ③ 清 PFS 聚合账本 → ④ 清全局裸标量 → ⑤ 清 key cache。
+
+```cpp
+/* sql/sql_show.cc:3328 —— 只清全局裸标量 */
+void reset_status_vars() {
+  for (Status_var_array::iterator ptr = all_status_vars.begin();
+       ptr < all_status_vars.end(); ptr++) {
+    /* Note that SHOW_LONG_NOFLUSH variables are not reset */
+    if (ptr->type == SHOW_LONG || ptr->type == SHOW_SIGNED_LONG)
+      *(ulong *)ptr->value = 0;
+  }
+}
+```
+> ★ `SHOW_LONG_STATUS` / `SHOW_LONGLONG_STATUS` 是 offsetof，**无法在这里清零**——它们靠"每个 THD 清零 + 退出时并入"达到归零效果。
+
+```cpp
+/* sql/sql_reload.cc:93 —— 权限 */
+  if ((op_type & REFRESH_STATUS) &&
+      !sctx->has_global_grant(STRING_WITH_LEN("FLUSH_STATUS")).first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "RELOAD or FLUSH_STATUS");
+    return true;
+  }
+```
+```cpp
+/* sql/sql_reload.cc:343 —— ★ thd 非空才做：FLUSH STATUS 总是会话上下文内 */
+  if (thd && (options & REFRESH_STATUS)) refresh_status();
+```
 
 ### H. 与 PFS / I_S 系统表的关系
 
@@ -1292,9 +2338,60 @@ lex->sql_command = command;      // 恢复成 SQLCOM_SHOW_VARIABLES
 
 两个值得注意的权限差异：`variables_by_thread`/`user_variables_by_thread` 用 `pfs_readonly_acl`（**不是** world）——能看到别的会话/后台线程的变量值属于敏感能力，需要显式授权；而 `global_variables`/`session_variables`/`global_status` 人人可读（world），因为它们是"所有会话共享"或"本会话自己"的。
 
+**★ 精确构成：5 变量 + 6 状态 + 1 用户变量 = 12 张**（`storage/perfschema/` 全量 `table_*.cc` 实测）：
+
+| 类别 | 源文件 | PFS 表名 |
+|---|---|---|
+| 系统变量（5） | `table_global_variables.cc` / `table_session_variables.cc` / `table_variables_by_thread.cc` / `table_variables_info.cc` / `table_persisted_variables.cc` | `global_variables` / `session_variables` / `variables_by_thread` / `variables_info` / `persisted_variables` |
+| 状态变量（6） | `table_global_status.cc` / `table_session_status.cc` / `table_status_by_thread.cc` / `table_status_by_user.cc` / `table_status_by_host.cc` / `table_status_by_account.cc` | `global_status` / `session_status` / `status_by_thread` / `status_by_user` / `status_by_host` / `status_by_account` |
+| 用户变量（1） | `table_user_variables_by_thread.cc` | `user_variables_by_thread` |
+
+> ⚠️ **一个常见误数**：如果只 grep `variables`/`status` 两类会得出 **11 张**，漏掉 `user_variables_by_thread`——后者是唯一一张"用户变量"表，文件前缀是 `table_user_variables` 而非 `table_variables`。
+> ★ 另一个不对称：**变量表只有 `by_thread` 一个维度，状态表才有 user/host/account 三维**——因为"别人的会话变量值"属于敏感信息，而状态计数器可以安全聚合。
+
+**★ `variables_info` 的 9 种来源**（`storage/perfschema/table_variables_info.cc:49`，★ 这就是"变量来源优先级"的完整清单）：
+
+```cpp
+Plugin_table table_variables_info::m_table_def(
+    /* Schema name */ "performance_schema",
+    /* Name */        "variables_info",
+    /* Definition */
+    "  VARIABLE_NAME varchar(64) not null,\n"
+    "  VARIABLE_SOURCE ENUM('COMPILED','GLOBAL','SERVER','EXPLICIT','EXTRA',\n"
+    "                       'USER','LOGIN','COMMAND_LINE','PERSISTED',\n"
+    "                       'DYNAMIC') DEFAULT 'COMPILED',\n"
+    "  VARIABLE_PATH varchar(1024),\n"
+    "  MIN_VALUE varchar(64),\n"
+    "  MAX_VALUE varchar(64),\n"
+    "  SET_TIME TIMESTAMP(6) default null,\n"
+    "  SET_USER CHAR(32) collate utf8mb4_bin default null,\n"
+    "  SET_HOST CHAR(255) CHARACTER SET ASCII default null\n",
+    /* Options */ " ENGINE=PERFORMANCE_SCHEMA", nullptr);
+```
+> ★ `PERSISTED` 对应 `mysqld-auto.cnf`，`DYNAMIC` 对应运行期 `SET GLOBAL`。
+
+**★ `persisted_variables` 的行数来自内存单例**（`table_persisted_variables.cc`）：
+
+```cpp
+PFS_engine_table_share table_persisted_variables::m_share = {
+    &pfs_readonly_world_acl,   /* ★ 谁都能读，没人能写 */
+    ...
+    nullptr, /* write_row */
+    nullptr, /* delete_all_rows */
+    table_persisted_variables::get_row_count, ...
+};
+
+ha_rows table_persisted_variables::get_row_count() {
+  Persisted_variables_cache *pv = Persisted_variables_cache::get_instance();
+  if (pv) return pv->get_persisted_dynamic_variables()->size();
+  return 0;
+}
+```
+> ★ 不落表不读盘，直接取 `Persisted_variables_cache` 单例的容器大小。
+
 #### 3. 统一的 PFS 处理管线
 
-PFS 侧两个平行的 cache 类把三类变量统一成 `SHOW_VAR` 中间格式，走"INITIALIZE（构建排序清单）→ MATERIALIZE（求值转文本）→ OUTPUT"同一条管线——系统变量从双 hash 枚举（`enumerate_sys_vars`），状态变量遍历 `all_status_vars` 展开 `SHOW_ARRAY`。**完整实现（`do_materialize_*` 家族、线程间读三重防护、mem_root 管理）见 [`pfs.md` 的 1.9 节](pfs.md#19-pfs-的变量与状态表实现show-variablesstatus-的幕后)**。
+PFS 侧两个平行的 cache 类把三类变量统一成 `SHOW_VAR` 中间格式，走"INITIALIZE（构建排序清单）→ MATERIALIZE（求值转文本）→ OUTPUT"同一条管线——系统变量从双 hash 枚举（`enumerate_sys_vars`），状态变量遍历 `all_status_vars` 展开 `SHOW_ARRAY`。**完整实现（`do_materialize_*` 家族、线程间读三重防护、mem_root 管理）见 [`pfs.md` 的 1.9 节](../../infra/observability/pfs/pfs.md#19-pfs-的变量与状态表实现show-variablesstatus-的幕后)**。
 
 ```
 PFS_system_variable_cache（系统变量）
@@ -1322,6 +2419,75 @@ PFS_status_variable_cache（状态变量）
 
 动机与 `SHOW STATUS` 投靠 PFS 相同：一套实现服务 SHOW 语法 + SQL 表查询两种接口，消灭 I_S 临时表、SHOW、PFS 三份实现的分歧。
 
+**★ grep 实证**（★ 不是"视图转发到 PFS"，而是 **I_S 侧彻底删除 + SHOW 在解析期改写**）：
+
+```
+# ① sql/dd/impl/system_views/ 下 grep "variables" → 0 命中
+#    （8.0 的 I_S 表全是 DD 系统视图，目录里已无任何变量/状态表）
+
+# ② 全库 grep 那四个名字，只出现在 PFS 表定义与 SHOW 重写目标里：
+sql/sql_show_status.cc:274:  table_name = "session_status"
+sql/sql_show_status.cc:282:  table_name = "global_status"
+sql/sql_show_status.cc:291:  table_name = "session_variables"
+sql/sql_show_status.cc:299:  table_name = "global_variables"
+storage/perfschema/table_global_status.cc:63:     "global_status"
+storage/perfschema/table_session_status.cc:63:    "session_status"
+storage/perfschema/table_global_variables.cc:64:  "global_variables"
+storage/perfschema/table_session_variables.cc:63: "session_variables"
+```
+> ★★ **没有任何 I_S 视图转发实现** ⇒ 结论是"删除 + 改写"，不是"转发"。
+
+**★ 四个入口：表名写死**（`sql/sql_show_status.cc:272`）：
+
+```cpp
+Query_block *build_show_session_status(const POS &pos, THD *thd,
+                                       const String *wild, Item *where_cond) {
+  static const LEX_CSTRING table_name = {STRING_WITH_LEN("session_status")};
+  return build_query(pos, thd, SQLCOM_SHOW_STATUS, table_name, wild, where_cond);
+}
+Query_block *build_show_global_status(...)   { ... "global_status" ... }
+Query_block *build_show_session_variables(...) { ... "session_variables" ... }
+Query_block *build_show_global_variables(...)  { ... "global_variables" ... }
+```
+
+**★★ "SHOW STATUS 是 SELECT 的皮"的确凿证据**（`sql/sql_show_status.cc:99`）：
+
+```cpp
+  static const LEX_CSTRING col_name = {STRING_WITH_LEN("VARIABLE_NAME")};
+  static const LEX_CSTRING as_name = {STRING_WITH_LEN("Variable_name")};
+  static const LEX_CSTRING col_value = {STRING_WITH_LEN("VARIABLE_VALUE")};
+  static const LEX_CSTRING as_value = {STRING_WITH_LEN("Value")};
+  static const LEX_CSTRING pfs = {STRING_WITH_LEN("performance_schema")};
+  ...
+  lex->sql_command = SQLCOM_SELECT;          /* ★ 先伪装成 SELECT */
+  if (query_expression2->contextualize(&pc)) return nullptr;
+  if (pc.finalize_query_expression()) return nullptr;
+  /* contextualize sets to COM_SELECT */
+  lex->sql_command = command;                /* ★ 再把命令字改回 SHOW_STATUS */
+```
+> ★★ 执行计划**完全是 SELECT**，只是命令字留了个壳——所以 `Com_show_status` 计数器照常 +1，权限检查也走 SHOW 路径。
+
+**★ `SHOW STATUS` 默认作用域是 SESSION**（`sql/sql_yacc.yy:15934`，⚠️ 常被说成 GLOBAL）：
+
+```cpp
+opt_var_type:
+          %empty      { $$=OPT_SESSION; }    /* ★★ 裸写 SHOW STATUS → SESSION */
+        | GLOBAL_SYM  { $$=OPT_GLOBAL; }
+        | LOCAL_SYM   { $$=OPT_SESSION; }
+        | SESSION_SYM { $$=OPT_SESSION; }
+        ;
+```
+```cpp
+/* sql/parse_tree_nodes.cc:2813 —— GLOBAL 与 SESSION 的实现差异只有一处：换 PFS 表名 */
+  if (m_var_type == OPT_SESSION) {
+    if (build_show_session_status(m_pos, thd, lex->wild, m_where) == nullptr)
+      return nullptr;
+  } else if (m_var_type == OPT_GLOBAL) {
+    if (build_show_global_status(m_pos, thd, lex->wild, m_where) == nullptr)
+      return nullptr;
+  }
+```
+
 #### 5. 其他相关系统对象
 
 - **`mysql.component`**（DD 表）：组件注册系统变量时，变量名是 `component_name.var_name` 点分格式——组件被卸载，其变量随 `UNINSTALL COMPONENT` 从 dynamic hash 摘除（`component_sys_variable_unregister`）。
@@ -1341,6 +2507,55 @@ PFS_status_variable_cache（状态变量）
 | `session_track_system_variables` | 见说明 | G/S | 哪些会话变量变更时经 `SESSION_TRACK_SYSTEM_VARIABLES` 通知客户端 |
 | `session_track_state_change` | OFF | G/S | 是否跟踪会话状态变化 |
 
+**★ 另一组"元变量"：`version` / `hostname` / `port` 等**（`sql/sys_vars.cc`，★ 逐个核实）：
+
+| 变量 | 行号 | 类 | 只读 | 命令行 |
+|---|---|---|---|---|
+| **`version`** | 5307 | **`Sys_var_version`**（专属类） | READ_ONLY | NO_CMD_LINE |
+| `version_comment` | 5313 | `Sys_var_charptr` | READ_ONLY | NO_CMD_LINE |
+| `version_compile_machine` | 5319 | `Sys_var_charptr` | READ_ONLY | NO_CMD_LINE |
+| `version_compile_os` | 5325 | `Sys_var_charptr` | READ_ONLY | NO_CMD_LINE |
+| `version_compile_zlib` | 5331 | `Sys_var_charptr` | READ_ONLY | NO_CMD_LINE |
+| `hostname` | 5813 | `Sys_var_charptr`（`IN_FS_CHARSET`） | READ_ONLY | NO_CMD_LINE |
+| `port` | 3605 | `Sys_var_uint` | READ_ONLY | `CMD_LINE(REQUIRED_ARG,'P')` |
+| `socket` | 3995 | `Sys_var_charptr`（`IN_FS_CHARSET`） | READ_ONLY | `CMD_LINE(REQUIRED_ARG)` |
+| `character_set_system` | 1889 | `Sys_var_struct<CHARSET_INFO,Get_csname>` | READ_ONLY | NO_CMD_LINE |
+| `system_time_zone` | 5078 | `Sys_var_system_time_zone`（**computed**） | — | — |
+| `time_zone` | 6529 | `Sys_var_tz` | SESSION | NO_CMD_LINE |
+
+```cpp
+/* sql/sys_vars.cc:5306 —— ⚠️ @@version 是专属类，不是 Sys_var_charptr */
+static Sys_var_version Sys_version(
+    "version", "Server version",
+    READ_ONLY NON_PERSIST GLOBAL_VAR(server_version_ptr), NO_CMD_LINE,
+    IN_SYSTEM_CHARSET, DEFAULT(server_version));
+```
+```cpp
+/* sql/sys_vars.cc:3605 —— port 是 READ_ONLY，但它是命令行选项且 NON_PERSIST */
+static Sys_var_uint Sys_port(
+    "port",
+    "Port number to use for connection or 0 to default to, my.cnf, "
+    "$MYSQL_TCP_PORT, built-in default ...",
+    READ_ONLY NON_PERSIST GLOBAL_VAR(mysqld_port), CMD_LINE(REQUIRED_ARG, 'P'),
+    VALID_RANGE(0, 65535), DEFAULT(0), BLOCK_SIZE(1));
+```
+```cpp
+/* sql/sys_vars.cc:1887 —— character_set_system 固定 utf8mb3 */
+static CHARSET_INFO *charset_system_default = &my_charset_utf8mb3_general_ci;
+static Sys_var_struct<CHARSET_INFO, Get_csname> Sys_character_set_system(
+    "character_set_system",
+    "The character set used by the server for storing identifiers",
+    READ_ONLY NON_PERSIST GLOBAL_VAR(system_charset_info), NO_CMD_LINE,
+    DEFAULT(&charset_system_default));
+```
+```cpp
+/* sql/sys_vars.cc:5078 —— 纯计算型，没有 GLOBAL_VAR/SESSION_VAR 存储槽 */
+static Sys_var_system_time_zone Sys_system_time_zone(
+    "system_time_zone", "The server system time zone");
+```
+> ★ 一个细微差异：`time_zone` 是 `IN_BINLOG`（会写进 binlog 保证复制一致），而 `lc_messages` 是 `NOT_IN_BINLOG`——差别来自"是否影响复制语义"。
+> ⚠️ `port` / `socket` 虽是命令行选项，但标了 `NON_PERSIST`，所以 `SET PERSIST port=3307` 会被拒。
+
 ---
 
 ## Misc
@@ -1358,6 +2573,53 @@ PFS_status_variable_cache（状态变量）
 | `SET SESSION` vs `SET TRANSACTION` | TRANSACTION（无前缀）= one-shot | 不改 session 默认值 |
 | `OPT_DEFAULT` | `SET @@x=1` 无前缀的作用域（等价 SESSION） | 与 `SET @@x=DEFAULT` 的 DEFAULT 无关 |
 | `Questions` vs `Queries` vs `Com_*` | 客户端语句 / 含内层语句 / 按命令分类 | 三套口径常被混用来算吞吐 |
+| `SET GLOBAL x` vs `SET @@global.x` | **语义等价**（都进 `add_system_variable_assignment()`） | 但存在三处不对称，见下 |
+
+**★ `SET GLOBAL x` 与 `SET @@global.x` 的三处不对称**（★ 等价但不完全一样）：
+
+```cpp
+/* sql/parse_tree_nodes.cc:3778 —— `SET GLOBAL x = 1` */
+  return add_system_variable_assignment(pc->thd, m_opt_prefix, m_name,
+                                        pc->thd->lex->option_type, m_opt_expr);
+  /* ★ var_type 取自 lex->option_type（LEX 全局状态） */
+```
+```cpp
+/* sql/parse_tree_nodes.cc:3813 —— `SET @@global.x = 1` */
+  return add_system_variable_assignment(thd, m_opt_prefix, m_name,
+                                        m_scope, m_opt_expr);
+  /* ★ var_type 取自语法里的 opt_set_var_ident_type */
+```
+```cpp
+/* sql_yacc.yy —— ★ 关键不对称：option_type 没有 %empty 分支 */
+opt_set_var_ident_type:
+          %empty          { $$=OPT_DEFAULT; }      /* ★ @@x 可省略前缀 */
+        | PERSIST_SYM '.' { $$=OPT_PERSIST; }
+        | GLOBAL_SYM '.'  { $$=OPT_GLOBAL; }
+        | SESSION_SYM '.' { $$=OPT_SESSION; }
+        ;
+option_type:
+          GLOBAL_SYM      { $$=OPT_GLOBAL; }       /* ⚠️ 没有 %empty → 必须显式写 */
+        | PERSIST_SYM     { $$=OPT_PERSIST; }
+        | LOCAL_SYM       { $$=OPT_SESSION; }
+        | SESSION_SYM     { $$=OPT_SESSION; }
+        ;
+```
+> ★★ 三处差异：① `SET GLOBAL` 前缀形式会先做 `find_sp_variable()` 检查（`:3773`），`@@` 形式不做；② `option_type` 是 **LEX 全局状态**（`PT_option_value_type::contextualize` 里 `lex->option_type = type`），**批量 SET 时会被后续子句共享**——这是历史包袱；③ `SET @@x = 1`（无前缀、有 `@@`）合法且走 `OPT_DEFAULT`（由 `sys_var` 自己的默认作用域决定），而 `SET x = 1`（无前缀无 `@@`）是**另一条规则** `option_value_no_option_type`，语义完全不同。
+
+**★ `SHOW_ARRAY` 的名字是前缀，不是真名**（`sql/sql_show.cc:3410`）：
+
+```cpp
+    } else if (list->type == SHOW_ARRAY && list->name &&
+               !strncmp(list->name, name, strlen(list->name))) {
+      // the variable name matches an array prefix: dive into it and skip the
+      // prefix and the underscore
+      if (get_recursive_status_var_inner(thd, (SHOW_VAR *)list->value, true,
+                                         name + strlen(list->name) + 1, value,
+                                         var_type, length, charset))
+        return true;
+    }
+```
+> ★ 查 `Com_select` 时先匹配 `{"Com", com_status_vars, SHOW_ARRAY}`，然后 `name + strlen("Com") + 1` **跳过 `"Com_"`**，在子数组里找 `"select"`——所以子数组里的名字必须小写。
 
 ### 已知坑
 
@@ -1369,6 +2631,42 @@ PFS_status_variable_cache（状态变量）
 - `Com_stmt_*`/`Com_restart`/`Com_shutdown` 失败也计数；`Innodb_rows_updated` 官方标注 "not meant to be 100% accurate"。
 - 压缩表下 `Innodb_buffer_pool_pages_data` 可能大于 `_total`（Bug #59550）；`Last_query_cost` 8.0.16 前对复杂查询为 0（Bug #92766）。
 - `Innodb_row_lock_time_avg` 是启动以来累计平均，被历史长尾拉高后不回落，与 `SHOW ENGINE INNODB STATUS` 的瞬时语义不同。
+- **★ 直查 PFS 表看不到任何 `Com_xxx`**（`pfs_variable.cc:939` `filter_by_name`）：`SELECT * FROM performance_schema.global_status` **不含 `Com_*` 行**——只有真的发 `SHOW STATUS` 命令时才展开 `Com` 子数组。想采集 `Com_select` 必须走 `SHOW STATUS`，或改用 `events_statements_summary_global_by_event_name`。
+- **★ `FLUSH STATUS` 是全局 + 所有会话一起清**，不只是本会话（`mysqld.cc:11753`）——本以为"只清 session"是常见误解。
+- **★ `SET PERSIST_ONLY` 只认动态权限，`SUPER` 不够**（`set_var.cc:204`）——必须同时有 `SYSTEM_VARIABLES_ADMIN` 和 `PERSIST_RO_VARIABLES_ADMIN`。
+- **★ my.cnf 不支持行尾 `\` 续行，也不支持 `$VAR` 环境变量展开**（`my_default.cc:926` 一次 `mysql_file_getline` 只读一行）。
+- **★ 行尾注释只认 `#`，且必须不在引号内**；行尾 `;` **不截断**（只有行首 `;` 才整行跳过）。
+- **★ 未知转义保留反斜杠**：`\d` 会变成字面的 `\d`（`my_default.cc:1116` `default: /* Unknown; Keep '\' */`）。
+
+### ★★★ 真名勘误全表（本轮新增）
+
+| 常见说法 / 想当然 | 8.0.39 真相 |
+|---|---|
+| `SHOW_VAR` 定义在 `sql/set_var.h` | **不在** → 真身 `include/mysql/status_var.h:80`（plugin 可见的公开头） |
+| `SHOW_SCOPE_*` 靠位或拼进 `SHOW_*` | **错** → 是独立枚举 `enum_mysql_show_scope`，作为第 4 个**独立字段**，无任何位或宏 |
+| `System_status_var` 在 `sql/mysqld.h` | **不在**（`mysqld.h:377` 只有 `extern`）→ 真身 `sql/system_variables.h:513` |
+| `SHOW_VAR status_vars[]` 在 `sql_show.cc` | 在 **`sql/mysqld.cc:9690`** |
+| `calc_sum_of_all_status()` 在 `mysqld.cc` | 在 **`sql/sql_show.cc:3736`** |
+| `add_to_status` 是宏 | 是**普通函数**，`sql/system_variables.cc:28` |
+| `FLUSH STATUS` 调 `reset_status_var()` | **不存在** → 真名 **`refresh_status()`**（`mysqld.cc:11753`） |
+| 8.0 仍用 `HASH hash_user_variables` | **已废弃** → `collation_unordered_map<std::string, unique_ptr_with_deleter<user_var_entry>>` |
+| `user_var_entry` 在 `sql_class.h` | 在 **`sql/item_func.h:2953`** |
+| `user_var_entry` 有 `update_query_id` | **不存在** → 只有 `m_used_query_id`（服务 binlog 去重，**不是**求值顺序保证） |
+| 查用户变量用 `get_var()` / 写用 `set_var()` | **都不存在** → `get_variable()`（`item_func.cc:5869`）/ `Item_func_set_user_var::update_hash()`（`:6088`） |
+| `show_innodb_vars` 是数组 | 是 **SHOW_FUNC 回调**（`ha_innodb.cc:21526`）；数组真名 `innodb_status_variables[]`（`:1126`）/ `..._export[]`（`:21956`） |
+| `SHOW STATUS` 默认 GLOBAL | 默认 **SESSION**（`sql_yacc.yy:15935` `%empty { $$=OPT_SESSION; }`） |
+| `MYSQL_THDVAR_*` 宏在 `sql/set_var.h` | **不在**（grep `THDVAR` 0 命中）→ 在 `include/mysql/plugin.h:463` |
+| THDVAR 的 offset 是编译期常量 | **错** → 宏里硬写 `-1`，由 `sql_plugin.cc:3281` 在**插件装载时运行时回填**，resolve 也同批赋值 |
+| `PLUGIN_VAR_*` 定义在 `plugin.h` | 只是引用 → 真值在 `include/mysql/components/services/bits/system_variables_bits.h:63` |
+| 改全局变量只需 `SUPER` | 动态变量 `SUPER` **或** `SYSTEM_VARIABLES_ADMIN`；`PERSIST_ONLY` **只认动态权限**，SUPER 不够 |
+| `SESSION_VARIABLES_ADMIN` 不存在 | **存在**，但**不是 C enum**，是字符串型动态权限 |
+| PFS 变量/状态表 11 张 | **12 张** = 5 变量 + 6 状态 + **`user_variables_by_thread`**（文件前缀是 `table_user_variables`，按 `variables` grep 会漏） |
+| I_S 表是"视图转发到 PFS" | **不是** → I_S 侧**彻底删除**（`sql/dd/impl/system_views/` grep `variables` 0 命中），SHOW 在**解析期**改写为对 PFS 的 SELECT |
+| `@@version` 是 `Sys_var_charptr` | **错** → 专属类 **`Sys_var_version`**（`sys_vars.cc:5307`） |
+| 配置文件支持 `\` 续行 / `$VAR` 展开 / 行尾 `;` 注释 | **都不支持** |
+| `SET PERSIST` 源码里有 `WL#8688` | **0 命中**——该 WL 编号不在源码注释里 |
+
+**★ `SHOW STATUS` vs `SHOW GLOBAL STATUS` 的实现差异只有一处**：换 PFS 表名（`parse_tree_nodes.cc:2813`），两者都走同一个 `build_query()`，生成同一形状的 SELECT。
 
 ---
 
@@ -1382,7 +2680,7 @@ PFS_status_variable_cache（状态变量）
 - *PostgreSQL Documentation → 19.1 Setting Parameters*、*53.25 pg_settings*（`ALTER SYSTEM`/`postgresql.auto.conf`/`pg_file_settings`/context 分类）
 
 **相关文档**
-- PFS 的通用表访问机制、PFS 系统变量 cache 的线程间读细节见 [`pfs.md`](pfs.md)
+- PFS 的通用表访问机制、PFS 系统变量 cache 的线程间读细节见 [`pfs.md`](../../infra/observability/pfs/pfs.md)
 - GTID 系列变量（`gtid_next`/`gtid_purged` 等）的读写语义见 [`../replication/gtid.md`](../replication/gtid.md)
 - 引擎接口（`handlerton`/`handler`）见 [`../handler.md`](../handler.md)
 - SET 语句解析（`PT_set_*` 语法树族）属于查询主链第 2 步，见 [`../query/README.md`](../query/README.md)

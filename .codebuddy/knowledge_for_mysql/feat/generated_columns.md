@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 VIRTUAL/STORED 生成列的元数据模型、读/写两条求值链路、虚拟列二级索引的 InnoDB 实现、undo/purge 与 binlog 复制中的特殊处理，以及隐藏生成列家族（功能索引 / 多值索引 / GIPK）。
 >
-> **边界**：本篇讲生成列这一特性在 SQL 层与 InnoDB 层的完整闭环。Item 表达式树本身的求值机制（`fix_fields`/`save_in_field`）见 [`../server/query/13_item_expression.md`](../server/query/13_item_expression.md)；DDL 的通用框架（COPY/INPLACE 决策、row log）见 [`../innodb/ddl.md`](../innodb/ddl.md)；binlog 组提交与行事件格式见 [`../server/replication/binlog.md`](../server/replication/binlog.md)。
+> **边界**：本篇讲生成列这一特性在 SQL 层与 InnoDB 层的完整闭环。Item 表达式树本身的求值机制（`fix_fields`/`save_in_field`）见 [`../server/query/13_item_expression.md`](../server/query/13_item_expression.md)；DDL 的通用框架（COPY/INPLACE 决策、row log）见 [`../feat/ddl/ddl.md`](../feat/ddl/ddl.md)；binlog 组提交与行事件格式见 [`../server/replication/binlog.md`](../server/replication/binlog.md)。
 
 ## 目录
 
@@ -121,6 +121,142 @@ B+ 树按索引记录排序、用索引记录定位聚簇行。若索引记录�
 同期放弃的还有标准 SQL（T175）的**隐式类型推导**（`GENERATED ALWAYS AS (5)` 不写类型）：做类型推导需要过早 `fix_fields`，5.7 的架构做不到，只能要求显式类型。这个"架构限制塑造语法"的案例与「表达式长度 64K」（从补丁的 255 字节放宽以容纳 JSON/GIS 长表达式）一起，说明生成列的语言设计同时被两个方向拉扯：标准对齐 vs Server 架构能力。
 
 **7. 求值时序的精确位置：BEFORE 触发器之后、约束检查之前。** WL#411 明确定义 STORED 生成列在 INSERT/UPDATE 的 BEFORE 触发器之后、CHECK 约束之前求值。后果有二：触发器对基列的修改会改变生成列的值（因此触发器路径要二次重算，见「写入路径」）；触发器对生成列本身的赋值被丢弃（重算覆盖）。这个时序 8.0 未变。
+
+**★★ 上面第 1 点"惰性求值"的收口就在这一个函数**——`update_generated_columns()`（`sql/table.cc:7089`）：
+
+```cpp
+static bool update_generated_columns(TABLE *table, const MY_BITMAP *columns,
+                                     bool virtual_only,
+                                     MY_BITMAP *updated_columns) {
+  assert(table != nullptr);
+  assert(table->has_gcol());
+  const THD *const thd = current_thd;
+  assert(!thd->is_error());
+
+  for (Field **field_ptr = table->vfield; *field_ptr != nullptr; ++field_ptr) {
+    Field *field = *field_ptr;
+    assert(field->is_gcol());
+    assert(field->gcol_info->expr_item != nullptr);
+
+    // Skip stored generated columns if the caller requested update of virtual
+    // generated column only.
+    if (virtual_only && !field->is_virtual_gcol()) continue;
+
+    // Skip columns not in the columns bitmap (which is typically
+    // table->read_set or table->write_set).
+    if (!bitmap_is_set(columns, field->field_index())) continue;   // ★★ 惰性：没进 read_set 就不算
+
+    // For a virtual generated column of blob type, we have to keep the current
+    // blob value since it might be needed by the storage engine during updates.
+    // All arrays are BLOB fields.
+    if (field->handle_old_value()) {
+      const auto blob = down_cast<Field_blob *>(field);
+      blob->keep_old_value();
+      blob->set_keep_old_value(true);
+    }
+
+    type_conversion_status status =
+        field->gcol_info->expr_item->save_in_field(field, false);  // ★★ 唯一求值点
+
+    if (status != TYPE_OK && thd->is_error()) return true;
+    if (updated_columns != nullptr)
+      bitmap_set_bit(updated_columns, field->field_index());
+  }
+  return false;
+}
+```
+
+```cpp
+  /**
+    Whether field's old valued have to be handled.
+    @returns
+      true   if field is virtual an either one of BLOB types or typed array
+      false  otherwise
+  */
+  bool handle_old_value() const {
+    return (is_flag_set(BLOB_FLAG) || is_array()) && is_virtual_gcol();
+  }
+```
+
+> ★★ **全篇只有这一处 `save_in_field` 供 DML 用**（另一处在 `my_eval_gcolumn_expr_helper`，供引擎回调）。两条路径在此汇合。
+> ★ 两个调用者的差别只有第三参：`virtual_only`——读路径 `true`（只算 virtual，stored 由引擎提供），写路径 `false`（两者都算）。
+
+**★ 第 1 点"依赖位图 O(1)"的收口在 `mark_generated_columns()`**（`sql/table.cc:6206`）——INSERT 全算，UPDATE 只算受影响的：
+
+```cpp
+void TABLE::mark_generated_columns(bool is_update) {
+  Field **vfield_ptr, *tmp_vfield;
+  bool bitmap_updated = false;
+
+  if (is_update) {
+    MY_BITMAP dependent_fields;
+    my_bitmap_map bitbuf[bitmap_buffer_size(MAX_FIELDS) / sizeof(my_bitmap_map)];
+    bitmap_init(&dependent_fields, bitbuf, s->fields);
+
+    for (vfield_ptr = vfield; *vfield_ptr; vfield_ptr++) {
+      tmp_vfield = *vfield_ptr;
+      /*
+        We need to evaluate the GC if:
+        - it depends on any updated column
+        - or it is virtual indexed, for example:
+           * UPDATE changes the primary key's value, and the virtual index
+           is a secondary index which includes the pk's value
+           * the gcol is in a multi-column index, and UPDATE changes another
+           column of this index
+           * in both cases the entry in the index needs to change, so needs to
+           be located first, for that the GC's value is needed.
+      */
+      if ((!tmp_vfield->stored_in_db && tmp_vfield->m_indexed) ||
+          bitmap_is_overlapping(write_set,
+                                &tmp_vfield->gcol_info->base_columns_map)) {
+        //  ★★ O(1)：一次位图相交判定
+        tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_WRITE);
+        // In order to update the new value, we have to read the old value
+        tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_READ);
+        bitmap_updated = true;
+      }
+    }
+  } else  // Insert needs to evaluate all generated columns
+  {
+    for (vfield_ptr = vfield; *vfield_ptr; vfield_ptr++) {
+      tmp_vfield = *vfield_ptr;
+      tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_WRITE);
+      bitmap_updated = true;
+    }
+  }
+
+  if (bitmap_updated) file->column_bitmaps_signal();
+}
+```
+
+> ★★ 第二个条件 `!stored_in_db && m_indexed` 常被忽略：**即使基列没变，被索引的 virtual 列也要重算**——因为 UPDATE 改了同索引里的其它列时，引擎需要 vcol 值才能定位旧索引项。这是"索引里有、行里没有"的非对称直接导致的代价。
+
+**★ 而 `base_columns_map` 的收集本身复用了 Item 的 visitor**（`sql/table.cc:2524`）——没有为生成列写专门的遍历器：
+
+```cpp
+bool Value_generator::register_base_columns(TABLE *table) {
+  my_bitmap_map *bitbuf = static_cast<my_bitmap_map *>(
+      table->mem_root.Alloc(bitmap_buffer_size(table->s->fields)));
+  assert(num_non_virtual_base_cols == 0);
+  bitmap_init(&base_columns_map, bitbuf, table->s->fields);
+
+  MY_BITMAP *save_old_read_set = table->read_set;
+  table->read_set = &base_columns_map;        // ★ 借 read_set 当收集器（技巧）
+  Mark_field mark_fld(MARK_COLUMNS_TEMP);
+  expr_item->walk(&Item::mark_field_in_map, enum_walk::PREFIX,
+                  (uchar *)&mark_fld);        // ★ 走一遍 Item 树，被引用的列自动进位图
+  table->read_set = save_old_read_set;
+
+  /* Calculate the number of non-virtual base columns */
+  for (uint i = 0; i < table->s->fields; i++) {
+    Field *field = table->field[i];
+    if (bitmap_is_set(&base_columns_map, field->field_index()) &&
+        field->stored_in_db)
+      num_non_virtual_base_cols++;
+  }
+  return false;
+}
+```
 
 ### 理论溯源
 
@@ -253,6 +389,44 @@ bool unpack_value_generator(THD *thd, TABLE *table,
   return false;
 }
 ```
+
+**`register_base_columns` 本体——"依赖收集"的实现有个很巧的借力**（`table.cc:2533`）：
+
+```cpp
+bool Value_generator::register_base_columns(TABLE *table) {
+  my_bitmap_map *bitbuf = static_cast<my_bitmap_map *>(
+      table->mem_root.Alloc(bitmap_buffer_size(table->s->fields)));
+  assert(num_non_virtual_base_cols == 0);
+  bitmap_init(&base_columns_map, bitbuf, table->s->fields);   // ① 位图按列数开
+
+  MY_BITMAP *save_old_read_set = table->read_set;
+  table->read_set = &base_columns_map;                        // ★ ② 临时顶替 read_set
+  Mark_field mark_fld(MARK_COLUMNS_TEMP);
+  expr_item->walk(&Item::mark_field_in_map, enum_walk::PREFIX,
+                  (uchar *)&mark_fld);                        // ③ 走一遍表达式
+  table->read_set = save_old_read_set;                        // ④ 还原
+
+  /* Calculate the number of non-virtual base columns */
+  for (uint i = 0; i < table->s->fields; i++) {
+    Field *field = table->field[i];
+    if (bitmap_is_set(&base_columns_map, field->field_index()) &&
+        field->stored_in_db)
+      num_non_virtual_base_cols++;                            // ★ ⑤ 只数物理列
+  }
+  return false;
+}
+```
+
+★ 核心是 ②③④：**没有为生成列写任何表达式遍历代码，而是"借用"了现成的 read_set 标记机制**——
+
+- 服务端本来就有 `Item::walk(&Item::mark_field_in_map)` + `Mark_field` 这套设施（用于计算"这条查询需要读哪些列"）。这里**临时把 `table->read_set` 指向自己的 `base_columns_map`**，跑一遍同样的 walk，被引用到的字段就自动落进了自己的位图，随后还原 `read_set`。
+
+⇒ 依赖分析因此是**零新增遍历逻辑**的，且未来 Item 树新增节点类型时，这套收集自动跟随生效——这正是上文 149 行说的"复用了 Item 树的 visitor 基础设施"。
+
+另外两点：
+
+- `Mark_field mark_fld(MARK_COLUMNS_TEMP)`——用的是**临时标记**语义（区别于永久标记），不会污染 TABLE 的正常 read_set。
+- ★ `num_non_virtual_base_cols` 只累加 **`field->stored_in_db`** 的列：虚拟生成列作为基列时**不计数**。这个计数用于判断"该生成列是否只依赖虚拟列"（进而影响某些优化与 DDL 判定）。
 
 要点：
 
@@ -646,6 +820,175 @@ static void row_mysql_convert_row_to_innobase(
 ### 数据格式：dtuple 双段与索引记录中的 vcol
 
 **dtuple 的双段布局。** 携带 vcol 的 dtuple 由 `dtuple_create_with_vcol(heap, n_fields, n_v_fields)` 创建：fields 段（物理列）与 vfields 段（虚拟列）连续分配，`dtuple_get_nth_v_field(row, v_pos)` 直接索引第二段。`dtuple_init_v_fld` 把整个 vfields 段初始化成 `DATA_MISSING`（`mtype = DATA_MISSING, len = UNIV_SQL_NULL`）——`DATA_MISSING` 是贯穿引擎的"这个 vcol 值尚未获得"哨兵，读路径跳过、MVCC 回溯填充、DDL 重算，全看它。
+
+**★ 双段布局的权威证据在 `dtuple_create_from_mem()`**（`data0data.ic:392`）——两段是**同一块 malloc 内的两个偏移**，不是两次分配：
+
+```cpp
+static inline dtuple_t *dtuple_create_from_mem(void *buf, ulint buf_size,
+                                               ulint n_fields,
+                                               ulint n_v_fields) {
+  dtuple_t *tuple;
+  ulint n_t_fields = n_fields + n_v_fields;      // ★ 一次性按总数申请
+
+  ut_ad(buf != nullptr);
+  ut_a(buf_size >= DTUPLE_EST_ALLOC(n_t_fields));
+
+  tuple = (dtuple_t *)buf;
+  tuple->info_bits = 0;
+  tuple->n_fields = n_fields;
+  tuple->n_v_fields = n_v_fields;
+  tuple->n_fields_cmp = n_fields;                // ★ 比较只看物理段
+  tuple->fields = (dfield_t *)&tuple[1];         // ★ 紧接 dtuple_t 之后
+  if (n_v_fields > 0) {
+    tuple->v_fields = &tuple->fields[n_fields];  // ★★ 虚拟段紧接物理段
+  } else {
+    tuple->v_fields = nullptr;
+  }
+```
+
+```
+  ┌──────────┬─────────────────────┬─────────────────────────┐
+  │ dtuple_t │ fields[0..n_fields) │ v_fields[0..n_v_fields) │
+  └──────────┴─────────────────────┴─────────────────────────┘
+              ↑ tuple->fields        ↑ tuple->v_fields = &fields[n_fields]
+              DTUPLE_EST_ALLOC(n_fields + n_v_fields) 一次分配完
+```
+
+```cpp
+/* Estimate the number of bytes that are going to be allocated when
+creating a new dtuple_t object */
+#define DTUPLE_EST_ALLOC(n_fields) \
+  (sizeof(dtuple_t) + (n_fields) * sizeof(dfield_t))
+```
+
+> ★ **`dtuple_create(heap, n_fields)` 本质是 `dtuple_create_with_vcol(heap, n_fields, 0)`**。
+> ⚠️ **`dtuple_set_v_fields()` 不存在**——v_fields 只能在创建时一次性定好，不能事后改。
+> ★ `n_v_fields` 覆盖的是**该表全部虚拟列**（下标 = `dict_v_col_t::v_pos`），**无论是否被索引**；未被物化的那几个仍是 `DATA_MISSING`。
+> ★ "纯 vcol 段"的 dtuple 造法：`dtuple_create_with_vcol(heap, 0, n_v_cols)`——`n_fields=0`，只有虚拟段。purge / update vector / 二级索引抽取都用它。
+
+**★ vcol 值从 mysql 行进 dtuple 的位置**（`row_mysql_convert_row_to_innobase`，`row0mysql.cc:569`）——注意 **InnoDB 在这里只是搬运，不计算**：
+
+```cpp
+  for (i = 0; i < prebuilt->n_template; i++) {
+    bool is_multi_val = false;
+    templ = prebuilt->mysql_template + i;
+
+    if (templ->is_virtual) {
+      ut_ad(n_v_col < dtuple_get_n_v_fields(row));
+      dfield = dtuple_get_nth_v_field(row, n_v_col);   // ★ 虚拟列 → v_fields 段
+      n_v_col++;
+      if (dfield_is_multi_value(dfield)) { is_multi_val = true; n_m_v_col++; }
+    } else {
+      dfield = dtuple_get_nth_field(row, n_col);       // ★ 普通列 → fields 段
+      n_col++;
+    }
+    ...
+    } else {
+      row_mysql_store_col_in_innobase_format(
+          dfield, prebuilt->ins_upd_rec_buff + templ->mysql_col_offset,
+          true, mysql_rec + templ->mysql_col_offset, templ->mysql_col_len,
+          dict_table_is_comp(prebuilt->table));
+      /* server has issue regarding handling BLOB virtual fields,
+      and we need to duplicate it with our own memory here */
+      if (templ->is_virtual &&
+          DATA_LARGE_MTYPE(dfield_get_type(dfield)->mtype)) {
+        if (*heap == nullptr) *heap = mem_heap_create(dfield->len, UT_LOCATION_HERE);
+        dfield_dup(dfield, *heap);                     // ★ BLOB vcol 必须深拷贝
+      }
+    }
+  }
+```
+
+```cpp
+// dtuple 的创建点（row0mysql.cc:1106）
+  row = dtuple_create_with_vcol(prebuilt->heap, table->get_n_cols(),
+                                dict_table_get_n_v_cols(table));
+```
+
+> ★★ 这里印证了「正常路径"推"值」：值由 **server 在 `update_generated_write_fields()` 里算好**放进 mysql 行，InnoDB 只搬运。异常路径（purge / 外键）才回调 server「拉」值。
+
+**★ 真正"拉"值的入口 `innobase_get_computed_value()`**（`ha_innodb.cc:23614`）关键三行：
+
+```cpp
+  const mysql_row_templ_t *vctempl =
+      index->table->vc_templ
+          ->vtempl[index->table->vc_templ->n_col + col->v_pos];   // ① vcol 自身模板在数组后半段
+  ...
+  for (ulint i = 0; i < col->num_base; i++) {
+    ...
+    row_sel_field_store_in_mysql_format(                           // ② 基列值按模板摆进 mysql_rec
+        mysql_rec + templ->mysql_col_offset, templ, index,
+        templ->clust_rec_field_no, (const byte *)data, len, ULINT_UNDEFINED);
+  }
+  ...
+  bitmap_set_bit(&column_map, col->m_col.ind);                     // ③ 只让 server 算这一个 vcol
+  ret = handler::my_eval_gcolumn_expr(
+      thd, mysql_table, &column_map, (uchar *)mysql_rec, ...);
+```
+
+而回调的 server 侧实现（`handler.cc:8262`）做了一件关键的事——**把 TABLE 的字段指针临时指向引擎给的 buffer**：
+
+```cpp
+static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
+                                        const MY_BITMAP *const fields,
+                                        uchar *record, bool in_purge,
+                                        const char **mv_data_ptr,
+                                        ulong *mv_length) {
+  assert(table && table->vfield);
+  uchar *old_buf = table->record[0];
+  repoint_field_to_record(table, old_buf, record);    // ★★ 字段指针改指向 mysql_rec
+  ...
+  my_bitmap_map *old_maps[2];
+  dbug_tmp_use_all_columns(table, old_maps, table->read_set, table->write_set);
+  //  ★ 忽略 read_set/write_set——引擎可能要求算比它声明的更多的列
+
+  for (Field **vfield_ptr = table->vfield; *vfield_ptr; vfield_ptr++) {
+    Field *field = *vfield_ptr;
+    if (bitmap_is_set(&fields_to_evaluate, field->field_index()) &&
+        field->is_virtual_gcol()) {
+      const type_conversion_status save_in_field_status =
+          field->gcol_info->expr_item->save_in_field(field, false);   // ★★ 真正的求值
+      if (save_in_field_status != TYPE_OK && thd->is_error()) { res = true; break; }
+    }
+  }
+  dbug_tmp_restore_column_maps(table->read_set, table->write_set, old_maps);
+  ...
+  repoint_field_to_record(table, record, old_buf);    // 还原
+```
+
+> ★ 两个变体：`my_eval_gcolumn_expr()`（`in_purge=false`，有现成 TABLE）与 `my_eval_gcolumn_expr_with_open()`（`in_purge=true`，purge 线程临时开表）。**`in_purge` 时还要额外处理 BLOB**：`extract_blob_space_and_length_from_record_buff()` + `copy_blob_data()`——因为表关掉后 BLOB 内存就失效了。
+> ★★ 依赖闭包：引擎只要求算列 X，但 X 依赖的虚拟列也要先算——`bitmap_union(&fields_to_evaluate, &field->gcol_info->base_columns_map)`。**这就是 `base_columns_map` 在引擎侧的第二用途**。
+
+**★ `vc_templ` 惰性构造**（`ha_innodb.cc:23524`），purge 线程也会触发：
+
+```cpp
+void innobase_init_vc_templ(dict_table_t *table) {
+  dict_sys_mutex_enter();
+  if (table->vc_templ != nullptr) { dict_sys_mutex_exit(); return; }
+  table->vc_templ = ut::new_withkey<dict_vcol_templ_t>(UT_NEW_THIS_FILE_PSI_KEY);
+  table->vc_templ->vtempl = nullptr;
+  table->get_table_name(schema_name, table_name);
+  THD *thd = current_thd;
+  handler::my_prepare_gcolumn_template(
+      thd, schema_name.c_str(), table_name.c_str(),
+      &innobase_build_v_templ_callback, static_cast<void *>(table));
+  dict_sys_mutex_exit();
+}
+
+bool handler::my_prepare_gcolumn_template(THD *thd, const char *db_name,
+                                          const char *table_name,
+                                          my_gcolumn_template_callback_t myc,
+                                          void *ib_table) {
+  bool rc = true;
+  Temp_table_handle tblhdl;
+  TABLE *table = tblhdl.open(thd, db_name, table_name);   // ★ 只在 server 层开表，不开引擎
+  if (table) { myc(table, ib_table); rc = false; }
+  return rc;
+}
+```
+
+> ★ `Temp_table_handle` 的注释明写：**必须以 `open_in_engine=false` 打开**，否则会死锁。
+> ★ purge 线程还要先等 `mysqld_server_started`（`row0purge.cc:982`），未就绪就 `sleep_for(1s)` 重试——因为 vcol 计算需要 server 完全启动。
 
 **二级索引记录里 vcol 是"普通字段"。** 物化之后，vcol 在索引记录中的物理布局与普通字段**完全同构**：占 NULL 位图一位、变长列有长度字节、定长列定长存放。`rec_get_nth_field` / `rec_get_offsets` / `rec_init_offsets` 对含 vcol 的索引记录**没有任何特判**——物理层根本不知道什么是"虚拟列"。这是物化方案最大的工程收益：整条 B+ 树基础设施（搜索、分裂、MVCC、崩溃恢复）零改动即支持 vcol 索引。
 
@@ -1453,6 +1796,170 @@ instant add 虚拟列同时建 vcol 索引的路径里，`handler0alter.cc` 的 
 
 它们共用前面全部机制：打开时重解析表达式、vfield 求值、vc_templ 回调、binlog 过滤——差异只在**可见性**（`dd::Column::enum_hidden_type`）与**表达式的写入口**（功能索引由 `Add_drop_index` 的 key part 表达式直接生成 `Create_field`，见 `sql_table.cc` 里 `gcol_info->expr_item = kp->get_expression()` 的路径）。
 
+**★★ 重大勘误：GIPK 不是隐藏虚拟列**——它是 **STORED** 的 `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT`，hidden 类型是 **`HT_HIDDEN_USER`**（不是 `HT_HIDDEN_SQL`，更不是虚拟列）。所以"三种都用同一个模板"的说法只对**两种**（功能索引、多值索引）成立，GIPK 是例外：
+
+```cpp
+static bool generate_invisible_primary_key(THD *thd, Alter_info *alter_info) {
+  /*
+    Create primary key column "my_row_id bigint unsigned NOT NULL AUTO_INCREMENT
+    INVISIBLE" and add it as the first column in the column list.
+  */
+  Create_field *cr_field = new (thd->mem_root) Create_field();
+  if (cr_field->init(
+          thd, gipk_column_name, MYSQL_TYPE_LONGLONG, nullptr, nullptr,
+          (UNSIGNED_FLAG | NOT_NULL_FLAG | AUTO_INCREMENT_FLAG), nullptr,
+          nullptr, &EMPTY_CSTR, nullptr, nullptr, nullptr, false, 0, nullptr,
+          nullptr, {}, dd::Column::enum_hidden_type::HT_HIDDEN_USER, false))
+    //  ★★ 证据链：① MYSQL_TYPE_LONGLONG + AUTO_INCREMENT（真正落盘的聚簇索引列）
+    //             ② 未设 stored_in_db=false ⇒ 默认 STORED
+    //             ③ hidden = HT_HIDDEN_USER（不是 HT_HIDDEN_SQL）
+    //             ④ 没有 gcol_info ⇒ 不是生成列，不进 vfield 数组
+    return true;
+  if (alter_info->create_list.push_front(cr_field)) return true;
+  ...
+  Key_spec *key = new (thd->mem_root)
+      Key_spec(thd->mem_root, KEYTYPE_PRIMARY, NULL_CSTR,
+               &default_key_create_info, false, true, key_parts);
+```
+
+**★ 三种隐藏列对比**（这是本节最该记住的一张表）：
+
+| 维度 | 功能索引隐藏列 | 多值索引隐藏列 | GIPK |
+|---|---|---|---|
+| VIRTUAL / STORED | **VIRTUAL** | **VIRTUAL** | **STORED** |
+| DD hidden 类型 | `HT_HIDDEN_SQL`(3) | `HT_HIDDEN_SQL`(3) | **`HT_HIDDEN_USER`(4)** |
+| 命名 | `!hidden!<idx>!<kp>!<n>` | 同左（多值索引也是功能索引） | 固定 `my_row_id` |
+| `gcol_info` | 有 | 有（`returns_array()` 为真） | **无** |
+| InnoDB 侧标记 | `DICT_VIRTUAL` | `DICT_VIRTUAL \| DICT_MULTI_VALUE` | 普通聚簇列 |
+| I_S 是否可见 | 否 | 否 | **是**（除非 `show_gipk...=OFF`） |
+
+```cpp
+// ① 功能索引：VIRTUAL + HT_HIDDEN_SQL —— sql_table.cc:7853
+  cr->hidden = dd::Column::enum_hidden_type::HT_HIDDEN_SQL;
+  cr->stored_in_db = false;
+  Value_generator *gcol_info = new (thd->mem_root) Value_generator();
+  gcol_info->expr_item = kp->get_expression();
+  gcol_info->set_field_stored(false);          // ★ 显式 VIRTUAL
+
+// ② 多值索引：先虚拟再多值 —— dict0dd.cc:3006
+    if (field->is_virtual_gcol()) {
+      index->type |= DICT_VIRTUAL;
+      if ((field->gcol_info->expr_item &&
+           field->gcol_info->expr_item->returns_array()) ||
+          field->is_array()) {
+        index->type |= DICT_MULTI_VALUE;
+      }
+    }
+```
+
+**⚠️ 三个"不存在"**：**不存在 `sql/functional_index.cc`**（全仓只有 mysql-test 文件）；**不存在 `functional_index_creator()` / `create_functional_index()` / `functional_index_prepare()`**——真名 `add_functional_index_to_create_list()`；**不存在 `Functional_index_info`**——真名 `Key_spec` / `Key_part_spec` / `KEY_CREATE_INFO`（全大写）。
+
+**★ 隐藏列命名规则是 `!hidden!` 无下划线**，且**没有宏常量**：
+
+```cpp
+static const char *make_functional_index_column_name(
+    std::string_view key_name, unsigned key_part_number,
+    const List<Create_field> &fields, MEM_ROOT *mem_root) {
+  for (unsigned count = 0;; ++count) {
+    string name("!hidden!");          // ★ 裸字符串，不是宏
+    name += key_name;
+    string suffix("!");
+    suffix += to_string(key_part_number);
+    suffix += '!';
+    suffix += to_string(count);
+    // 超长时截断「索引名」部分而非 counter，否则会死循环
+    name.resize(min(name.size(), NAME_CHAR_LEN - suffix.size()));
+    name.append(suffix);
+    if (column_name_exists(fields, name)) continue;   // 撞名 → counter++
+    return strmake_root(mem_root, name.data(), name.size());
+  }
+}
+```
+
+> 完整格式 `!hidden!<index_name>!<key_part_number>!<counter>`。对照：InnoDB instant DROP 的前缀**有**宏 `INSTANT_DROP_PREFIX_8_0_32 = "!hidden!_dropped_"`（**带下划线**）——两个 `!hidden!` 系列不要混。
+
+**★ 功能索引的核心一步：key part 从"表达式"改写为指向隐藏列名**：
+
+```cpp
+  alter_info->flags |= Alter_info::ALTER_ADD_COLUMN;
+  kp->set_name_and_prefix_length(field_name, 0);   // ★★ 索引定义从此指向隐藏列，不再是表达式
+```
+
+```cpp
+bool KEY::is_functional_index() const {
+  for (uint i = 0; i < actual_key_parts; ++i) {
+    if (key_part[i].field->is_field_for_functional_index()) return true;
+  }
+  return false;
+}
+bool Field::is_field_for_functional_index() const {
+  return hidden() == dd::Column::enum_hidden_type::HT_HIDDEN_SQL &&
+         gcol_info != nullptr;     // ★ 必须同时是生成列；GIPK 是 HT_HIDDEN_USER，故不匹配
+}
+```
+
+**多值索引的三条硬限制**（源码证据）：
+
+```cpp
+// ① 一个索引内最多一个多值 key part —— sql_table.cc:4837
+          if (kp->has_expression() && kp->get_expression()->returns_array()) {
+            if (mv_key_parts++) {
+              my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                       "more than one multi-valued key part per index");
+              return true;
+            }
+            if (kp->is_explicit()) {      // ② 不能显式写 ASC/DESC
+              my_error(ER_WRONG_USAGE, MYF(0), "multi-valued index",
+                       "explicit index order");
+              return true;
+            }
+          }
+```
+
+```cpp
+// ③ 存储程序里禁止、字符集只允许 binary —— item_create.cc:1855
+  if (as_array) {
+    if (thd->lex->get_sp_current_parsing_ctx()) {
+      my_error(ER_WRONG_USAGE, MYF(0), "CAST( .. AS .. ARRAY)",
+               "stored routines");
+      return true;
+    }
+    if (cast_type.charset != nullptr && cast_type.charset != &my_charset_bin) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "specifying charset for multi-valued index");
+      return true;
+    }
+  }
+```
+
+> ⚠️ **不存在 `dd::Index::IT_MULTI_VALUED`**——`enum_index_type` 只有 `IT_PRIMARY / IT_UNIQUE / IT_MULTIPLE / IT_FULLTEXT / IT_SPATIAL` 五值。多值索引在 **DD 层没有专门类型**，靠 `Field::is_array()` 运行时推导成 `HA_MULTI_VALUED_KEY`（`1 << 19`）。
+> ⚠️ **不存在 `Multi_value_index_builder`**——真名 `Multi_value_logger`（undo 日志序列化器，不是索引构建器）。
+> ★ InnoDB 侧：`DICT_MULTI_VALUE = 512`（索引 type 位）、`DATA_MULTI_VALUE = 16384`（列 prtype 位），且**有断言"多值列必然是虚拟列"**：`ut_ad(!(!innobase_is_v_fld(field) && innobase_is_multi_value_fld(field)))`。
+> ★ 多值索引不支持有序检索/覆盖索引：`if (key_info[key].flags & HA_MULTI_VALUED_KEY) flags &= ~(HA_READ_ORDER | HA_KEYREAD_ONLY);`
+> ★ `MYSQL_TYPE_TYPED_ARRAY` 注释明写 **"Used for replication only"**——`Field_typed_array::type()` 返回的是**元素类型**，`binlog_type()` 才返回它。
+
+**GIPK 的三条启用条件与两条禁止**（`sql_gipk.cc`）：
+
+```cpp
+bool is_generate_invisible_primary_key_mode_active(THD *thd) {
+  return (thd->variables.sql_generate_invisible_primary_key &&
+          !thd->is_dd_system_thread() && !thd->is_initialize_system_thread());
+}
+```
+
+- **分区表不支持**：`my_error(ER_NOT_SUPPORTED_YET, ..., "generating invisible primary key for the partitioned tables")`
+- **SBR 下 `CREATE TABLE ... SELECT` 不支持**：报 `ER_CREATE_SELECT_WITH_GIPK_DISALLOWED_IN_SBR`（auto_increment 值非确定）
+- 表已有名为 `my_row_id` 的列 → `ER_GIPK_COLUMN_EXISTS`；已有 auto_increment 列 → `ER_GIPK_FAILED_AUTOINC_COLUMN_EXISTS`
+
+```cpp
+static Sys_var_bool Sys_show_gipk_in_create_table_and_information_schema(
+    "show_gipk_in_create_table_and_information_schema", "...",
+    SESSION_VAR(show_gipk_in_create_table_and_information_schema),
+    CMD_LINE(OPT_ARG), DEFAULT(true), ...);   // ★ 默认 true（显示）；SESSION 级
+```
+
+> ★ GIPK 在 DD 里靠 `options` 里的 `"gipk"=true` 标记（**表/索引/列三处都打**），`IS_VISIBLE_DD_OBJECT` 在 `show_gipk...=OFF` 时据此隐藏。
+
 ### 系统表与视图：生成列如何对外可见
 
 **DD 存两份表达式文本。** `mysql.columns` 表里生成列占两列：`generation_expression`（binary，建表时的原始字符集）与 `generation_expression_utf8`（`dd_table.cc` 在 `fill_dd_column_from_create_field` 里用 `convert_and_print` 转成 system charset 的副本，注释明说 "Prepare UTF expression for IS"）。后者是 information_schema 的数据源；`is_virtual` 位存 VIRTUAL/STORED。注意 DD 里存的是 **`print_expr` 规范化后的打印文本**，不是用户原始书写——`SHOW CREATE TABLE` 显示的表达式可能与建表语句字面不同。
@@ -1489,6 +1996,111 @@ IF (col.hidden = 'SQL', col.generation_expression_utf8, NULL)
 ```
 
 功能索引在 `STATISTICS` 里以隐藏列 + `EXPRESSION` 列展示表达式，而不是把表达式塞进 `COLUMN_NAME`。
+
+**★ I_S.COLUMNS 的隐藏列过滤**（视图 WHERE 子句，`sql/dd/impl/system_views/columns.cc:145`）：
+
+```cpp
+  m_target_def.add_where(
+      "AND IS_VISIBLE_DD_OBJECT(tbl.hidden, col.hidden NOT IN ('Visible', "
+      "'User'), col.options)");
+```
+
+> ★★ 核心判据 `col.hidden NOT IN ('Visible','User')` ⇒ 只有 `'SE'` / `'SQL'` 被判为 hidden：
+> - **功能索引 / 多值索引隐藏列（`HT_HIDDEN_SQL`）→ 被过滤掉**
+> - **GIPK（`HT_HIDDEN_USER`）→ 保留可见**（除非 `show_gipk...=OFF`）
+
+GIPK 的二次过滤在 `IS_VISIBLE_DD_OBJECT` 内部按 `options` 里的 `"gipk"` 键：
+
+```cpp
+longlong Item_func_is_visible_dd_object::val_int() {
+  ...
+  // Skip generated invisible primary key and key columns.
+  if (arg_count == 3 && !args[2]->is_null() &&
+      !thd->variables.show_gipk_in_create_table_and_information_schema) {
+    String options;
+    String *options_ptr = args[2]->val_str(&options);
+    if (options_ptr != nullptr) {
+      std::unique_ptr<dd::Properties> p(
+          dd::Properties::parse_properties(options_ptr->c_ptr_safe()));
+      if (p.get()) {
+        if (p->exists("gipk")) {
+          bool gipk_value = false;
+          p->get("gipk", &gipk_value);
+          if (gipk_value) return 0;      // ★ 带 "gipk" option 的对象一律隐藏
+        }
+```
+
+`mysql.columns` 里 hidden 是 ENUM 字符串，四值一一对应枚举：
+
+```cpp
+  m_target_def.add_field(
+      FIELD_HIDDEN, "FIELD_HIDDEN",
+      "hidden ENUM('Visible', 'SE', 'SQL', 'User') NOT NULL");
+```
+
+```cpp
+  enum class enum_hidden_type {
+    /// The column is visible (a normal column)
+    HT_VISIBLE = 1,
+    /// The column is completely invisible to the server
+    HT_HIDDEN_SE = 2,
+    /// The column is visible to the server, but hidden from the user.
+    /// This is used for i.e. implementing functional indexes.
+    HT_HIDDEN_SQL = 3,
+    /// User table column marked as INVISIBLE by using the column visibility
+    /// attribute. ...
+    HT_HIDDEN_USER = 4
+  };
+```
+
+> ⚠️ 真名是 **`hidden()`**，不是 `hidden_type()`。
+
+**★ `SHOW CREATE TABLE` 靠两条独立机制跳过**（`sql_show.cc:2028`）——注意 GIPK 与功能索引用的是**不同**手段：
+
+```cpp
+  bool skip_gipk =
+      (for_show_create_stmt &&
+       table_has_generated_invisible_primary_key(table) &&
+       !thd->variables.show_gipk_in_create_table_and_information_schema);
+
+  Field **first_field = table->field;
+  if (skip_gipk) first_field++;      // ★① GIPK 靠"跳第一列"（HT_HIDDEN_USER 不会被下面的谓词拦住）
+
+  for (ptr = first_field; (field = *ptr); ptr++) {
+    // Skip hidden system fields.
+    if (field->is_hidden_by_system()) continue;   // ★② 功能索引/多值索引（HT_HIDDEN_SQL/SE）在此跳过
+```
+
+```cpp
+  bool is_hidden_by_system() const {
+    return (hidden() == dd::Column::enum_hidden_type::HT_HIDDEN_SE ||
+            hidden() == dd::Column::enum_hidden_type::HT_HIDDEN_SQL) &&
+           DBUG_EVALUATE_IF("show_hidden_columns", false, true);
+  }
+```
+
+> ★ 有一个 DEBUG 开关 `show_hidden_columns` 可以让隐藏列现形——排障时可用。
+> ⚠️ `is_hidden()`（含 `HT_HIDDEN_USER`）与 `is_hidden_by_system()`（只含 SE/SQL）是**两个不同谓词**，别混用。
+
+**★ STATISTICS 里隐藏列名显示 NULL、表达式单独一列**（`sql_show.cc:4295`）：
+
+```cpp
+      if (key_part->field && key_part->field->is_hidden_by_system()) {
+        table->field[TMP_TABLE_KEYS_COLUMN_NAME]->set_null();   // ★ 列名置 NULL
+      } else { ...store(str...); }
+      ...
+      if (key_part->field != nullptr &&
+          key_part->field->is_field_for_functional_index()) {
+        Value_generator *gcol = key_info->key_part->field->gcol_info;
+        table->field[TMP_TABLE_KEYS_EXPRESSION]->store(
+            gcol->expr_str.str, gcol->expr_str.length, cs);      // ★ 取的是 expr_str（TABLE_SHARE 的文本）
+        table->field[TMP_TABLE_KEYS_EXPRESSION]->set_notnull();
+      } else {
+        table->field[TMP_TABLE_KEYS_EXPRESSION]->set_null();
+      }
+```
+
+> ★ 注意这里读的是 **`gcol->expr_str`**（TABLE_SHARE 持有的 DD 文本），**不是** `print_expr()` 重新打印的 Item 树——与 `SHOW CREATE TABLE` 路径不同。且 ⚠️ 8.0.39 的粗糙点：`EXPRESSION` 始终取 `key_info->key_part[0]` 的 gcol，对**多列功能索引**不准。
 
 **SHOW CREATE TABLE / SHOW COLUMNS 的打印路径**（`sql_show.cc`）：
 
@@ -1530,11 +2142,263 @@ if (field->gcol_info) {
 | 生成列做分区键时列本身不可 DROP/MODIFY | gcol 依赖检查 |
 | `CREATE TABLE ... LIKE` 总是包含生成列（不支持标准 F385 的 `EXCLUDING GENERATED` / DROP EXPRESSION 降级为基列） | WL#411 FUTURE PLAN |
 
+**★ 但上表有三条是错的，源码里并不禁止**：
+
+1. **生成列可以做分区键**——`sql/sql_partition.cc` 与 `sql/partitioning/` 里**没有任何** gcol 禁止逻辑；相反 `partition_handler.cc` 主动为 virtual gcol 补依赖：
+
+```cpp
+    /* Fill the base columns of virtual generated columns if necessary */
+    for (Field **ptr = m_part_info->full_part_field_array; *ptr; ptr++) {
+      if ((*ptr)->is_virtual_gcol()) m_table->mark_gcol_in_maps(*ptr);
+    }
+```
+
+> 真正禁的只是"virtual 列被**提升为主键**"（分区表要求分区键 ⊆ PK，所以会**间接**排除 virtual 分区键——这是 PK 规则的连带效果，不是分区代码里的显式禁止）。
+
+2. **BLOB/TEXT/JSON/GEOMETRY 做生成列本身不禁止**——类型层面没有黑名单。限制在**索引用法**：JSON 不能做任何 key（`ER_JSON_USED_AS_KEY`，对所有列生效）；GEOMETRY/SPATIAL 不能做 virtual 索引。
+
+3. **virtual 生成列可以建二级索引**（这是最大的一条误解）——`HA_VIRTUAL_GEN_KEY` 就是为它设的。真正禁止的是 PK / FULLTEXT / SPATIAL / 外键：
+
+```cpp
+  if (sql_field->is_virtual_gcol()) {
+    const char *errmsg = nullptr;
+    if (key->type == KEYTYPE_FULLTEXT) {
+      errmsg = "Fulltext index on virtual generated column";
+      functional_index_error_handler.force_error_code(ER_FULLTEXT_FUNCTIONAL_INDEX);
+    } else if (key->type == KEYTYPE_SPATIAL ||
+               sql_field->sql_type == MYSQL_TYPE_GEOMETRY) {
+      errmsg = "Spatial index on virtual generated column";
+      functional_index_error_handler.force_error_code(ER_SPATIAL_FUNCTIONAL_INDEX);
+    } else if (key->type == KEYTYPE_PRIMARY) {
+      errmsg = "Defining a virtual generated column as primary key";
+      functional_index_error_handler.force_error_code(ER_FUNCTIONAL_INDEX_PRIMARY_KEY);
+    }
+    if (errmsg) {
+      my_error(ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN, MYF(0), errmsg);
+      return true;
+    }
+    /* Check if the storage engine supports indexes on virtual columns. */
+    if (!(file->ha_table_flags() & HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN)) {
+      my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0),
+               ha_resolve_storage_engine_name(file->ht),
+               "Index on virtual generated column");
+      return true;
+    }
+    key_info->flags |= HA_VIRTUAL_GEN_KEY;      // ★★ 通过了才打标记 → virtual 二级索引是允许的
+  }
+```
+
+> ⚠️ 三处 PK 判定用的都是 `is_virtual_gcol()` 而**不是** `is_gcol()` ⇒ **STORED 生成列可以做主键**。
+
+**★ `ER_GENERATED_COLUMN_NON_PRIOR` 的唯一产生点**（前向引用/自引用）：
+
+```cpp
+bool Item_field::check_function_as_value_generator(uchar *checker_args) {
+  Check_function_as_value_generator_parameters *func_args = ...;
+  if (field == nullptr) return false;     // pre_validate 阶段（未 fix_fields）没有 field，直接放过
+
+  int fld_idx = func_args->col_index;
+  assert(fld_idx > -1);
+  if ((func_args->source != VGS_CHECK_CONSTRAINT) &&
+      (field->is_gcol() ||
+       field->has_insert_default_general_value_expression()) &&
+      field->field_index() >= fld_idx) {
+    //  ★★ 被引用的列是生成列/生成默认值列，且它的位置 >= 当前列 → 前向引用或自引用
+    func_args->err_code = (func_args->source == VGS_GENERATED_COLUMN)
+                              ? ER_GENERATED_COLUMN_NON_PRIOR
+                              : ER_DEFAULT_VAL_GENERATED_NON_PRIOR;
+    return true;
+  }
+  if (field->is_flag_set(AUTO_INCREMENT_FLAG)) {
+    //  ★ 生成值在 write_row() 之前算，而 auto_inc 值在 write_row() 里才由引擎定 → 时序矛盾
+    func_args->err_code =
+        (func_args->source == VGS_GENERATED_COLUMN)
+            ? ER_GENERATED_COLUMN_REF_AUTO_INC
+            : ...;
+    return true;
+  }
+  return false;
+}
+```
+
+**★ 白名单机制是"默认拒绝、显式放行"**——基类 `Item::check_function_as_value_generator()` 直接 `return true`：
+
+```cpp
+bool Item::check_function_as_value_generator(uchar *checker_args) {
+  Check_function_as_value_generator_parameters *func_arg = ...;
+  Item_func *func_item = nullptr;
+  if (type() == Item::FUNC_ITEM && ((func_item = down_cast<Item_func *>(this)))) {
+    func_arg->banned_function_name = func_item->func_name();
+  }
+  func_arg->err_code = func_arg->get_unnamed_function_error_code();
+  return true;      // ★★ 默认一律拒绝
+}
+```
+
+允许的函数必须**逐个 override 返回 false**（`Item_func_mul` / `div` / `mod` / `neg` / `abs` / `ceiling` / `floor` / `CAST` 等）。拒绝形态有三类：
+
+```cpp
+// ① 已废弃函数
+  bool check_function_as_value_generator(uchar *checker_args) override {
+    if (is_deprecated()) { ...; func_arg->banned_function_name = func_name(); return true; }
+    return false;
+  }
+// ② 仅禁止于生成列与 CHECK，DEFAULT(expr) 允许（如 ROUND）
+  bool check_function_as_value_generator(uchar *checker_args) override {
+    func_arg->banned_function_name = func_name();
+    return ((func_arg->source == VGS_GENERATED_COLUMN) ||
+            (func_arg->source == VGS_CHECK_CONSTRAINT));
+  }
+// ③ 一律禁止（GET_LOCK / BENCHMARK / SLEEP / RELEASE_LOCK / 复制类函数等）
+  bool check_function_as_value_generator(uchar *checker_args) override {
+    func_arg->banned_function_name = func_name();
+    return true;
+  }
+```
+
+> ★★ 这是理解"非确定性禁止"的关键：**不是黑名单，是白名单**——凡是没显式 override 的函数一律被拒。这也解释了为什么新加的内建函数可能突然不支持生成列。
+> ⚠️ **`check_gcol_func_processor()` / `check_gcol_depended_processor()` 都不存在**（全库 0 命中）。真名 `Item::check_function_as_value_generator()`；`check_gcol_*` 系列只剩 `Item::check_gcol_depend_default_processor()`。
+
+**★ 列属性禁止走的是解析器期的 `pc->is_generated`**（`parse_tree_column_attrs.h`）：`DEFAULT` / `ON UPDATE` / `AUTO_INCREMENT` / `SERIAL DEFAULT VALUE` / `COLUMN_FORMAT` / `STORAGE` / `DEFAULT (expr)` 全部报 `ER_WRONG_USAGE`：
+
+```cpp
+// PT_default_column_attr::contextualize
+  bool contextualize(Column_parse_context *pc) override {
+    if (pc->is_generated) {
+      my_error(ER_WRONG_USAGE, MYF(0), "DEFAULT", "generated column");
+      return true;
+    }
+    return super::contextualize(pc) || item->itemize(pc, &item);
+  }
+```
+
+```cpp
+// PT_generated_field_def 自己额外禁 SERIAL 类型
+    // column of type serial cannot be generated
+    if (type_node->is_serial_type()) {
+      my_error(ER_WRONG_USAGE, MYF(0), "SERIAL", "generated column");
+      return true;
+    }
+```
+
+**★ 存储引擎能力门控两道**：
+
+```cpp
+// ① 能不能有生成列
+  if (share->vfields && outparam->file &&
+      !(outparam->file->ha_table_flags() & HA_GENERATED_COLUMNS)) {
+    my_error(ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN, MYF(0),
+             "Specified storage engine");
+    error_reported = true;
+    goto err;
+  }
+// ② 能不能给 virtual 建索引 → HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN（见上）
+```
+
+InnoDB 两者都支持（`ha_innodb.cc:2977` 的 `HA_GENERATED_COLUMNS | HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN | HA_MULTI_VALUED_KEY_SUPPORT`）。
+
+**★ 删除被生成列依赖的列**：
+
+```cpp
+      expr->walk(&Item::mark_field_in_map, enum_walk::PREFIX,
+                 reinterpret_cast<uchar *>(&mark_fld));
+      if (bitmap_is_set(table->read_set, field->field_index())) {
+        if (vfield->is_gcol()) {
+          if (vfield->is_field_for_functional_index())
+            my_error(ER_DEPENDENT_BY_FUNCTIONAL_INDEX, MYF(0), field->field_name);
+          else
+            my_error(ER_DEPENDENT_BY_GENERATED_COLUMN, MYF(0), field->field_name);
+        } else {
+          my_error(ER_DEPENDENT_BY_DEFAULT_GENERATED_VALUE, MYF(0),
+                   field->field_name, table->alias);
+        }
+        ...
+```
+
+**★ 函数索引的错误码改写**（"生成列错误 → 函数索引措辞"，`error_handler.cc:366`）——这是"函数索引 = 隐藏虚拟生成列"这一实现的必然副产品：
+
+```cpp
+    case ER_GENERATED_COLUMN_REF_AUTO_INC: {
+      res_errno = ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT;
+      break;
+    }
+    case ER_GENERATED_COLUMN_NAMED_FUNCTION_IS_NOT_ALLOWED:
+    case ER_GENERATED_COLUMN_FUNCTION_IS_NOT_ALLOWED: {
+      res_errno = ER_FUNCTIONAL_INDEX_FUNCTION_IS_NOT_ALLOWED;
+      break;
+    }
+    case ER_GENERATED_COLUMN_ROW_VALUE: {
+      my_error(ER_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, MYF(0),
+               m_functional_index_name.c_str());
+      return true;
+    }
+```
+
 ### 概念澄清
 
 - **生成列的 "VIRTUAL" 与 InnoDB 页格式的 "virtual" 无关**：前者指"聚簇记录中不物理存储"（DD 里 `is_virtual` 位）；后者在引擎代码里泛指"非物理列"这一属性（`dict_col_t::is_virtual()`）。vcol 在二级索引中是物理存在的。
 - **`vfield` 不是"虚拟列数组"**：它是**全部生成列**（virtual + stored）的数组。`is_virtual_gcol()` = `gcol_info && !stored_in_db` 才区分。
 - **5.7 的 `vcol_set` 已不存在**：8.0 用 `vfield` 数组 + `Value_generator::base_columns_map` 取代了 5.7 的位图式 `TABLE::vcol_set`。读 5.7 时代资料时注意。
+
+**★ 真名勘误清单**（这一节最容易写错名字）：
+
+| 常见写法 | 8.0.39 真相 |
+|---|---|
+| `Field::is_stored_gcol()` | **不存在**。只有 `is_gcol()` 与 `is_virtual_gcol()`；STORED 靠 `is_gcol() && !is_virtual_gcol()` |
+| `TABLE::has_virtual_gcol()` | **不存在**（SQL 层）。只有 `TABLE::has_gcol()` = `vfield != nullptr`；`has_virtual_gcol` 只残留在 NDB 插件 |
+| `TABLE_SHARE::visible_field_count()` / `hidden_field_count()` | **不在 TABLE_SHARE**。是 `TABLE::visible_field_count()`（函数）+ `TABLE::hidden_field_count`（**数据成员 uint**，非函数），且注释明写"仅内部临时表使用，否则为 0"——**它统计的不是功能索引/GIPK 的隐藏列** |
+| `PARSE_GCOL_EXPR` 常量 | **不存在**。只有 `LEX_CSTRING PARSE_GCOL_KEYWORD = "parse_gcol_expr"`（**小写**）；大写 `"PARSE_GCOL_EXPR"` 只是 yacc 里 `is_identifier()` 的字面量比对。旧 token 已降为 `OBSOLETE_TOKEN_654` |
+| `PT_generated_field_def` 在 `parse_tree_nodes.h` | **不在**。真身在 `sql/parse_tree_column_attrs.h:983` |
+| `Virtual_or_stored` 是普通 enum | 是 **`enum class`**，在 `sql/parser_yystype.h:244`（不在 field.h/table.h） |
+| `fill_field_from_dd()` | **不存在**。DD→TABLE_SHARE 的读回在 `sql/dd_table_share.cc:1007-1028`，没有独立函数包装 |
+| `Value_generator::restore_stmt_unsafe_flags()` | **不存在**。只有 `backup_stmt_unsafe_flags()`（写）+ `get_stmt_unsafe_flags()`（读） |
+
+**引擎侧同样有一批**：
+
+| 常见写法 | 8.0.39 真相 |
+|---|---|
+| `dict_srch_v_col_t` | **不存在**。真名 `dict_s_col_t`——是**外键依赖的 stored column**（`s_pos = i + table->n_v_def`），不是"二级索引虚拟列" |
+| `dict_table_add_v_col()` | **不存在**。真名 `dict_mem_table_add_v_col()` |
+| `dict_index_add_v_col()` | **不存在**。真名 `dict_index_add_col()`（内部自动识别 virtual） |
+| `dict_table_has_virtual()` | **不存在**。只有 `dict_index_has_virtual()` / `dict_table_has_indexed_v_cols()` / `dict_table_have_virtual_index()` |
+| `dict_index_t::n_v_fields` / `v_fields` | **不在 `dict_index_t`**。这两个成员属于 `dtuple_t`；索引侧靠 `index->type & DICT_VIRTUAL` |
+| `dtuple_create_vcol()` | **不存在**。真名 `dtuple_create_with_vcol()`；"纯 vcol 段"的造法是 `dtuple_create_with_vcol(heap, 0, n_v_cols)` |
+| `dtuple_set_v_fields()` | **不存在**。v_fields 只能在 `dtuple_create_from_mem()` 里一次性布局 |
+| `innobase_get_computed_value_with_row()` | **不存在**。带"打开表"的版本在 server 侧叫 `handler::my_eval_gcolumn_expr_with_open()` |
+| `my_gcolumn_templateclass_t` / `handler::my_gcolumn_template` | **不存在**。只有 typedef `my_gcolumn_template_callback_t` |
+| `row_upd_store_vcol_val()` | **不存在**。真名 `row_upd_build_difference_binary()` / `row_upd_replace_vcol()` / `row_upd_set_vcol_data()` |
+| `trx_undo_rec_set_v_cols` / `trx_undo_read_vcol_value` | **不存在**。真名 `trx_undo_report_insert_virtual()` / `trx_undo_log_v_idx()` / `trx_undo_read_v_idx()` / `trx_undo_store_multi_value()` |
+| `dict_col_t::v_index` | **不存在**。索引列表在 `dict_v_col_t::v_indexes`（`std::list<dict_v_idx_t>`） |
+| `sql/system_views/columns.cc` | 真名 **`sql/dd/impl/system_views/columns.cc`**（`sql/system_views/` 目录不存在） |
+
+**★ `Value_generator` 是三源共用的，不只服务生成列**：
+
+```cpp
+enum Value_generator_source : short {
+  VGS_GENERATED_COLUMN = 0,  // 生成列
+  VGS_DEFAULT_EXPRESSION,    // DEFAULT (expr)   —— 8.0.13
+  VGS_CHECK_CONSTRAINT       // CHECK 约束        —— 8.0.16
+};
+```
+
+> ★ 三者在**校验策略上并不等价**：非确定性函数**只有生成列禁止**，DEFAULT(expr) 允许（`if (expr->is_non_deterministic() && (source == VGS_GENERATED_COLUMN))`）；而变量/存储函数三类源**全禁**。`Field` 上两个槽并存：`gcol_info`（生成列）与 `m_default_val_expr`（DEFAULT 表达式），且**互斥**（同一列不能同时有，报 `ER_WRONG_USAGE "DEFAULT" "generated column"`）。
+> ★ 打开表时**三者的 unpack 是三段并列代码**（`table.cc` 3068 / 3104 / 3154），各自构造 `vfield` / `gen_def_fields_ptr` / `table_check_constraint_list` 三个数组。
+
+**★ 两条校验用的是不同的 walk 模式**（容易看漏）：
+
+```cpp
+// pre_validate（fix_fields 之前）：SUBQUERY_POSTFIX —— 连子查询内部一起查
+  if (expression->walk(&Item::check_function_as_value_generator,
+                       enum_walk::SUBQUERY_POSTFIX,
+                       pointer_cast<uchar *>(&checker_args))) { ... }
+
+// validate（fix_fields 之后）：POSTFIX —— 子查询此时已在解析期被挡掉，只剩兜底断言
+  assert(!expr->has_subquery());
+  if (expr->walk(&Item::check_function_as_value_generator, enum_walk::POSTFIX,
+                 pointer_cast<uchar *>(&checker_args))) { ... }
+```
+
+> ★ `unpack_value_generator()` 里子查询是被**解析器开关**挡掉的，不是 walk：`thd->lex->expr_allows_subquery = false;` + `assert(thd->lex->allow_sum_func == 0)`（顺带禁掉聚合函数与窗口函数）。
 
 ---
 
@@ -1557,7 +2421,7 @@ if (field->gcol_info) {
 **相关文档**
 - 表达式树（`Item`、`fix_fields`、`save_in_field`）：[`../server/query/13_item_expression.md`](../server/query/13_item_expression.md)
 - JSON 上的索引方案（生成列 8.1 / 功能索引 8.2 / 多值索引 8.3，与本篇互为补充）：[`../server/datatype/json.md`](../server/datatype/json.md)
-- DDL 框架（instant DDL、row log）：[`../innodb/ddl.md`](../innodb/ddl.md)
+- DDL 框架（instant DDL、row log）：[`../feat/ddl/ddl.md`](../feat/ddl/ddl.md)
 - binlog 行事件与复制：[`../server/replication/binlog.md`](../server/replication/binlog.md)
 - handler 接口与位图协议（read_set/write_set/covering）：[`../server/handler.md`](../server/handler.md)
 - 同类"DD→文本→重解析"往返：分区信息见 [`partitioning.md`](partitioning.md)

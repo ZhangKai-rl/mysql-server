@@ -1,6 +1,6 @@
 # MySQL 内存分配器矩阵：mem_heap / MEM_ROOT / buf_buddy / jemalloc
 
-> 本篇聚焦 **分层内存分配器矩阵**。PFS 可观测性见 [pfs.md](pfs.md)；读源码通用知识地图与共享术语/论文见 [README.md](README.md)。
+> 本篇聚焦 **分层内存分配器矩阵**（mem_heap / MEM_ROOT / buf_buddy / jemalloc）。全局内存架构总览（各内存区、预算、OOM 排查）见 [memory_architecture.md](memory_architecture.md)；PFS 可观测性见 [pfs.md](../observability/pfs/pfs.md)；读源码通用知识地图与共享术语/论文见 [README.md](../../server/infra/README.md)。
 > 基于 MySQL 8.0 源码（`storage/innobase`、`mysys` 等模块）。
 
 ## 目录
@@ -351,6 +351,38 @@ struct Scoped_heap {
 
 **核心洞察：** bump allocator 不是"做不到"细粒度复用，而是**刻意不做**。它用"放弃复用"换来了极致的分配速度和零碎片——这对于 InnoDB 内部频繁的、短生命周期的临时分配（一次 B-tree 操作、一次 undo 构建）是正确权衡。补偿性手段是粗粒度的 `free_top` / `empty`，允许在一个操作的生命周期内重复利用同一块内存。
 
+### 2.2.7 ut::allocator 族：STL 容器在 InnoDB 里的两种内存走法
+
+InnoDB 的 C++ 容器（`ut::vector/map/unordered_map` 等）有两套 allocator 适配，走**完全不同的底层**：
+
+```cpp
+// ut0new.h:2180-2183（8.0 名称为 ut::allocator，非 ut_allocator）
+template <typename T, typename Allocator_base = std::conditional_t<
+    ut::WITH_PFS_MEMORY, detail::allocator_base_pfs<T>, detail::allocator_base<T>>>
+class allocator : public Allocator_base {
+  // 2259-2272：allocate() 越界抛 bad_array_new_length，失败抛 bad_alloc
+  // 2279-2281：deallocate → ut::free(ptr)
+  // 2224-2227：提供 rebind；默认 PSI key = mem_key_std（2200）
+};
+```
+
+```cpp
+// mem0mem.h:418-487（mem_heap_allocator）
+452: pointer allocate(size_type n, ...)
+      { return reinterpret_cast<pointer>(mem_heap_alloc(m_heap, n * sizeof(T))); }
+456: void deallocate(pointer, size_type) {}   // 空实现！
+```
+
+| 维度 | `ut::allocator<T>` | `mem_heap_allocator<T>` |
+|------|--------------------|--------------------------|
+| 底层 | `ut::malloc_withkey` / `ut::free`（每次分配/释放都进出 jemalloc） | mem_heap bump（heap 底层 block 才走 malloc） |
+| deallocate | 真释放 | **空操作**（内存随整个 heap 释放） |
+| PFS 插桩 | ✅（PFS 模式下多分配 `PFS_metadata` 前缀；`max_size()` 会扣掉 `ut::pfs_overhead()`，ut0new.h:2242-2245） | ❌ 不经 ut::malloc，无插桩 |
+| 适用 | 生命周期不可预期的容器（如 dict 的长期对象） | 生命周期与某次操作绑定、整体释放的容器 |
+| 与 std::allocator 的关系 | 不继承，自实现 Allocator 概念 | 同左 |
+
+**要点**：`ut::allocator` 不是简单的 malloc 包装——PFS 模式下它是"带统计前缀的分配器"（前缀机制见本篇「二、可观测性交汇」），`max_size()` 主动扣除前缀开销，保证 `size() + overhead` 语义正确。这两套 allocator 的选择就是"容器活多久、要不要统计"的取舍。
+
 ### 2.3 MEM_ROOT —— Server 层的 Arena Allocator
 
 #### 2.3.1 核心思想
@@ -548,11 +580,87 @@ m_end_idx    物理结束索引（one-past-end）
 // buf_pool_t 中的 zip_free 数组
 UT_LIST_BASE_NODE_T(buf_buddy_free_t, list) zip_free[BUF_BUDDY_SIZES_MAX];
 
-// 分配接口
+// 分配接口（转发层）
 static inline byte *buf_buddy_alloc(buf_pool_t *buf_pool, ulint size) {
     return buf_buddy_alloc_low(buf_pool, buf_buddy_get_slot(size));
 }
 ```
+
+真正的分配逻辑在 `buf_buddy_alloc_low`——**四级回退链**，这是理解 buddy 分配行为的关键：
+
+```cpp
+void *buf_buddy_alloc_low(buf_pool_t *buf_pool, ulint i) {
+  buf_block_t *block;
+  ut_ad(!mutex_own(&buf_pool->zip_mutex));
+  ut_ad(i >= buf_buddy_get_slot(UNIV_ZIP_SIZE_MIN));
+
+  if (i < BUF_BUDDY_SIZES) {
+    /* Try to allocate from the buddy system. */
+    block = (buf_block_t *)buf_buddy_alloc_zip(buf_pool, i);   // ① 伙伴系统 zip free list
+    if (block) goto func_exit;
+  }
+
+  /* Try allocating from the buf_pool->free list. */
+  block = buf_LRU_get_free_only(buf_pool);                      // ② BP 空闲链表
+  if (block) goto alloc_big;
+
+  /* Try replacing an uncompressed page in the buffer pool. */
+  block = buf_LRU_get_free_block(buf_pool);                     // ③ LRU 淘汰一个未压缩页
+
+alloc_big:
+  buf_buddy_block_register(block);
+  mutex_enter(&buf_pool->zip_free_mutex);
+  block = (buf_block_t *)buf_buddy_alloc_from(buf_pool, block->frame, i,
+                                              BUF_BUDDY_SIZES);  // ④ 从最大阶整块向下分裂
+  mutex_exit(&buf_pool->zip_free_mutex);
+
+func_exit:
+  buf_pool->buddy_stat[i].used.fetch_add(1);
+  return (block);
+}
+```
+
+四级依次降级：**① 先查伙伴系统自己的 `zip_free[i]`**（最快，正好有合适块）→ **② 用 BP 的空闲链表** → **③ 不够就淘汰一个未压缩页**（`buf_LRU_get_free_block`，可能触发刷脏）→ **④ 拿到整块后 `buf_buddy_alloc_from` 从 `BUF_BUDDY_SIZES`（最大阶）向下分裂**到所需阶。
+
+两点值得记住：
+
+- ①②③ 失败才走 ④，而 ④ 才是"伙伴分裂"真正发生的地方——**分裂的起点始终是最大阶整块**（16KB 页框），不是从相邻阶切；这也是为什么小阶分配可能昂贵：它要先弄到一整页再一路对半切。
+- ③ 这一步说明 buddy 分配**会挤压未压缩页**：压缩表用得多时，LRU 里的普通页会被替换掉（这也是压缩表影响 BP 命中率的一条路径）。
+
+**size 到"阶"的映射**（`buf_buddy_get_slot`，`buf0buddy.ic:56`）——分配的第一步，也是 buddy 尺寸的基准：
+
+```cpp
+/** Get the index of buf_pool->zip_free[] for a given block size.
+ @return index of buf_pool->zip_free[], or BUF_BUDDY_SIZES */
+static inline ulint buf_buddy_get_slot(ulint size) {
+  ulint i;
+  ulint s;
+
+  ut_ad(size >= UNIV_ZIP_SIZE_MIN);
+
+  for (i = 0, s = BUF_BUDDY_LOW; s < size; i++, s <<= 1) {
+  }
+
+  ut_ad(i <= BUF_BUDDY_SIZES);
+  return (i);
+}
+```
+
+即**从最小块 `BUF_BUDDY_LOW` 起逐次翻倍，取第一个能容纳 `size` 的阶**——"向上取到 2 的幂"。值得记两点：
+
+- 用的是**循环左移而非位运算技巧**（`s <<= 1`）：阶数范围很小（`UNIV_ZIP_SIZE_SHIFT_MIN = 10`，即最小块 1KB → 最大 16KB，只有 5 个阶），循环比位运算更可读且代价可忽略。
+- 返回值可能等于 `BUF_BUDDY_SIZES`——那表示 **size 超出了最大块**（越界），`ut_ad(i <= BUF_BUDDY_SIZES)` 只断言不超一档，调用方要保证 size 在 `[UNIV_ZIP_SIZE_MIN, UNIV_PAGE_SIZE]` 内。
+
+**调用协议同样重要**——`buf_buddy_alloc` 的函数头注释写死了前置条件：
+
+```
+  This function should only be used for allocating compressed page frames.
+  The thread calling this function must hold buf_pool->LRU_list_mutex and
+  must not hold buf_pool->zip_mutex or any block->mutex.
+  @return allocated block, never NULL
+```
+
+三点：① **只能用于压缩页 frame**（普通页走 BP 常规分配）；② ★ 调用者必须持有 `LRU_list_mutex`，且**不得持有 `zip_mutex` 或任何 `block->mutex`**——这解释了上节 ④ 里 `buf_buddy_alloc_low` 为什么要自己 `mutex_enter(&zip_free_mutex)`：它是唯一需要这把锁的地方，且入口处禁止已持有；③ **`never NULL`**——四级回退链保证了必定返回块（最坏情况 LRU 强制淘汰一个未压缩页）。
 
 通过 `BUF_BUDDY_STAMP_FREE` 魔数（写在 page 的 `space_id` 字段位置复用）判断伙伴是否空闲，避免引入额外元数据。
 
@@ -619,6 +727,8 @@ buf_buddy 也按 2 的幂次分 size，但它服务于**分裂/合并**——bud
 
 MySQL 编译时可选链接 jemalloc 或 glibc malloc。jemalloc 的优势：多核扩展性好、碎片更少、支持精确的内存用量统计（对 PFS 汇总有利）。
 
+> jemalloc 的**接入机制**（链接期替换 / Windows LoadLibraryEx / `--malloc-lib` 的今昔）、`MALLOC_CONF` 调优、**profiling 实操**（PFS 查不到 RSS 时用 jeprof）与 THP 交互见 [jemalloc.md](jemalloc.md)。本节只覆盖其算法设计。
+
 ### 2.6 各分配器的理论渊源汇总
 
 | 分配器 | 算法类型 | 核心论文 | 会议/出处 | 年份 |
@@ -673,8 +783,73 @@ ORDER BY current_alloc DESC;
 -- memory/innodb/buf_buf_pool         8.5 GB
 -- memory/innodb/mem_heap             1.2 GB
 -- memory/innodb/btr_search           800 MB
--- memory/innodb/row0merge            500 MB
+-- memory/innodb/ddl                 500 MB
 ```
+
+### 3.3 PFS 内存埋点的实现机制（PFS 查到的数是怎么来的）
+
+"带 key 分配"落到 `memory_summary_*` 表要走四段链路：前缀结构 → key 注册 → 分配回调 → 聚合容器。
+
+#### 3.3.1 分配前缀：InnoDB 的 `PFS_metadata`
+
+InnoDB 的 PFS 埋点在返回指针前挂一个元数据前缀（8.0 已删除旧名 `ut_new_pfx_t`，现在是 `detail/ut/pfs.h:86-192` 的 `PFS_metadata`）：
+
+```
+detail/ut/alloc.h:198-258 的内存布局：
+[PFS-META | VARLEN | PFS-META-OFFSET] [USER DATA]
+                              ↑ 返回给调用方的指针指向 DATA 段
+
+PFS_metadata 字段（pfs.h:90-100）：
+  OWNER   (PSI_thread*)   归属线程
+  DATALEN (size_t)        用户数据长度
+  KEY     (PSI_memory_key) 模块 key
+  PFS-META-OFFSET (uint32_t) 从 DATA 指针往前 4 字节读出，再 deduce_pfs_meta() 恢复基址
+```
+
+#### 3.3.2 自动 key：`UT_NEW_THIS_FILE_PSI_KEY`
+
+InnoDB 每处分配都写 `UT_NEW_THIS_FILE_PSI_KEY`——它不是每文件一个静态变量，而是**"文件名 → 全局 `auto_event_keys[]` 下标"的编译期映射**（ut0new.h:561-567）：
+
+```cpp
+#define UT_NEW_THIS_FILE_PSI_INDEX \
+  (force_constexpr<ut_new_get_key_by_file(MY_BASENAME)>::value)
+#define UT_NEW_THIS_FILE_PSI_KEY (UT_NEW_THIS_FILE_PSI_INDEX == -1
+    ? ut::make_psi_memory_key(PSI_NOT_INSTRUMENTED)
+    : ut::make_psi_memory_key(auto_event_keys[UT_NEW_THIS_FILE_PSI_INDEX]))
+```
+
+`ut_new_get_key_by_file(MY_BASENAME)`（ut0new.h:549-551）在**编译期**把调用方文件名（如 `btr0btr`、`buf0buf`）与静态表 `auto_event_names[]`（ut0new.h:246-445，共 n_auto 项）做前缀匹配得到下标；未命中回退 `PSI_NOT_INSTRUMENTED`（即"不插桩"）。keys 数组在 `ut/ut0new.cc:111-112` 定义，`ut_new_boot()`（118-135）里按 "innodb" 分类 `register_memory` 注册——这就是 `memory/innodb/*` event 名的来源。
+
+开关链：`HAVE_PSI_MEMORY_INTERFACE`（cmake）→ `univ.i:148-150` 定义 `UNIV_PFS_MEMORY` → `ut0new.h:579-583` 的 `constexpr bool WITH_PFS_MEMORY`。关闭时 `UT_NEW_THIS_FILE_PSI_KEY` 恒为 `PSI_NOT_INSTRUMENTED`，分配退化为裸 malloc。
+
+#### 3.3.3 聚合路径：`pfs_memory_alloc_vc`
+
+Server 层与 InnoDB 的 PSI 回调最终汇到 `storage/perfschema/pfs.cc:8319-8404`：
+
+```
+pfs_memory_alloc_vc(key, size, &owner_thread)
+  ├─ !flag_global_instrumentation → 返回 PSI_NOT_INSTRUMENTED   // 第一道闸
+  ├─ find_memory_class(key) 为空 或 !klass->m_enabled → 不插桩  // setup_instruments 控制
+  ├─ 线程级 key → pfs_thread 的 per-class 数组上 count_alloc，*owner_thread = pfs_thread
+  └─ 全局级 key（PSI_FLAG_ONLY_GLOBAL_STAT）→ global_instr_class_memory_array.count_global_alloc
+```
+
+三道闸的语义：
+
+1. **`performance_schema=OFF` 时插桩完全不生效**（`pfs_server.cc:199-202` 把该参数赋给 `flag_global_instrumentation`，第一道闸直接拦截）；
+2. ON 之后还需 `setup_instruments` 中该 memory 类 `ENABLED=YES`；
+3. `TIMED` 对 memory 统计无实际作用（memory 类没有 timing 消费，只有 ENABLED 和 FLAGS 生效，`table_setup_instruments.cc:463-497`）。
+
+#### 3.3.4 high_alloc 的语义：历史峰值
+
+`memory_summary_*` 的 `HIGH_COUNT_USED` / `HIGH_ALLOCATED` 是**曾经达到的最高水位**，不是容量上限。8.0 里旧的 `PFS_memory_stat` 已拆为三件套（pfs_stat.h）：`PFS_memory_safe_stat`（每线程）、`PFS_memory_shared_stat`（全局，全 atomic）、`PFS_memory_monitoring_stat`（builtin 类）。峰值由差额缓冲维护（pfs_stat.h:894-913 注释）：
+
+```
+CURRENT_COUNT_USED = m_alloc_count - m_free_count
+CURRENT_COUNT_USED + m_alloc_count_capacity = HIGH_COUNT_USED
+```
+
+`*_capacity` 是"保留给上浮/下沉的差额缓冲"（alloc 增加、free 抵扣，`count_alloc/count_free` 维护），查询时 `normalize()` 折算——所以 HIGH 是"峰值记忆"，用它对比 CURRENT 就能判断"曾经涨到过多少、现在回落了多少"。
 
 ---
 ## 三、内存管理模块涉及的设计模式
@@ -836,4 +1011,4 @@ if (type == MEM_HEAP_BTR_SEARCH) {
 
 ---
 
-*本文基于 MySQL 8.0 源码分析撰写。PFS 部分见 [pfs.md](pfs.md)，读源码通用知识地图见 [README.md](README.md)。*
+*本文基于 MySQL 8.0 源码分析撰写。全局内存架构总览见 [memory_architecture.md](memory_architecture.md)，PFS 部分见 [pfs.md](../observability/pfs/pfs.md)，读源码通用知识地图见 [README.md](../../server/infra/README.md)。*

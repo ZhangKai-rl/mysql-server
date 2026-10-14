@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码，涵盖 `mysqld --initialize` / `--initialize-insecure` 的全链路：选项判定 → 数据目录准备 → Data Dictionary 自举 → InnoDB 建库 → 系统表与预置数据 → root 口令与证书 → 退出。
 >
-> **边界**：本篇讲**数据目录从无到有的创建**（一次性动作）；
+> **本篇横跨 server 层与 InnoDB 层**，讲完「数据目录从无到有」这一段纵向闭环：server 侧选项判定 → DD 自举 → **下探到 InnoDB 建库（`srv_start(true)` 全流程）** → root 口令与证书 → 退出。
 > 已存在数据目录时的启动走 [`02_startup.md`](02_startup.md)；
 > 关闭与退出码走 [`03_shutdown.md`](03_shutdown.md)；
 > mysql-test 复用同一 bootstrap 机制搭建测试实例，见 [`../infra/mtr.md`](../infra/mtr.md)；
@@ -57,6 +57,287 @@
 ### 设计思想与权衡
 
 #### 一、为什么把初始化做进 `mysqld`，而不是留一个外部脚本
+
+**`--initialize` 不是系统变量，而是 `my_long_early_options[]` 里的纯命令行选项**（`sql/mysqld.cc:8892`）：
+
+```cpp
+/*
+  定义了需要提前解析的 sys_vars
+*/
+struct my_option my_long_early_options[] = {
+#if !defined(_WIN32)
+    {"daemonize", 'D', "Run mysqld as sysv daemon", ...},
+#endif
+    {"skip-grant-tables", 0,
+     "Start without grant tables. This gives all users FULL ACCESS to all "
+     "tables.", &opt_noacl, &opt_noacl, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
+    {"help", '?', ...}, {"verbose", 'v', ...}, {"version", 'V', ...},
+    {"initialize", 'I',                          // ★ 短选项就是 -I
+     "Create the default database and exit."
+     " Create a super user with a random expired password and store it into "
+     "the log.",
+     &opt_initialize, &opt_initialize, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
+     nullptr, 0, nullptr},
+    {"initialize-insecure", 0,                   // ★ 没有短选项
+     "Create the default database and exit."
+     " Create a super user with empty password.",
+     &opt_initialize_insecure, &opt_initialize_insecure, nullptr, GET_BOOL,
+     NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
+    ...};
+```
+
+> ⚠️ **勘误**：`opt_initialize` 定义在 `sql/mysqld.cc:1228`，但 **`opt_initialize_insecure` 定义在 `sql/sql_initialize.cc:61`**（mysqld.cc 只是 `#include "sql/sql_initialize.h"`）。两者都**不在 `sys_vars.cc`**，所以 `SHOW VARIABLES` 查不到、SET 改不了。
+
+**为什么必须"提前解析"**（`handle_early_options()`，`:8732`）：
+
+```cpp
+  /* Add the system variables parsed early */
+  sys_var_add_options(&all_early_options, sys_var::PARSE_EARLY);
+  /* Add the command line options parsed early */
+  for (my_option *opt = my_long_early_options; opt->name != nullptr; opt++)
+    all_early_options.push_back(*opt);
+  add_terminator(&all_early_options);
+```
+
+**初始化期的选项改写**（`adjust_related_options()`，`:8860`）——只有一条：
+
+```cpp
+static void adjust_related_options(ulong *requested_open_files) {
+  /*
+    In bootstrap, disable grant tables (about to be created)
+  */
+  if (opt_initialize) opt_noacl = true;   // ★★ grant 表此刻还没建出来
+  /* The order is critical here, because of dependencies. */
+  adjust_open_files_limit(requested_open_files);
+  adjust_max_connections(*requested_open_files);
+  adjust_table_cache_size(*requested_open_files);
+  adjust_table_def_size();
+}
+```
+
+同一语义族的其他初始化期改写：
+
+```cpp
+// :4861 —— 强制关 binlog
+  if (opt_initialize || opt_initialize_insecure) {
+    /*
+      System tables initialization are not binary logged (regardless
+      --log-bin option). ...
+    */
+    opt_bin_log = false;
+  }
+// :6816 —— 日志只输出 FILE（mysql.general_log / slow_log 还没建）
+  if (opt_initialize) log_output_options = LOG_FILE;
+// :8166 —— 不起复制线程
+  if (opt_initialize) opt_skip_replica_start = true;
+// :6596 —— 不动态加载插件
+  if (opt_initialize) flags |= PLUGIN_INIT_SKIP_DYNAMIC_LOADING;
+// :7758 —— 与 --daemonize 互斥
+  if (opt_initialize && opt_daemonize) {
+    fprintf(stderr, "Initialize and daemon options are incompatible.\n");
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+```
+
+**`mysqld_main()` 里的两处分流**：
+
+```cpp
+// :6545 —— ① DD 初始化路径分流
+  if (opt_initialize) {
+    if (!is_help_or_validate_option()) {
+      if (dd::init(dd::enum_dd_init_type::DD_INITIALIZE)) {
+        LogErr(ERROR_LEVEL, ER_DD_INIT_FAILED); unireg_abort(1);
+      }
+      if (dd::init(dd::enum_dd_init_type::DD_INITIALIZE_SYSTEM_VIEWS)) {
+        LogErr(ERROR_LEVEL, ER_SYSTEM_VIEW_INIT_FAILED); unireg_abort(1);
+      }
+    }
+  } else {
+    if (!is_help_or_validate_option() &&
+        dd::init(dd::enum_dd_init_type::DD_RESTART_OR_UPGRADE)) { ... }
+  }
+
+// :8218 —— ② bootstrap 总入口（--initialize 从这里就再也不返回）
+  process_bootstrap();
+// :5236 —— ③ 建数据目录（只有 --initialize，不含 --initialize-insecure）
+  if (unlikely(opt_initialize) &&
+      initialize_create_data_directory(mysql_real_data_home)) return 1;
+```
+
+**★ `process_bootstrap()` 全文**（`sql/mysqld.cc:8654`）：
+
+```cpp
+/**
+  Execute the bootstrap thread, if required.
+
+  When mysqld is started with --initialize only,
+  the bootstrap thread executes
+  - compiled in statements.
+  - create the non-DD based INFORMATION_SCHEMA.
+  and the server exits.
+
+  When mysqld is started with --init-file only,
+  the bootstrap thread executes SQL statements provided
+  in the input text file, and the server continues and serves requests.
+
+  When mysqld is started with both --initialize and --init-file,
+  the bootstrap thread:
+  - executes compiled in statements,
+  - executes SQL statements in the --init-file.
+  - creates the non-DD based INFORMATION_SCHEMA.
+  The server then exits.
+
+  Compiled in statements are executed in a privileged mode,
+  with SYSTEM_THREAD_SERVER_INITIALIZE.
+*/
+static void process_bootstrap() {
+  MYSQL_FILE *init_file = nullptr;
+  const char *init_file_name = nullptr;
+  enum_thread_type system_thread;
+  bool need_bootstrap = false;
+
+  if (opt_initialize) {
+    // Make sure we can process SIGHUP during bootstrap.
+    server_components_initialized();
+    need_bootstrap = true;
+    system_thread = SYSTEM_THREAD_SERVER_INITIALIZE;   // ★ 特权：允许访问 DD 表
+  } else {
+    system_thread = SYSTEM_THREAD_INIT_FILE;           // ★ 禁止访问 DD 表
+  }
+
+  if (opt_init_file != nullptr) {                      // ★ --init-file 与 --initialize 不互斥
+    if (*opt_init_file != '\0') {
+      init_file_name = opt_init_file;
+      LogErr(INFORMATION_LEVEL, ER_BEG_INITFILE, init_file_name);
+      init_file = mysql_file_fopen(key_file_init, init_file_name, O_RDONLY,
+                                   MYF(MY_WME));
+      need_bootstrap = true;
+    }
+    if (init_file == nullptr) {
+      LogErr(ERROR_LEVEL, ER_INIT_CANT_OPEN_BOOTSTRAP_FILE, init_file_name);
+      unireg_abort(MYSQLD_ABORT_EXIT);
+    }
+  }
+
+  if (need_bootstrap) {
+    bool error = bootstrap::run_bootstrap_thread(init_file_name, init_file,
+                                                 nullptr, system_thread);
+
+    if (init_file != nullptr) {
+      mysql_file_fclose(init_file, MYF(MY_WME));
+      LogErr(INFORMATION_LEVEL, ER_END_INITFILE, init_file_name);
+    }
+    if (error) {
+      /* Abort during system initialization, but not init-file execution */
+      if (system_thread == SYSTEM_THREAD_SERVER_INITIALIZE) {
+        unireg_abort(MYSQLD_ABORT_EXIT);   // ★ 单纯 init-file 失败不退出（只警告）
+      }
+    }
+
+    if (opt_initialize) {
+      // Create non DD based system views during --initialize.
+      error = dd::init(
+          dd::enum_dd_init_type::DD_INITIALIZE_NON_DD_BASED_SYSTEM_VIEWS);
+      if (error != 0) {
+        LogErr(ERROR_LEVEL, ER_SYSTEM_VIEW_INIT_FAILED);
+        unireg_abort(MYSQLD_ABORT_EXIT);
+      }
+      unireg_abort(MYSQLD_SUCCESS_EXIT);   // ★★★ 成功终点：永不返回
+    }
+  }
+  return;   // ★ 只有 --init-file（非 --initialize）会走到这里
+}
+```
+
+**`unireg_abort()` 里针对初始化的特化**（`:2451`）：
+
+```cpp
+static void unireg_abort(int exit_code) {
+  if (opt_initialize && exit_code && !opt_validate_config)
+    LogErr(ERROR_LEVEL,
+           mysql_initialize_directory_freshly_created
+               ? ER_DATA_DIRECTORY_UNUSABLE_DELETABLE     // ★ 本次新建 → 提示可删
+               : ER_DATA_DIRECTORY_UNUSABLE,              // ★ 目录本来就存在 → 别乱删
+           mysql_real_data_home);
+  ...
+  clean_up(!is_help_or_validate_option() && !daemon_launcher_quiet &&
+           (exit_code || !opt_initialize));   // ★ --initialize 成功（exit_code==0）时不做 clean_up
+  mysqld_exit(exit_code);
+}
+```
+
+```cpp
+// :2505
+[[noreturn]] static void mysqld_exit(int exit_code);   // ★ [[noreturn]]
+
+static void mysqld_exit(int exit_code) {
+  assert((exit_code >= MYSQLD_SUCCESS_EXIT && exit_code <= MYSQLD_ABORT_EXIT) ||
+         exit_code == MYSQLD_RESTART_EXIT);
+  mysql_audit_finalize();
+  Srv_session::module_deinit();
+  delete_optimizer_cost_module();
+  clean_up_mutexes();
+  my_end(opt_endinfo ? MY_CHECK_ERROR | MY_GIVE_INFO : 0);
+  destroy_error_log();
+  ...
+  exit(exit_code);
+}
+```
+
+```cpp
+// sql/sql_const.h:241
+constexpr const int MYSQLD_SUCCESS_EXIT{0};   // ★ 不在 mysqld.h！
+constexpr const int MYSQLD_ABORT_EXIT{1};     // systemd 不应自动重启
+```
+
+> ★★ "摇身一变成服务器"为什么不行：看 `mysqld_exit()` 做的事——`mysql_audit_finalize()` / `clean_up_mutexes()` / `my_end()` / `destroy_error_log()` / `shutdown_performance_schema()`。这些是**单向不可逆**的全局析构。而 `--initialize` 成功路径**故意跳过** `clean_up()`（见上面的 `!opt_initialize`），因为此刻进程处于 `opt_noacl` / 无 listener / 无 PFS 运行时的畸形态，直接 `exit(0)` 最干净。
+
+**`initialize_create_data_directory()`**（`sql/sql_initialize.cc:227`）——三条分支：
+
+```cpp
+bool initialize_create_data_directory(const char *data_home) {
+  MY_DIR *dir;
+  int flags =
+#ifdef _WIN32
+      0
+#else
+      S_IRWXU | S_IRGRP | S_IXGRP          // ★ 0750 风格
+#endif
+      ;
+  if (nullptr != (dir = my_dir(data_home, MYF(MY_DONT_SORT)))) {
+    /* ① 目录已存在 */
+    bool no_files = true;
+    for (uint i = 0; i < dir->number_off_files; i++) {
+      FILEINFO *file = dir->dir_entry + i;
+      /* Ignore files that start with . or == 'lost+found'. */
+      if (file->name[0] != '.' && strcmp(file->name, "lost+found")) {
+        no_files = false; break;
+      }
+    }
+    my_dirend(dir);
+    if (!no_files) {
+      LogErr(ERROR_LEVEL, ER_INIT_DATADIR_NOT_EMPTY_WONT_INITIALIZE);
+      return true;                        // ★ 非空 → 拒绝
+    }
+    LogErr(INFORMATION_LEVEL, ER_INIT_DATADIR_EXISTS_WONT_INITIALIZE);
+
+    /* ② 存在但为空：建一个临时文件 is_writable 探测可写性 */
+    if (-1 != (fd = my_create(path, 0, flags, MYF(MY_WME)))) {
+      my_close(fd, MYF(MY_WME)); my_delete(path, MYF(MY_WME));
+    } else {
+      LogErr(ERROR_LEVEL, ER_INIT_DATADIR_EXISTS_AND_NOT_WRITABLE_WONT_INITIALIZE);
+      return true;
+    }
+    return false;
+  }
+  /* ③ 不存在：创建 */
+  LogErr(INFORMATION_LEVEL, ER_INIT_CREATING_DD, data_home);
+  if (my_mkdir(data_home, flags, MYF(MY_WME))) return true;
+  mysql_initialize_directory_freshly_created = true;   // ★ 失败时错误日志才会提示可删
+  return false;
+}
+```
 
 5.7 的 `mysql_install_db` 是 Perl 脚本，它做的事本质上是"拼一个 `mysqld --bootstrap` 命令行，把 `mysql_system_tables.sql` 灌进去"。8.0 把这一步**收回进程内**，收益是：
 
@@ -175,10 +456,144 @@ SYSTEM_THREAD_SERVER_UPGRADE    = 8192
 
 ### 主链路
 
+#### 三篇总览：生命周期与数据目录状态
+
+三篇的分界线不是"模块"，而是**数据目录的状态**：
+
+```mermaid
+flowchart LR
+    subgraph P0["数据目录：【不存在 或 空】"]
+        A0["mysqld --initialize<br/>（一次性，做完即退出）"]
+        A1["① 建目录 / 校验空目录"]
+        A2["② DD 自举（硬编码 DDL）"]
+        A3["③ InnoDB 建物理文件"]
+        A4["④ 灌系统表 + 预置数据"]
+        A5["⑤ root 口令 + SSL 证书"]
+        A0 --> A1 --> A2 --> A3 --> A4 --> A5
+    end
+
+    A5 -->|"unireg_abort(SUCCESS_EXIT)<br/>退出码 0"| B0
+
+    subgraph P1["数据目录：【已初始化 → 可接受连接】"]
+        B0["mysqld（正常启动，反复）"]
+        B1["① 两阶段选项解析"]
+        B2["② init_server_components<br/>（60+ 步，顺序即依赖）"]
+        B3["③ ★ 两阶段插件注册<br/>夹着 dd::init()"]
+        B4["④ InnoDB srv_start(false)<br/>ARIES 三阶段恢复"]
+        B5["⑤ 线程分批启动（4 批）"]
+        B6["⑥ network_init + ready 宣告"]
+        B0 --> B1 --> B2 --> B3 --> B4 --> B5 --> B6
+    end
+
+    B6 --> C0
+
+    subgraph P2["数据目录：【已初始化 → 进程退出】"]
+        C0["mysqld（运行）"]
+        C1["① 三入口汇聚到信号线程"]
+        C2["② close_connections<br/>两轮 kill + 无超时等待"]
+        C3["③ InnoDB pre_dd_shutdown<br/>（九态屏障）"]
+        C4["④ clean_up 逆序卸载"]
+        C5["⑤ srv_shutdown<br/>刷脏 + checkpoint + 释放"]
+        C6["⑥ mysqld_exit → exit(code)"]
+        C0 --> C1 --> C2 --> C3 --> C4 --> C5 --> C6
+    end
+
+    C6 -.->|"下次启动"| B0
+    C6 -.->|"fast_shutdown=2<br/>下次要走崩溃恢复"| B4
+
+    style A0 fill:#e8f5e9
+    style B0 fill:#e3f2fd
+    style C0 fill:#fff3e0
+    style B3 fill:#ffebee
+    style C3 fill:#ffebee
+    style B4 fill:#ffebee
+```
+
+两处红色是**跨层耦合最强的地方**：启动的"两阶段插件注册"、关闭的"`pre_dd_shutdown` 屏障"——都是因为 8.0 把元数据放进了 InnoDB 表。虚线是循环：正常关闭回到启动；`fast_shutdown=2` 则直接跳到崩溃恢复。
+
+> 本篇 = P0；[`02_startup.md`](02_startup.md) = P1；[`03_shutdown.md`](03_shutdown.md) = P2。
+
+#### 初始化全链路（★ 右侧标出每一步在 datadir 里的产出物）
+
 ```
 mysqld --initialize
 │
 ├─[早期选项] handle_early_options()
+│    my_long_early_options[] 解析 --initialize / --initialize-insecure
+│    if (opt_initialize_insecure) opt_initialize = true;      ← insecure 是 initialize 的超集
+│                                                                        ┌─ 产出 ─────────────┐
+├─ adjust_related_options()                                              │（无文件）           │
+│    if (opt_initialize) opt_noacl = true;                               └────────────────────┘
+│
+├─ init_common_variables()
+│    ├─ opt_bin_log = false;  LogErr(ER_STARTING_INIT)
+│    ├─ initialize_create_data_directory()   ← 建目录 / 校验空目录      ┌─ 产出 ─────────────┐
+│    │                                                                  │ datadir/（0750）    │
+│    └─ generate_server_uuid()                                          │ auto.cnf（uuid）    │
+│                                                                       └────────────────────┘
+├─ plugin_register_builtin_and_init_core_se()
+│    └─ plugin_initialize → ha_initialize_handlerton → innodb_init()
+│         只是登记 handlerton 回调（ddse_dict_init / dict_recover / sdi_*）
+│         ★ 此刻【不建任何文件】
+│
+├─ dd::init(DD_INITIALIZE)                                              ┌─ 产出 ─────────────┐
+│   └─ run_bootstrap_thread(&bootstrap::initialize,                     │ ibdata1            │
+│                            SYSTEM_THREAD_DD_INITIALIZE)               │ #innodb_redo/       │
+│      └─ bootstrap::initialize()                                       │   #ib_redo0         │
+│         ├─ DDSE_dict_init(DICT_INIT_CREATE_FILES)                     │ undo_001 / undo_002 │
+│         │    └─ innobase_init_files()                                 │ ibtmp1 + .ibt 池   │
+│         │        ├─ srv_start(true)                                   │ mysql.ibd           │
+│         │        │    ① ibdata1  ② redo  ③ undo                       │ （dblwr v2 文件）   │
+│         │        │    ④ fsp_header  ⑤ rseg#1  ⑥ dict_create           └────────────────────┘
+│         │        │    ⑦ SDI_0  ⑧ dblwr v1(page 64/128)
+│         │        └─ dd_create_hardcoded()  → mysql.ibd（含 SDI）
+│         └─ initialize_dictionary()
+│              store_predefined_tablespace_metadata   (内存脚手架)
+│              → create_dd_schema (CREATE SCHEMA mysql)
+│              → initialize_dd_properties (建 dd_properties + 写 DD_VERSION)
+│              → create_tables (CREATE TABLE × N，C++ 硬编码 DDL)
+│              → flush_meta_data ★ 自举落地：把脚手架写成真正的 DD 行
+│              → populate_tables (字符集/排序规则)
+│              → verify_contents (自检：用刚建好的 DD 查刚建好的 DD)
+│              → update_versions
+│
+├─ dd::init(DD_INITIALIZE_SYSTEM_VIEWS)      ← I_S 视图（建表脚本要查 I_S）
+├─ dd::performance_schema::init_pfs_tables(DD_INITIALIZE)
+│
+├─ init_ssl_communication()                                             ┌─ 产出 ─────────────┐
+│    自动生成（auto_generate_certs 默认 ON）                             │ ca.pem / ca-key.pem │
+│                                                                       │ server-cert/key.pem │
+│                                                                       │ client-cert/key.pem │
+│                                                                       │ private_key.pem     │
+│                                                                       │ public_key.pem      │
+│                                                                       └────────────────────┘
+│
+├─ process_bootstrap()
+│   └─ run_bootstrap_thread(nullptr, init_file, nullptr,
+│                            SYSTEM_THREAD_SERVER_INITIALIZE)
+│      └─ handle_bootstrap_impl()
+│         └─ process_iterator(Compiled_in_command_iterator)   ← 走完整 DDL 路径
+│              USE mysql
+│              → mysql_system_tables[]      (CREATE TABLE user/db/tables_priv/...)
+│              → initialization_data[]      (FLUSH PRIVILEGES
+│                                            + CREATE USER root@localhost  ← ★ 在代码里
+│                                            + GRANT + global_grants)
+│              → mysql_system_data[]        (字符集/排序规则/SRS，5.26 MB)
+│              → fill_help_tables[]         (help 内容，1.42 MB)
+│              → mysql_system_users[]       (mysql.session / mysql.infoschema)
+│              → mysql_sys_schema[]         (sys schema)
+│            （若给了 --init-file）切 system_thread=INIT_FILE，跑 File_command_iterator
+│            ★ init-file 失败【不会】abort
+│
+├─ dd::init(DD_INITIALIZE_NON_DD_BASED_SYSTEM_VIEWS)
+│
+└─ unireg_abort(MYSQLD_SUCCESS_EXIT)   → mysqld_exit(0)   ★ 进程退出，不做服务器
+      └─ 用 abort 路径走【成功】退出码，因为此刻进程处于畸形态
+         （opt_noacl / 无 listener / 无 PFS 运行时）
+```
+
+**读图要点**：文件产出集中在两处——`srv_start(true)`（物理文件）与 `init_ssl_communication()`（证书）；而"表"的产出分两批——DD 表在 `dd::init()` 里用 C++ 硬编码 DDL 建，`mysql.*` 系统表在 `process_bootstrap()` 里用 SQL 建。**两条轨道，别混**。
+```
 │    my_long_early_options[] 解析 --initialize / --initialize-insecure
 │    if (opt_initialize_insecure) opt_initialize = true;      ← insecure 是 initialize 的超集
 │
@@ -298,6 +713,50 @@ mysqld --initialize
 | `--user` 场景 | 建完目录后 `chown` 给 `--user` |
 
 ### 二、数据目录准备
+
+#### 判定流程（三条分支、三种结果）
+
+```mermaid
+flowchart TD
+    A["initialize_create_data_directory(data_home)"] --> B{"my_dir() 能打开目录?"}
+
+    B -->|否：目录不存在| C["LogErr(ER_INIT_CREATING_DD)"]
+    C --> C1["my_mkdir(0750)"]
+    C1 --> C2{"成功?"}
+    C2 -->|否| X1["return true（启动失败）"]
+    C2 -->|是| C3["★ mysql_initialize_directory_freshly_created = true"]
+    C3 --> OK["return false（可用）"]
+
+    B -->|是：目录存在| D["遍历目录项<br/>忽略 '.' 开头 与 'lost+found'"]
+    D --> E{"还有其它文件?"}
+    E -->|是| X2["ER_INIT_DATADIR_NOT_EMPTY_WONT_INITIALIZE<br/>★ 直接失败"]
+    E -->|否：空目录| F["ER_INIT_DATADIR_EXISTS_WONT_INITIALIZE（info）"]
+
+    F --> G["fn_format() 拼 is_writable 试探路径"]
+    G --> H{"路径过长?"}
+    H -->|是| X3["ER_INIT_DATADIR_EXISTS_AND_PATH_TOO_LONG_WONT_INITIALIZE"]
+    H -->|否| I["my_create() 建试探文件"]
+    I --> J{"建成功?"}
+    J -->|否| X4["ER_INIT_DATADIR_EXISTS_AND_NOT_WRITABLE_WONT_INITIALIZE"]
+    J -->|是| K["my_close() + my_delete() 删掉"]
+    K --> OK
+
+    OK --> L["后续失败时…"]
+    X1 --> L
+    X2 --> L
+    X3 --> L
+    X4 --> L
+    L --> M{"freshly_created?"}
+    M -->|true| M1["ER_DATA_DIRECTORY_UNUSABLE_DELETABLE<br/>\"你可以把整个目录删掉\""]
+    M -->|false| M2["ER_DATA_DIRECTORY_UNUSABLE<br/>\"你可以删掉 server 加进去的文件\""]
+
+    style C3 fill:#e8f5e9
+    style X2 fill:#ffebee
+    style M1 fill:#fff3e0
+    style M2 fill:#fff3e0
+```
+
+**两条运维要点**：① "空"的判据是"只含 `.` 开头文件或 `lost+found`"——为挂载点上的隐藏文件留的口子；② **失败的数据目录 MySQL 从不自动清理**，只提示用户自己删，且用 `freshly_created` 这个标志区分"整个删"还是"只删 server 加的文件"。
 
 `initialize_create_data_directory()` 是初始化的第一个实质性动作：
 
@@ -558,6 +1017,41 @@ bool upgrade_tables(THD *thd) {
 
 而它的**唯一调用点**在 `bootstrap::restart()`（重启/升级路径）里。初始化走 `bootstrap::initialize()`，链路上根本没有它。同理 `sync_meta_data`（把内存定义与磁盘对象做比对同步）也只在 restart 路径出现——初始化用的是反过来方向的 `flush_meta_data`。
 
+#### 3.7 自举的十步：状态机视角
+
+`DD_bootstrap_ctx::Stage` 有 11 态。**初始化只走其中 8 态**（升级走全 11 态）——区别就在 `sync_meta_data` vs `flush_meta_data` 方向相反：
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> STARTED : DD_bootstrap_ctx::set_stage()
+
+    STARTED --> CREATED_TABLESPACES : store_predefined_tablespace_metadata()<br/>① 内存里造 mysql / innodb_system 两个 Tablespace 对象
+    CREATED_TABLESPACES --> CREATED_TABLES : ② create_dd_schema()<br/>CREATE SCHEMA mysql + USE mysql<br/>③ initialize_dd_properties()<br/>④ create_tables() ← SET FOREIGN_KEY_CHECKS=0（循环外键）
+
+    CREATED_TABLES --> POPULATED : ⑤ DDSE_dict_recover(INITIALIZE_SERVER)<br/>⑥ flush_meta_data() ★★ 自举落地<br/>（把内存脚手架写成真正的 DD 行）<br/>⑦ DDSE_dict_recover(INITIALIZE_TABLESPACES)<br/>⑧ populate_tables()
+
+    POPULATED --> VERSION_UPDATED : ⑨ update_properties()<br/>⑩ verify_contents() ★ 自检<br/>（用刚建好的 DD 查刚建好的 DD）
+    VERSION_UPDATED --> FINISHED : update_versions()
+    FINISHED --> [*]
+
+    note right of CREATED_TABLES
+      ★ 此时表是【空的物理表】
+      还没有描述自己的元数据行
+    end note
+    note right of POPULATED
+      ★ flush_meta_data() 是元循环落地点：
+      DD 表描述 DD 表自己
+    end note
+
+    FETCHED_PROPERTIES : （仅升级路径）
+    SYNCED : （仅升级路径）
+    UPGRADED_TABLES : （仅升级路径）
+    STORED_DD_META_DATA : （仅升级路径）
+```
+
+对比**重启路径**（`bootstrap::restart()`）走的分支：它不经过 `flush_meta_data`，而是 `sync_meta_data()`（把内存 C++ 表定义与磁盘上的 DD 对象做比对同步，并顺带填满共享缓存）——方向正好相反。这也是 `upgrade_tables()` 只在 restart 路径被调用的原因。
+
 ### 四、系统表与预置数据：SQL 怎么"编进二进制"
 
 #### 4.1 `comp_sql` 代码生成
@@ -618,6 +1112,58 @@ static const char *cmd_descs[] = {
 **关键点**：bootstrap **不走** `dispatch_command()`。它直接调 `dispatch_sql_command()`，因此**没有 `COM_QUERY` 命令分派这一层**——`thd->set_command()` 一直停在构造函数设的 `COM_CONNECT`。（`COM_QUERY` 在这个文件里只作为 general log 的分类参数出现。）这是初始化链路与常规查询链路的分水岭。
 
 ### 五、InnoDB 建库：物理文件从哪来
+
+#### 5.0 server 与引擎的握手时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SV as server 侧<br/>dd::init(DD_INITIALIZE)
+    participant BS as bootstrap 线程<br/>(SYSTEM_THREAD_DD_INITIALIZE)
+    participant H as handler 层<br/>innobase_ddse_dict_init
+    participant F as fil / log / fsp<br/>(物理文件层)
+
+    SV->>BS: run_bootstrap_thread(&bootstrap::initialize)
+    BS->>BS: Disable_autocommit_guard（关 autocommit）
+    BS->>H: DDSE_dict_init(DICT_INIT_CREATE_FILES)
+
+    rect rgb(255, 244, 229)
+        Note over H,F: ★ 第一层：先建物理文件
+        H->>H: dblwr 目录决定（innodb_doublewrite_dir）
+        H->>H: innobase_init_files(create=true)
+        H->>H: srv_sys_space.check_file_spec(create=true)
+        H->>F: srv_start(true)
+        F->>F: dblwr::open()（v2 独立文件）
+        F->>F: log_sys_init(true) → log_files_create()<br/>#innodb_redo/#ib_redo0（只 1 个）
+        F->>F: log_start() + log_start_background_threads()
+        F->>F: srv_undo_tablespaces_init(true) → undo_001/002
+        F->>F: fsp_header_init(0, sum_of_new_sizes)（page 0）
+        F->>F: trx_sys_create_sys_pages()（第 1 个 rseg）
+        F->>F: dict_create()（SYS_* 四棵内部表 + DICT_HDR）
+        F->>F: srv_create_sdi_indexes()（SDI_0）
+        F->>F: dblwr::v1::create()（page 64 / 128）
+        F->>F: srv_open_tmp_tablespace() → ibtmp1
+        F->>F: ibt::open_or_create() → 临时表空间池
+        F->>F: trx_rseg_adjust_rollback_segments()（补齐剩余 rseg）
+    end
+
+    H->>F: dd_create_hardcoded() → mysql.ibd（含 SDI）
+    H-->>SV: 回报 2 个 Plugin_tablespace<br/>（mysql / innodb_system）
+    H-->>SV: 回报 4 个 Object_table<br/>（dynamic_metadata / table_stats / index_stats / ddl_log）
+
+    rect rgb(232, 245, 233)
+        Note over BS,F: ★ 第二层：再用 SQL 建字典表
+        BS->>BS: create_dd_schema() + create_tables()<br/>（C++ 硬编码 DDL，非 SQL 文件）
+        BS->>H: DDSE_dict_recover(INITIALIZE_SERVER)<br/>（打开 4 张私有表）
+        BS->>BS: flush_meta_data() ★ 自举落地
+        BS->>H: DDSE_dict_recover(INITIALIZE_TABLESPACES)<br/>（注册预定义表空间 + commit）
+        BS->>BS: populate_tables() → verify_contents()
+    end
+
+    Note over SV: 回到 mysqld_main → process_bootstrap()<br/>灌 mysql_system_tables[] 等 SQL（另一条链路）
+```
+
+**这张图解释了全文最核心的一个问题**：为什么必须分两层。第一层（物理文件）不能走 SQL——因为还没有表可以往里写；第二层（字典表）必须走完整 DDL 路径——为了保证与运行期行为 100% 一致。
 
 #### 5.1 调用栈与"谁先谁后"
 
@@ -720,6 +1266,699 @@ static bool dd_create_hardcoded(space_id_t space_id, const char *filename) {
 ```
 id=%u;flags=%u;server_version=%u;space_version=%u;state=normal
 ```
+
+#### 5.4 系统表空间的页布局：为什么"第一个 rseg 必须建在 dblwr 之前"
+
+建库分支里有一条看起来很奇怪的顺序约束：
+
+```cpp
+    /* To maintain backward compatibility we create only
+    the first rollback segment before the double write buffer.
+    All the remaining rollback segments will be created later,
+    after the double write buffers haves been created. */
+    trx_sys_create_sys_pages();
+```
+
+系统表空间的页布局是**历史约定**：页 0 是 FSP header、页 2 起是 legacy doublewrite 的预留区、页 5 是 `TRX_SYS`。`trx_sys_create_sys_pages()` 建的第 1 个回滚段落在 dblwr 预留区**之前**，其余 rseg 则必须在 dblwr 之后分配。
+
+这个约束的代价是源码里两处 `FIXME`：
+
+```cpp
+    /* We always create the legacy double write buffer to preserve the
+    expected page ordering of the system tablespace.
+    FIXME: Try and remove this requirement. */
+    err = dblwr::v1::create();
+```
+
+即：**即便新版 doublewrite 已经不依赖系统表空间，建库时仍然必须建一个 legacy dblwr**，纯粹为了保持页序兼容。这是 8.0 里一段真实的升级包袱。
+
+其余 rseg 的补齐发生在 `srv_start` 的公共后段（`create_new_db` 两条路径共有）：
+
+```cpp
+  /* Here the double write buffer has already been created and so
+  any new rollback segments will be allocated after the double
+  write buffer. The default segment should already exist.
+  We create the new segments only if it's a new database or
+  the database was shutdown cleanly. */
+
+  /* Note: When creating the extra rollback segments during an upgrade
+  we violate the latching order, even if the change buffer is empty.
+  We make an exception in sync0sync.cc and check srv_is_being_started
+  for that violation. It cannot create a deadlock because we are still
+  running in single threaded mode essentially. Only the IO threads
+  should be running at this stage. */
+
+  ut_a(srv_rollback_segments > 0);
+  ut_a(srv_rollback_segments <= TRX_SYS_N_RSEGS);
+
+  if (!trx_rseg_adjust_rollback_segments(srv_rollback_segments)) {
+    return (srv_init_abort(DB_ERROR));
+  }
+```
+
+注意第二条注释：升级时创建额外 rseg 会**违反 latch 顺序**，`sync0sync.cc` 里专门用 `srv_is_being_started` 给它开了例外——理由是此刻实质上是单线程的（只有 IO 线程在跑），不可能死锁。这是"用运行时状态为静态锁序校验开后门"的实例。
+
+#### 5.5 `dict_create()`：InnoDB 自己的四棵内部系统表
+
+```cpp
+    err = dict_create();
+    if (err != DB_SUCCESS) return (srv_init_abort(err));
+
+    srv_create_sdi_indexes();
+```
+
+**这里最容易混淆的一点**：`dict_create()` 建的是 **InnoDB 引擎内部**的四棵系统表——`SYS_TABLES` / `SYS_COLUMNS` / `SYS_INDEXES` / `SYS_FIELDS`，以及定位它们的 `DICT_HDR` 页。它们与 server 层 8.0 的 Data Dictionary（`mysql.tables` / `mysql.columns` …）**是两套东西**，后者建立在前者之上。
+
+建库顺序上 `dict_create()` 必须在 `srv_create_sdi_indexes()` 之前——SDI 索引要挂在 dict 内部表之上。
+
+#### 5.6 undo 表空间的三个子函数
+
+```cpp
+static dberr_t srv_undo_tablespaces_init(bool create_new_db) {
+  dberr_t err = DB_SUCCESS;
+
+  /* Open any existing implicit undo tablespaces. */
+  if (!create_new_db) {
+    err = srv_undo_tablespaces_open();
+    if (err != DB_SUCCESS) return (err);
+  }
+
+  /* If this is opening an existing database, create and open any
+  undo tablespaces that are still needed. For a new DB, create
+  them all. */
+  mutex_enter(&undo::ddl_mutex);
+  err = srv_undo_tablespaces_create();
+  if (err != DB_SUCCESS) { mutex_exit(&undo::ddl_mutex); return (err); }
+
+  /* Finish building any undo tablespaces just created by adding
+  header pages, rseg_array pages, and rollback segments. Then delete
+  any undo truncation log files and clear the construction list.
+  This list includes any tablespace newly created or fixed-up. */
+  err = srv_undo_tablespaces_construct();
+  if (err != DB_SUCCESS) { mutex_exit(&undo::ddl_mutex); return (err); }
+
+  mutex_exit(&undo::ddl_mutex);
+  return (DB_SUCCESS);
+}
+```
+
+三阶段职责：`_create` 建文件（`undo_001` / `undo_002`）→ `_construct` 补 header 页、rseg_array 页、回滚段，并清理 `trunc.log` → 全部完成后由 `srv_undo_tablespaces_mark_construction_done()` 收尾。
+
+注意 `create_new_db=false` 时先 `_open()` 再补齐——所以"重启时也可能建新 undo 表空间"（比如上次 truncate 没做完）。
+
+#### 5.7 临时表空间：`ibtmp1` 与临时表空间池
+
+建库分支走完之后（两条路径共有）：
+
+```cpp
+  /* Open temp-tablespace and keep it open until shutdown. */
+  err = srv_open_tmp_tablespace(create_new_db, &srv_tmp_space);
+  if (err != DB_SUCCESS) return (srv_init_abort(err));
+
+  err = ibt::open_or_create(create_new_db);
+  if (err != DB_SUCCESS) return (srv_init_abort(err));
+```
+
+两个不同的东西：
+
+| | `srv_tmp_space`（`ibtmp1`） | `ibt::open_or_create()` |
+|---|---|---|
+| 用途 | 非压缩临时表的回滚段与临时数据 | 8.0 的 **InnoDB 临时表空间池**（session temporary tablespaces） |
+| 数量 | 1 个 | 池（默认 10 个 `.ibt` 文件） |
+| 相关变量 | `innodb_temp_data_file_path` | `innodb_temp_tablespaces_dir` |
+
+#### 5.8 建库分支的完整顺序（汇总）
+
+```
+1  srv_sys_space.open_or_create()      → ibdata1         （默认 ibdata1:12M:autoextend）
+2  log_sys_init(true, ...)             → redo            （8.0.30+ 是 #innodb_redo/#ib_redoN）
+3  log_start() + log_start_background_threads()
+4  srv_undo_tablespaces_init(true)     → undo_001 / undo_002
+5  fsp_header_init(0, sum_of_new_sizes, &mtr)
+6  trx_sys_create_sys_pages()          → 第 1 个 rseg（在 dblwr 之前，为兼容）
+7  trx_purge_sys_mem_create() / trx_sys_init_at_db_start() / trx_purge_sys_initialize()
+8  dict_create()                       → SYS_TABLES/COLUMNS/INDEXES/FIELDS + DICT_HDR 页
+9  srv_create_sdi_indexes()
+10 dblwr::v1::create()                 → legacy doublewrite（为页序兼容，有 FIXME）
+── 以下两条路径共有 ──
+11 srv_open_tmp_tablespace()           → ibtmp1
+12 ibt::open_or_create()               → 临时表空间池
+13 trx_rseg_adjust_rollback_segments() → 补齐剩余 rseg（在 dblwr 之后）
+14 srv_undo_tablespaces_mark_construction_done()
+```
+
+#### 5.9 redo 文件到底怎么建出来的
+
+`log_sys_init(create_new_db, flushed_lsn, new_files_lsn)` 是 redo 的建/开入口。先看命名与容量常量（`include/log0constants.h`）：
+
+```cpp
+constexpr const char *const LOG_DIRECTORY_NAME = "#innodb_redo";
+constexpr const char *const LOG_FILE_BASE_NAME = "#ib_redo";
+constexpr size_t LOG_N_FILES = 32;
+constexpr os_offset_t LOG_CAPACITY_MIN = 8 * 1024 * 1024;          /* 8M */
+constexpr os_offset_t LOG_CAPACITY_MAX = 512ull * 1024 * 1024 * 1024; /* 512G */
+constexpr lsn_t LOG_START_LSN = 16 * OS_FILE_LOG_BLOCK_SIZE;       /* 16*512 = 8192 */
+constexpr os_offset_t LOG_FILE_HDR_SIZE = 4 * OS_FILE_LOG_BLOCK_SIZE; /* 2048 */
+constexpr uint32_t LOG_BLOCK_HDR_SIZE = 12;
+```
+
+即：`LOG_START_LSN = 8192`、`LOG_BLOCK_HDR_SIZE = 12`。这解释了两处断言：
+
+```cpp
+    ut_a(log_sys->last_checkpoint_lsn.load() == LOG_START_LSN + LOG_BLOCK_HDR_SIZE);  // 8204
+    ut_a(new_files_lsn == LOG_START_LSN + LOG_BLOCK_HDR_SIZE);
+```
+
+**建库时只建 1 个文件，不是 32 个**：
+
+```cpp
+  if (expect_no_files) {
+    ut_a(srv_force_recovery < SRV_FORCE_NO_LOG_REDO);
+    ut_a(!srv_read_only_mode);
+    new_files_lsn = flushed_lsn;
+    return log_files_create(log, flushed_lsn);
+  }
+```
+
+`log_files_create()` 里只有一句 `log_files_create_file(log, LOG_FIRST_FILE_ID, ...)`，即 `#innodb_redo/#ib_redo0`。**其余 31 个由后台线程 `log_files_governor` 在运行时按需创建**——这是 8.0.30 `innodb_redo_log_capacity` 带来的变化：redo 从"固定 2 个预分配文件"变成"按需增长的环形文件池"。
+
+单文件大小：
+
+```cpp
+os_offset_t Log_files_capacity::next_file_size(os_offset_t physical_capacity) {
+  const auto file_size = ut_uint64_align_down(physical_capacity / LOG_N_FILES, UNIV_PAGE_SIZE);
+  ...
+}
+```
+
+即 **`align_down(innodb_redo_log_capacity / 32, UNIV_PAGE_SIZE)`**（默认 `innodb_redo_log_capacity = 100MB` → 约 3.125MB/文件）。
+
+建文件的手法值得一看——**先建 `_tmp` 再 rename**：
+
+```cpp
+  err = log_create_unused_file(log.m_files_ctx, file_id, file_size);   // #ib_redo0_tmp
+  ...
+  err = log_file_header_write(file_handle, header);
+  err = log_files_write_checkpoint_low(log, file_handle, HEADER_1, checkpoint_lsn);
+  err = log_files_write_checkpoint_low(log, file_handle, HEADER_2, checkpoint_lsn);
+  ...
+  err = log_mark_file_as_in_use(log.m_files_ctx, file_id);              // 去掉 _tmp
+```
+
+先写两个 checkpoint 头（HEADER_1 / HEADER_2），再 rename 成正式文件。这样"文件存在"本身就意味着"两个 checkpoint 域都已初始化"，不会出现半成品 redo 文件。
+
+最后一步是 `log_start()`，它把内存 `log_t` 的 LSN/sn/link buffer 对齐到"可继续写入"的状态，并把最后一个不完整 block 按 `start_lsn` **截断**：
+
+```cpp
+  block_header.m_data_len = start_lsn - block_lsn;   // 截断到最后一个完整 mtr
+```
+
+#### 5.10 `fsp_header_init()` 写了什么
+
+```cpp
+bool fsp_header_init(space_id_t space_id, page_no_t size, mtr_t *mtr) {
+  mtr_x_lock_space(space, mtr);
+  auto block = buf_page_create(page_id_t(space_id, 0), page_size, RW_SX_LATCH, mtr);  // 创建 page 0
+  space->size_in_header = size;
+  fsp_init_file_page(block, mtr);                                    // 清页 + 写 FIL 头/尾
+  mlog_write_ulint(page + FIL_PAGE_TYPE, FIL_PAGE_TYPE_FSP_HDR, MLOG_2BYTES, mtr);
+  mlog_write_ulint(page + FIL_PAGE_SRV_VERSION, DD_SPACE_CURRENT_SRV_VERSION, MLOG_4BYTES, mtr);
+  mlog_write_ulint(page + FIL_PAGE_SPACE_VERSION, DD_SPACE_CURRENT_SPACE_VERSION, MLOG_4BYTES, mtr);
+
+  auto header = FSP_HEADER_OFFSET + page;                            // FSP_HEADER_OFFSET = FIL_PAGE_DATA = 38
+  mlog_write_ulint(header + FSP_SPACE_ID, space_id, MLOG_4BYTES, mtr);
+  fsp_header_size_update(header, size, mtr);                         // FSP_SIZE
+  mlog_write_ulint(header + FSP_FREE_LIMIT, 0, MLOG_4BYTES, mtr);
+  mlog_write_ulint(header + FSP_SPACE_FLAGS, space->flags, MLOG_4BYTES, mtr);
+  mlog_write_ulint(header + FSP_FRAG_N_USED, 0, MLOG_4BYTES, mtr);
+  flst_init(header + FSP_FREE, mtr);
+  flst_init(header + FSP_FREE_FRAG, mtr);
+  flst_init(header + FSP_FULL_FRAG, mtr);
+  flst_init(header + FSP_SEG_INODES_FULL, mtr);
+  flst_init(header + FSP_SEG_INODES_FREE, mtr);
+  mlog_write_ull(header + FSP_SEG_ID, 1, mtr);                       // 下一个可用 segment id
+  fsp_fill_free_list(..., space, header, mtr);
+  ...
+  if (space_id == TRX_SYS_SPACE) {                                   // ★ 只有系统表空间
+    if (btr_create(DICT_CLUSTERED | DICT_IBUF, 0, DICT_IBUF_ID_MIN + space_id,
+                   dict_ind_redundant, mtr) == FIL_NULL) return (false);
+  }
+```
+
+FSP_HEADER 的字段布局（`include/fsp0fsp.h`）：
+
+| 偏移 | 字段 | 含义 |
+|---|---|---|
+| 0 | `FSP_SPACE_ID` | 表空间 ID |
+| 4 | `FSP_NOT_USED` | 历史遗留 |
+| 8 | `FSP_SIZE` | 当前大小（页数） |
+| 12 | `FSP_FREE_LIMIT` | 尚未加入 free list 的最小页号 |
+| 16 | `FSP_SPACE_FLAGS` | 页大小 / 压缩 / 加密 / **SDI** 等标志 |
+| 20 | `FSP_FRAG_N_USED` | `FSP_FREE_FRAG` 中已用页数 |
+| 24 | `FSP_FREE` | 空闲 extent 链表 |
+| +16 | `FSP_FREE_FRAG` | 部分空闲 extent 链表 |
+| +32 | `FSP_FULL_FRAG` | 满 fragment extent 链表 |
+| +48 | `FSP_SEG_ID` | 下一个可用 segment id（8 字节） |
+| … | `FSP_SEG_INODES_FULL` / `FSP_SEG_INODES_FREE` | inode 页链表 |
+
+**为什么必须 mtr 包裹**：所有写页都通过 `mlog_write_*` / `flst_init` / `fsp_fill_free_list` 完成，它们都会**产生 redo**。mtr 保证"page 0 + XDES 页 + IBUF 根页"要么全生效要么全不生效。若不用 mtr，会出现"页类型已改成 `FIL_PAGE_TYPE_FSP_HDR` 但 FSP 字段还没写"的半初始化页，崩溃后无法恢复。
+
+系统表空间的页布局常量（`fsp0types.h`）：
+
+```cpp
+constexpr uint32_t FSP_IBUF_TREE_ROOT_PAGE_NO = 4;
+constexpr uint32_t FSP_TRX_SYS_PAGE_NO = 5;
+constexpr uint32_t FSP_FIRST_RSEG_PAGE_NO = 6;
+constexpr uint32_t FSP_DICT_HDR_PAGE_NO = 7;
+```
+
+合起来看，建库后**系统表空间的页布局**是这样（这也是理解"为什么第一个 rseg 必须建在 dblwr 之前"的直观图）：
+
+```
+page 0   FSP_HDR        ← fsp_header_init()：FSP_SIZE / SPACE_FLAGS / 五条 extent 链表 / SEG_ID
+page 1   IBUF_BITMAP
+page 2   INODE
+page 3   SYS（insert buffer header）
+page 4   IBUF 树根      ← fsp_header_init() 尾部 btr_create(DICT_IBUF)，仅系统表空间
+page 5   TRX_SYS        ← trx_sys_create_sys_pages()；★ legacy dblwr 的元信息存在此处
+                          （TRX_SYS_DBLWR_V1 = UNIV_PAGE_SIZE - 200）
+page 6   FSP_FIRST_RSEG ← ★ 第 1 个回滚段（在 dblwr 之前，为向后兼容）
+page 7   DICT_HDR       ← dict_create()：SYS_TABLES / SYS_COLUMNS / SYS_INDEXES / SYS_FIELDS 的根
+  ...    （dict_create() 分配的其它页 + SDI_0 索引根页）
+page 64  ┐
+  ...    ├ LEGACY_PAGE1：dblwr 第 1 段（1 个 extent = 64 页）
+page 127 ┘            页类型 FIL_PAGE_TYPE_LEGACY_DBLWR
+page 128 ┐
+  ...    ├ LEGACY_PAGE2：dblwr 第 2 段（1 个 extent = 64 页）
+page 191 ┘
+  ...    其余 rseg（trx_rseg_adjust_rollback_segments，建在 dblwr 之后）
+  ...    XDES / IBUF_BITMAP 页按 extent 推进
+```
+
+**为什么这布局改不动**：页号是历史约定，旧版本与工具（甚至崩溃恢复的某些路径）都按它假设。所以即使 8.0.20 起 v2 dblwr 已经不依赖系统表空间，**建库时仍然要建 v1 占住 page 64/128**——源码为此留了两处 `FIXME`。
+
+#### 5.11 doublewrite 的 legacy 页布局：`LEGACY_PAGE1 = 64`、`LEGACY_PAGE2 = 128`
+
+这两个名字**不是编译期常量**，而是运行时分配后写回的变量：
+
+```cpp
+static page_no_t LEGACY_PAGE1;
+static page_no_t LEGACY_PAGE2;
+```
+
+`Double_write::create_v1()` 里的分配逻辑：
+
+```cpp
+  const uint32_t n_blocks = 2 * DBLWR_V1_EXTENT_SIZE + FSP_EXTENT_SIZE / 2;   // 2*64 + 32 = 160
+  for (uint32_t i = 0; i < n_blocks; ++i) {
+    auto new_block = fseg_alloc_free_page(fseg_header, prev_page_no + 1, FSP_UP, &mtr);
+    mach_write_to_2(new_block->frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_LEGACY_DBLWR);
+    auto page_no = new_block->page.id.page_no();
+    if (i == FSP_EXTENT_SIZE / 2) {                    // i == 32
+      ut_a(page_no == FSP_EXTENT_SIZE);                // ★ 64
+      mlog_write_ulint(doublewrite + DBLWR_V1_BLOCK1, page_no, MLOG_4BYTES, &mtr);
+      page_no1 = page_no;                              // LEGACY_PAGE1 = 64
+    } else if (i == FSP_EXTENT_SIZE / 2 + DBLWR_V1_EXTENT_SIZE) {   // i == 96
+      ut_a(page_no == 2 * FSP_EXTENT_SIZE);            // ★ 128
+      mlog_write_ulint(doublewrite + DBLWR_V1_BLOCK2, page_no, MLOG_4BYTES, &mtr);
+      page_no2 = page_no;                              // LEGACY_PAGE2 = 128
+    }
+  }
+  mlog_write_ulint(doublewrite + DBLWR_VER, DBLWR_V1, MLOG_4BYTES, &mtr);
+```
+
+即：legacy dblwr 占用系统表空间 **page 64..127 与 page 128..191** 两个 extent，页类型 `FIL_PAGE_TYPE_LEGACY_DBLWR`；两个起始页号（各写两份，含 `DBLWR_V1_REPEAT` 冗余副本）存在 **TRX_SYS 第 5 页** 的 `TRX_SYS_DBLWR_V1 = UNIV_PAGE_SIZE - 200` 偏移处。启动时 `dblwr::v1::init()` 读回这两个值。
+
+**为什么叫 legacy / 为什么 8.0 还在建**：v1 把 buffer 放在系统表空间内部（8.0.20 前唯一实现）；8.0.20 起引入 **v2**——独立的 `#innodb_dblwr` 目录下的 `.dblwr` / `.bdblwr` 文件，由 `dblwr::open()` 创建（注意它在 `log_sys_init()` **之前**）。建库时**仍然必须建 v1**，理由是那句带 `FIXME` 的注释：保持系统表空间的页序不变。
+
+`dblwr::is_enabled()` 的判据：
+
+```cpp
+bool Mode::is_enabled_low(ulong mode) {
+  return mode == ON || mode == TRUEE || mode == DETECT_AND_RECOVER || mode == DETECT_ONLY;
+}
+```
+
+即：**只有 `OFF` / `FALSEE` 算关闭**，`DETECT_ONLY`（reduced，只检测不恢复、写量减半）也算启用。
+
+#### 5.12 SDI 索引是什么
+
+SDI 是每个表空间内部一张**隐藏的 B 树**，表名 `SDI_<space_id>`：
+
+```cpp
+  snprintf(table_name, sizeof(table_name), "SDI_" SPACE_ID_PF, space);   // 如 "SDI_0"
+  constexpr size_t n_cols_sdi = 5;
+  dict_mem_table_add_col(table, heap, "type",             DATA_INT, ..., 4, true);
+  dict_mem_table_add_col(table, heap, "id",               DATA_INT, ..., 8, true);
+  dict_mem_table_add_col(table, heap, "compressed_len",   DATA_INT, ..., 4, true);
+  dict_mem_table_add_col(table, heap, "uncompressed_len", DATA_INT, ..., 4, true);
+  dict_mem_table_add_col(table, heap, "data",             DATA_BLOB, ...);
+  const char *index_name = "CLUST_IND_SDI";
+  dict_index_t *temp_index = dict_mem_index_create(table_name, index_name, space,
+                              DICT_CLUSTERED | DICT_UNIQUE | DICT_SDI, 2);
+  temp_index->add_field("type", 0, true);
+  temp_index->add_field("id", 0, true);
+  temp_index->disable_ahi = true;                    // 关闭 AHI
+```
+
+- 聚簇唯一索引，键 `(type, id)`，`data` 列存**压缩后的 JSON 字典信息**；
+- 根页号 + `SDI_VERSION` 写在 **page 0** 的 FSP header 之后（`fsp_sdi_write_root_to_page()`），并在 `FSP_SPACE_FLAGS` 上置 SDI 标志位；
+- table_id 用高 32 位全 1 编码：`dict_sdi_get_table_id(space_id) = (~0ULL << 32) | space_id`；index_id 固定为 `UINT64_MAX`。
+
+**为什么建库时只在 system tablespace 建**（`srv_create_sdi_indexes()` 只有一句 `btr_sdi_create_index(SYSTEM_TABLE_SPACE, false)`）：此刻唯一存在的表空间就是系统表空间。其它表空间在各自被创建时建 SDI——`mysql.ibd` 在 `dd_create_hardcoded()` 里，每个 `.ibd` 在 `dict0crea.cc` 里，IMPORT / CREATE TABLESPACE 各有调用点。
+
+#### 5.13 引擎侧与 server 的握手：`innobase_ddse_dict_init()`
+
+⚠️ **勘误**：
+- 它注册的是 **4 张**表（`innodb_dynamic_metadata` / `innodb_table_stats` / `innodb_index_stats` / `innodb_ddl_log`），不是两张。
+- **`srv_start()` 在 `storage/innobase` 全仓只有一处调用点**（`ha_innodb.cc:5492`，在 `innobase_init_files()` 内），而 `innobase_init_files()` 只被 `innobase_ddse_dict_init()` 调用 ⇒ **InnoDB 启动发生在 DD 自举线程里、任何 `CREATE TABLE mysql.*` 之前**。
+- 方向是 **server → engine**（server 通过 handlerton 回调），引擎只往出参回填 `List<const dd::Object_table>` 与 `List<const Plugin_tablespace>`；随后由 server 侧 `DDSE_dict_init()` 灌进 registry。**不是**引擎回调 `dd::get_dictionary()`。
+
+**完整函数体**（`storage/innobase/handler/ha_innodb.cc:12907`）：
+
+```cpp
+static bool innobase_ddse_dict_init(
+    dict_init_mode_t dict_init_mode, uint, List<const dd::Object_table> *tables,
+    List<const Plugin_tablespace> *tablespaces) {
+  DBUG_TRACE;
+  LogErr(SYSTEM_LEVEL, ER_IB_MSG_INNODB_START_INITIALIZE);
+  assert(tables && tables->is_empty());
+  assert(tablespaces && tablespaces->is_empty());
+
+  if (dblwr::is_enabled()) {                       // ★ doublewrite 目录在此定下来
+    if (innobase_doublewrite_dir != nullptr && *innobase_doublewrite_dir != 0) {
+      dblwr::dir.assign(innobase_doublewrite_dir);
+      switch (dblwr::dir.front()) {
+        case '#': case '.': break;
+        default:
+          if (!Fil_path::is_absolute_path(dblwr::dir)) dblwr::dir.insert(0, "#");
+      }
+      ib::info(ER_IB_MSG_DBLWR_1325) << "Using " << dblwr::dir
+                                     << " as doublewrite directory";
+    } else { dblwr::dir.assign("."); }
+    ib::info(ER_IB_MSG_DBLWR_1304) << "Atomic write enabled";
+  } else {
+    ib::info(ER_IB_MSG_DBLWR_1305) << "Atomic write disabled";
+  }
+
+  if (innobase_init_files(dict_init_mode, tablespaces)) {   // ★★ 内部调 srv_start()
+    return true;
+  }
+
+  /* Instantiate table defs only if we are successful so far. */
+  dd::Object_table *innodb_dynamic_metadata =
+      dd::Object_table::create_object_table();    // ★ 工厂方法（sql/dd/types/object_table.h:90）
+  innodb_dynamic_metadata->set_hidden(true);      // ★ hidden ⇒ server 登记为 DDSE_PRIVATE
+  dd::Object_table_definition *def =
+      innodb_dynamic_metadata->target_table_definition();
+  def->set_table_name("innodb_dynamic_metadata");
+  def->add_field(0, "table_id", "table_id BIGINT UNSIGNED NOT NULL");
+  def->add_field(1, "version", "version BIGINT UNSIGNED NOT NULL");
+  def->add_field(2, "metadata", "metadata BLOB NOT NULL");
+  def->add_index(0, "index_pk", "PRIMARY KEY (table_id)");
+  /* Options and tablespace are set at the SQL layer. */   // ★ 引擎不指定 ENGINE/表空间
+
+  /* Changing these values would change the specification of innodb statistics
+  tables. */
+  static constexpr size_t DB_NAME_FIELD_SIZE = 64;
+  static constexpr size_t TABLE_NAME_FIELD_SIZE = 199;
+  static_assert(DB_NAME_FIELD_SIZE == dict_name::MAX_DB_CHAR_LEN, "...");
+  static_assert(TABLE_NAME_FIELD_SIZE == dict_name::MAX_TABLE_CHAR_LEN, "...");
+
+  dd::Object_table *innodb_table_stats = dd::Object_table::create_object_table();
+  innodb_table_stats->set_hidden(false);          // ★ 非 hidden ⇒ DDSE_PROTECTED（可 DML）
+  def = innodb_table_stats->target_table_definition();
+  def->set_table_name("innodb_table_stats");
+  def->add_field(0, "database_name", db_field.c_str());   // VARCHAR(64)
+  def->add_field(1, "table_name", table_field.c_str());   // VARCHAR(199)
+  def->add_field(2, "last_update", "last_update TIMESTAMP NOT NULL \n"
+                 "  DEFAULT CURRENT_TIMESTAMP \n  ON UPDATE CURRENT_TIMESTAMP");
+  def->add_field(3, "n_rows", "n_rows BIGINT UNSIGNED NOT NULL");
+  def->add_field(4, "clustered_index_size", "... BIGINT UNSIGNED NOT NULL");
+  def->add_field(5, "sum_of_other_index_sizes", "... BIGINT UNSIGNED NOT NULL");
+  def->add_index(0, "index_pk", "PRIMARY KEY (database_name, table_name)");
+
+  dd::Object_table *innodb_index_stats = dd::Object_table::create_object_table();
+  innodb_index_stats->set_hidden(false);
+  def = innodb_index_stats->target_table_definition();
+  def->set_table_name("innodb_index_stats");
+  ...
+  def->add_index(0, "index_pk",
+                 "PRIMARY KEY (database_name, table_name, index_name, stat_name)");
+
+  dd::Object_table *innodb_ddl_log = dd::Object_table::create_object_table();
+  innodb_ddl_log->set_hidden(true);               // ★ DDL log 也 hidden
+  def = innodb_ddl_log->target_table_definition();
+  def->set_table_name("innodb_ddl_log");
+  def->add_field(0, "id", "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT");
+  def->add_field(1, "thread_id", "thread_id BIGINT UNSIGNED NOT NULL");
+  def->add_field(2, "type", "type INT UNSIGNED NOT NULL");
+  ...
+  def->add_index(0, "index_pk", "PRIMARY KEY(id)");
+  def->add_index(1, "index_k_thread_id", "KEY(thread_id)");
+
+  tables->push_back(innodb_dynamic_metadata);     // ★★ 交给 server：4 张
+  tables->push_back(innodb_table_stats);
+  tables->push_back(innodb_index_stats);
+  tables->push_back(innodb_ddl_log);
+
+  LogErr(SYSTEM_LEVEL, ER_IB_MSG_INNODB_END_INITIALIZE);
+  return false;
+}
+```
+
+**handlerton 钩子注册点**（`ha_innodb.cc:5183`）：
+
+```cpp
+  innobase_hton->ddse_dict_init = innobase_ddse_dict_init;   // ★★ server → engine 的入口
+  innobase_hton->dict_register_dd_table_id = innobase_dict_register_dd_table_id;
+  innobase_hton->dict_cache_reset = innobase_dict_cache_reset;
+  innobase_hton->dict_cache_reset_tables_and_tablespaces = ...;
+  innobase_hton->dict_recover = innobase_dict_recover;       // ★ 对应 DICT_RECOVERY_* 三态
+  innobase_hton->dict_get_server_version = innobase_dict_get_server_version;
+```
+
+**`innobase_init_files()` —— `srv_start()` 的唯一调用点 + 表空间回填**（`ha_innodb.cc:5471`）：
+
+```cpp
+static int innobase_init_files(dict_init_mode_t dict_init_mode,
+                               List<const Plugin_tablespace> *tablespaces) {
+  bool create = (dict_init_mode == DICT_INIT_CREATE_FILES);
+  //  ★ --initialize 时 initialize() 传的就是 DICT_INIT_CREATE_FILES ⇒ create == true
+
+  /* Check if the data files exist or not. */
+  dberr_t err = srv_sys_space.check_file_spec(create, MIN_EXPECTED_TABLESPACE_SIZE);
+  if (err != DB_SUCCESS) return innodb_init_abort();
+
+  srv_is_upgrade_mode = (dict_init_mode == DICT_INIT_UPGRADE_57_FILES);
+
+  /* Start the InnoDB server. */
+  err = srv_start(create);      // ★★★ srv_start() 在 storage/innobase 的唯一调用点
+  if (err != DB_SUCCESS) return innodb_init_abort();
+
+  ...  /* 5.7 升级专用：build table id / 拒绝 prepared XA / 跑空 purge ... */
+
+  bool ret;
+  create |= (dict_init_mode == DICT_INIT_UPGRADE_57_FILES);
+  ret = create ? dd_create_hardcoded(dict_sys_t::s_dict_space_id,
+                                     dict_sys_t::s_dd_space_file_name)   // ★ --initialize：物理建 mysql.ibd
+               : dd_open_hardcoded(dict_sys_t::s_dict_space_id,
+                                   dict_sys_t::s_dd_space_file_name);    // ★ 重启：只打开
+  if (!ret) {
+    /* 回填两个预定义表空间给 server */
+    static Plugin_tablespace dd_space(dict_sys_t::s_dd_space_name, "",
+                                      se_private_data_dd, "", innobase_hton_name);
+    static Plugin_tablespace::Plugin_tablespace_file dd_file(
+        dict_sys_t::s_dd_space_file_name, "");
+    dd_space.add_file(&dd_file);
+    tablespaces->push_back(&dd_space);        // ★ mysql ⇒ server 标成 Types::DD
+
+    static Plugin_tablespace innodb(dict_sys_t::s_sys_space_name, "",
+                                    se_private_data_innodb_system, "",
+                                    innobase_hton_name);
+    ...
+    tablespaces->push_back(&innodb);          // ★ innodb_system ⇒ Types::PREDEFINED_DDSE
+  } else return innodb_init_abort();
+
+  ...
+  innodb_inited = true;      // ★ 到这一步 InnoDB 才算可用
+}
+```
+
+**server 侧接收：`DDSE_dict_init()`（`sql/dd/impl/bootstrap/bootstrapper.cc:729`）**：
+
+```cpp
+bool DDSE_dict_init(THD *thd, dict_init_mode_t dict_init_mode, uint version) {
+  handlerton *ddse = ha_resolve_by_legacy_type(thd, DB_TYPE_INNODB);   // ★ DDSE 硬编码 InnoDB
+
+  List<const Object_table> ddse_tables;
+  List<const Plugin_tablespace> ddse_tablespaces;
+  if (ddse->ddse_dict_init == nullptr ||
+      ddse->ddse_dict_init(dict_init_mode, version, &ddse_tables,
+                           &ddse_tablespaces))
+    return true;                              // ★★ 回调进 InnoDB
+
+  List_iterator<const Object_table> table_it(ddse_tables);
+  const Object_table *ddse_table = nullptr;
+  while ((ddse_table = table_it++)) {
+    System_tables::Types table_type = System_tables::Types::DDSE_PROTECTED;   // 可见 ⇒ 只读 DML
+    if (ddse_table->is_hidden())
+      table_type = System_tables::Types::DDSE_PRIVATE;                       // hidden ⇒ DDL/DML 都不可见
+    System_tables::instance()->add(MYSQL_SCHEMA_NAME.str, ddse_table->name(),
+                                   table_type, ddse_table);
+  }
+
+  if (!opt_initialize) {                      // ★ --initialize 时跳过版本协商（新目录没有旧版本）
+    uint server_version = 0;
+    if (ddse->dict_get_server_version == nullptr ||
+        ddse->dict_get_server_version(&server_version)) { ... return true; }
+    if (server_version != MYSQL_VERSION_ID) { ...升级/降级检查... }
+  }
+
+  System_tables::instance()->add_remaining_dd_tables();   // ★ 补登记 server 自带的 CORE/SECOND/SYSTEM 表
+
+  List_iterator<const Plugin_tablespace> tablespace_it(ddse_tablespaces);
+  const Plugin_tablespace *tablespace = nullptr;
+  while ((tablespace = tablespace_it++)) {
+    if (my_strcasecmp(system_charset_info, MYSQL_TABLESPACE_NAME.str,
+                      tablespace->get_name()) == 0)
+      System_tablespaces::instance()->add(tablespace->get_name(),
+                                          System_tablespaces::Types::DD, tablespace);
+    else
+      System_tablespaces::instance()->add(tablespace->get_name(),
+                                          System_tablespaces::Types::PREDEFINED_DDSE,
+                                          tablespace);
+  }
+  return false;
+}
+```
+
+**registry 的真实机制**（⚠️ **不存在 `dd::Object_table_registry`**）——是 `System_tables` + 匿名 namespace 里的模板函数：
+
+```cpp
+// sql/dd/impl/system_registry.cc:107
+namespace {
+template <typename X>
+void register_table(dd::System_tables::Types type) {
+  dd::System_tables::instance()->add(
+      MYSQL_SCHEMA_NAME.str, X::instance().name(), type, &X::instance());
+}
+void register_table(const dd::String_type table, dd::System_tables::Types type) {
+  dd::System_tables::instance()->add(MYSQL_SCHEMA_NAME.str, table, type, nullptr);
+}
+}
+
+void System_tables::add_inert_dd_tables() {
+  dd::System_tables::Types inert = dd::System_tables::Types::INERT;
+  register_table<DD_properties>(inert);   // ★★ INERT 表只有 dd_properties 一张，必须先建才能读版本号
+}
+
+void System_tables::add_remaining_dd_tables() {
+  dd::System_tables::Types core = dd::System_tables::Types::CORE;
+  dd::System_tables::Types second = dd::System_tables::Types::SECOND;
+  dd::System_tables::Types system = dd::System_tables::Types::SYSTEM;
+
+  register_table<Catalogs>(core);
+  register_table<Character_sets>(core);
+  register_table<Check_constraints>(core);
+  register_table<Collations>(core);
+  register_table<dd::tables::Column_statistics>(core);
+  register_table<Column_type_elements>(core);
+  register_table<Columns>(core);
+  register_table<Events>(second);
+  register_table<Foreign_key_column_usage>(core);
+  register_table<Foreign_keys>(core);
+  register_table<Index_column_usage>(core);
+  register_table<Index_partitions>(core);
+  register_table<Index_stats>(second);
+  register_table<Indexes>(core);
+  register_table<Parameter_type_elements>(second);
+  register_table<Parameters>(second);
+  register_table<Resource_groups>(core);
+  register_table<Routines>(second);
+  register_table<Schemata>(core);
+  register_table<Spatial_reference_systems>(second);
+  register_table<Table_partition_values>(core);
+  register_table<Table_partitions>(core);
+  register_table<Table_stats>(second);
+  register_table<Tables>(core);
+  register_table<Tablespace_files>(core);
+  register_table<Tablespaces>(core);
+  register_table<Triggers>(core);
+  register_table<View_routine_usage>(core);
+  register_table<View_table_usage>(core);
+  register_table("backup_history", system);   // 已废弃的表：只有名字没有实体
+  ...
+}
+```
+
+```cpp
+// sql/dd/impl/system_registry.h:332 —— 表分类
+  enum class Types { INERT, CORE, SECOND, DDSE_PRIVATE, DDSE_PROTECTED, PFS, SYSTEM };
+  /*
+    - An INERT table can never change.
+    - The dd::Table objects representing the CORE tables must be present
+      to handle a cache miss for an arbitrary table.
+    - The dd::Table objects representing the SECOND order tables can be
+      fetched from the dd tables as long as the core table objects are present.
+  */
+```
+
+> ★ `innodb_dynamic_metadata` / `innodb_ddl_log` 是 `DDSE_PRIVATE`（hidden），`innodb_table_stats` / `innodb_index_stats` 是 `DDSE_PROTECTED`（可 DML，优化器和 `ANALYZE` 会写它们）。这解释了为什么 `SELECT * FROM mysql.innodb_dynamic_metadata` 会报"不存在"。
+
+这个函数是 server（`DD_bootstrap_ctx`）与 InnoDB 之间唯一的建库接口，它向 server 回报两类东西：
+
+**(a) 4 张 `dd::Object_table`**
+
+| 表名 | hidden | 关键字段 |
+|---|---|---|
+| `innodb_dynamic_metadata` | **true** | `table_id` / `version` / `metadata BLOB`，PK(table_id) |
+| `innodb_table_stats` | false | `database_name`(64) / `table_name`(199) / `last_update` / `n_rows` / `clustered_index_size` / `sum_of_other_index_sizes`，PK(db, table) |
+| `innodb_index_stats` | false | + `index_name` / `stat_name` / `stat_value` / `sample_size` / `stat_description`，PK(db, table, index, stat_name) |
+| `innodb_ddl_log` | **true** | `id` AUTO_INCREMENT / `thread_id` / `type` / `space_id` / `page_no` / `index_id` / `table_id` / `old_file_path` / `new_file_path`，PK(id) + KEY(thread_id) |
+
+前两张是**统计信息**（`innodb_stats_persistent` 的落点），后两张是引擎私有的**动态元数据**与**原子 DDL 日志**。
+
+**(b) 2 个 `Plugin_tablespace`**
+
+```cpp
+    const char *fmt = "id=%u;flags=%u;server_version=%u;space_version=%u;state=normal";
+    snprintf(se_private_data_dd, len, fmt, dict_sys_t::s_dict_space_id, ...);
+    snprintf(se_private_data_innodb_system, len, fmt, TRX_SYS_SPACE, ...);
+    tablespaces->push_back(&dd_space);       // mysql  → mysql.ibd
+    tablespaces->push_back(&innodb);         // innodb_system → ibdata*
+```
+
+> **名字核实**：8.0.39 里**没有** `dict_sys_t::s_dd_space_id`，真实成员是 **`s_dict_space_id = 0xFFFFFFFE`**（`s_temp_space_id = 0xFFFFFFFD`，系统表空间 `TRX_SYS_SPACE = 0`）；文件名/名常量是 `s_dd_space_file_name = "mysql.ibd"`、`s_dd_space_name = "mysql"`、`s_sys_space_name = "innodb_system"`。
+
+**`dict_recovery_mode_t` 只有 3 个取值**（常见资料误记为 4 个）：
+
+```cpp
+enum dict_recovery_mode_t {
+  DICT_RECOVERY_INITIALIZE_SERVER,       ///< First start of a new server
+  DICT_RECOVERY_INITIALIZE_TABLESPACES,  ///< First start, create tablespaces
+  DICT_RECOVERY_RESTART_SERVER            ///< Restart of an existing server
+};
+```
+
+建库路径（`bootstrap::initialize_dictionary()`）调用 **2 次** `DDSE_dict_recover()`：
+
+```cpp
+  if (DDSE_dict_recover(thd, DICT_RECOVERY_INITIALIZE_SERVER, ...) ||       // 打开 4 张私有表
+      flush_meta_data(thd) ||                                              // ★ 自举落地
+      DDSE_dict_recover(thd, DICT_RECOVERY_INITIALIZE_TABLESPACES, ...) ||  // 注册预定义表空间
+      populate_tables(thd) || ...)
+```
+
+语义分工很清晰：
+
+| 模式 | 做什么 |
+|---|---|
+| `INITIALIZE_SERVER` | 打开 4 张 InnoDB 私有 DD 表、建 `DDTableBuffer` 与 `Log_DDL`，然后**立即返回**（不起线程、不开文件） |
+| `INITIALIZE_TABLESPACES` | 不动 DD 表；向 DD 注册预定义表空间（`innodb_temporary` + 所有 undo 表空间），随后 `srv_start_threads()` + `fil_open_for_business()` |
+| `RESTART_SERVER` | 打开 4 张表 + `boot_tablespaces()` + `fix_cloned_tables()` + `srv_dict_recover_on_restart()` |
+
+只有 `INITIALIZE_TABLESPACES` 这一路会 `dd::end_transaction()` 提交——因为它要往 DD 里写表空间元数据。
 
 ### 六、root@localhost 与随机口令
 
@@ -1131,11 +2370,13 @@ Compiled_in_command_iterator    File_command_iterator
 - [Bug #20629014](https://bugs.mysql.com/bug.php?id=20629014) —— `ER_TOO_LONG_KEY`，`Key_length_error_handler` 的 workaround 出处
 
 **内核月报 / 技术文章**
-- 腾讯云数据库内核月报：MySQL 8.0 数据字典相关专题（读时注意：月报多基于 5.7 或早期 8.0，函数名需回到 8.0.39 源码核实）
+- 本篇未引用具体某篇月报（初始化主题在公开月报中覆盖很薄，且多为 5.7 时代的 `mysql_install_db`）。**通用警告**：月报多基于 5.6/5.7，函数名几乎必然与 8.0.39 不符，用到前必须回源码 grep 核实。
+- 已核实可用的月报（涉及 InnoDB 启动与恢复）见 [`02_startup.md`](02_startup.md) 的「外部材料核实记录」
 
 **相关文档**
 - 已存在数据目录时的启动：见 [`02_startup.md`](02_startup.md)
 - 关闭与退出码：见 [`03_shutdown.md`](03_shutdown.md)
 - DD 对象模型与缓存：见 [`../dd/dd.md`](../dd/dd.md)
+- 已存在数据目录时的启动（含 **InnoDB 重启与崩溃恢复**的引擎侧实现）：见 [`02_startup.md`](02_startup.md)
 - mysql-test 复用 bootstrap 搭测试实例：见 [`../infra/mtr.md`](../infra/mtr.md)
 - 编译构建（`comp_sql`）：见 [`../infra/build.md`](../infra/build.md)

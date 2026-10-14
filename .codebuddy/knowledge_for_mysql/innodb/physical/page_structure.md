@@ -799,6 +799,8 @@ FIL header + 186B undo page header（类型/事务 id/段信息/日志起始偏�
 
 **结构上就是 INDEX 页**（`fil_page_type_is_index()` 包含它）——存序列化字典信息（SDI = Serialized Dictionary Information），数据是压缩的 JSON。SDI 记录的溢出走 `FIL_PAGE_SDI_BLOB`(18) / `FIL_PAGE_SDI_ZBLOB`(19)。每张表在独立表空间里都有两个 SDI 记录（表 + 列/索引元数据），供 `ibd2sdi` 与"表导入/导出"使用。
 
+> ★ **SDI 的深度剖析在 [`../../feat/sdi.md`](../../feat/sdi.md) 17.**（跨层篇：server 定 JSON 格式、InnoDB 提供 B-tree 存储）。那里才有：**记录定长偏移**（type+0 / id+4 / trx_id+12 / roll_ptr+18 / 长度列 +25、+29 / data +33）、★**两种溢出页布局完全不同**（BLOB 有 8B LOB_HDR 数据起 46、ZBLOB 无 LOB_HDR 数据起 38 且串链用 `FIL_PAGE_NEXT`）、★**page 0 里 SDI Header 的偏移是算出来的**（`150 + 40×256 + 115 = 10505`，**不是** ≈10654）、根页与段、以及 redo（`MLOG_PAGE_CREATE_SDI` 无 payload）。**本篇只保留"它是 INDEX 页的一种"这层定位** —— 通用布局直接套上面的 ①。
+
 #### ⑫ ENCRYPTED 页（15 / 16 / 17）
 
 与对应原始页类型布局相同，只是数据在**写入磁盘时加密、读入内存时解密**（页内明文）。`FIL_PAGE_ENCRYPTED`(15) 对应普通页、`FIL_PAGE_COMPRESSED_AND_ENCRYPTED`(16) 对应压缩页、`FIL_PAGE_ENCRYPTED_RTREE`(17) 对应 R-tree 页——**加密不改布局，只改内容**，这是它区别于 COMPRESSED（改了 FIL header 语义）的关键。

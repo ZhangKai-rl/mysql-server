@@ -72,6 +72,43 @@ MySQL 的"索引类型"有两层含义，理解这两层的分离是本篇的核
 
 **4. 专用结构只给无法降解的需求。** 全文（倒排：词 → 文档列表）和空间（R-tree：MBR 层次包络）无法用有序 B-tree 表达，才引入完全不同的存储与插入路径（这二者的 DDL 构建也不走 `Builder` 批量建页）。
 
+### ★ 为什么无主键表也要造一个隐藏聚簇索引（GEN_CLUST_INDEX）
+
+InnoDB 是索引组织表（第 1 条）——**表就是一棵 B-tree**。所以"没有主键"在物理上是不成立的，MySQL 必须造一个键出来：
+
+| 情况 | 聚簇索引的键 |
+|---|---|
+| 有显式 PRIMARY KEY | 用户主键 |
+| 无非空唯一键 | `GEN_CLUST_INDEX`：引擎生成的 **6 字节隐藏 rowid**（单调递增） |
+| 有 NOT NULL UNIQUE 键但无 PK | 该唯一键被**提升**为主键（见 [`construction.md`](construction.md)「为什么主键提升不重命名 KEY」） |
+
+★ 两个约束决定了不能"干脆不要聚簇索引"：
+
+1. **行必须有物理位置**：IOT 的行数据就存在聚簇索引的叶子页里，没有聚簇索引就没有存行的地方；
+2. **二级索引需要一个稳定的行指针**：二级索引叶子记录要带"指向聚簇记录的值"（见 [`secondary.md`](secondary.md)）——没有主键就用 6 字节 rowid 顶上。
+
+★ 代价（实务要点）：`GEN_CLUST_INDEX` 的 6 字节 rowid **完全由引擎掌控**，用户看不到也用不了；且它是**插入顺序递增**的，虽然对插入友好（顺序写），但**二级索引里存的都是这个无意义的 rowid**，无法通过它做任何业务定位。这也是"每张 InnoDB 表都应该有显式主键"的物理层理由（另一层理由是复制，见 [`../server/replication/replication.md`](../server/replication/replication.md)）。
+
+### ★ 为什么要"不可见索引"这个语义
+
+`ALTER TABLE ... ALTER INDEX idx INVISIBLE` 让索引对优化器不可见，但**物理上仍然存在、仍在维护**。为什么需要这种"半死不活"的状态：
+
+- 约束：**删索引是不可逆的高风险操作**。删掉后发现某条查询崩了，重建索引在大表上要很久（可能几十分钟甚至小时级）；
+- 不可见索引提供一个**可回滚的验证手段**：先置不可见 → 观察一段时间（业务无影响）→ 确认后删除。若发现问题，`VISIBLE` 一下立刻恢复（元数据操作，瞬间完成）；
+- 代价：不可见期间，索引**仍然参与 DML 维护**（插入/更新/删除都要维护它），白付写入成本——所以它是**过渡状态**，不该长期保留。
+
+★ 这与"延迟释放"（[`operations.md`](operations.md)）是同一种思路：**把不可逆的操作拆成"可逆的中间态 + 确认后的终态"**。
+
+### ★ 为什么新类型总是"降解"而不是新增实现（深化）
+
+第 3 条讲了功能索引 / 多值索引都被降解成"隐藏虚拟列上的普通二级索引"。这个策略在 MySQL 里反复出现——GIPK（隐藏主键）、功能索引、多值索引都是同一套路。为什么：
+
+- 约束：**新增一种引擎索引类型的成本极高**——要改记录格式、比较器、B-tree 插入/分裂逻辑、统计采集、redo 类型、导入导出……；
+- 而"隐藏列 + 已有索引机制"只需要改 **server 层的构造与优化器**，引擎侧零改动；
+- 所以只要语义能被"表达为某种已有索引 + 隐藏数据"，MySQL 就一定选择降解。
+
+★ 例外（第 4 条）：当语义**无法**用有序 B-tree 表达时（全文的"词→文档"、空间的"MBR 包含"），才不得不引入专用结构——这个判据很清晰：**能降解就降解，降解不了才造新的**。
+
 ### 理论溯源
 
 - Bayer & McCreight，*Organization and Maintenance of Large Ordered Indexes*（1972）：B-tree 起源。
@@ -399,6 +436,38 @@ static dberr_t row_ins_sec_index_multi_value_entry(dict_index_t *index, dtuple_t
 ```
 
 builder 的注释点明实现要点："It simply **replace the pointers** to the multi-value field data for each different value"——不重建 tuple，只换指针，零拷贝。UPDATE 场景用 `Multi_value_entry_builder_normal`，靠 `bitset` 只处理变化的元素（新旧数组里相同的元素不必删了再插）。一个多值索引**只能有一个多值列**（`dict0mem.h:1643` 注释 "Only one multi-value field"）。
+
+**UPDATE 差量更新：`innobase_get_multi_value_and_diff`**（`ha_innodb.cc:9241`，调用链 `ha_innobase::update_row` → `calc_row_difference`；触发条件 = 多值虚拟列新旧值都非 NULL 且二进制变化，此时 `multi_value_calc_by_diff = true`）：
+
+```cpp
+/* 新旧数组都解析为 json_binary::Value，再各自 innobase_store_multi_value 物化
+   成 multi_value_data（升序排列——服务端 Field_typed_array 保证） */
+if (old_field->len == UNIV_NO_INDEX_VALUE || new_field->len == UNIV_NO_INDEX_VALUE)
+  return;                              // 空数组：不建 bitset（后续全量处理）
+old_mv->alloc_bitset(heap);            // bitset 全置 1（= 需处理）
+new_mv->alloc_bitset(heap);
+while (old_counter < ... && new_counter < ...) {
+  int res = old_v.element(old_counter).eq(new_v.element(new_counter));
+  if (res == 0) {                      // 双指针归并：两数组共有
+    old_mv->bitset->set(old_counter++, false);   // ★ 清零 = 不变，跳过
+    new_mv->bitset->set(new_counter++, false);
+  } else if (res < 0) { ++old_counter; }   // 仅旧有：保持 1（需删）
+  else                { ++new_counter; }   // 仅新有：保持 1（需插）
+}
+```
+
+**bitset 语义**（每元素 **1 bit**，不是 2 位；`alloc_bitset` 先 `set()` 全 1）：**1 = 该元素需要处理**（旧数组独有 → 删该二级项；新数组独有 → 插），**0 = 两数组共有 → 不变跳过**；方向由所在数组决定，无第三种状态。`bitset == nullptr`（空数组/INSERT）= 无差量信息 → 全量处理。bitset 随多值字段**序列化进 undo**（`Multi_value_logger::log`，UPDATE 时算出的 bitset 与旧数组一起落 undo），purge/rollback/online-DDL 回放时原样读回——所以 purge 的差量删除与在线 UPDATE 语义一致。
+
+**消费点**（统一经 `Multi_value_entry_builder_normal::skip()` 状态机——`while (m_pos < num_v && !bitset->test(m_pos)) ++m_pos;`）：
+
+| 场景 | 函数 | selected |
+|---|---|---|
+| 在线 UPDATE 删旧/插新 | `row_upd_multi_sec_index_entry`（断点续传 `del_multi_val_pos`/`upd_multi_val_pos`） | `!(UPDATE_ALL_SEC \|\| non_mv_upd)` |
+| 整行 DELETE | `row_upd_del_multi_sec_index_entry` | false（全删） |
+| purge | `row_purge_remove_multi_sec_if_poss` | 整行删 false / UPDATE `!non_mv_upd` |
+| rollback | `row_undo_mod_upd_exist_multi_sec` / `row_undo_ins_remove_multi_sec` | `!non_mv_upd` / 全量 |
+| online DDL 回放 | `apply_delete_multi_value` / `row_log_table_apply_update` | `!non_mv_upd` |
+| INSERT | `Multi_value_entry_builder_insert` | 无 bitset，全量 |
 
 **数据载体与比较**：
 

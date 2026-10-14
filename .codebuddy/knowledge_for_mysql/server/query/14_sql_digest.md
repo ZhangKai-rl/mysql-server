@@ -153,6 +153,224 @@ lip->reduce_digest_token(TOK_GENERIC_VALUE, NULL_SYM);
 - 结尾分号在词法器返回 token 0 时被弹掉 → DIGEST_TEXT 不带尾分号
 - 归一化文本最多输出 `max_digest_length`（默认 1024）字节即截断，**无 `...` 后缀**
 
+### 1.7.1 ★ `digest_add_token()` 完整源码（1.1–1.7 全部规则的唯一实现处）
+
+> 前面 1.1–1.7 讲的所有规则，**都只是这一个 `switch` 的分支**。它是"归一化"的全部实现（`sql/sql_digest.cc:380-621`）：
+
+```cpp
+sql_digest_state *digest_add_token(sql_digest_state *state, uint token,
+                                   Lexer_yystype *yylval) {
+  sql_digest_storage *digest_storage = nullptr;
+
+  digest_storage = &state->m_digest_storage;
+
+  /*
+    Stop collecting further tokens if digest storage is full or
+    if END token is received.
+  */
+  if (digest_storage->m_full || token == END_OF_INPUT) {
+    return nullptr;      // ★ nullptr 会让调用方 m_digest 置空 → 之后彻底短路
+  }
+
+  /*
+    Take last_token 2 tokens collected till now. These tokens will be used
+    in reduce for normalisation. Make sure not to consider ID tokens in reduce.
+  */
+  uint last_token;
+  uint last_token2;
+
+  switch (token) {
+    case NUM:
+    case LONG_NUM:
+    case ULONGLONG_NUM:
+    case DECIMAL_NUM:
+    case FLOAT_NUM:
+    case BIN_NUM:
+    case HEX_NUM: {
+      bool found_unary;
+      do {
+        found_unary = false;
+        peek_last_two_tokens(digest_storage, state->m_last_id_index,
+                             &last_token, &last_token2);
+
+        if ((last_token == '-') || (last_token == '+')) {
+          /*
+            We need to differentiate:
+            - a <unary minus> operator
+            - a <unary plus> operator
+            from
+            - a <binary minus> operator
+            - a <binary plus> operator
+            to only reduce "a = -1" to "a = ?", and not change "b - 1" to "b ?"
+
+            Binary operators are found inside an expression,
+            while unary operators are found at the beginning of an expression,
+            or after operators.
+
+            To achieve this, every token that is followed by an <expr>
+            expression in the SQL grammar is flagged. See sql/sql_yacc.yy See
+            sql/gen_lex_token.cc
+
+            For example,
+            "(-1)" is parsed as "(", "-", NUM, ")", and
+            lex_token_array["("].m_start_expr is true, so reduction of the "-"
+            NUM is done, the result is "(?)".
+            "(a-1)" is parsed as "(", ID, "-", NUM, ")", and
+            lex_token_array[ID].m_start_expr is false, so the operator is
+            binary, no reduction is done, and the result is "(a-?)".
+          */
+          if (lex_token_array[last_token2].m_start_expr) {
+            /*
+              REDUCE:
+              TOK_GENERIC_VALUE := (UNARY_PLUS | UNARY_MINUS) (NUM | LOG_NUM |
+              ... | FLOAT_NUM)
+
+              REDUCE:
+              TOK_GENERIC_VALUE := (UNARY_PLUS | UNARY_MINUS) TOK_GENERIC_VALUE
+            */
+            token = TOK_GENERIC_VALUE;
+            digest_storage->m_byte_count -= SIZE_OF_A_TOKEN;   // ★ 弹出一元 +/-，游标回退 2
+            found_unary = true;                                // ★ do-while 支持 "- -1"
+          }
+        }
+      } while (found_unary);
+    }
+      /* fall through, for case NULL_SYM below */
+      [[fallthrough]];      // ★ 数字字面量归约完，继续往下走 TOK_GENERIC_VALUE 归一化
+    case LEX_HOSTNAME:
+    case TEXT_STRING:
+    case NCHAR_STRING:
+    case PARAM_MARKER: {
+      /*
+        REDUCE:
+        TOK_GENERIC_VALUE := BIN_NUM | DECIMAL_NUM | ... | ULONGLONG_NUM
+      */
+      token = TOK_GENERIC_VALUE;      // ★ 所有字面量 → '?'（PARAM_MARKER 同形）
+
+      peek_last_two_tokens(digest_storage, state->m_last_id_index, &last_token,
+                           &last_token2);
+
+      if ((last_token2 == TOK_GENERIC_VALUE ||
+           last_token2 == TOK_GENERIC_VALUE_LIST) &&
+          (last_token == ',')) {
+        /*
+          REDUCE:
+          TOK_GENERIC_VALUE_LIST :=
+            TOK_GENERIC_VALUE ',' TOK_GENERIC_VALUE
+          REDUCE:
+          TOK_GENERIC_VALUE_LIST :=
+            TOK_GENERIC_VALUE_LIST ',' TOK_GENERIC_VALUE
+        */
+        digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;   // ★ 弹出 '?' 与 ',' 共 4 字节
+        token = TOK_GENERIC_VALUE_LIST;                        // ★ 折叠点 1 → "?, ..."
+      }
+      store_token(digest_storage, token);
+      break;
+    }
+    case ')': {
+      peek_last_two_tokens(digest_storage, state->m_last_id_index, &last_token,
+                           &last_token2);
+
+      if (last_token == TOK_GENERIC_VALUE && last_token2 == '(') {
+        /*
+          REDUCE:
+          TOK_ROW_SINGLE_VALUE := '(' TOK_GENERIC_VALUE ')'
+        */
+        digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;
+        token = TOK_ROW_SINGLE_VALUE;                          // ★ 折叠点 2 → "(?)"
+
+        /* Read last two tokens again */
+        peek_last_two_tokens(digest_storage, state->m_last_id_index,
+                             &last_token, &last_token2);
+
+        if ((last_token2 == TOK_ROW_SINGLE_VALUE ||
+             last_token2 == TOK_ROW_SINGLE_VALUE_LIST) &&
+            (last_token == ',')) {
+          digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;
+          token = TOK_ROW_SINGLE_VALUE_LIST;                   // ★ 折叠点 3 → "(?) /* , ... */"
+        } else if (last_token == IN_SYM) {
+          /*
+            REDUCE:
+            TOK_IN_GENERIC_VALUE_EXPRESSION := IN_SYM TOK_ROW_SINGLE_VALUE
+          */
+          digest_storage->m_byte_count -= SIZE_OF_A_TOKEN;
+          token = TOK_IN_GENERIC_VALUE_EXPRESSION;             // ★ 折叠点 4 → "IN (...)"
+        }
+      } else if (last_token == TOK_GENERIC_VALUE_LIST && last_token2 == '(') {
+        /*
+          REDUCE:
+          TOK_ROW_MULTIPLE_VALUE := '(' TOK_GENERIC_VALUE_LIST ')'
+        */
+        digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;
+        token = TOK_ROW_MULTIPLE_VALUE;                        // ★ 折叠点 5 → "(...)"
+
+        /* Read last two tokens again */
+        peek_last_two_tokens(digest_storage, state->m_last_id_index,
+                             &last_token, &last_token2);
+
+        if ((last_token2 == TOK_ROW_MULTIPLE_VALUE ||
+             last_token2 == TOK_ROW_MULTIPLE_VALUE_LIST) &&
+            (last_token == ',')) {
+          digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;
+          token = TOK_ROW_MULTIPLE_VALUE_LIST;                 // ★ 折叠点 6 → "(...) /* , ... */"
+        } else if (last_token == IN_SYM) {
+          /*
+          REDUCE:
+          TOK_IN_GENERIC_VALUE_EXPRESSION := IN_SYM TOK_ROW_MULTIPLE_VALUE
+          */
+          digest_storage->m_byte_count -= SIZE_OF_A_TOKEN;
+          token = TOK_IN_GENERIC_VALUE_EXPRESSION;
+        }
+      }
+      store_token(digest_storage, token);
+      break;
+    }
+    case IDENT:
+    case IDENT_QUOTED:
+    case TOK_IDENT_AT: {
+      Lexer_yystype *lex_token = yylval;
+      char *yytext = lex_token->lex_str.str;
+      size_t yylen = lex_token->lex_str.length;
+
+      /*
+        REDUCE:
+          TOK_IDENT := IDENT | IDENT_QUOTED
+        The parser gives IDENT or IDENT_TOKEN for the same text,
+        depending on the character set used.
+        We unify both to always print the same digest text,
+        and always have the same digest hash.
+      */
+      if (token != TOK_IDENT_AT) {
+        token = TOK_IDENT;     // ★ 加不加反引号不影响 DIGEST（统一成 TOK_IDENT）
+      }
+      store_token_identifier(digest_storage, token, yylen, yytext);
+
+      /* Update the index of last identifier found. */
+      state->m_last_id_index = digest_storage->m_byte_count;  // ★ 护栏推进
+      break;
+    }
+    case 0: {
+      if (digest_storage->m_byte_count < SIZE_OF_A_TOKEN) break;
+      unsigned int temp_tok;
+      read_token(digest_storage, digest_storage->m_byte_count - SIZE_OF_A_TOKEN,
+                 &temp_tok);
+      if (temp_tok == ';') {
+        digest_storage->m_byte_count -= SIZE_OF_A_TOKEN;   // ★ 弹掉尾部分号
+      }
+      break;
+    }
+    default: {
+      store_token(digest_storage, token);   // 关键字/运算符：原样入流，无归约
+      break;
+    }
+  }
+
+  return state;
+}
+```
+
+> ★ **六个折叠点全在这一个函数里**（`)` 分支尤其密集：它连调两次 `peek_last_two_tokens`，所以才能做"二级折叠"）。`compute_digest_text()` **不做任何折叠**，只负责把已折叠好的 token 查表打印出来——这点常被说反。
+
 ---
 
 ### 1.8 归一化的实现：就地归约状态机
@@ -173,16 +391,111 @@ store_token(digest_storage, token);                // 再写归约后的 token
 标识符是变长存储（token + 长度 + 原文），"回退 2 字节拿到上一个 token"这个假设对它不成立。所以标识符写完后记下位置，所有 peek 都不许越过它：
 
 ```cpp
+// sql/sql_digest_stream.h:36
+/**
+  State data storage for @c digest_start, @c digest_add_token.
+  This structure extends the @c sql_digest_storage structure
+  with temporary state used only during parsing.
+*/
 struct sql_digest_state {
   /**
     Index, in the digest token array, of the last identifier seen.
     Reduce rules used in the digest computation can not
     apply to tokens seen before an identifier.
+    @sa digest_add_token
   */
   int m_last_id_index;
+  sql_digest_storage m_digest_storage;
+
+  inline void reset(unsigned char *token_array, uint length) {
+    m_last_id_index = 0;
+    m_digest_storage.reset(token_array, length);
+  }
+
+  inline bool is_empty() { return m_digest_storage.is_empty(); }
+};
 ```
 
-`peek_last_two_tokens()` 的每个分支都以 `last_id_index + SIZE_OF_A_TOKEN <= peek_index` 为条件，否则返回 `TOK_UNUSED`。
+`peek_last_two_tokens()` 的每个分支都以 `last_id_index + SIZE_OF_A_TOKEN <= peek_index` 为条件，否则返回 `TOK_UNUSED`。**完整源码**：
+
+```cpp
+// sql/sql_digest.cc:304
+static inline uint peek_token(const sql_digest_storage *digest, uint index) {
+  uint token;
+  assert(index + SIZE_OF_A_TOKEN <= digest->m_byte_count);
+  assert(digest->m_byte_count <= digest->m_token_array_length);
+
+  token =
+      ((digest->m_token_array[index + 1]) << 8) | digest->m_token_array[index];
+  return token;
+}
+
+// sql/sql_digest.cc:318
+/**
+  Function to read last two tokens from token array. If an identifier
+  is found, do not look for token before that.
+*/
+static inline void peek_last_two_tokens(
+    const sql_digest_storage *digest_storage, uint last_id_index, uint *t1,
+    uint *t2) {
+  uint byte_count = digest_storage->m_byte_count;
+  uint peek_index = byte_count;
+
+  if (last_id_index + SIZE_OF_A_TOKEN <= peek_index) {
+    /* Take last token. */
+    peek_index -= SIZE_OF_A_TOKEN;
+    *t1 = peek_token(digest_storage, peek_index);
+
+    if (last_id_index + SIZE_OF_A_TOKEN <= peek_index) {
+      /* Take 2nd token from last. */
+      peek_index -= SIZE_OF_A_TOKEN;
+      *t2 = peek_token(digest_storage, peek_index);
+    } else {
+      *t2 = TOK_UNUSED;      // ★ 再往前就碰到标识符边界了
+    }
+  } else {
+    *t1 = TOK_UNUSED;
+    *t2 = TOK_UNUSED;
+  }
+}
+```
+
+> ★★ **护栏的真正作用**：`m_last_id_index` 只在 `IDENT` 分支被推进到当前 `m_byte_count`（`sql_digest.cc:598`）。所以 `(a-1)` 里读到 `-` 要回看时，`last_id_index` 已经卡在 `a` 之后——**`-` 后面那个位置之前不允许再看**，于是 `t2` 拿到 `TOK_UNUSED`，`m_start_expr` 为 false，`-` 被判为二元。这就是"一元吸收、二元保留"能成立的结构性保证，而不只是靠一张表。
+
+三 token 版（`digest_reduce_token` 专用，`sql_digest.cc:346`）：
+
+```cpp
+static inline void peek_last_three_tokens(
+    const sql_digest_storage *digest_storage, uint last_id_index, uint *t1,
+    uint *t2, uint *t3) {
+  uint byte_count = digest_storage->m_byte_count;
+  uint peek_index = byte_count;
+
+  if (last_id_index + SIZE_OF_A_TOKEN <= peek_index) {
+    peek_index -= SIZE_OF_A_TOKEN;
+    *t1 = peek_token(digest_storage, peek_index);
+
+    if (last_id_index + SIZE_OF_A_TOKEN <= peek_index) {
+      peek_index -= SIZE_OF_A_TOKEN;
+      *t2 = peek_token(digest_storage, peek_index);
+
+      if (last_id_index + SIZE_OF_A_TOKEN <= peek_index) {
+        peek_index -= SIZE_OF_A_TOKEN;
+        *t3 = peek_token(digest_storage, peek_index);
+      } else {
+        *t3 = TOK_UNUSED;
+      }
+    } else {
+      *t2 = TOK_UNUSED;
+      *t3 = TOK_UNUSED;
+    }
+  } else {
+    *t1 = TOK_UNUSED;
+    *t2 = TOK_UNUSED;
+    *t3 = TOK_UNUSED;
+  }
+}
+```
 
 #### 七处回退（这是"就地归约"的全部形态）
 
@@ -247,6 +560,103 @@ IN_SYM ( 1  →  IN_SYM '(' TOK_GENERIC_VALUE
   if (token_to_push != TOK_UNUSED) {
     store_token(digest_storage, token_to_push);   // 再压回去
   }
+```
+
+**`digest_reduce_token()` 完整源码**（`sql/sql_digest.cc:623-704`）：
+
+```cpp
+sql_digest_state *digest_reduce_token(sql_digest_state *state, uint token_left,
+                                      uint token_right) {
+  sql_digest_storage *digest_storage = nullptr;
+
+  digest_storage = &state->m_digest_storage;
+
+  /*
+    Stop collecting further tokens if digest storage is full.
+  */
+  if (digest_storage->m_full) {
+    return nullptr;
+  }
+
+  uint last_token;
+  uint last_token2;
+  uint last_token3;
+  uint token_to_push = TOK_UNUSED;
+
+  peek_last_two_tokens(digest_storage, state->m_last_id_index, &last_token,
+                       &last_token2);
+
+  /*
+    There is only one caller of digest_reduce_token(),
+    see sql/sql_yacc.yy, rule literal := NULL_SYM.
+    REDUCE:
+      token_left := token_right
+    Used for:
+      TOK_GENERIC_VALUE := NULL_SYM
+  */
+
+  if (last_token == token_right) {
+    /*
+      Current stream is like:
+        TOKEN_X TOKEN_RIGHT .
+      REDUCE to
+        TOKEN_X TOKEN_LEFT .
+    */
+    digest_storage->m_byte_count -= SIZE_OF_A_TOKEN;
+    store_token(digest_storage, token_left);        // ★ NULL 就在末尾：直接替换
+  } else {
+    /*
+      Current stream is like:
+        TOKEN_X TOKEN_RIGHT TOKEN_Y .
+      Pop TOKEN_Y
+        TOKEN_X TOKEN_RIGHT . TOKEN_Y
+      REDUCE to
+        TOKEN_X TOKEN_LEFT . TOKEN_Y
+    */
+    assert(last_token2 == token_right);
+    digest_storage->m_byte_count -= 2 * SIZE_OF_A_TOKEN;
+    store_token(digest_storage, token_left);
+    token_to_push = last_token;                     // ★ 暂存 TOKEN_Y
+  }
+
+  peek_last_three_tokens(digest_storage, state->m_last_id_index, &last_token,
+                         &last_token2, &last_token3);
+
+  if ((last_token3 == TOK_GENERIC_VALUE ||
+       last_token3 == TOK_GENERIC_VALUE_LIST) &&
+      (last_token2 == ',') && (last_token == TOK_GENERIC_VALUE)) {
+    /*
+      REDUCE:
+      TOK_GENERIC_VALUE_LIST := TOK_GENERIC_VALUE ',' TOK_GENERIC_VALUE
+      REDUCE:
+      TOK_GENERIC_VALUE_LIST := TOK_GENERIC_VALUE_LIST ',' TOK_GENERIC_VALUE
+    */
+    digest_storage->m_byte_count -= 3 * SIZE_OF_A_TOKEN;
+    store_token(digest_storage, TOK_GENERIC_VALUE_LIST);
+    // ★ 只有 yacc 侧主动归约才做得到：NULL 不是词法器的 NUM/TEXT_STRING
+  }
+
+  if (token_to_push != TOK_UNUSED) {
+    store_token(digest_storage, token_to_push);     // 再压回去
+  }
+
+  return state;
+}
+```
+
+`sql_yacc.yy` 里那个**唯一调用点**（`sql/sql_yacc.yy:14727`，`literal: NULL_SYM`）：
+
+```yacc
+            /*
+              For the digest computation, in this context only,
+              NULL is considered a literal, hence reduced to '?'
+              REDUCE:
+                TOK_GENERIC_VALUE := NULL_SYM
+            */
+            lip->reduce_digest_token(TOK_GENERIC_VALUE, NULL_SYM);
+            $$= NEW_PTN Item_null(@$);
+          }
+        ;
 ```
 
 #### 缓冲满 = 停止收集，不是打省略号
@@ -317,6 +727,92 @@ lip->skip_digest = false;
 
 hint 内部 token（`/*+` 写 `TOK_HINT_COMMENT_OPEN`，hint 参数里的数字/文本照常归一化成 `?`）由 `Hint_scanner::add_hint_token_digest()` 写入。**所以不同 hint 会改变 digest**（hint 是语句形状的一部分）。
 
+**`skip_digest` 完整声明**（`sql/sql_lex.h:3608`，注释即上面那段原文）：
+
+```cpp
+  /// Skip adding of the current token's digest since it is already added
+  ///
+  /// Usually we calculate a digest token by token at the top-level function
+  /// of the lexer: MYSQLlex(). However, some complex ("hintable") tokens break
+  /// that data flow: for example, the `SELECT /*+ HINT(t) */` is the single
+  /// token from the main parser's point of view, and we add the "SELECT"
+  /// keyword to the digest buffer right after the lex_one_token() call,
+  /// but the "/*+ HINT(t) */" is a sequence of separate tokens from the hint
+  /// parser's point of view, and we add those tokens to the digest buffer
+  /// *inside* the lex_one_token() call. Thus, the usual data flow adds
+  /// tokens from the "/*+ HINT(t) */" string first, and only than it appends
+  /// the "SELECT" keyword token to that stream: "/*+ HINT(t) */ SELECT".
+  /// This is not acceptable, since we use the digest buffer to restore
+  /// query strings in their normalized forms, so the order of added tokens is
+  /// important. Thus, we add tokens of "hintable" keywords to a digest buffer
+  /// right in the hint parser and skip adding of them at the caller with the
+  /// help of skip_digest flag.
+  bool skip_digest;
+
+  void add_digest_token(uint token, Lexer_yystype *yylval);
+  void reduce_digest_token(uint token_left, uint token_right);
+```
+
+**置位处**（`sql/sql_lex.cc:905`，`find_keyword()`）：
+
+```cpp
+static int find_keyword(Lex_input_stream *lip, uint len, bool function) {
+  const char *tok = lip->get_tok_start();
+
+  const SYMBOL *symbol =
+      function ? Lex_hash::sql_keywords_and_funcs.get_hash_symbol(tok, len)
+               : Lex_hash::sql_keywords.get_hash_symbol(tok, len);
+
+  if (symbol) {
+    lip->yylval->keyword.symbol = symbol;
+    lip->yylval->keyword.str = const_cast<char *>(tok);
+    lip->yylval->keyword.length = len;
+
+    if ((symbol->tok == NOT_SYM) &&
+        (lip->m_thd->variables.sql_mode & MODE_HIGH_NOT_PRECEDENCE))
+      return NOT2_SYM;
+    if ((symbol->tok == OR_OR_SYM) &&
+        !(lip->m_thd->variables.sql_mode & MODE_PIPES_AS_CONCAT)) {
+      push_deprecated_warn(lip->m_thd, "|| as a synonym for OR", "OR");
+      return OR2_SYM;
+    }
+
+    lip->yylval->optimizer_hints = nullptr;
+    if (symbol->group & SG_HINTABLE_KEYWORDS) {
+      lip->add_digest_token(symbol->tok, lip->yylval);   // ★ 先写 "SELECT"，保证顺序正确
+      if (consume_optimizer_hints(lip)) return ABORT_SYM; // ★ hint parser 在内部写 /*+ ... */
+      lip->skip_digest = true;                           // ★★ 置位：MYSQLlex 这次别再写一遍
+    }
+
+    return symbol->tok;
+  }
+  return 0;
+}
+```
+
+**消费处**（`sql/sql_lex.cc:1367`，`MYSQLlex()` 尾部）：
+
+```cpp
+  yylloc->cpp.end = lip->get_cpp_ptr();
+  yylloc->raw.end = lip->get_ptr();
+  if (!lip->skip_digest) lip->add_digest_token(token, yylval);
+  lip->skip_digest = false;                     // ★ 一次性标志，读完立刻清零
+  return token;
+}
+```
+
+hint 扫描器把 digest 状态交回主 lexer（`sql/sql_lex.cc:896`）：
+
+```cpp
+    lip->yylineno = hint_scanner.get_lineno();
+    lip->yySkipn(hint_scanner.get_ptr() - lip->get_ptr());
+    lip->yylval->optimizer_hints = hint_list;   // NULL in case of syntax error
+    lip->m_digest = hint_scanner.get_digest();  // NULL is digest buf. is full.
+    return false;
+```
+
+> ⚠️ **不存在 `SKIP_DIGEST` 宏**——只有 `Lex_input_stream::skip_digest` 这个 bool 成员。
+
 ### 2.3 预编译参数
 
 `stmt_prepare_mode` 下 `?` 返回 `PARAM_MARKER`，它在 `digest_add_token` 里同样归为 `TOK_GENERIC_VALUE` → 打印 `?`。即**预编译参数与字面量在 digest 中同形**。PREPARE 阶段同样完整算 digest（`sql/sql_prepare.cc`）。
@@ -346,23 +842,136 @@ void compute_digest_hash(const sql_digest_storage *digest_storage,
 
 ### 3.2 存储格式
 
-```cpp
-#define DIGEST_HASH_SIZE 32                        // SHA-256 = 32 字节
-#define DIGEST_HASH_TO_STRING_LENGTH 64            // 展示为 64 字符 hex 小写
-#define MAX_DIGEST_STORAGE_SIZE (1024 * 1024)      // token 数组绝对上限 1MB
+**全部宏与结构定义**（`sql/sql_digest.h:34` / `:94`）：
 
+```cpp
+#define MAX_DIGEST_STORAGE_SIZE (1024 * 1024)   // token 数组绝对上限 1MB
+
+/**
+  Write SHA-256 hash value in a string to be used as DIGEST for the statement.
+*/
+#define DIGEST_HASH_TO_STRING(_hash, _str)                                    \
+  (void)sprintf(_str,                                                         \
+                "%02x%02x%02x%02x%02x%02x%02x%02x"                            \
+                ... /* 32 个 %02x */ ...                                       \
+                _hash[0], _hash[1], ... _hash[31])
+
+/// SHA-256 = 32 bytes of binary = 64 printable characters.
+#define DIGEST_HASH_TO_STRING_LENGTH 64
+
+/*
+  Various hashes considered for digests.   ← ★ 哈希算法"选型史"注释原文
+  MD5:     128 bits, used up to MySQL 5.7, abandoned in MySQL 8.0, non FIPS compliant.
+  SHA1:    160 bits, non FIPS compliant in strict mode, not used
+  SHA2-224:224 bits, non FIPS compliant in strict mode, not used
+  SHA2-256:256 bits, FIPS compliant, Used starting with MySQL 8.0
+  SHA2-384:384 bits
+  SHA2-512:512 bits
+*/
+
+/**
+  DIGEST hash size, in bytes. 256 bits, for SHA256.
+*/
+#define DIGEST_HASH_SIZE 32                      // ★ 不是 5.7 的 16 字节 MD5
+
+ulong get_max_digest_length();                   // 对应 sql_digest.cc:49 的全局 max_digest_length
+```
+
+```cpp
+// sql/sql_digest.h:94
+/**
+  Structure to store token count/array for a statement
+  on which digest is to be calculated.
+*/
 struct sql_digest_storage {
-  bool m_full;
-  size_t m_byte_count;
+  bool m_full;                    // ★ buffer 满则停止收集（digest_add_token 立刻 return nullptr）
+  size_t m_byte_count;            // ★ 既是长度也是"写指针"；归约时直接减它来弹出 token
   unsigned char m_hash[DIGEST_HASH_SIZE];
-  uint m_charset_number;                            // 记录解析时的字符集
-  unsigned char *m_token_array;                     // 归约后的 token 字节流
+  /** Character set number. */
+  uint m_charset_number;          // ★ compute_digest_text 靠它 get_charset() 做标识符转码
+  /**
+    Token array.
+    Token array is an array of bytes to store tokens received during parsing.
+    Following is the way token array is formed.
+    ... <non-id-token> <non-id-token> <id-token>
+    <id_len> <id_text> ... For Example: SELECT * FROM T1;
+    <SELECT_TOKEN> <*> <FROM_TOKEN> <ID_TOKEN> <2> <T1>
+
+    @note Only the first @c m_byte_count bytes are initialized,
+      out of @c m_token_array_length.
+  */
+  unsigned char *m_token_array;   // 字节流本体
+  /* Length of the token array to be considered for DIGEST_TEXT calculation. */
   size_t m_token_array_length;
+
+  sql_digest_storage() { reset(nullptr, 0); }
+
+  inline void reset(unsigned char *token_array, size_t length) {
+    m_token_array = token_array;
+    m_token_array_length = length;
+    reset();
+  }
+
+  inline void reset() {
+    m_full = false;
+    m_byte_count = 0;
+    m_charset_number = 0;
+    memset(m_hash, 0, DIGEST_HASH_SIZE);
+  }
+
+  inline bool is_empty() { return (m_byte_count == 0); }
+
+  inline void copy(const sql_digest_storage *from) {
+    /*
+      Keep in mind this is a dirty copy of something that may change,
+      as the thread producing the digest is executing concurrently,
+      without any lock enforced.
+    */
+    size_t byte_count_copy = m_token_array_length < from->m_byte_count
+                                 ? m_token_array_length
+                                 : from->m_byte_count;   // ★ 按目标容量截断
+    if (byte_count_copy > 0) {
+      m_full = from->m_full;
+      m_byte_count = byte_count_copy;
+      m_charset_number = from->m_charset_number;
+      memcpy(m_token_array, from->m_token_array, m_byte_count);
+      memcpy(m_hash, from->m_hash, DIGEST_HASH_SIZE);
+    } else {
+      m_full = false;
+      m_byte_count = 0;
+      m_charset_number = 0;
+    }
+  }
 };
 ```
 
 - `performance_schema` 表里 `DIGEST VARCHAR(64)`（64 字符 hex），`DIGEST_TEXT LONGTEXT`
 - 字符集：解析时记 `m_charset_number`，重放 TEXT 时把标识符从原字符集转成 utf8mb3 再打印
+- ⚠️ **不存在 `Token_Digest_Store` 类型**（全仓库 0 命中），8.0.39 只有 `sql_digest_storage` 与 `sql_digest_state`
+- ⚠️ `SIZE_OF_A_TOKEN`（=2）定义在 **`sql/sql_digest.cc:47`**，不在头文件里
+
+`THD` 与 `Lex_input_stream` 侧的 `m_digest` 声明：
+
+```cpp
+// sql/sql_class.h:2409
+  /** Current statement digest. */
+  sql_digest_state *m_digest;              // ★ 嵌套解析（SP/trigger/PREPARE）会临时换掉再恢复
+  /** Current statement digest token array. */
+  unsigned char *m_token_array;            // ★ 真正的字节流缓冲区，由 PFS 分配
+  /** Top level statement digest. */
+  sql_digest_state m_digest_state;         // 顶层语句那一份（内嵌对象）
+
+// sql/sql_lex.h:3773
+  sql_digest_state *m_digest;
+```
+
+绑定处（`sql/sql_parse.cc:7117`）——注意字符集就是在这里记的：
+
+```cpp
+        parser_state->m_lip.m_digest = thd->m_digest;
+        parser_state->m_lip.m_digest->m_digest_storage.m_charset_number =
+            thd->charset()->number;
+```
 
 #### 3.2.1 字节流的实际编码
 
@@ -382,6 +991,108 @@ struct sql_digest_storage {
 | 标识符 | token(2) + **长度前缀 2 字节小端** + 原文裸字节（不补 NUL） | `4 + len` |
 
 所以 token **不是变长编码**——这保证了 1.8 里"回退 2 字节"总是安全的（只要不越过标识符边界，而那正是 `m_last_id_index` 的用途）。
+
+**四个读写原语的完整源码**（`sql/sql_digest.cc:52-157`）——这就是上面两条编码规则的全部实现：
+
+```cpp
+// sql/sql_digest.cc:44 —— 必须定义它，lex_token.h 里的 lex_token_array[] 才带出定义
+#define LEX_TOKEN_WITH_DEFINITION
+#include "sql/lex_token.h"
+
+#define SIZE_OF_A_TOKEN 2                         // ★ 定义在 .cc 里，不在 .h 里
+
+ulong max_digest_length = 0;                      // PFS 启动时写入
+ulong get_max_digest_length() { return max_digest_length; }
+
+// :52 读一个 token
+inline uint read_token(const sql_digest_storage *digest_storage, uint index,
+                       uint *tok) {
+  size_t safe_byte_count = digest_storage->m_byte_count;   // ★ 先快照：并发读时可能被别的线程改动
+
+  if (index + SIZE_OF_A_TOKEN <= safe_byte_count &&
+      safe_byte_count <= digest_storage->m_token_array_length) {   // ★ 双重护栏
+    const unsigned char *src = &digest_storage->m_token_array[index];
+    *tok = src[0] | (src[1] << 8);                        // 小端拼回 uint16
+    return index + SIZE_OF_A_TOKEN;
+  }
+
+  /* The input byte stream is exhausted. */
+  *tok = 0;
+  return MAX_DIGEST_STORAGE_SIZE + 1;                     // ★ 哨兵：任何合法索引都不可能 > 1MB
+}
+
+// :71 写一个 token
+inline void store_token(sql_digest_storage *digest_storage, uint token) {
+  /* WRITE: ok to assert, storing a token is race free. */
+  assert(digest_storage->m_byte_count <= digest_storage->m_token_array_length);
+
+  if (digest_storage->m_byte_count + SIZE_OF_A_TOKEN <=
+      digest_storage->m_token_array_length) {
+    unsigned char *dest =
+        &digest_storage->m_token_array[digest_storage->m_byte_count];
+    dest[0] = token & 0xff;
+    dest[1] = (token >> 8) & 0xff;
+    digest_storage->m_byte_count += SIZE_OF_A_TOKEN;
+  } else {
+    digest_storage->m_full = true;   // ★ 写不下不打错，只置 m_full
+  }
+}
+
+// :90 读标识符
+inline uint read_identifier(const sql_digest_storage *digest_storage,
+                            uint index, const char **id_string,
+                            int *id_length) {
+  uint new_index;
+  uint safe_byte_count = digest_storage->m_byte_count;
+
+  /* READ: never assert on data, reading can be racy when used concurrently
+   * (pfs). */
+  /*
+    token + length + string are written in an atomic way,
+    so we do always expect a length + string here
+  */
+  uint bytes_needed = SIZE_OF_A_TOKEN;                 // 标识符布局：[len:2][text:N]
+  if ((safe_byte_count <= digest_storage->m_token_array_length) &&
+      (index + bytes_needed) <= safe_byte_count) {
+    const unsigned char *src = &digest_storage->m_token_array[index];
+    uint length = src[0] | (src[1] << 8);
+    bytes_needed += length;
+    if ((index + bytes_needed) <= safe_byte_count) {
+      *id_string = pointer_cast<const char *>(src) + 2;  // ★ 跳过 2 字节长度，零拷贝
+      *id_length = length;
+      new_index = index + bytes_needed;
+      return new_index;
+    }
+  }
+  return MAX_DIGEST_STORAGE_SIZE + 1;
+}
+
+// :129 写标识符
+inline void store_token_identifier(sql_digest_storage *digest_storage,
+                                   uint token, size_t id_length,
+                                   const char *id_name) {
+  assert(digest_storage->m_byte_count <= digest_storage->m_token_array_length);
+
+  size_t bytes_needed = 2 * SIZE_OF_A_TOKEN + id_length;   // 4 + N
+  if (digest_storage->m_byte_count + bytes_needed <=
+      (unsigned int)digest_storage->m_token_array_length) {
+    unsigned char *dest =
+        &digest_storage->m_token_array[digest_storage->m_byte_count];
+    dest[0] = token & 0xff;
+    dest[1] = (token >> 8) & 0xff;
+    dest[2] = id_length & 0xff;       // 长度前缀，小端
+    dest[3] = (id_length >> 8) & 0xff;
+    if (id_length > 0) {
+      memcpy((char *)(dest + 4), id_name, id_length);
+    }
+    digest_storage->m_byte_count += bytes_needed;
+  } else {
+    digest_storage->m_full = true;
+  }
+}
+```
+
+> ★ 注意读写两侧的**不对称**：`store_*` 可以 `assert`（"WRITE: ok to assert, storing a token is race free"），而 `read_*` 一律不 assert——*"READ: never assert on data, reading can be racy when used concurrently (pfs)"*。这是 PFS 脏读的源码级自白。
 
 #### 3.2.2 一个完整例子：`SELECT a FROM t WHERE b=1`
 
@@ -420,37 +1131,398 @@ SELECT `a` + `b` , `a` - `b` FROM `t1` , `t2` , `t3` WHERE `a` = `c`
 
 ### 3.3 digest 值是被刻意冻结的 ABI
 
-token 编号分区预留，源码注释明说：
+★ **这是本篇与 [`04_parser.md`](04_parser.md) 的交叉点**：`sql/sql_yacc.yy:537` 那段 `MAINTAINER:` 注释说的"token 值进了 digest、新 token 只能追加在末尾、由 `gen_lex_token` 强制执行"，执行者就是下面这个文件和它的 `static_assert`。
+
+**硬断言原文**（`sql/gen_lex_token.cc:238`）：
+
+```cpp
+static_assert(YYUNDEF == 1150,
+              "YYUNDEF must be stable, because raw token numbers are used in "
+              "PFS digest calculations");
+```
+
+> 注意措辞 **"raw token numbers"**——没有映射层、没有版本化间接，编号本身就是哈希输入的一对字节。
+
+#### 3.3.1 编号空间的"分区宪法"（`sql/gen_lex_token.cc:33-86` 注释全文）
+
+```cpp
+/*
+  MAINTAINER:
+
+  Tokens printed in sql/lex_token.h do come from several sources:
+  - tokens from sql_yacc.yy
+  - tokens from sql_hints.yy
+  - fake tokens for digests.
+
+  All the token values are mapped in the same space,
+  indexed by the token value directly.
+
+  To account for enhancements and new tokens,
+  gap are created, so that adding a token from one source
+  does not change values of tokens from other sources.
+
+  This is done to ensure stability in digest computed values.
+
+  As of now (8.0.0), the mapping looks like this:
+  - PART 1: [0 .. 255] tokens of single-character lexemes
+  - PART 2: [256 .. ...] tokens < YYUNDEF from sql_yacc.yy
+  - PART 3: [... .. 999] reserved for sql_yacc.yy new tokens < YYUNDEF
+  - PART 4: [1000 .. ...] tokens from sql_hints.yy
+  - PART 5: [... .. 1099] reserved for sql_hints.yy new tokens
+  - PART 6: [1100 .. ...] digest special fake tokens
+  - PART 7: [... .. 1149] reserved for new digest special fake tokens
+  - PART 8: [1150 .. ...] tokens > YYUNDEF from sql_yacc.yy
+
+  Should gen_lex_token fail when tokens are exhausted
+  (maybe you are reading this comment because of a fprintf(stderr) below),
+  the options are as follows, by order of decreasing desirability:
+
+  1) Reuse OBSOLETE_TOKEN_XXX instead of consuming new token values
+
+  2) Consider if you really need to create a new token,
+  instead of re using an existing one.
+
+  Keep in mind that syntax sugar in the parser still adds
+  to complexity, by making the parser tables bigger,
+  so adding tokens all the time is not a good practice.
+
+  3) Expand boundary values for
+     - range_for_sql_hints
+     - range_for_digests
+  and record again all the MTR tests that print a DIGEST,
+  because DIGEST values have now changed.
+
+  While at it, because digests have changed anyway,
+  please seriously consider to clean up and reorder:
+  - all the tokens in sql/sql_yacc.yy in one nice list,
+  ordered alphabetically, removing obsolete values if any.
+  - likewise for sql/sql_hints.yy
+*/
+```
+
+> ⚠️ **勘误**：只有 **PART 1..PART 8**。文档/资料里常见的"PART 9"只是 `print_tokens()` 输出到末尾时的一句哨兵注释 `/* PART 9: End of token list. */`（`:460`），**不是一个编号区间**。
+
+#### 3.3.2 `range` 类：编号配额的执行者（`sql/gen_lex_token.cc:149`）
+
+```cpp
+struct range {
+  range(const char *title, int start, int end)
+      : title{title}, start{start}, end{end}, max_seen{0} {}
+
+  void set_token(int tok, const char *str, int line) {
+    if (tok <= 0) {
+      fprintf(stderr, "%s:%d: Bad token found\n", __FILE__, line);
+      exit(1);
+    }
+
+    if (tok > end) {                       // ★★ 越界即 exit(1)：这就是"token 配额耗尽"的报错点
+      fprintf(stderr,
+              "%s:%d: Token reserve for %s exhausted: %d (should be <= %d).\n"
+              "Please see MAINTAINER instructions in sql/gen_lex_token.cc\n",
+              __FILE__, line, title, tok, end);
+      exit(1);
+    }
+
+    if (tok >= MY_MAX_TOKEN) {
+      fprintf(stderr,
+              "%s:%d: Added that many new keywords ? Increase MY_MAX_TOKEN\n",
+              __FILE__, line);
+      exit(1);
+    }
+
+    if (tok > max_seen) max_seen = tok;
+
+    compiled_token_array[tok].m_initialized = true;
+    compiled_token_array[tok].m_token_string = str;
+    compiled_token_array[tok].m_token_length = strlen(str);
+    compiled_token_array[tok].m_append_space = true;   // ★ 默认补空格
+    compiled_token_array[tok].m_start_expr = false;    // ★ 默认不开启表达式
+  }
+
+  int add_token(const char *str, int line) {   // digest fake token 走这里：自动 max_seen+1
+    set_token(max_seen ? max_seen + 1 : start, str, line);
+    return max_seen;
+  }
+
+  void print(const char *header1, const char *header2 = nullptr) const {
+    puts(header1);
+    for (int tok = start; tok <= max_seen; tok++) print_token(tok);
+    if (header2 == nullptr) return;
+    puts(header2);
+    for (int tok = max_seen + 1; tok <= end; tok++)
+      printf("/* reserved %03d for %s */  { \"\", 0, false, false},\n", tok, title);
+  }
+  ...
+};
+```
+
+四个 range 变量与第二条硬约束（`:238-252`）：
+
+```cpp
+static_assert(YYUNDEF == 1150, "YYUNDEF must be stable, ...");
+range range_for_sql_yacc2{"sql/sql_yacc.yy (before YYUNDEF)", YYUNDEF, MY_MAX_TOKEN};
+                                                   // 实际 1150..1251  → PART 8
+
+range range_for_digests{"digest specials", 1100, range_for_sql_yacc2.start - 1};
+                                                   // 实际 1100..1149  → PART 6/7
+
+static_assert(MAX_EXECUTION_TIME_HINT == 1000,
+              "MAX_EXECUTION_TIME_HINT should be equal to 1000");   // ★ 第二条硬钉
+range range_for_sql_hints{"sql/sql_hints.yy", MAX_EXECUTION_TIME_HINT,
+                          range_for_digests.start - 1};             // 实际 1000..1099 → PART 4/5
+
+range range_for_sql_yacc1{"sql/sql_yacc.yy (after YYUNDEF)", 256,
+                          range_for_sql_hints.start - 1};           // 实际 256..999 → PART 2/3
+```
+
+> ⚠️ **源码的一处笔误**：`range_for_sql_yacc1`（256..999）的 title 写成 `"(after YYUNDEF)"`，但实际区间是 **before YYUNDEF**；`range_for_sql_yacc2`（1150..1251）反过来。数值是对的，**title 字符串写反了**——只影响报错文本，不影响行为。
+
+`MY_MAX_TOKEN = 1251`（`:145`）。第三处硬约束钉住 5.7 的最后一个 token（`sql/gen_lex_token.cc:483`）：
+
+```cpp
+/*
+  ZEROFILL_SYM is the last token in the MySQL 5.7 token list,
+  see sql/sql_yacc.yy
+  The token value is frozen and should not change,
+  to avoid changing query digest values.
+*/
+static const int zerofill_expected_value = 906;
+
+static_assert(!(ZEROFILL_SYM < zerofill_expected_value),
+              "Token deleted. "
+              "Please read MAINTAINER instructions in sql/sql_yacc.yy");
+static_assert(!(ZEROFILL_SYM > zerofill_expected_value),
+              "Token added in the wrong place. "
+              "Please read MAINTAINER instructions in sql/sql_yacc.yy");
+```
+
+> ★ 两个方向各一条：**删 token**（编号左移）与**在中间插 token**（编号右移）都会触发。这就是 `OBSOLETE_TOKEN_NNN` 存在的原因——删不得，只能废弃。
+
+`YYUNDEF` 本身在 `sql_yacc.yy:1337` 显式留出 gap：
+
+```yacc
+/*
+  Here is an intentional gap in token numbers.
+
+  Token numbers starting 1000 till YYUNDEF are occupied by:
+  1. hint terminals (see sql_hints.yy),
+  2. digest special internal token numbers (see gen_lex_token.cc, PART 6).
+
+  Note: YYUNDEF in internal to Bison. Please don't change its number, or change
+  it in sync with YYUNDEF in sql_hints.yy.
+*/
+%token YYUNDEF 1150                /* INTERNAL (for use in the lexer) */
+%token<lexer.keyword> JSON_VALUE_SYM 1151               /* SQL-2016-R */
+```
+
+#### 3.3.3 生成流程：三步
+
+```cmake
+# sql/CMakeLists.txt:46-90
+SET(GEN_DIGEST_SOURCES
+  ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h            # 归类为 "digest 源"
+)
+...
+# Gen_lex_token
+# Make sure sql_yacc.h is generated before compiling gen_lex_token
+MYSQL_ADD_EXECUTABLE(gen_lex_token
+  gen_lex_token.cc
+  DEPENDENCIES GenServerSource        # ★ 强制先由 bison 生成 sql_yacc.h / sql_hints.yy.h
+  SKIP_INSTALL
+  )
+
+ADD_CUSTOM_COMMAND(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h
+  COMMAND gen_lex_token > lex_token.h   # ★ 靠 shell 重定向生成
+  DEPENDS gen_lex_token
+)
+```
 
 ```
-/* This is done to ensure stability in digest computed values */
-static_assert(YYUNDEF == 1150, "YYUNDEF must be stable, because raw token
-numbers are used in PFS digest calculations");
+① bison 生成 sql_yacc.h（含 #define YYUNDEF 1150 等）与 sql_hints.yy.h
+② 编译 gen_lex_token.cc：#include 上述两个头拿【编号】，
+   链接 sql/lex.h 的 symbols[] 拿【文本】（sql/gen_lex_token.cc:319-332）
+③ 运行 gen_lex_token > lex_token.h：compute_tokens() 填表 → print_tokens() 输出
 ```
 
-任何 token 表变更都会静默改变**所有**已存 digest 值，需重录全部 MTR 测试。
+> ⚠️ **常见误解**：`gen_lex_token` **不解析任何文件**。`main(int, char **)`（`:498`）完全忽略 argv，不做 `fgets`/`strstr`。token 编号靠 `#include "sql/sql_yacc.h"`（`:32`）在**编译期**拿到，可读名字来自 `lex.h` 的 `symbols[]`（5.6/5.7 确有解析 `sql_yacc.h` 的旧实现，8.0 已简化）。
+
+**本工作树的构建产物实证**（`clion-build-950-debug/sql/lex_token.h`）：
+
+```c
+/* 1202 */  { "URL", 3, true, false},
+/* 1203 */  { "GENERATE", 8, true, false},
+/* 1204 */  { "TEST_0528", 9, true, false},    /* ← 本地新增的非上游 token，见 04_parser.md */
+/* PART 9: End of token list. */
+/* DUMMY */ { "", 0, false, false}
+};
+#endif /* LEX_TOKEN_WITH_DEFINITION */
+/* DIGEST specific tokens. */
+#define TOK_GENERIC_VALUE 1100
+...
+#define TOK_UNUSED 1111
+```
+
+> ★ `TEST_0528` 落在 **1204**，位于 PART 8（≥ YYUNDEF）且是**追加**，所以 `YYUNDEF` 仍是 1150、既有编号一个没动 ⇒ 三条 `static_assert` 全过 ⇒ 已有 digest 不变。这正是"只能追加不能中间插"的现场演示。
+
+任何"中间插入 / 删除 / 挤压分区边界"的改动都会静默改变**所有**已存 digest 值，需重录全部 MTR 测试。
 
 ### 3.4 反解析：从字节流还原 DIGEST_TEXT
 
 哈希是单向的，`DIGEST_TEXT` 是**从 token 字节流重放出来的**——3.2.2 那个 31 字节数组能完整还原成文本。这一步叫 `compute_digest_text()`，是纯线性重放。
 
-#### 3.4.1 算法
+#### 3.4.1 `compute_digest_text()` 完整源码（`sql/sql_digest.cc:167-302`）
 
-```
-current_byte = 0
-while (current_byte < byte_count):
-    tok = read_token(...)              # 读 2 字节
-    tok_data = &lex_token_array[tok]   # 查表
-    if tok 是标识符类:
-        (id_ptr, id_len) = read_identifier(...)   # 读"长度 + 原文"
-        转码到 utf8mb3
-        append("`" + id + "`")
-    else:
-        append(tok_data->m_token_string)
-        add_space = tok_data->m_append_space
+> ⚠️ **勘误**：常见说法"重放时把 `TOK_*_LIST` 折叠成 `...`"是**错的**——折叠全在 `digest_add_token()` 里完成（见 1.7.1 六个折叠点）。这里只是把**已折叠好的 token** 原样查表输出。
+
+```cpp
+/*
+  Iterate token array and updates digest_text.
+*/
+void compute_digest_text(const sql_digest_storage *digest_storage,
+                         String *digest_text) {
+  assert(digest_storage != nullptr);
+  uint byte_count = digest_storage->m_byte_count;
+  String *digest_output = digest_text;
+  uint tok = 0;
+  uint current_byte = 0;
+  lex_token_string *tok_data;
+
+  /*
+    When a space needs to be appended, set add_space to true,
+    and delay actually adding the space until the next token
+    is found.
+    This is to prevent printing digest text
+    with a trailing space character.
+  */
+  bool add_space = false;                    // ★ 空格规则①：延迟空格
+
+  /* Reset existing data */
+  digest_output->length(0);
+
+  if (byte_count > digest_storage->m_token_array_length) {
+    digest_output->append("\0", 1);          // ★ 脏读防御：并发下 byte_count 可能暂时越界
+    return;
+  }
+
+  /* Convert text to utf8 */
+  const CHARSET_INFO *from_cs =
+      get_charset(digest_storage->m_charset_number, MYF(0));
+  const CHARSET_INFO *to_cs = &my_charset_utf8mb3_bin;   // ★ DIGEST_TEXT 固定落在 utf8mb3_bin
+
+  if (from_cs == nullptr) {
+    /*
+      Can happen, as we do dirty reads on digest_storage,
+      which can be written to in another thread.
+    */
+    digest_output->append("\0", 1);
+    return;
+  }
+
+  char id_buffer[NAME_LEN + 1] = {'\0'};     // ★ 标识符转码暂存区，上限 NAME_LEN(64) 字符
+  const char *id_string;
+  size_t id_length;
+  bool convert_text = !my_charset_same(from_cs, to_cs);
+
+  while (current_byte < byte_count) {        // ★ 主循环：纯粹的流重放，不做任何归约
+    current_byte = read_token(digest_storage, current_byte, &tok);
+
+    if (tok <= 0 || tok >= array_elements(lex_token_array) ||
+        current_byte > max_digest_length) {
+      return;                                // ★ 直接 return，不加 "..."；已写出的部分保留
+    }
+
+    tok_data = &lex_token_array[tok];        // ★ 查表（字段是 m_token_string，不是 m_token_text）
+
+    switch (tok) {
+      /* All identifiers are printed with their name. */
+      case IDENT:
+      case IDENT_QUOTED:
+      case TOK_IDENT:
+      case TOK_IDENT_AT: {                   // ★ 4 种标识符统一处理
+        const char *id_ptr = nullptr;
+        int id_len = 0;
+        uint err_cs = 0;
+
+        current_byte =
+            read_identifier(digest_storage, current_byte, &id_ptr, &id_len);
+        if (current_byte > max_digest_length) {
+          /* Truncation */
+          return;
+        }
+
+        if (convert_text) {
+          /* Verify that the converted text will fit. */
+          if (to_cs->mbmaxlen * id_len > NAME_LEN) {
+            if (add_space) {
+              digest_output->append(" ", 1);
+              add_space = false;
+            }
+            digest_output->append("...", 3);   // ★ 唯一一处整体 "..."
+            break;
+          }
+          /* Convert identifier string into the storage character set. */
+          id_length = my_convert(id_buffer, NAME_LEN, to_cs, id_ptr, id_len,
+                                 from_cs, &err_cs);
+          id_string = id_buffer;
+        } else {
+          id_string = id_ptr;
+          id_length = id_len;
+        }
+
+        if (id_length == 0 || err_cs != 0) {
+          break;                              // 空名或转码失败：整个标识符被丢弃
+        }
+
+        if (add_space) {
+          digest_output->append(" ", 1);
+          add_space = false;
+        }
+
+        /* Copy the converted identifier into the digest string. */
+        digest_output->append("`", 1);        // ★ 标识符一律加反引号
+        if (id_length > 0) {
+          digest_output->append(id_string, id_length);
+        }
+        if (tok == TOK_IDENT_AT)  // No space before @ in "table@query_block".
+        {
+          digest_output->append("`", 1);      // ★ 空格规则③
+        } else {
+          digest_output->append("`", 1);
+          add_space = true;
+        }
+      } break;
+
+      /* Everything else is printed as is. */
+      default:
+        if (add_space) {
+          digest_output->append(" ", 1);
+          add_space = false;
+        }
+
+        int tok_length = tok_data->m_token_length;
+
+        digest_output->append(tok_data->m_token_string, tok_length);
+        // ★★ 这里就是 "?" / "?, ..." / "(?)" / "(?) /* , ... */"
+        //     / "(...)" / "(...) /* , ... */" / "IN (...)" 的落地处——
+        //     文本由 gen_lex_token.cc:341-359 登记，此处原样打印
+
+        if (tok_data->m_append_space) {
+          add_space = true;                   // ★ 空格规则②
+        }
+        break;
+    }
+  }
+}
 ```
 
-关键在 `lex_token_array` 这张表。
+关键在 `lex_token_array` 这张表。三条空格规则的落点汇总：
+
+| 规则 | 代码位置 | 作用 |
+|---|---|---|
+| ① 延迟空格 `add_space` | `:186` 声明、`:288-291`、`:268-270` | 只有下一个 token 真来了才补空格 ⇒ 杜绝尾部空格 |
+| ② 每 token 属性位 `m_append_space` | `:296-298`；数据源 `gen_lex_token.cc:379` | 默认 true；`'@'` 显式置 false |
+| ③ `TOK_IDENT_AT` 例外 | `:277-283` | `table@query_block` 的 `@` 前不加空格 |
 
 #### 3.4.2 `lex_token.h` 是构建期生成的，源码树里没有
 
@@ -467,18 +1539,196 @@ struct lex_token_string {
 
 **`m_append_space` 和 `m_start_expr` 这两个 bool 就是全部"语法智能"的来源**——1.2 的一元/二元判定用的是 `m_start_expr`，空格排版用的是 `m_append_space`。
 
-表按 token 号分成 8 段（`gen_lex_token.cc` 的 MAINTAINER 注释）：
+表按 token 号分成 8 段（完整分区见 3.3.1）。
 
-```
-- PART 1: [0 .. 255]        tokens of single-character lexemes
-- PART 2: [256 .. ...]      tokens < YYUNDEF from sql_yacc.yy
-- PART 3: [... .. 999]      reserved for sql_yacc.yy new tokens < YYUNDEF
-- PART 4: [1000 .. ...]     tokens from sql_hints.yy
-- PART 6: [1100 .. ...]     digest special fake tokens
-- PART 8: [1150 .. ...]     tokens > YYUNDEF from sql_yacc.yy
+**结构体是 `main()` 现场 `printf` 打印出来的**（`sql/gen_lex_token.cc:501-512`）——所以生成的 `lex_token.h` 里那 4 个字段**没有任何注释**，注释只存在于 `gen_lex_token_string`（`:88`）：
+
+```cpp
+int main(int, char **) {                      // ★ 完全忽略 argv：不解析任何文件
+  puts(ORACLE_GPL_COPYRIGHT_NOTICE("2016"));
+
+  printf("/*\n");
+  printf("  This file is generated, do not edit.\n");
+  printf("  See file sql/gen_lex_token.cc.\n");
+  printf("*/\n");
+  printf("struct lex_token_string\n");
+  printf("{\n");
+  printf("  const char *m_token_string;\n");
+  printf("  int m_token_length;\n");
+  printf("  bool m_append_space;\n");
+  printf("  bool m_start_expr;\n");
+  printf("};\n");
+  printf("typedef struct lex_token_string lex_token_string;\n");
+
+  compute_tokens();     // ① 填 compiled_token_array[]
+  print_tokens();       // ② 全部输出到 stdout（CMake 重定向到 lex_token.h）
+
+  return 0;
+}
 ```
 
-PART 1（单字符）的 `m_token_string` 就是字符本身。被归一化的 token 其文本是**永远不会显示**的占位串（因为收集阶段已被改写成 `TOK_GENERIC_VALUE`）：
+```cpp
+// sql/gen_lex_token.cc:88 —— 带注释的"内部版"结构体
+  /**
+    Real lexeme string or user-specified text to output with a normalized
+    query string.
+  */
+  const char *m_token_string;
+  /** Byte length of m_token_string. */
+  int m_token_length;
+  /**
+    If true, output ' ' after this token to a normalized query string.
+    See digest_add_token().
+  */
+  bool m_append_space;
+  /** See digest_add_token(). */
+  bool m_start_expr;
+  /** The structure is uninitialized if false. */
+  bool m_initialized{false};
+```
+
+**`print_tokens()`**（`:431-481`）——数组被 `#ifdef LEX_TOKEN_WITH_DEFINITION` 包住，因为只有 `sql_digest.cc` 需要数组实体，`sql_yacc.yy` 与 `sql_lex_hints.cc` 只要 `TOK_*` 宏：
+
+```cpp
+static void print_tokens() {
+  int tok;
+
+  printf("#ifdef LEX_TOKEN_WITH_DEFINITION\n");
+  printf("lex_token_string lex_token_array[]=\n");
+  printf("{\n");
+  printf("/* PART 1: character tokens. */\n");
+
+  for (tok = 0; tok < 256; tok++) {
+    printf("/* %03d */  { \"\\x%02x\", 1, %s, %s},\n", tok, tok, ...);
+  }
+
+  range_for_sql_yacc1.print(
+      "/* PART 2: named tokens from sql/sql_yacc.yy (chunk 1). */",
+      "/* PART 3: padding reserved for sql/sql_yacc.yy extensions. */");
+
+  range_for_sql_hints.print(
+      "/* PART 4: named tokens from sql/sql_hints.yy. */",
+      "/* PART 5: padding reserved for sql/sql_hints.yy extensions. */");
+
+  range_for_digests.print(
+      "/* PART 6: Digest special tokens. */",
+      "/* PART 7: padding reserved for digest special tokens. */");
+
+  range_for_sql_yacc2.print(
+      "/* PART 8: named tokens from sql/sql_yacc.yy (chunk 2). */");
+
+  printf("/* PART 9: End of token list. */\n");   // ★ 哨兵注释，不是编号区间
+
+  printf("/* DUMMY */ { \"\", 0, false, false}\n");
+  printf("};\n");
+  printf("#endif /* LEX_TOKEN_WITH_DEFINITION */\n");
+
+  printf("/* DIGEST specific tokens. */\n");      // ★ 以下 #define 无条件输出
+  printf("#define TOK_GENERIC_VALUE %d\n", tok_generic_value);
+  ...
+  printf("#define TOK_UNUSED %d\n", tok_unused);
+}
+```
+
+#### 3.4.2.1 digest fake token 的登记（`compute_tokens()`，`:334-363`）
+
+```cpp
+  /*
+    Additional FAKE tokens,
+    used internally to normalize a digest text.
+  */
+
+  /* Digest tokens in 5.7 */
+
+  tok_generic_value = range_for_digests.add_token("?", __LINE__);            // 1100
+  tok_generic_value_list = range_for_digests.add_token("?, ...", __LINE__);  // 1101
+  tok_row_single_value = range_for_digests.add_token("(?)", __LINE__);       // 1102
+  tok_row_single_value_list =
+      range_for_digests.add_token("(?) /* , ... */", __LINE__);              // 1103
+  tok_row_multiple_value = range_for_digests.add_token("(...)", __LINE__);   // 1104
+  tok_row_multiple_value_list =
+      range_for_digests.add_token("(...) /* , ... */", __LINE__);            // 1105
+  tok_ident = range_for_digests.add_token("(tok_id)", __LINE__);             // 1106
+  tok_ident_at = range_for_digests.add_token("(tok_id_at)", __LINE__);       // 1107
+  tok_hint_comment_open =
+      range_for_digests.add_token(HINT_COMMENT_STARTER, __LINE__);           // 1108 "/*+"
+  tok_hint_comment_close =
+      range_for_digests.add_token(HINT_COMMENT_TERMINATOR, __LINE__);        // 1109 "*/"
+
+  /* New in 8.0 */
+
+  tok_in_generic_value_expression =
+      range_for_digests.add_token("IN (...)", __LINE__);                     // 1110
+
+  /* Add new digest tokens here */
+
+  tok_unused = range_for_digests.add_token("UNUSED", __LINE__);              // 1111
+```
+
+> ★ `add_token()` 用 `max_seen + 1` 递增，所以**在 5.7 组和 8.0 组之间插一个新 fake token 会改变后面所有编号**——这也证明了 3.3 的"只能追加"原则在 fake token 段同样成立。
+
+#### 3.4.2.2 ★ `m_start_expr` 的 35 个 token（1.2 那条规则的完整判据）
+
+```cpp
+  /*
+    Define additional properties for tokens.
+
+    List all the token that are followed by an expression.
+    This is needed to differentiate unary from binary
+    '+' and '-' operators, because we want to:
+    - reduce <unary +> <NUM> to <?>,
+    - preserve <...> <binary +> <NUM> as is.
+  */
+  set_start_expr_token('(');
+  set_start_expr_token(',');
+  set_start_expr_token(EVERY_SYM);
+  set_start_expr_token(AT_SYM);
+  set_start_expr_token(STARTS_SYM);
+  set_start_expr_token(ENDS_SYM);
+  set_start_expr_token(DEFAULT_SYM);
+  set_start_expr_token(RETURN_SYM);
+  set_start_expr_token(IF);
+  set_start_expr_token(ELSEIF_SYM);
+  set_start_expr_token(CASE_SYM);
+  set_start_expr_token(WHEN_SYM);
+  set_start_expr_token(WHILE_SYM);
+  set_start_expr_token(UNTIL_SYM);
+  set_start_expr_token(SELECT_SYM);
+
+  set_start_expr_token(OR_SYM);
+  set_start_expr_token(OR2_SYM);
+  set_start_expr_token(XOR);
+  set_start_expr_token(AND_SYM);
+  set_start_expr_token(AND_AND_SYM);
+  set_start_expr_token(NOT_SYM);
+  set_start_expr_token(BETWEEN_SYM);
+  set_start_expr_token(LIKE);
+  set_start_expr_token(REGEXP);
+
+  set_start_expr_token('|');
+  set_start_expr_token('&');
+  set_start_expr_token(SHIFT_LEFT);
+  set_start_expr_token(SHIFT_RIGHT);
+  set_start_expr_token('+');
+  set_start_expr_token('-');
+  set_start_expr_token(INTERVAL_SYM);
+  set_start_expr_token('*');
+  set_start_expr_token('/');
+  set_start_expr_token('%');
+  set_start_expr_token(DIV_SYM);
+  set_start_expr_token(MOD_SYM);
+  set_start_expr_token('^');
+```
+
+三组共 **35 个**（`sql/gen_lex_token.cc:390-428`）：**① 结构/语句起始**（`( , EVERY AT STARTS ENDS DEFAULT RETURN IF ELSEIF CASE WHEN WHILE UNTIL SELECT`）— **② 布尔/逻辑**（`OR OR2 XOR AND && NOT BETWEEN LIKE REGEXP`）— **③ 算术/位运算**（`| & << >> + - INTERVAL * / % DIV MOD ^`）。
+
+> ★ **语义**：这些 token 后面**一定跟一个表达式**，所以紧随的 `+`/`-` 是**一元**号（应被吸收成 `?`）。否则为二元，保留原样。消费点就是 `sql/sql_digest.cc:441` 的 `if (lex_token_array[last_token2].m_start_expr)`。
+>
+> ★ 注意这个列表**不完备**的语法后果：`NOT`、`BETWEEN` 在；但 `IN`、`IS`、`ON`、`WHERE`、`HAVING`、`THEN`、`ELSE` 不在——所以 `WHERE a-1` 里的 `-` 会被判为**一元**（因为前一个 token 是标识符 `a`，`m_start_expr=false` → 其实还是二元）。真正会误判的是 `SELECT-1` 这类。
+
+#### 3.4.2.3 PART 1 与"永不显示"的占位串
+
+PART 1（单字符）的 `m_token_string` 就是字符本身（打印成 `"\xNN"`）。被归一化的 token 其文本是**永远不会显示**的占位串（因为收集阶段已被改写成 `TOK_GENERIC_VALUE`）：
 
 ```cpp
   /*
@@ -490,6 +1740,10 @@ PART 1（单字符）的 `m_token_string` 就是字符本身。被归一化的 t
   range_for_sql_yacc1.set_token(TEXT_STRING, "(text)", __LINE__);
   range_for_sql_yacc1.set_token(IDENT, "(id)", __LINE__);
 ```
+
+同理被登记为占位串的还有 `(bin) (decimal) (float) (hex) (hostname) (long) (ulonglong) (nchar) (id_quoted)`，以及 `sql_lex.cc` 里硬编码的合成 token：`"WITH ROLLUP"`（单 token 打印两个词）、`"!"`、`"||"`、`"?"`、`":="`、`"(_charset)"`、`""`(END_OF_INPUT)、`"->"`、`"->>"`。
+
+> ★ `WITH_ROLLUP_SYM` 是"一个 token 打印成两个词"的典型——这正是 04 篇提到的 LALR(2) 问题在词法层的解法，也是"归一化规则散布在词法器各处"（第七章限制）的实例。
 
 #### 3.4.3 空格规则（三条）
 
@@ -702,7 +1956,7 @@ if (digest_stat != nullptr) {
 }
 ```
 
-> 统计字段的全貌（COUNT_STAR / SUM_TIMER_WAIT / 直方图 / QUERY_SAMPLE 采样）见 [`../infra/pfs_statement.md`](../infra/pfs_statement.md)，本篇只讲指纹本身。
+> 统计字段的全貌（COUNT_STAR / SUM_TIMER_WAIT / 直方图 / QUERY_SAMPLE 采样）见 [`../infra/pfs_statement.md`](../../infra/observability/pfs/pfs_statement.md)，本篇只讲指纹本身。
 
 ### 5.3 存储结构与槽分配算法
 

@@ -10,12 +10,12 @@
   - 主线与基础构件
     - [整体结构](#整体结构)
   - 构建与维护
-    - [★ 哈希键的自适应算法（前缀长度学习）](#哈希键的自适应算法前缀长度学习)
+    - [★ 哈希键的自适应算法（前缀长度学习）](#-哈希键的自适应算法前缀长度学习)
     - [维护路径（建 / 删 / 改）](#维护路径建--删--改)
   - 读路径
     - [查询路径 `btr_search_guess_on_hash`](#查询路径-btr_search_guess_on_hash)
   - 并发与治理
-    - [★ 锁协议与分片](#锁协议与分片)
+    - [★ 锁协议与分片](#-锁协议与分片)
     - [开关、内存与监控](#开关内存与监控)
 - [相关的系统变量](#相关的系统变量)
 - [Misc](#Misc)
@@ -284,6 +284,96 @@ struct alignas(alignof(uint64_t)) btr_search_prefix_info_t {
 
 索引级还有开关 `dict_index_t::disable_ahi`（`dict0mem.h`）——目前只用于 intrinsic 临时表与 SDI 表，因为**它们的 index id 不唯一**，而 AHI 校验依赖 index id。
 
+**★ 完整定义**（⚠️ 真名是 `btr_search_t`，**不存在 `btr_search_info_t`**——只有函数 `btr_search_info_create()` 保留了旧名）：
+
+```cpp
+struct btr_search_t {
+  /** Number of blocks in this index tree that have search index built i.e.
+  block->ahi.index points to this index. */
+  std::atomic<size_t> ref_count;
+
+  /** @{ The following fields are not protected by any latch.
+  Unfortunately, this means that they must be aligned to the machine word, i.e.,
+  they cannot be turned into bit-fields. */
+
+  /** the root page frame when it was last time fetched, or NULL. */
+  buf_block_t *root_guess;
+  /** when this exceeds BTR_SEARCH_HASH_ANALYSIS, the hash analysis starts; this
+  is reset if no success noticed. */
+  std::atomic<uint64_t> hash_analysis;
+  /** true if the last search would have succeeded, or did succeed, using the
+  hash index; NOTE that the value here is not exact: it is not calculated for
+  every search, and the calculation itself is not always accurate! */
+  bool last_hash_succ;
+  /** number of consecutive searches which would have succeeded, or did succeed,
+  using the hash index; the range is 0 .. BTR_SEARCH_BUILD_LIMIT + 5. */
+  std::atomic<uint64_t> n_hash_potential;
+  /** @} */
+
+  std::atomic<btr_search_prefix_info_t> prefix_info;
+  static_assert(decltype(prefix_info)::is_always_lock_free);
+#ifdef UNIV_SEARCH_PERF_STAT
+  std::atomic<ulint> n_hash_succ;
+  std::atomic<ulint> n_hash_fail;
+  std::atomic<ulint> n_patt_succ;
+  std::atomic<ulint> n_searches;
+#endif /* UNIV_SEARCH_PERF_STAT */
+#ifdef UNIV_DEBUG
+  ulint magic_n;
+#endif
+};
+```
+
+> ⚠️ **`n_fields` / `n_bytes` / `left_side` 已不再是独立字段**——8.0.30+ 打包进 `std::atomic<btr_search_prefix_info_t> prefix_info`（见下）。
+> ⚠️ `n_hash_succ` / `n_hash_fail` / `n_patt_succ` / `n_searches` **只在 `UNIV_SEARCH_PERF_STAT` 下存在**，默认构建**不编译**。所以"`hash_analysis`、`n_hash_potential`"才是总在生效的统计项。
+> ⚠️ **不存在 `n_patt_move`**（UNIV_SEARCH_PERF_STAT 下也没有这个字段）。
+
+**★★ `btr_search_prefix_info_t` 真身不在 `btr0sea.h`，而在 `buf0buf.h:1666`**：
+
+```cpp
+/** Structure used by AHI to contain information on record prefixes to be
+considered in hash index subsystem. It is meant for using as a single 64bit
+atomic value, thus it needs to be aligned properly. */
+struct alignas(alignof(uint64_t)) btr_search_prefix_info_t {
+  /** recommended prefix: number of bytes in an incomplete field */
+  uint32_t n_bytes;
+  /** recommended prefix length for hash search: number of full fields */
+  uint16_t n_fields;
+  /** true or false, depending on whether the leftmost record of several records
+  with the same prefix should be indexed in the hash index */
+  bool left_side;
+
+  bool equals_without_left_side(const btr_search_prefix_info_t &other) const {
+    return n_bytes == other.n_bytes && n_fields == other.n_fields;
+  }
+  bool operator==(const btr_search_prefix_info_t &other) const { ... }
+  bool operator!=(const btr_search_prefix_info_t &other) const { ... }
+};
+```
+
+> ★★ 整个结构 8 字节（4+2+1+padding），所以 `std::atomic<...>` 能做到 **lock-free 单指令读写**——这正是 8.0.30 重构的核心收益：**一次原子 load 同时拿到 `(n_fields, n_bytes, left_side)` 三元组**，避免三者不一致。源码里 `static_assert(decltype(prefix_info)::is_always_lock_free);` 把这个前提钉死。
+> ★ `equals_without_left_side()` 用于 insert 路径——只关心前缀长度、不关心方向。
+
+**★ 索引级推荐 → 页级使用的传递链**：
+
+```
+【产生】btr_search_info_update_hash()          btr0sea.cc:407
+          └─ info->prefix_info = {n_bytes, n_fields, left_side}   ← 单条 8 字节原子写
+【复制到 block】btr_search_update_block_hash_info()   btr0sea.cc:548
+          └─ block->ahi.recommended_prefix_info = info->prefix_info.load();
+【落到实际使用前缀】btr_search_build_page_hash_index()  btr0sea.cc:1579
+          ├─ block->ahi.prefix_info = prefix_info;
+          └─ block->ahi.index = index;
+【读取用于 fold】
+   ├─ rec_hash(..., block->ahi.prefix_info.*, ...)         btr0sea.cc:1136（删除）
+   ├─ rec_hash(..., recommended_prefix_info.*, ...)        btr0sea.cc:1480/1503（建立）
+   └─ rec_hash(..., block_prefix_info.*, ...)              btr0sea.cc:623（修复）
+【查询侧】btr_search_guess_on_hash()   btr0sea.cc:840
+   └─ prefix_info = info->prefix_info.load();  （索引级推荐）
+```
+
+> ★★★ **不变式**：删除（`btr0sea.cc:1136`）与修复（`btr0sea.cc:623`）**必须**用 `block->ahi.prefix_info`（当初建索引时用的那个），**不能**用 `info->prefix_info`（当前推荐）。若两者不同，说明页即将被重建——修复路径直接跳过，删除路径回到 `for(;;)` 重试。**否则会往哈希表塞入一个永远删不掉的条目，破坏 AHI**。
+
 #### 1.5 阈值常量
 
 | 常量 | 值 | 含义 |
@@ -470,6 +560,209 @@ AHI 每个"相等前缀组"**只存一条**（最左或最右，由 `left_side` 
 }
 ```
 
+**⚠️ 两个关键真名更正**：① **`rec_hash()` / `dtuple_hash()` 的定义体在 `.ic` 文件**（头文件只有声明带分号）；② **`rec_fold()` / `dtuple_fold()` / `ut_fold_binary()` 在 8.0.39 全部不存在**（全仓 0 命中），"fold" 只剩注释里的历史词汇。
+
+**★ `rec_hash()` 完整定义**（`rem0rec.ic:836`）：
+
+```cpp
+static inline uint64_t rec_hash(const rec_t *rec, const ulint *offsets,
+                                ulint n_fields, ulint n_bytes,
+                                uint64_t hash_value,
+                                const dict_index_t *index) {
+  uint16_t i;
+  const byte *data;
+  ulint len;
+  ulint n_fields_rec;
+
+  ut_ad(rec_offs_validate(rec, nullptr, offsets));
+  ut_ad(rec_validate(rec, offsets));
+  ut_ad(n_fields > 0 || n_bytes > 0);
+
+  n_fields_rec = rec_offs_n_fields(offsets);
+  ut_ad(n_fields <= n_fields_rec);
+  ut_ad(n_fields < n_fields_rec || n_bytes == 0);
+
+  if (n_fields > n_fields_rec) {
+    n_fields = n_fields_rec;        // 防御：不超出记录实际字段数
+  }
+  if (n_fields == n_fields_rec) {
+    n_bytes = 0;                    // 已哈希全部字段，就不存在"半个字段"
+  }
+
+  for (i = 0; i < n_fields; i++) {
+    data = rec_get_nth_field_instant(rec, offsets, i, index, &len);
+    //  ★ instant ADD COLUMN 兼容版本
+
+    if (len != UNIV_SQL_NULL) {     // ★★ SQL NULL 完全不参与 hash
+      hash_value = ut::hash_binary(data, len, hash_value);
+    }
+  }
+
+  if (n_bytes > 0) {                // 前缀截断
+    data = rec_get_nth_field_instant(rec, offsets, i, index, &len);
+    if (len != UNIV_SQL_NULL) {
+      if (len > n_bytes) len = n_bytes;
+      hash_value = ut::hash_binary(data, len, hash_value);
+    }
+  }
+
+  return hash_value;
+}
+```
+
+**★ `dtuple_hash()` 完整定义**（`data0data.ic:596`）——**结构必须与 `rec_hash` 逐位一致**：
+
+```cpp
+static inline uint64_t dtuple_hash(const dtuple_t *tuple, ulint n_fields,
+                                   ulint n_bytes, uint64_t hash_value) {
+  const dfield_t *field;
+  ulint i;
+  const byte *data;
+  ulint len;
+
+  for (i = 0; i < n_fields; i++) {
+    field = dtuple_get_nth_field(tuple, i);
+    data = (const byte *)dfield_get_data(field);
+    len = dfield_get_len(field);
+
+    if (len != UNIV_SQL_NULL) {
+      hash_value = ut::hash_binary(data, len, hash_value);
+    }
+  }
+
+  if (n_bytes > 0) {
+    field = dtuple_get_nth_field(tuple, i);   // ★ 复用循环变量 i（此时 i == n_fields）
+    data = (const byte *)dfield_get_data(field);
+    len = dfield_get_len(field);
+
+    if (len != UNIV_SQL_NULL) {
+      if (len > n_bytes) len = n_bytes;
+      hash_value = ut::hash_binary(data, len, hash_value);
+    }
+  }
+
+  return (hash_value);
+}
+```
+
+> ★★ **"逐位一致"的三条硬约束**：① 同样的 `seed`；② 同样的 `n_fields`/`n_bytes`；③ **同样跳过 SQL NULL**（不是"跳过该字段"，是"这一轮不加料"）。第三条最容易被忽略——若一边把 NULL 当 0 字节哈希、另一边跳过，结果立刻分叉。
+
+**★ 种子与底层哈希**：
+
+```cpp
+static ulint btr_hash_seed_for_record(const dict_index_t *index) {
+  ut_ad(index != nullptr);
+  return btr_search_hash_index_id(index);      // = ut::hash_uint64_pair(index->space, index->id)
+}
+
+static inline uint64_t hash_uint64_pair(uint64_t n1, uint64_t n2) {
+  return hash_uint64(hash_uint64(n1) ^ n2);     // ★ Tabulation Hashing
+}
+
+static inline uint64_t hash_binary(const byte *str, size_t len, uint64_t seed) {
+  if (len >= 15) {
+    /* 长字段快路径：前 8 字节 tab-hash 做种子，其余走硬件 CRC32 */
+    const auto h = hash_uint64_pair(seed, detail::read_from_8(str));
+    return hash_uint64_pair(h, ut_crc32(str + 8, len - 8));
+  }
+  /* 短字段：把剩余 <8 字节塞进一个 uint64 再折叠 */
+  uint64_t h = seed;
+  size_t i = 0;
+  if (len & 8) { h = hash_uint64_pair(h, detail::read_from_8(str + i)); i += 8; }
+  uint64_t last_part = 0;
+  if ((len & 7) == 0) return h;
+  if (len & 4) { last_part |= detail::read_from_4(str + i) << (16 + 8); i += 4; }
+  if (len & 2) { last_part |= detail::read_from_2(str + i) << 8;         i += 2; }
+  if (len & 1) { last_part |= detail::read_from_1(str + i);              i += 1; }
+  return hash_uint64_pair(h, last_part);
+}
+```
+
+> ★ 默认 `seed = 0xacb1f3526e25dd39`（`ut0rnd.h:102`），但 AHI 一律用 `btr_hash_seed_for_record(index)` 覆盖它——**同一索引的所有 fold 共享同一个 seed**，这样不同索引的同名值不会互相污染。
+
+**★ 建索引时"每组只留一条"的落地**（`btr_search_build_page_hash_index`:1490-1523）：
+
+```cpp
+    if (hash_value != next_hash_value) {
+      /* Insert an entry into the hash index */
+      if (prefix_info.left_side) {
+        hashes[n_cached] = next_hash_value;   // ★ left_side=true  → 取新组的第一条
+        recs[n_cached] = next_rec;
+        n_cached++;
+      } else {
+        hashes[n_cached] = hash_value;        // ★ left_side=false → 取上一组的最后一条
+        recs[n_cached] = rec;
+        n_cached++;
+      }
+    }
+```
+
+而哈希表层则保证"同一 hash_value 最多一个节点"——`ha_insert_for_hash_func()` 命中同 `hash_value` 时**原地改 `data` 指针**，不新增节点。这两处共同实现了"每个等值前缀组只缓存一条记录"。
+
+**★ 哈希表层：`ha_search_and_get_data()` 只比较 64 位 hash_value，不比较记录内容**：
+
+```cpp
+static inline const rec_t *ha_search_and_get_data(hash_table_t *table,
+                                                  uint64_t hash_value) {
+  hash_assert_can_search(table, hash_value);
+  ut_ad(btr_search_enabled);
+
+  for (const ha_node_t *node = ha_chain_get_first(table, hash_value);
+       node != nullptr; node = ha_chain_get_next(node)) {
+    if (node->hash_value == hash_value) {
+      return node->data;      // ★ 返回 rec_t*，不是 node
+    }
+  }
+  return nullptr;
+}
+```
+
+> ★★ 返回的 `rec_t*` 是**页内物理地址**，调用方立刻用 `buf_block_from_ahi(rec)` 反推 `buf_block_t`。**假命中（hash 冲突 / 前缀折叠）由上层 `btr_search_check_guess()` 兜底**——这就是"允许有瑕疵"的工程落点。
+
+**★ 配套：`ha_remove_a_node_to_page()`（真名，⚠️ 不存在 `ha_remove_all_nodes_to_page`）**——一次只删一条：
+
+```cpp
+void ha_remove_a_node_to_page(hash_table_t *table, uint64_t hash_value,
+                              const page_t *page) {
+  ha_node_t *node;
+  hash_assert_can_modify(table, hash_value);
+  ut_ad(btr_search_enabled);
+
+  node = ha_chain_get_first(table, hash_value);
+
+  while (node) {
+    if (page_align(ha_node_get_data(node)) == page) {
+      /* Remove the hash node. It may be a node with a different fold, but we
+      don't care about it - we delete any entry in this chain for the
+      specified page. */
+      ha_delete_hash_node(table, node);
+      break;                     // ★★ 命中一条就 break
+    } else {
+      node = ha_chain_get_next(node);
+    }
+  }
+}
+```
+
+> ★ 所以 `btr_search_drop_page_hash_index()` 必须**先把整页的 fold 值去重收集到 `hashes[]`**，再逐条调用——每个不同的 hash_value 各调一次。
+> ★ `ha_delete_hash_node()` 用的是 `HASH_DELETE_AND_COMPACT` 宏：摘除后**把链尾节点搬到被删位置**（compact），避免第二次遍历。这也是"节点必须自带 `hash_value` 字段"的原因（搬移后要重新定位 cell）。
+
+**★ `ha_node_t` 与内存布局**：
+
+```cpp
+struct ha_node_t {
+  uint64_t hash_value;        // ★ 自带 hash_value（搬移所需）
+  ha_node_t *next;
+#if defined UNIV_AHI_DEBUG || defined UNIV_DEBUG
+  buf_block_t *block;         // ⚠️ 仅 debug 下存在，生产构建无此字段
+#endif
+  const rec_t *data;          // ★ 直接指向页内记录
+};
+```
+
+> ★ **release 构建 24 字节**（8+8+8）；**debug/AHI_DEBUG 下 32 字节**。源码**没有** `static_assert` 固化这个大小。一个 16KB buffer pool 帧约可放 **680 个** AHI 节点。
+> ⚠️ 注意 `ha_delete_hash_node()` 里有一行 `ut_a(del_node->block->frame = page_align(del_node->data));`——**是赋值 `=` 而非比较 `==`**（源码原样，仅在 debug 下编译）。
+
 ---
 
 ### 查询路径 `btr_search_guess_on_hash`
@@ -632,6 +925,68 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 `trx->has_search_latch` 有专门的 latch-order 校验（`btrsea_sync_check`），`i_s.innodb_trx` 里还有 `trx_adaptive_hash_latched` 列。
 
+#### `row_sel_try_search_shortcut_for_mysql`：三态返回值
+
+上面 `switch` 里的这个函数只有 51 行，但**返回值是三态**——这是它最容易看错的地方（`SEL_RETRY` 不是失败）：
+
+```cpp
+static ulint row_sel_try_search_shortcut_for_mysql(
+    const rec_t **out_rec, row_prebuilt_t *prebuilt, ulint **offsets,
+    mem_heap_t **heap, mtr_t *mtr) {
+  dict_index_t *index = prebuilt->index;
+  const dtuple_t *search_tuple = prebuilt->search_tuple;
+  btr_pcur_t *pcur = prebuilt->pcur;
+  trx_t *trx = prebuilt->trx;
+  const rec_t *rec;
+
+  // 两个断言界定了捷径的适用面（与外层调用条件呼应）
+  ut_ad(index->is_clustered());
+  ut_ad(!prebuilt->templ_contains_blob);
+
+  // ★ BTR_SEARCH_LEAF 就是"走 AHI"的定位模式；已持有 search latch 就不重复加
+  pcur->open_no_init(index, search_tuple, PAGE_CUR_GE, BTR_SEARCH_LEAF,
+                     (trx->has_search_latch) ? RW_S_LATCH : 0, mtr,
+                     UT_LOCATION_HERE);
+  rec = pcur->get_rec();
+
+  if (!page_rec_is_user_rec(rec)) {
+    return (SEL_RETRY);        // 落在 infimum/supremum ⇒ 交给正常流程
+  }
+
+  /* As the cursor is now placed on a user record after a search with
+  the mode PAGE_CUR_GE, the up_match field in the cursor tells how many
+  fields in the user record matched to the search tuple */
+  if (pcur->get_up_match() < dtuple_get_n_fields(search_tuple)) {
+    return (SEL_EXHAUSTED);    // 匹配字段数不足 ⇒ 这个键根本不存在
+  }
+
+  *offsets = rec_get_offsets(rec, index, *offsets, ULINT_UNDEFINED,
+                             UT_LOCATION_HERE, heap);
+
+  if (!lock_clust_rec_cons_read_sees(rec, index, *offsets,
+                                     trx_get_read_view(trx))) {
+    return (SEL_RETRY);        // ★ 不可见 ⇒ 要沿 undo 回溯，捷径做不了，回退
+  }
+
+  if (rec_get_deleted_flag(rec, dict_table_is_comp(index->table))) {
+    return (SEL_EXHAUSTED);    // delete-mark ⇒ 确定没有这一行
+  }
+
+  *out_rec = rec;
+  return (SEL_FOUND);
+}
+```
+
+三态的边界：
+
+| 返回值 | 含义 | 主循环怎么做 |
+|---|---|---|
+| `SEL_FOUND` | 命中：可见且非 delete-mark | 直接 `row_sel_store_mysql_rec` 转换返回 |
+| `SEL_EXHAUSTED` | **确定没有**：键不存在或已 delete-mark | `DB_RECORD_NOT_FOUND` |
+| `SEL_RETRY` | **捷径做不了**：落在非用户记录，或不可见需回溯 | `break` 回退正常流程（重新 B-tree 下降 + 完整 MVCC） |
+
+⇒ ★ `SEL_RETRY` 不是错误，是"捷径放弃"。**捷径只覆盖能一次判定的情况**（可见且未被删），任何需要 undo 回溯的都退回主流程——这也解释了为什么外层要求"有活跃 read view 且隔离级别 > RU"。
+
 ---
 
 ### 维护路径（建 / 删 / 改）
@@ -773,6 +1128,109 @@ bool btr_search_guess_on_hash(const dtuple_t *tuple, ulint mode,
 
 **两处都体现"可丢弃"**：① 同一 hash_value 只保留一个；② `mem_heap_alloc` 返回 nullptr 时静默返回 false，不报错。
 
+**★ `btr_search_update_hash_ref()` 完整实现——"惰性修补"的三重防御**：
+
+```cpp
+static void btr_search_update_hash_ref(buf_block_t *block,
+                                       const btr_cur_t *cursor) {
+  ut_ad(cursor->flag == BTR_CUR_HASH_FAIL);
+  ...
+  const auto index = block->ahi.index.load();
+  const auto block_prefix_info = block->ahi.prefix_info.load();
+
+  if (!index) return;                          // 该页不在 AHI → 无需修
+
+  const auto info = index->search_info;
+  /* Dirty read without latch, will be repeated after we take the x-latch, which
+  we take after we have the hash value ready, to reduce time consumed under the
+  latch. ... Note that only records folded using the block's current prefix info
+  can be in AHI. */
+  if (info->n_hash_potential > 0 &&
+      block_prefix_info == info->prefix_info.load()) {      // ① 锁外预判
+    const auto rec = btr_cur_get_rec(cursor);
+    if (!page_rec_is_user_rec(rec)) return;
+
+    const auto hash_value = rec_hash(
+        rec, Rec_offsets{}.compute(rec, index), block_prefix_info.n_fields,
+        block_prefix_info.n_bytes, btr_hash_seed_for_record(index), index);
+    //  ★★ 用「块当前实际使用的 prefix_info」fold，与插入时保持一致
+
+    btr_search_check_free_space_in_heap(cursor->index);
+
+    if (!btr_search_x_lock_nowait(cursor->index, UT_LOCATION_HERE)) {
+      return;                                  // ② nowait，抢不到就放弃
+    }
+    /* ... If it does not match, we can't add the entry to hash table, as it
+    would never be deleted and would corrupt the AHI. */
+    if (btr_search_enabled && block->ahi.index != nullptr) {
+      ut_ad(block->ahi.index == index);
+      if (info->n_hash_potential > 0 &&
+          block_prefix_info == block->ahi.prefix_info.load()) {   // ③ 持锁后复核
+        const auto hash_table = btr_get_search_table(index);
+        ha_insert_for_hash(hash_table, hash_value, block, rec);
+      }
+    }
+    btr_search_x_unlock(cursor->index);
+  }
+}
+```
+
+> ★★ **三重防御缺一不可**：① 锁外先算 hash 值（减少持锁时间）；② `x_lock_nowait` 抢不到就放弃；③ 拿到锁后**再校验** `btr_search_enabled` + `block->ahi.index != nullptr` + `block_prefix_info` 未变。
+> ★★ 第 ③ 条的理由写在源码注释里：*"If it does not match, we can't add the entry to hash table, **as it would never be deleted and would corrupt the AHI**"*——用一个过期 prefix 算出的 fold，**将来删除时用新 prefix 重算会找不到它**，这条 entry 就成了永久垃圾。
+
+**★ `btr_search_drop_page_hash_index()` 的两个精妙处**：
+
+```cpp
+void btr_search_drop_page_hash_index(buf_block_t *block, bool force) {
+  for (;;) {
+    const auto index = block->ahi.index.load();
+    if (index == nullptr) return;
+    ...
+    /* 先在【锁外】把整页 fold 值算出来并去重 */
+    while (!page_rec_is_supremum(rec)) {
+      const auto hash_value = rec_hash(rec, offsets.compute(...),
+          prefix_info.n_fields, prefix_info.n_bytes, index_hash, index);
+      if (hash_value != prev_hash_value || prev_hash_value == 0) {
+        hashes[n_cached] = hash_value;   // ★ 相邻相同 fold 只记一次
+        n_cached++;
+      }
+      rec = page_rec_get_next_low(rec, page_rec_is_comp(rec));
+      prev_hash_value = hash_value;
+    }
+
+    btr_search_x_lock(index, UT_LOCATION_HERE);
+    ...
+    {
+      const auto is_ahi_enabled = btr_search_enabled.load();
+      /* We need to read the block->ahi.index after we read btr_search_enabled. ... */
+      const auto latched_index = block->ahi.index.load();
+      if (latched_index == nullptr) return;
+      if (!is_ahi_enabled) {
+        if (force) { block->ahi.n_pointers.store(0); btr_search_set_block_not_cached(block); }
+        /* 普通页交给 buf_pool_clear_hash_index() 处理，本线程不动 */
+        return;
+      }
+      ut_a(latched_index == index);
+    }
+
+    if (block->ahi.prefix_info.load() == prefix_info) {
+      const auto hash_table = btr_get_search_table(index);
+      for (size_t i = 0; i < n_cached; i++) {
+        ha_remove_a_node_to_page(hash_table, hashes[i], page);
+      }
+      btr_search_set_block_not_cached(block);
+      MONITOR_ATOMIC_INC_VALUE(MONITOR_ADAPTIVE_HASH_ROW_REMOVED, n_cached);
+      return;
+    }
+    /* Someone else has meanwhile built a new hash index on the page, with
+    different parameters. We need to retry the process of removal. */
+  }                                            // ★★ 唯一不 return 的出口：prefix 被改 → 重来
+}
+```
+
+> ★★ 两点值得记：① **内存序陷阱**——必须先读 `btr_search_enabled` **再**读 `block->ahi.index`，否则会把一个已被 disable 流程清空的 block 再删一遍（源码有一段很长的注释解释）。② **`for(;;)` 唯一的"不返回"出口是 prefix_info 被并发改了**，此时用新 prefix 重算再来一遍。
+> ★ `force` 参数**只有一个用途**：来自 `buf_LRU_free_page()`、block 处于 `BUF_BLOCK_REMOVE_HASH` 状态时。此时 AHI 正在被 disable，普通页交给 `buf_pool_clear_hash_index()`，只有 force 才自己清。
+
 ---
 
 ### ★ 锁协议与分片
@@ -853,6 +1311,106 @@ AHI 的节点（24 字节/个）来自 **buffer pool 的空闲帧**：
 
 即 `总 cell 数 ≈ BP 字节数 / 512`，平均分给 8 个 part，再经 `ut::find_prime` 取素数。例：128 GiB BP → 262144 个 cell（总）→ 每片 32768。
 
+**★★ 但"借用空闲帧"这件事的真正原因不是省内存，是防死锁**——这是本篇最值得记住的一条工程因果链：
+
+```cpp
+static inline void btr_search_check_free_space_in_heap(dict_index_t *index) {
+  if (!btr_search_enabled) return;
+  ut_ad(!rw_lock_own(btr_get_search_latch(index), RW_LOCK_S));
+  ut_ad(!rw_lock_own(btr_get_search_latch(index), RW_LOCK_X));   // ★★ 必须在【无锁】时调用
+
+  auto &free_block_for_heap = btr_get_search_part(index).free_block_for_heap;
+  const bool no_free_block = free_block_for_heap.load() == nullptr;
+
+  /* We can't do this check and alloc a block from Buffer pool only when needed
+  while inserting new nodes to AHI hash table, as in case the eviction is needed
+  to free up a block from LRU, the AHI latches may be required to complete the
+  page eviction. The execution can reach the following path: buf_block_alloc ->
+  buf_LRU_get_free_block -> buf_LRU_scan_and_free_block ->
+  buf_LRU_free_from_common_LRU_list -> buf_LRU_free_page ->
+  btr_search_drop_page_hash_index */
+  if (no_free_block) {
+    const auto block = buf_block_alloc(nullptr);      // ★★ 内存来源：buffer pool 空闲帧
+    buf_block_t *expected = nullptr;
+    if (!free_block_for_heap.compare_exchange_strong(expected, block)) {
+      buf_block_free(block);                          // 别人已备好，归还自己那份
+    }
+  }
+}
+```
+
+> ★★ 死锁链：`ha_node_t` 从 `MEM_HEAP_FOR_BTR_SEARCH` heap 分配 → heap 不够要向 BP 申请 16KB 页 → `buf_block_alloc` 可能因 LRU 淘汰调用 `btr_search_drop_page_hash_index()` → 后者要拿 **AHI X latch** → **若此时已持 AHI X latch 就是死锁**。
+> ★ 解法：**每个分片常备一个"预留帧" `free_block_for_heap`，在持锁之前先保证它非空**；持锁后的分配只从这个预留帧取，**取不到就 `return nullptr` 静默放弃**——这正是 `ha_insert_for_hash_func()` 能返回 false 的根因。
+
+堆侧消费预留帧的地方（`mem/memory.cc:279`）：
+
+```cpp
+    if ((type & MEM_HEAP_BTR_SEARCH) && heap) {
+      /* We cannot allocate the block from the buffer pool, but must get the
+      free block from free block field of the heap base block. This is because
+      we hold the X latch on AHI, and getting a block by eviction from LRU might
+      require it too. ... */
+      ut_ad(heap->free_block_ptr != nullptr);
+      buf_block = static_cast<buf_block_t *>(heap->free_block_ptr->load());
+      if (!buf_block) {
+        return nullptr;              // ★★ 预留帧耗尽 → 返回 NULL（唯一允许失败的 heap 类型）
+      }
+      heap->free_block_ptr->store(nullptr);
+    } else {
+      buf_block = buf_block_alloc(nullptr);
+    }
+    block = (mem_block_t *)buf_block->frame;    // ★ AHI 节点直接写在 buffer pool 的 16KB 页帧里
+```
+
+```cpp
+/** this flag can optionally be ORed to MEM_HEAP_BUFFER, in which case
+ heap->free_block is used in some cases for memory allocations, and if it's
+ NULL, the memory allocation functions can return NULL. */
+constexpr uint32_t MEM_HEAP_BTR_SEARCH = 2;
+constexpr uint32_t MEM_HEAP_FOR_BTR_SEARCH = MEM_HEAP_BTR_SEARCH | MEM_HEAP_BUFFER;  // = 3
+```
+
+> ⚠️ **没有 `buf_buddy` 参与**——AHI 内存 100% 走 `buf_block_alloc()` 拿 BP 帧，不是 buddy 分配器、也不是独立内存池。
+> ⚠️ 首个 heap block（4096 字节）来自 `ut::malloc`（OS 堆），**不是** BP；只有后续扩展块才用 BP 帧。
+> ⚠️ AHI **没有独立的"已用字节数"计数器**：`buf_block_t::ahi.n_pointers` 是 `uint16_t` 且**只在 debug 下存在**，release 下 `validate()` / `assert_empty()` 全是空函数。生产环境唯一的量化输出是 `SHOW ENGINE INNODB STATUS` 的 `node heap has N buffer(s)`。
+
+**★ PFS 统计严重低估 AHI 真实占用**——`mem_key_ahi` 只覆盖两个对象：
+
+```cpp
+PSI_memory_key mem_key_ahi;
+    {&mem_key_ahi, "adaptive hash index", 0, 0, PSI_DOCUMENT_ME},
+```
+
+```cpp
+  btr_search_sys = ut::new_withkey<btr_search_sys_t>(
+      ut::make_psi_memory_key(mem_key_ahi), hash_size);      // ① sys 对象本身
+  parts = ut::make_unique_aligned<part_type[]>(
+      ut::make_psi_memory_key(mem_key_ahi), alignof(part_type), btr_ahi_parts);  // ② parts 数组
+```
+
+> ★★ **不覆盖** hash table 的 cell 数组（`ut::new_<hash_table_t>(n)` 走文件默认 key），**更不覆盖** AHI 节点所在的 BP 帧（那算在 buffer pool 账上）。所以 `memory/innodb/adaptive hash index` 的数值**远小于** AHI 真实占用，不要拿它做容量判断。
+
+**★ `hash_size` 公式的确切位置**（`buf0buf.cc:1541`，resize 时 `:2583` 复用同一式）：
+
+```cpp
+  btr_search_sys_create(buf_pool_get_curr_size() / sizeof(void *) / 64);
+```
+
+```cpp
+void btr_search_sys_t::search_part_t::initialize(size_t hash_size) {
+  rw_lock_create(btr_search_latch_key, &latch, LATCH_ID_BTR_SEARCH);
+  hash_table = ib_create((hash_size / btr_ahi_parts), LATCH_ID_HASH_TABLE_MUTEX,
+                         0, MEM_HEAP_FOR_BTR_SEARCH);    // ★ n_sync_obj = 0
+  hash_table->heap->free_block_ptr = &free_block_for_heap;   // ★ 预留帧接线点
+#if defined UNIV_AHI_DEBUG || defined UNIV_DEBUG
+  hash_table->adaptive = true;
+#endif
+}
+```
+
+> ★ **`n_sync_obj = 0` 是关键**：AHI 的 hash table **不带任何内部 rw_lock**，并发保护完全交给外层 `search_part_t::latch`。这与 `buf_pool->page_hash`（`n_sync_obj > 0`，自带 rw_locks 数组）正好相反——**同为 `hash_table_t`，两种用法**。
+> ⚠️ 因此 **`ha_clear()` 不适用于 AHI**：它的断言是 `table->type == HASH_TABLE_SYNC_RW_LOCK` 且 `heap == nullptr`，只对 page_hash 成立。AHI 清空走 `hash_table_clear()` + `mem_heap_empty()`。
+
 #### 6.2 ★ 关闭 AHI 的危险代码
 
 `btr_search_await_no_reference`（`btr0sea.cc`）：
@@ -929,6 +1487,139 @@ static MYSQL_SYSVAR_ULONG(
 
 > `parts` 只读是必然的：`btr_ahi_parts_fast_modulo` 在 `btr_search_sys_t` 构造时一次性设定，而 AHI 在 `buf_pool_init` 末尾创建。
 
+**★ `parts` 只读的真实机制**（⚠️ **两个回调都是 `nullptr`**，InnoDB 侧**没有任何**专用校验函数/报错文案）：
+
+```cpp
+static MYSQL_SYSVAR_ULONG(
+    adaptive_hash_index_parts, btr_ahi_parts,
+    PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,     // ★★ READONLY 是唯一的约束来源
+    "Number of InnoDB Adaptive Hash Index Partitions. (default = 8). ",
+    nullptr, nullptr,                              // ★ on_check = nullptr, on_update = nullptr
+    8, 1, 512, 0);                                 // 默认 8，范围 1..512，block_size 0
+```
+
+```cpp
+      : sys_var(
+            chain, name_arg, plugin_var_arg->comment,
+            (plugin_var_arg->flags & PLUGIN_VAR_THDLOCAL ? SESSION : GLOBAL) |
+                (plugin_var_arg->flags & PLUGIN_VAR_READONLY ? READONLY : 0) |
+                ...
+```
+
+> ★★ 所以"只能在启动时改"是 **server 通用层的 `sys_var::READONLY`** 拦的，`SET GLOBAL` 会被通用层拒绝，InnoDB 侧并不参与。初始化后才真正写入 fast_modulo：
+> ```cpp
+> btr_search_sys_t::btr_search_sys_t(size_t hash_size) {
+>   parts = ut::make_unique_aligned<part_type[]>(
+>       ut::make_psi_memory_key(mem_key_ahi), alignof(part_type), btr_ahi_parts);
+>   static_assert(alignof(part_type) >= ut::INNODB_CACHE_LINE_SIZE);   // ★ 每 part 独占 cache line
+>   btr_ahi_parts_fast_modulo = ut::fast_modulo_t{btr_ahi_parts};       // ★ 只在构造时写一次
+>   for (ulint i = 0; i < btr_ahi_parts; ++i) parts[i].initialize(hash_size);
+> }
+> ```
+
+**★ 开关变量的真名**（⚠️ **不存在 `srv_innodb_adaptive_hash_index`**，全仓 0 命中）：
+
+```cpp
+/** Flag storing if the search system is in enabled state. While it is false,
+the AHI data structures can't have new entries added, they can only be
+removed. It is changed to false while having all AHI latches X-latched, so any
+section that adds entries to AHI data structures must have at least one S-latch. */
+std::atomic_bool btr_search_enabled = true;      // ★ 真正的原子开关（热路径无锁读）
+
+/** A value that basically stores the same as btr_search_enabled, but is not
+atomic and thus can be used as SYSVAR. */
+bool srv_btr_search_enabled = true;              // ★ sysvar 后端存储（sysvar 不能绑 atomic）
+
+/** Protects changes of btr_search_enabled flag. */
+static ib_mutex_t btr_search_enabled_mutex;
+```
+
+> ★★ **为什么要有两份**：sysvar 的后端变量**不能**是 `std::atomic`，所以必须再存一个非原子副本。两者在 `enable()` / `disable()` 里**成对同步更新**；且**启动时 sysvar 的 on_update 不会被调用**，所以 `btr_search_sys_create()` 里有一行手工同步：`btr_search_enabled = srv_btr_search_enabled;`。
+
+```cpp
+static void innodb_adaptive_hash_index_update(THD *, SYS_VAR *, void *,
+                                              const void *save) {
+  if (*(bool *)save) { btr_search_enable(); } else { btr_search_disable(); }
+}
+```
+
+**★ `btr_search_disable()` 的五步**（返回 `bool`：原本 enabled 且被本次关闭才 true，供 BP resize 后决定是否恢复）：
+
+```cpp
+bool btr_search_disable() {
+  mutex_enter(&btr_search_enabled_mutex);
+  if (!btr_search_enabled) { mutex_exit(...); return false; }
+
+  btr_search_x_lock_all(UT_LOCATION_HERE);       // ② X 锁全部 AHI 分区
+  ut_a(btr_search_enabled);
+  btr_search_enabled = false;                    // ③ 在持全 X 锁时改 → 此后只许删不许加
+  srv_btr_search_enabled = false;
+  btr_search_x_unlock_all();
+
+  buf_pool_clear_hash_index();                   // ④ 清空所有 block 的 ahi.index
+
+  dict_sys_mutex_enter();
+  for (auto table : dict_sys->table_LRU)     btr_search_await_no_reference(table);
+  for (auto table : dict_sys->table_non_LRU) btr_search_await_no_reference(table);
+  dict_sys_mutex_exit();                         // ⑤ 等所有索引 ref_count 归零（含 600s 自杀）
+
+  for (ulint i = 0; i < btr_ahi_parts; ++i) {
+    const auto hash_table = btr_search_sys->parts[i].hash_table;
+    hash_table_clear(hash_table);
+    mem_heap_empty(hash_table->heap);
+  }
+  mutex_exit(&btr_search_enabled_mutex);
+  return true;
+}
+```
+
+> ⚠️ **`btr_search_enable()` 不一定能开**：若正在 BP resize（`srv_buf_pool_old_size != srv_buf_pool_size`）**静默 return，不报错**。
+> ⚠️ `btr_search_sys_resize()`（真名，确实存在）**前提必须是 AHI 已 disabled**，否则 release 下打一条 error 后直接 return。
+
+**★★ 监控出口只有两个，且都没有 status 变量**（⚠️ **不存在任何 `Innodb_adaptive_hash_*` status 变量**，全仓 0 命中——5.6/5.7 时代的 `adaptive_hash_hash_searches` 等已被移除）：
+
+```cpp
+  for (ulint i = 0; i < btr_ahi_parts; ++i) {          // ① SHOW ENGINE INNODB STATUS
+    auto &part = btr_search_sys->parts[i];
+    rw_lock_s_lock(&part.latch, UT_LOCATION_HERE);
+    ha_print_info(file, part.hash_table);
+    rw_lock_s_unlock(&part.latch);
+  }
+  fprintf(file, "%.2f hash searches/s, %.2f non-hash searches/s\n",
+          (btr_cur_n_sea - btr_cur_n_sea_old) / time_elapsed,
+          (btr_cur_n_non_sea - btr_cur_n_non_sea_old) / time_elapsed);
+```
+
+```cpp
+  fprintf(file, "Hash table size %zu", hash_get_n_cells(table));
+  ...
+  n_bufs = UT_LIST_GET_LEN(table->heap->base) - 1;      // 首块是 ut::malloc 的常规块
+  if (table->heap->free_block_ptr->load()) n_bufs++;
+  fprintf(file, ", node heap has %zu buffer(s)\n", n_bufs);
+```
+
+> ★★ **`node heap has N buffer(s)` 是 AHI 内存占用的唯一对外量化**：`N ≈ (已挂块数 - 1) + 预留帧`，每块 16KB ⇒ **AHI 每 part ≈ (N-1) × 16KB**。
+> ⚠️ `used cells` 只在 `UNIV_DEBUG` 下打印（生产构建为性能裁掉了）。
+> ⚠️ `time_elapsed` 用 `steady_clock` **截断到秒** + 0.001 防除零——**两次 SHOW ENGINE 间隔 < 1 秒时速率会被放大约 1000 倍**。
+
+```cpp
+    {"adaptive_hash_searches", "adaptive_hash_index", ..., MONITOR_OVLD_ADAPTIVE_HASH_SEARCH},
+    {"adaptive_hash_searches_btree", "adaptive_hash_index", ..., MONITOR_OVLD_ADAPTIVE_HASH_SEARCH_BTREE},
+    {"adaptive_hash_pages_added", ..., MONITOR_ADAPTIVE_HASH_PAGE_ADDED},
+    {"adaptive_hash_pages_removed", ..., MONITOR_ADAPTIVE_HASH_PAGE_REMOVED},
+    {"adaptive_hash_rows_added", ..., MONITOR_ADAPTIVE_HASH_ROW_ADDED},
+    {"adaptive_hash_rows_removed", ..., MONITOR_ADAPTIVE_HASH_ROW_REMOVED},
+    {"adaptive_hash_rows_deleted_no_hash_entry", ..., MONITOR_ADAPTIVE_HASH_ROW_REMOVE_NOT_FOUND},
+    {"adaptive_hash_rows_updated", ..., MONITOR_ADAPTIVE_HASH_ROW_UPDATED},
+```
+
+```cpp
+    case MONITOR_OVLD_ADAPTIVE_HASH_SEARCH:       value = btr_cur_n_sea;      break;
+    case MONITOR_OVLD_ADAPTIVE_HASH_SEARCH_BTREE: value = btr_cur_n_non_sea;  break;
+```
+
+> ★ 这 8 个计数器经 `I_S.INNODB_METRICS` 暴露（**`i_s.cc` 里无 AHI 专属代码**，靠 srv0mon 通用框架自动挂载）。四个 `btr_cur_n_*` 都是**普通 `ulint` 非原子**，多线程递增存在竞争，只作近似值。
+
 ---
 
 ## Misc
@@ -941,6 +1632,40 @@ static MYSQL_SYSVAR_ULONG(
 | **`buf_block_t::search_index` / `n_fields` / `curr_*`** | **不存在**，改为 `ahi_t` + `btr_search_prefix_info_t` |
 | **全局 `btr_search_latch`** | **不存在**（8.0.30 已分片）；PFS 里那个名字是 8 个分片共用的 key |
 | **`Double_write::recover` 式的 `AHI recover`** | 不存在，AHI 不持久化 |
+
+**★ 真名勘误全表**（经全仓 grep 验证，写文档时勿用左列）：
+
+| 常见写法 | 8.0.39 真相 |
+|---|---|
+| `btr_search_info_t` | **不存在**。真名 `struct btr_search_t`；只有函数 `btr_search_info_create()` 保留了旧名 |
+| `n_fields` / `n_bytes` / `left_side` 是独立字段 | **错**。已打包进 `std::atomic<btr_search_prefix_info_t> prefix_info` |
+| `btr_search_prefix_info_t` 在 `btr0sea.h` | **不在**。真身在 **`buf0buf.h:1666`** |
+| `btr_search_info->n_patt_move` | **不存在** |
+| 全局 `btr_search_hash_table` 指针 | **不存在**。现在是 `btr_search_sys->parts[i].hash_table`，由 `btr_get_search_table()` 取（同名静态函数 `btr_search_hash_table_validate()` 存在但无关） |
+| `btr_search_index_num()` / `btr_search_get_index_num()` | **不存在**。真名 `btr_search_hash_index_id()` + `btr_get_search_part()` + `btr_get_search_latch()` |
+| `ha_remove_all_nodes_to_page()` | **不存在**。真名 `ha_remove_a_node_to_page()`（一次只删一条） |
+| `btr_search_latch_own()` | **不存在**。对应物 `btr_get_search_latch()` + `rw_lock_own()`；只有 debug 下的 `btr_search_own_all/own_any` |
+| `btr_search_info_n_hash_orderings` | **不存在**。真名 `btr_search_info_update_hash()`（前缀学习） |
+| `btr_search_lazy_changed` | **不存在**（全仓 0 命中）。惰性修正由 `btr_search_update_hash_ref()` 承担 |
+| `btr_search_get_hash_index()` | **不存在**。真名 `btr_search_hash_index_id()` |
+| `rec_fold()` / `dtuple_fold()` | **不存在**（0 命中）。8.0 一律用 `rec_hash` / `dtuple_hash` |
+| `ut_fold_binary()` | **不存在**。真名 `ut::hash_binary()` |
+| `rec_hash()` / `dtuple_hash()` 定义在 `.h` | 头文件**只有声明**；定义体在 `rem0rec.ic:836` / `data0data.ic:596` |
+| `buf_block_t::ahi.n_recs` | **不存在**。`ahi_t` 只有 `recommended_prefix_info` / `prefix_info` / `index` / `n_pointers`（最后一项仅 debug） |
+| 查询路径检查 `block->buf_fix_count` | **不检查**。改用 `buf_page_get_known_nowait()`；`buf_fix_count` 只在 `btr_drop_next_batch()` 出现 |
+| `srv_innodb_adaptive_hash_index` | **不存在**（0 命中）。真名 `srv_btr_search_enabled` + `btr_search_enabled` |
+| `btr_search_sys_t::get_hash_node_count()` | **不存在**（0 命中） |
+| `~btr_search_sys_t()` | **不存在**（类内只有构造函数）。释放由 `btr_search_sys_free()` 手工完成 |
+| `Innodb_adaptive_hash_*` status 变量 | **不存在**（0 命中）。只有 SHOW ENGINE 文本 + `I_S.INNODB_METRICS` 计数器 |
+| `innodb_adaptive_hash_index_parts` 有 on_check/on_update | **都是 `nullptr`**。约束靠 `PLUGIN_VAR_READONLY` → `sys_var::READONLY` |
+| AHI 内存走 `buf_buddy_alloc` | **否**。走 `buf_block_alloc()` 取 BP 空闲帧 |
+| `btr_search_disable()` 返回 void | 返回 **`bool`**（原 enabled 且被本次关闭才 true），供 BP resize 后决定是否恢复 |
+
+**★ 三个"结构性事实"**：
+
+1. **AHI 的 `hash_table_t` 用 `n_sync_obj = 0` 创建**——哈希表本身**不带任何内部锁**，保护完全由 `search_part_t::latch` 承担。而 `buf_pool->page_hash` 是 `n_sync_obj > 0`（自带 rw_locks）。**同一个 `hash_table_t`，两种截然不同的用法**。因此 **`ha_clear()` 不适用于 AHI**（它的断言要求 `type == HASH_TABLE_SYNC_RW_LOCK` 且 `heap == nullptr`）。
+2. **`btr_search_sys` 故意用裸指针而非 `unique_ptr`**——源码注释：*"destroying it at exit() will destroy its rw_lock after the PFS is deinitialized"*（静态析构晚于 PFS 反初始化会崩）。
+3. **`btr_search_guess_on_hash` 全仓只有一个调用点**（`btr0cur.cc:862`）。`row_search_mvcc()` 不直接调它——而是提前拿 AHI 分区 S 锁 → 置 `trx->has_search_latch` → 走 `pcur->open_no_init(..., RW_S_LATCH, ...)`，最终由 `btr_cur_search_to_nth_level` 内部的 AHI 分支自然命中。这是"唯一键等值 + 一致性读"的快捷路径，有 **6 个前置条件**（非顺序扫描 / unique_search / AHI 开 / 聚簇索引 / 无 blob 模板 / `mysql_row_len < UNIV_PAGE_SIZE/8`）。
 
 ### 常见误解
 

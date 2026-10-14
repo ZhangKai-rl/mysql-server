@@ -67,6 +67,81 @@ L3  实例          LOCK_open、THD::LOCK_thd_data、MDL_context::m_LOCK_waiting
 
 #### 一、为什么是三层：正交的三个维度
 
+**源码自带的官方注释**（`include/mysql/psi/mysql_mutex.h:38`）——作者明说这是"不可避免的 #ifdef 复杂度"：
+
+```cpp
+/*
+  Note: there are several orthogonal dimensions here.
+
+  Dimension 1: Instrumentation
+  HAVE_PSI_MUTEX_INTERFACE is defined when the instrumentation is compiled in.
+  This may happen both in debug or production builds.
+
+  Dimension 2: Debug
+  SAFE_MUTEX is defined when debug is compiled in.
+  This may happen both with and without instrumentation.
+
+  Dimension 3: Platform
+  Mutexes are implemented with one of:
+  - the pthread library
+  - fast mutexes
+  - window apis
+  This is implemented by various macro definitions in my_thread.h
+
+  This causes complexity with '#ifdef'-ery that can't be avoided.
+*/
+```
+
+**★ 完整链路是 5 层，不是 3 层**（`mysql_mutex_lock()` → `pthread_mutex_lock()`）：
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| ① 宏门面 | `mysql_mutex.h:170` | 注入 `__FILE__/__LINE__` |
+| ② PFS inline | `mysql_mutex.h:242` | `m_psi` 埋点（双重判空） |
+| ③ mysys 中间层 | `thr_mutex.h:180` | SAFE_MUTEX 二选一 |
+| ④ safe_mutex（仅 debug） | `mysys/thr_mutex.cc:68` | 记录持有者/文件/行号 |
+| ⑤ OS 原语 | `thr_mutex.h:90` | `pthread_mutex_lock` / `EnterCriticalSection` |
+
+```cpp
+// ① —— 两层宏，_with_src 才是真身
+#define mysql_mutex_lock(M) mysql_mutex_lock_with_src(M, __FILE__, __LINE__)
+#define mysql_mutex_lock_with_src(M, F, L) inline_mysql_mutex_lock(M, F, L)
+```
+
+```cpp
+// ③ —— my_mutex_lock：SAFE_MUTEX 下转 safe_mutex_lock，否则直落 native
+static inline int my_mutex_lock(my_mutex_t *mp
+#ifdef SAFE_MUTEX
+                                , const char *file, uint line
+#endif
+) {
+#ifdef SAFE_MUTEX
+  assert(mp != nullptr);
+  assert(mp->m_u.m_safe_ptr != nullptr);
+  return safe_mutex_lock(mp->m_u.m_safe_ptr, false, file, line);
+#else
+  return native_mutex_lock(&mp->m_u.m_native);
+#endif
+}
+```
+
+```cpp
+// ⑤ —— 终点
+static inline int native_mutex_lock(native_mutex_t *mutex) {
+#ifdef _WIN32
+  EnterCriticalSection(mutex);
+  return 0;
+#else
+  return pthread_mutex_lock(mutex);
+#endif
+}
+```
+
+> ⚠️ **勘误**：**不存在 `inline_mysql_mutex_assert_owner()` / `assert_not_owner()` 内联函数**——它们只是**宏** `mysql_mutex_assert_owner(M)` / `mysql_mutex_assert_not_owner(M)`，release 下展开成 `{}`。
+> ⚠️ **不存在 `include/mysql/psi/mysql_prlock.h`**——prlock 的 PFS 封装**全在 `mysql_rwlock.h` 里**，被 `#ifndef DISABLE_MYSQL_PRLOCK_H` 包裹。
+> ⚠️ **不存在 `include/my_pthread.h`**——`native_mutex_*` 在 **`include/thr_mutex.h`**（不是 `mysys/`）；`native_rw_*` 在 `include/thr_rwlock.h`；`native_cond_*` 在 `include/thr_cond.h`。`mysys/` 下只有三个 `.cc`。
+> ⚠️ **不存在 `MY_MUTEX_NO_DEADLOCK_DETECTION`**——8.0.39 只有 3 个 attr 宏：`MY_MUTEX_INIT_SLOW / FAST / ERRCHK`。死锁检测靠 `WITH_LOCK_ORDER`（lock_order 子系统），不再是 attr 标志。
+
 `mysql_mutex.h` 开头的注释是理解整个设计的钥匙——这里**不是一个开关，而是三个正交维度**：
 
 > ```c
@@ -90,6 +165,194 @@ L3  实例          LOCK_open、THD::LOCK_thd_data、MDL_context::m_LOCK_waiting
 被否决的方案：如果调试和埋点做成一个维度的三种模式（如编译期三选一），就无法"边计时边查锁 bug"——注释特意强调 "orthogonal" 就是为了堵死这种理解。
 
 #### 二、★ `m_psi` 指针无条件内嵌：ABI 换零分支成本
+
+**结构体定义**（`include/mysql/components/services/bits/mysql_mutex_bits.h:40`）：
+
+```cpp
+struct mysql_mutex_t {
+  /** The real mutex. */
+  my_mutex_t m_mutex;
+  /**
+    The instrumentation hook.
+    Note that this hook is not conditionally defined,
+    for binary compatibility of the @c mysql_mutex_t interface.
+  */
+  struct PSI_mutex *m_psi{nullptr};      // ★ 无条件存在，release 下恒为 nullptr
+};
+```
+
+```cpp
+/** union：native / safe 二选一 */
+struct my_mutex_t {
+  union u {
+    native_mutex_t m_native;      // release：内嵌 pthread_mutex_t
+    safe_mutex_t *m_safe_ptr;     // SAFE_MUTEX：改为指向 malloc 出来的 safe_mutex_t
+  } m_u;
+};
+```
+
+> ⚠️ **勘误**：**只有 `m_psi`，没有 `m_psi_internal`**（全仓 sync 结构体中无此成员）。
+
+**★ `HAVE_PSI_MUTEX_INTERFACE` 不是"两套函数"，而是同一个 inline 函数体内的 `#ifdef`**（`mysql_mutex.h:242`）：
+
+```cpp
+static inline int inline_mysql_mutex_lock(mysql_mutex_t *that,
+                                          const char *src_file, uint src_line) {
+  int result;
+
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+  if (that->m_psi != nullptr) {
+    if (that->m_psi->m_enabled) {              // ★ 双重判空：已 instrument + 该 instrument 被启用
+      /* Instrumentation start */
+      PSI_mutex_locker *locker;
+      PSI_mutex_locker_state state;            // ★ state 在调用方栈上，PFS 复用它做 locker，避免 malloc
+      locker = PSI_MUTEX_CALL(start_mutex_wait)(
+          &state, that->m_psi, PSI_MUTEX_LOCK, src_file, src_line);
+
+      /* Instrumented code */
+      result = my_mutex_lock(&that->m_mutex
+#ifdef SAFE_MUTEX
+                             , src_file, src_line
+#endif
+      );
+
+      /* Instrumentation end */
+      if (locker != nullptr) {                 // ★ PFS 判定"无需记录"时返回 NULL，直接跳过
+        PSI_MUTEX_CALL(end_mutex_wait)(locker, result);
+      }
+
+      return result;
+    }
+  }
+#endif
+
+  /* Non instrumented code */
+  result = my_mutex_lock(&that->m_mutex
+#ifdef SAFE_MUTEX
+                         , src_file, src_line
+#endif
+  );
+
+  return result;
+}
+```
+
+```cpp
+static inline int inline_mysql_mutex_unlock(mysql_mutex_t *that,
+                                            const char *src_file, uint src_line) {
+  int result;
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+  if (that->m_psi != nullptr) {
+    PSI_MUTEX_CALL(unlock_mutex)(that->m_psi);
+    //  ★ 注意：unlock 不检查 m_enabled（与 lock/trylock 不同），
+    //   因为 PFS 侧 unlock_mutex 只清 m_owner，成本极低
+  }
+#endif
+  result = my_mutex_unlock(&that->m_mutex
+#ifdef SAFE_MUTEX
+                           , src_file, src_line
+#endif
+  );
+  return result;
+}
+```
+
+**★ PFS 官方对开销的说明**（`storage/perfschema/pfs.cc:774`）：
+
+```cpp
+  When the performance schema is disabled at runtime, the @c m_psi pointer
+  is @c NULL, so the extra overhead is one if statement.
+
+  When the performance schema is enabled at runtime, the @c m_psi pointer
+  points to the actual instrumentation added to the mutex,
+  and two extra calls are present on the code path:
+  - a call to @c pfs_start_mutex_wait_v1() before the operation
+  - a call to @c pfs_end_mutex_wait_v1() after the operation
+
+  Both these calls are static, and point directly to the
+  performance_schema implementation.
+
+  @section PFS_PSI_PLUGIN Instrumentation for a plugin
+
+  Inside a plugin, @c PSI_MUTEX_CALL expands to a call using a function pointer.
+  This is to decouple the plugin binary from the implementation,
+  to avoid having hard coded references to symbols like
+  pfs_start_mutex_wait_v1() from the plugin library (either shared or static).
+```
+
+```cpp
+// include/pfs_mutex_provider.h:46 —— server 内部直接符号，插件走函数指针
+#define PSI_MUTEX_CALL(M) pfs_##M##_v1
+// 否则
+#ifndef PSI_MUTEX_CALL
+#define PSI_MUTEX_CALL(M) psi_mutex_service->M
+#endif
+```
+
+**★ `pfs_start_mutex_wait_v1()` 的三条返回 NULL 快路径**（`pfs.cc:3735`）：
+
+```cpp
+  if (flag_thread_instrumentation) {
+    PFS_thread *pfs_thread = my_thread_get_THR_PFS();
+    if (unlikely(pfs_thread == nullptr)) return nullptr;   // ①未 instrument 的线程
+    if (!pfs_thread->m_enabled) return nullptr;            // ②该线程未启用
+    ...
+    if (flag_events_waits_current) {
+      if (unlikely(pfs_thread->m_events_waits_current >=
+                   &pfs_thread->m_events_waits_stack[WAIT_STACK_SIZE])) {
+        locker_lost++;                                     // ③等待栈溢出
+        return nullptr;
+      }
+      ...
+      wait->m_source_file = src_file;    // ★ __FILE__/__LINE__ 落到这里
+      wait->m_source_line = src_line;
+      wait->m_object_instance_addr = pfs_mutex->m_identity;
+    }
+  } else {
+    if (pfs_mutex->m_timed) { ... }
+    else {
+      /* Complete shortcut. */
+      /* Aggregate to EVENTS_WAITS_SUMMARY_BY_INSTANCE (counted) */
+      pfs_mutex->m_mutex_stat.m_wait_stat.aggregate_counted();  // ★ 最廉价：只加计数
+      return nullptr;
+    }
+  }
+  return reinterpret_cast<PSI_mutex_locker *>(state);   // ★ locker 就是调用方栈上的 state
+```
+
+> ★ `pfs_end_mutex_wait_v1()` 只在 `rc == 0`（加锁成功）时记 `m_owner`——**trylock 失败不记 owner**。`pfs_unlock_mutex_v1()` 整个只做一件事：`m_owner = nullptr`。
+
+**`HAVE_PSI_*_INTERFACE` 的开关源头**（`include/my_psi_config.h:38`）：
+
+```cpp
+#ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
+#define HAVE_PSI_INTERFACE
+#endif
+#ifdef HAVE_PSI_INTERFACE
+#ifndef DISABLE_PSI_MUTEX
+#define HAVE_PSI_MUTEX_INTERFACE
+#endif
+#ifndef DISABLE_PSI_RWLOCK
+#define HAVE_PSI_RWLOCK_INTERFACE
+#endif
+#ifndef DISABLE_PSI_COND
+#define HAVE_PSI_COND_INTERFACE
+#endif
+```
+
+> ★ **`PSI_mutex_key == 0` 恒表示"不 instrument"**（`psi_mutex_bits.h:47`：`Using a zero key always disable the instrumentation`）。`pfs_init_mutex_v1()` 里 `find_mutex_class(key)` 找不到就返回 NULL → `m_psi == NULL` → 后续零开销。
+
+**assert 宏的 release 空实现**（`mysql_mutex.h:108`）：
+
+```cpp
+#ifdef SAFE_MUTEX
+#define mysql_mutex_assert_owner(M) \
+  safe_mutex_assert_owner((M)->m_mutex.m_u.m_safe_ptr);   // ★ 穿透到 union 里的 m_safe_ptr
+#else
+#define mysql_mutex_assert_owner(M) \
+  {}                                                      // ★ release：展开成空语句块
+#endif
+```
 
 ```cpp
 // mysql_mutex_bits.h —— L2 类型
@@ -116,6 +379,167 @@ struct mysql_mutex_t {
 
 #### 三、prlock 的取舍：手搓读写锁，故意让写者饿死
 
+**底层实现全文**（`mysys/thr_rwlock.cc:36`）——★ 读者**完全不阻塞**：
+
+```cpp
+int rw_pr_init(rw_pr_lock_t *rwlock) {
+  native_mutex_init(&rwlock->lock, nullptr);
+  native_cond_init(&rwlock->no_active_readers);
+  rwlock->active_readers = 0;
+  rwlock->writers_waiting_readers = 0;
+  rwlock->active_writer = false;
+#ifdef SAFE_MUTEX
+  rwlock->writer_thread = 0;
+#endif
+  return 0;
+}
+
+int rw_pr_rdlock(rw_pr_lock_t *rwlock) {
+  native_mutex_lock(&rwlock->lock);
+  /*
+    The fact that we were able to acquire 'lock' mutex means
+    that there are no active writers and we can acquire rd-lock.
+    Increment active readers counter to prevent requests for
+    wr-lock from succeeding and unlock mutex.
+  */
+  rwlock->active_readers++;          // ★★ 只要没写者，直接 +1 走人
+  native_mutex_unlock(&rwlock->lock);
+  return 0;
+}
+
+int rw_pr_wrlock(rw_pr_lock_t *rwlock) {
+  native_mutex_lock(&rwlock->lock);
+
+  if (rwlock->active_readers != 0) {
+    /* There are active readers. We have to wait until they are gone. */
+    rwlock->writers_waiting_readers++;
+
+    while (rwlock->active_readers != 0)       // ★★ 无超时、无让步：读者不断就来不了
+      native_cond_wait(&rwlock->no_active_readers, &rwlock->lock);
+
+    rwlock->writers_waiting_readers--;
+  }
+
+  /*
+    We own 'lock' mutex so there is no active writers.
+    Also there are no active readers.
+    This means that we can grant wr-lock.
+    Not releasing 'lock' mutex until unlock will block
+    both requests for rd and wr-locks.
+    ...
+    Thanks to the fact wr-lock/unlock in the absence of
+    contention from readers is essentially mutex lock/unlock
+    with a few simple checks make this rwlock implementation
+    wr-lock optimized.
+  */
+  rwlock->active_writer = true;
+#ifdef SAFE_MUTEX
+  rwlock->writer_thread = my_thread_self();
+#endif
+  return 0;                          // ★ 注意：不释放 lock，持到 unlock
+}
+```
+
+```cpp
+int rw_pr_unlock(rw_pr_lock_t *rwlock) {
+  if (rwlock->active_writer) {
+    /* We are unlocking wr-lock. */
+    rwlock->active_writer = false;
+    if (rwlock->writers_waiting_readers) {
+      /*
+        Avoid expensive cond signal in case when there is no contention
+        or if it is write-only.
+
+        Note that from a performance point of view it would be better to
+        signal on the condition variable after unlocking mutex (as it
+        reduces the number of context switches).
+
+        Unfortunately this would mean that such rwlock can't be safely
+        used by the MDL subsystem, which relies on the fact that it is okay
+        to destroy rwlock once it is in unlocked state.
+      */
+      native_cond_signal(&rwlock->no_active_readers);   // ★★ 必须在持 lock 时 signal —— MDL 的硬约束
+    }
+    native_mutex_unlock(&rwlock->lock);
+  } else {
+    /* We are unlocking rd-lock. */
+    native_mutex_lock(&rwlock->lock);
+    rwlock->active_readers--;
+    if (rwlock->active_readers == 0 && rwlock->writers_waiting_readers) {
+      native_cond_signal(&rwlock->no_active_readers);
+    }
+    native_mutex_unlock(&rwlock->lock);
+  }
+  return 0;
+}
+```
+
+**★ 设计意图的官方注释**（`include/.../thr_rwlock_bits.h:64`）——两条"不寻常"性质：
+
+```cpp
+/**
+  Portable implementation of special type of read-write locks.
+
+  These locks have two properties which are unusual for rwlocks:
+  1) They "prefer readers" in the sense that they do not allow
+     situations in which rwlock is rd-locked and there is a
+     pending rd-lock which is blocked (e.g. due to pending
+     request for wr-lock).
+     This is a stronger guarantee than one which is provided for
+     PTHREAD_RWLOCK_PREFER_READER_NP rwlocks in Linux.
+     MDL subsystem deadlock detector relies on this property for
+     its correctness.
+  2) They are optimized for uncontended wr-lock/unlock case.
+     This is scenario in which they are most often used
+     within MDL subsystem. Optimizing for it gives significant
+     performance improvements in some of tests involving many
+     connections.
+
+  Another important requirement imposed on this type of rwlock
+  by the MDL subsystem is that it should be OK to destroy rwlock
+  object which is in unlocked state even though some threads might
+  have not yet fully left unlock operation for it (of course there
+  is an external guarantee that no thread will try to lock rwlock
+  which is destroyed).
+  Putting it another way the unlock operation should not access
+  rwlock data after changing its state to unlocked.
+
+  TODO/FIXME: We should consider alleviating this requirement as
+  it blocks us from doing certain performance optimizations.
+*/
+struct rw_pr_lock_t {
+  native_mutex_t lock;              /* 保护结构；wr-lock 期间也持有 */
+  native_cond_t no_active_readers;  /* 写者等读者走光 */
+  unsigned int active_readers;
+  unsigned int writers_waiting_readers;
+  bool active_writer;
+  my_thread_t writer_thread;        /* 仅 debug */
+};
+```
+
+> ★★ **关键**：性质 1 比 Linux 的 `PTHREAD_RWLOCK_PREFER_READER_NP` **更强**——**MDL 死锁检测器依赖它才正确**。所以这不是"随便手搓"，而是为 MDL 定制的正确性前提。
+> ★ **"故意让写者饿死"**：`rw_pr_wrlock()` 的 `while` 没有任何让步机制，读者源源不断则写者永远进不来。MDL 场景下可接受（DDL 稀少）。
+
+**PFS 侧：prlock 复用 rwlock 的 PSI 类型**（`mysql_rwlock.h:270`）：
+
+```cpp
+#ifndef DISABLE_MYSQL_PRLOCK_H
+static inline int inline_mysql_prlock_init(PSI_rwlock_key key,
+                                           mysql_prlock_t *that, ...) {
+#ifdef HAVE_PSI_RWLOCK_INTERFACE
+  that->m_psi = PSI_RWLOCK_CALL(init_rwlock)(key, &that->m_prlock);
+#else
+  that->m_psi = nullptr;
+#endif
+  return rw_pr_init(&that->m_prlock);
+}
+#endif
+```
+
+> ★ 所以在 PFS 里 **prlock 就是一个 rwlock instrument**，看不出区别。
+> ★ **reader/writer 走两套独立 service 槽位**：`start_rwlock_rdwait` / `end_rwlock_rdwait` vs `start_rwlock_wrwait` / `end_rwlock_wrwait`（`pfs.cc:9347` 的 8 槽服务表）。`unlock` 不分读写，统一 `PSI_RWLOCK_UNLOCK`。
+> ★ op 枚举区分 5 种：`PSI_RWLOCK_READLOCK / WRITELOCK / TRYREADLOCK / TRYWRITELOCK / UNLOCK`。`try` 变体仍走 `rdwait`/`wrwait` 通道，仅 op 不同。
+
 `mysql_prlock_t` 的底座 `rw_pr_lock_t` **不是** pthread_rwlock 的包装，而是 mysys 用 mutex + cond 手搓的"优先读者"锁。它给出的两条硬保证（头注释原文翻译）：
 
 > 1) **"prefer readers"**：不允许"锁已被 rd-lock，且存在一个被阻塞的 pending rd-lock（例如被 wr-lock 请求挡住）"的局面。**这是比 Linux `PTHREAD_RWLOCK_PREFER_READER_NP` 更强的保证**。MDL 子系统的死锁检测器的正确性依赖它。
@@ -131,6 +555,211 @@ struct mysql_mutex_t {
 - **PFS 的低开销观测模型**：静态注册（key 预分配）+ 动态实例钩子（`m_psi`）+ 双重闸门（全局 `m_enabled`/实例 enabled）——思想与 eBPF 的静态探针类似：埋点代码常驻，开销由开关控制。
 
 ### 算法与数据结构
+
+**四个 instrumented 结构体**（⚠️ 全在 `include/mysql/components/services/bits/`，不是 `include/mysql/psi/`）：
+
+```cpp
+struct mysql_mutex_t   { my_mutex_t m_mutex;      struct PSI_mutex  *m_psi{nullptr}; };
+struct mysql_rwlock_t  { native_rw_lock_t m_rwlock; struct PSI_rwlock *m_psi; };
+struct mysql_prlock_t  { rw_pr_lock_t m_prlock;    struct PSI_rwlock *m_psi; };  // ★ 复用 rwlock 的 PSI 类型
+struct mysql_cond_t    { native_cond_t m_cond;     struct PSI_cond   *m_psi; };
+```
+
+**`native_*_t` 的平台定义**：
+
+```cpp
+// mutex
+#ifdef _WIN32
+typedef CRITICAL_SECTION native_mutex_t;
+typedef int native_mutexattr_t;
+#else
+typedef pthread_mutex_t native_mutex_t;
+typedef pthread_mutexattr_t native_mutexattr_t;
+#endif
+
+// rwlock —— ★ Windows 下不是裸 SRWLOCK
+#ifdef _WIN32
+struct native_rw_lock_t {
+  SRWLOCK srwlock;             /* native reader writer lock */
+  BOOL have_exclusive_srwlock; /* used for unlock */   // ★★ 必须自己记账
+};
+#else
+typedef pthread_rwlock_t native_rw_lock_t;
+#endif
+
+// cond
+#ifdef _WIN32
+typedef CONDITION_VARIABLE native_cond_t;
+#else
+typedef pthread_cond_t native_cond_t;
+#endif
+```
+
+> ★★ **Windows SRWLOCK 为什么要额外一个 bool**：`SRWLOCK` 的释放函数分 `ReleaseSRWLockShared` / `ReleaseSRWLockExclusive`，**没有一个统一的 unlock**，所以必须自己记住"当前是共享还是独占"。POSIX 的 `pthread_rwlock_unlock` 一个通吃。
+
+```cpp
+static inline int native_rw_unlock(native_rw_lock_t *rwp) {
+#ifdef _WIN32
+  if (rwp->have_exclusive_srwlock) {
+    rwp->have_exclusive_srwlock = false;
+    ReleaseSRWLockExclusive(&rwp->srwlock);
+  } else
+    ReleaseSRWLockShared(&rwp->srwlock);
+  return 0;
+#else
+  return pthread_rwlock_unlock(rwp);      // ★ pthread 一个 unlock 通吃
+#endif
+}
+```
+
+> ★ Windows 的 `native_mutex_trylock()` 还手工禁止了递归（`CRITICAL_SECTION` 天然递归）：
+> ```cpp
+>   if (TryEnterCriticalSection(mutex)) {
+>     /* Don't allow recursive lock */
+>     if (mutex->RecursionCount > 1) { LeaveCriticalSection(mutex); return EBUSY; }
+>     return 0;
+>   }
+> ```
+
+**★ `my_cond_timedwait` 是绝对时间（absolute），不是相对**（这是最常见的坑）：
+
+```cpp
+static inline int native_cond_timedwait(native_cond_t *cond,
+                                        native_mutex_t *mutex,
+                                        const struct timespec *abstime) {
+#ifdef _WIN32
+  DWORD timeout = get_milliseconds(abstime);   // ★ Windows 分支才做"绝对→相对"转换
+  if (!SleepConditionVariableCS(cond, mutex, timeout)) return ETIMEDOUT;
+  return 0;
+#else
+  return pthread_cond_timedwait(cond, mutex, abstime);  // ★★ POSIX：abstime 是 CLOCK_REALTIME 绝对时刻
+#endif
+}
+```
+
+调用方必须自己把"现在 + 偏移"写进 `abstime`（`mysys/my_systime.cc:58`）：
+
+```cpp
+void set_timespec_nsec(struct timespec *abstime, Timeout_type nsec) {
+  if (nsec == TIMEOUT_INF) { *abstime = TIMESPEC_POSINF; return; }
+  unsigned long long int now = my_getsystime() + (nsec / 100);   // ★ now = 当前 + 偏移 → 绝对时刻
+  ...
+}
+void set_timespec(struct timespec *abstime, Timeout_type sec) {
+  if (sec == TIMEOUT_INF) { *abstime = TIMESPEC_POSINF; return; }
+  set_timespec_nsec(abstime, sec * 1000000000ULL);
+}
+```
+
+标准范例（`my_thr_init.cc:213`）：
+
+```cpp
+  struct timespec abstime;
+  set_timespec(&abstime, my_thread_end_wait_time);   // ★ 先换算
+  mysql_mutex_lock(&THR_LOCK_threads);
+  while (THR_thread_count > 0) {
+    int error = mysql_cond_timedwait(&THR_COND_threads, &THR_LOCK_threads, &abstime);
+    if (is_timeout(error)) { ...; break; }
+  }
+```
+
+```cpp
+static inline int is_timeout(int e) {    // include/my_thread.h:57
+#if ETIMEDOUT == ETIME
+  return e == ETIMEDOUT;
+#else
+  return e == ETIMEDOUT || e == ETIME;
+#endif
+}
+```
+
+> ⚠️ Windows 分支因为 `SleepConditionVariableCS` 只接受相对毫秒，在 `get_milliseconds()`（`thr_cond.h:61`）里换算，**负差被 clamp 成 0**。
+
+**`MY_MUTEX_INIT_FAST` 的平台换挡**（`include/thr_mutex.h:60`）：
+
+```cpp
+#define MY_MUTEX_INIT_SLOW NULL                 // "慢" = 默认 attr
+
+#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+extern native_mutexattr_t my_fast_mutexattr;
+#define MY_MUTEX_INIT_FAST &my_fast_mutexattr   // ★ Linux/glibc：指向真 attr
+#else
+#define MY_MUTEX_INIT_FAST NULL                 // ★ 其它平台（含 macOS）：退化为 NULL，FAST == SLOW
+#endif
+
+#ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
+extern native_mutexattr_t my_errorcheck_mutexattr;
+#define MY_MUTEX_INIT_ERRCHK &my_errorcheck_mutexattr
+#else
+#define MY_MUTEX_INIT_ERRCHK NULL
+#endif
+```
+
+```cpp
+// mysys/my_thr_init.cc:167 —— adaptive 的官方解释
+#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+  /*
+    Set mutex type to "fast" a.k.a "adaptive"
+
+    In this case the thread may steal the mutex from some other thread
+    that is waiting for the same mutex.  This will save us some
+    context switches but may cause a thread to 'starve forever' while
+    waiting for the mutex (not likely if the code within the mutex is
+    short).
+  */
+  pthread_mutexattr_init(&my_fast_mutexattr);
+  pthread_mutexattr_settype(&my_fast_mutexattr, PTHREAD_MUTEX_ADAPTIVE_NP);
+#endif
+```
+
+> ★ **adaptive mutex = 先自旋若干次再 futex 睡眠**，用"可能饿死"换"少上下文切换"。
+
+**`my_atomic.h`：文件仍存在，但原子族已消亡**（`include/my_atomic.h`，全文 64 行）：
+
+```cpp
+#if defined(_MSC_VER)
+#define YIELD_LOOPS 200
+static inline int my_yield_processor() {
+  int i;
+  for (i = 0; i < YIELD_LOOPS; i++) { YieldProcessor(); }
+  return 1;
+}
+#define LF_BACKOFF my_yield_processor()
+#else
+#define LF_BACKOFF (1)          // ★ 非 MSVC：空操作
+#endif
+```
+
+> ⚠️ **勘误**：文件**存在**（不是"已删除"），但 `my_atomic_add32/64`、`my_atomic_loadptr`、`my_atomic_fasptr`、`my_atomic_casptr` 等**全部被删除**（8.0 起改用 `std::atomic`）。**现在只剩 `LF_BACKOFF` 一个宏**。
+
+**`st_my_thread_var`：只有 2 个字段，且仅 debug 存在**（`mysys/my_thr_init.cc:95`）：
+
+```cpp
+#ifndef NDEBUG
+struct st_my_thread_var {
+  my_thread_id id;            // ★ 字段 1：mysys 线程号（报错打印 T@%u）
+  struct CODE_STATE *dbug;    // ★ 字段 2：DBUG 的 per-thread 状态
+};
+#endif
+```
+
+```cpp
+extern "C" bool my_thread_init() {
+#ifndef NDEBUG
+  if (mysys_thread_var()) return false;          // ★ 幂等
+  if (!(tmp = (struct st_my_thread_var *)calloc(1, sizeof(*tmp)))) return true;
+  mysql_mutex_lock(&THR_LOCK_threads);
+  tmp->id = ++thread_id;
+  ++THR_thread_count;
+  mysql_mutex_unlock(&THR_LOCK_threads);
+  set_mysys_thread_var(tmp);
+#endif
+  return false;
+}
+```
+
+> ⚠️ **勘误**：`st_my_thread_var` **不含 mutex/cond/mysys_var 等一堆字段**，release（`NDEBUG`）下 `my_thread_init()` **几乎什么都不做**（整个函数体被 `#ifndef NDEBUG` 掏空）。`THR_mysys` 已是 C++11 `thread_local`，不再是 pthread_key。
+> ★ `my_thread_end()` 里 `PSI_THREAD_CALL(delete_current_thread)()` **必须在释放 `tmp` 之前**——注释明说 LF_HASH 依赖它。
 
 | 结构 | 组成 | 复杂度 |
 |---|---|---|

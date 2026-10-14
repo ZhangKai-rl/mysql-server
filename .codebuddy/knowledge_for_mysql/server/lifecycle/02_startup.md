@@ -2,11 +2,11 @@
 
 > 基于 MySQL 8.0.39 源码，覆盖 `main()` → `mysqld_main()` 的全链路：早期选项 → 配置与自动调整 → 降权/daemon 化 → `init_server_components()` → DD 加载与升级 → 引擎/插件/组件 → 崩溃恢复 → 网络监听 → 信号线程 → "ready for connections" → 进入接受循环。
 >
-> **边界**：本篇讲**已有数据目录时的正常启动**，止于 `do_command()`（连接进入命令循环）；
+> **本篇横跨 server 层与 InnoDB 层**，讲完「已有数据目录 → 可接受连接」这一段纵向闭环：早期选项 → 子系统初始化 → **下探到 InnoDB 启动与崩溃恢复（`srv_start(false)` 全流程、ARIES 三阶段、线程分批启动）** → 网络监听 → ready 宣告。止于 `do_command()`（连接进入命令循环）。
 > 数据目录从无到有的创建见 [`01_initialize.md`](01_initialize.md)；
 > 关闭与退出见 [`03_shutdown.md`](03_shutdown.md)；
 > 收包之后的协议分发与查询执行见 [`../query/01_protocol_to_dispatch.md`](../query/01_protocol_to_dispatch.md)；
-> InnoDB 崩溃恢复细节见 [`../../innodb/recovery.md`](../../innodb/recovery.md)；
+> InnoDB 侧的崩溃恢复在 [`../../innodb/recovery.md`](../../innodb/recovery.md)（另一视角：扫描与解析状态机、hash 聚合）；
 > 插件/组件框架本身见 [`../plugin/plugin.md`](../plugin/plugin.md) 与 [`../plugin/component.md`](../plugin/component.md)。
 
 ## 目录
@@ -185,6 +185,31 @@ flush_error_log_messages()    ← 把缓冲的消息冲给用户真正要的 sin
 | **配置优先级链（CLI > defaults-file > 目录扫描）** | `my_search_option_files()` |
 | **依赖注入式回调挂钩** | `set_psi_*_service()` 系列、`enter_cond_hook`/`is_killed_hook` 等把 mysys 回调接到 THD |
 
+#### ARIES：崩溃恢复的理论原型
+
+InnoDB 的恢复是 **ARIES**（Mohan et al., *ARIES: A Transaction Recovery Method*, ACM TODS 1992）的一个落地变体。三阶段对应关系：
+
+| ARIES 阶段 | InnoDB 落点 | 说明 |
+|---|---|---|
+| **Analysis** | `recv_recovery_from_checkpoint_start()` | 从 `last_checkpoint_lsn` 起扫 redo，解析出 (space_id, page_no) 建 `recv_sys` 哈希表；同时收集 `MLOG_FILE_OPEN` 建立 space_id → 文件的映射 |
+| **Redo**（repeating history） | `recv_apply_hashed_log_recs()` | 遍历哈希表，**按页**重放；幂等：页上 lsn ≥ redo lsn 则跳过 |
+| **Undo** | `trx_sys_init_at_db_start()` → `trx_rollback_or_clean_recovered()` | 扫 undo 重建 rseg/undo 链表 → 重建崩溃时的事务 → 按状态提交或回滚 |
+
+**与教科书 ARIES 的差异（这几条才是重点）**：
+
+| 维度 | ARIES 原型 | InnoDB 的落地 | 差异原因 |
+|---|---|---|---|
+| redo 粒度 | 逻辑的（page-oriented 或 logical） | **物理/逻辑混合**，记录类型有 50 多种，每种字段布局不同 | 既要能直接贴到页上，又要支持"页内重组织"这类逻辑操作。代价：**解析必须逐字段走一遍才能确定长度**（恢复慢的一个根因，对应 bug#82937） |
+| Analysis 的产物 | 事务表 + 脏页表（DPT） | `recv_sys` 的哈希表（按 space_id+page_no）+ space 映射 | 哈希表本身就编码了"哪些页是脏的"，不需要单独 DPT |
+| 脏页表排序 | 不需要 | **恢复期的 flush list 用红黑树加速插入定位** | 正常运行时顺序由 `log_sys->mutex` + `log_flush_order_mutex` 保证；恢复期没有这个保证，只能边插边找位置，线性查找太慢 |
+| Checkpoint | fuzzy checkpoint | fuzzy checkpoint，`last_checkpoint_lsn` 在 redo 头 | 同 |
+| 半页写 | ARIES 不讨论（假设原子写） | **doublewrite buffer** | 存储硬件不保证 16KB 原子写 |
+
+配套的两个经典设计：
+
+- **WAL 与幂等 redo**："只应用 redo lsn > page lsn 的记录"就是幂等性的落点——页头存着自己的 lsn，重放时比较即可，不需要额外事务表判断"这条 redo 是否已应用"。
+- **checkpoint 域双写**：redo 文件头有两个 checkpoint 域轮流写。若只有一个域，写那 512 字节（`OS_FILE_LOG_BLOCK_SIZE`）时掉电会导致整个域不可用、数据库无法启动。两个域轮流写把"单点半写"变成"至少有一个可用"，同时减少扇区故障影响。
+
 ### 算法与数据结构
 
 | 结构 | 用途 | 特点 |
@@ -210,6 +235,126 @@ flush_error_log_messages()    ← 把缓冲的消息冲给用户真正要的 sin
 ## 核心实现
 
 ### 主链路
+
+#### 流程图：23 个阶段与关键分支
+
+```mermaid
+flowchart TD
+    A["main() → mysqld_main()"] --> B["S1 my_init + load_defaults(读 my.cnf)"]
+    B --> C["★ handle_early_options()<br/>解析 --initialize / --daemonize / --validate-config"]
+
+    C --> D{"--initialize?"}
+    D -->|是| D1["走【01_initialize】<br/>init 完成后 unireg_abort(SUCCESS) 退出"]
+    D -->|否| E["S2 init_error_log（仅缓冲）<br/>+ adjust_related_options"]
+
+    E --> F["S3 component_infrastructure_init<br/>initialize_manifest_file_components(mysqld.my)"]
+    F --> G["S5 ★ init_common_variables() → get_options()<br/>解析 my_long_options[]（第二批）"]
+
+    G --> H["S6 my_init_signals()<br/>★ 所有业务信号被 pthread_sigmask 阻塞"]
+    H --> I{"--daemonize?"}
+    I -->|是| I1["双 fork + setsid（父进程退出）"]
+    I -->|否| J
+    I1 --> J["S8 check_user → set_user() 降权<br/>★ 必须在开数据文件 / 绑端口之前"]
+
+    J --> K["S11 ★ init_server_components()"]
+
+    K --> ISC
+
+    subgraph ISC["★ init_server_components() 内部 —— 顺序即依赖（分 5 个功能域）"]
+        direction TB
+
+        subgraph G1["① 最底层：锁 / 表 / 连接"]
+            K1["mdl_init()"]
+            K2["partitioning_init()"]
+            K3["table_def_init() / hostname_cache_init()"]
+            K4["dynamic_loader_srv->load(component_reference_cache)"]
+            K1 --> K2 --> K3 --> K4
+        end
+
+        subgraph G2["② 日志：两阶段（先缓冲、后接管）"]
+            K5["setup_error_log()<br/>★ 真正打开 error log 文件"]
+            K6["enter_cond_hook / is_killed_hook = thd_*<br/>（mysys 回调接到 THD）"]
+            K7["setup_error_log_components()<br/>★ 激活 log_error_services<br/>flush 缓冲 → 结束 buffering"]
+            K5 --> K6 --> K7
+        end
+
+        subgraph G3["③ 复制 / GTID / binlog 配置"]
+            K8["delegates_init()"]
+            K9["binlog 配置一致性检查<br/>log-bin / log-bin-index 路径校验"]
+            K10["gtid_server_init()<br/>（global_sid_map / gtid_state / persistor）"]
+            K11["udf_init_globals()<br/>★ 必须在读 proc 表之前"]
+            K12["init_server_auto_options()<br/>★ 读/生成 auto.cnf 的 server_uuid<br/>必须在打开 binlog 之前"]
+            K8 --> K9 --> K10 --> K11 --> K12
+        end
+
+        subgraph G4["④ ★ 插件两阶段 + DD（依赖三角）"]
+            K13["plugin_register_early_plugins()<br/>（--early-plugin-load）"]
+            K14["★ plugin_register_builtin_and_init_core_se()<br/>只启 4 个：daemon_keyring_proxy<br/>/ MyISAM / InnoDB / CSV"]
+            K15["★ dd::init(DD_RESTART_OR_UPGRADE)"]
+            K16["★ plugin_register_dynamic_and_init_all()<br/>（要读 mysql.plugin 表）"]
+            K17["dd::init(DD_UPDATE_I_S_METADATA)<br/>注释：after all plugins registered"]
+            K18["init_pfs_tables + upgrade_system_schemas（如需）"]
+            K13 --> K14 --> K15 --> K16 --> K17 --> K18
+        end
+
+        subgraph G5["⑤ 引擎收尾 / 事务 / binlog 打开"]
+            K19["ha_init()（注释：必须在 CSV 日志之前）"]
+            K20["query_logger.set_handlers() + 打开 slow/general log<br/>（依赖 CSV 引擎）"]
+            K21["initialize_storage_engine(default_storage_engine)<br/>★ 此刻才把默认引擎从 MyISAM 换成配置值"]
+            K22["tc_log 由 dummy 换成真的<br/>（opt_bin_log ? mysql_bin_log : tc_log_mmap）"]
+            K23["tc_log->open() → dd::reset_tables_and_tablespaces()"]
+            K24["ha_post_recover()（DDL log 回放 / 加密 / 起线程）"]
+            K25["recover_prepared_xa_transactions()<br/>（从 ha_recover 挪出，避免与 K23 抢 MDL）"]
+            K26["mysql_bin_log.open_binlog()"]
+            K19 --> K20 --> K21 --> K22 --> K23 --> K24 --> K25 --> K26
+        end
+
+        G1 --> G2 --> G3 --> G4 --> G5
+    end
+
+    subgraph INNO["★ dd::init 内部下探到 InnoDB（ARIES 三阶段）"]
+        direction TB
+        I1["DDSE_dict_init(DICT_INIT_CHECK_FILES)"]
+        I2["innobase_init_files() → srv_start(false)"]
+        I3["公共前段：fil_scan_for_tablespaces<br/>→ buf_pool_init → log_sys_init → dblwr::open"]
+        I4["【Analysis】recv_recovery_from_checkpoint_start<br/>双层 max 找 checkpoint<br/>checkpoint_lsn != flush_lsn → 需要恢复"]
+        I5["【Redo】recv_apply_hashed_log_recs<br/>按页重放，幂等"]
+        I6["【Undo】trx_sys_init_at_db_start<br/>+ srv_dict_recover_on_restart"]
+        I1 --> I2 --> I3 --> I4 --> I5 --> I6
+    end
+
+    K15 -.->|下探| INNO
+    ISC --> L["S12 GTID / binlog 恢复"]
+    L --> M["S13 network_init()"]
+
+    M --> N{"DD 判定矩阵"}
+    N -->|"mysql.ibd 有<br/>无 upgrade status"| N1["bootstrap::restart()<br/>（普通重启 / 8.0→8.0 升级）"]
+    N -->|"mysql.ibd 无<br/>plugin.frm 有"| N2["5.7 in-place 升级<br/>DICT_INIT_UPGRADE_57_FILES"]
+    N -->|"两者都无"| N3["★ 报错 ER_DD_UPGRADE_FAILED_<br/>FIND_VALID_DATA_DIR 退出"]
+
+    N1 --> O
+    N2 --> O["S14 pid / acl_init / my_tz_init / grant_init<br/>component_infrastructure_init"]
+    O --> P["S15 start_signal_handler()<br/>★ 线程创建后会阻塞在 server_components_init_wait()"]
+    P --> Q["S19 start_handle_manager<br/>create_compress_gtid_table_thread"]
+    Q --> R["S20 ★ server_components_initialized()<br/>→ 唤醒阻塞的信号线程"]
+    R --> R1["LogErr: 'ready for connections'<br/>sysd::notify(READY=1)"]
+    R1 --> S["S21 socket_listener_active = true<br/>signal_parent(pipe, 1)"]
+    S --> T["★ connection_event_loop()<br/>主线程永久阻塞在此"]
+    T --> U["S22（关闭时）clean_up(true) → mysqld_exit()"]
+
+    N3 --> X["unireg_abort"]
+
+    style K5 fill:#e8f5e9
+    style K6 fill:#e8f5e9
+    style K7 fill:#e8f5e9
+    style R fill:#fff3e0
+    style T fill:#e3f2fd
+    style N3 fill:#ffebee
+```
+
+**读图要点**：三处绿色是启动最关键的依赖三角——**两阶段插件注册夹着 `dd::init()`**；橙色是"宣告 ready"（同时唤醒信号线程）；蓝色是主线程此后的归宿。
+
+#### 调用栈全景
 
 ```
 main()                                              sql/main.cc（只有一行：return mysqld_main(argc, argv)）
@@ -328,6 +473,46 @@ const char *load_default_groups[] = {"mysqld", "server", MYSQL_BASE_VERSION, nul
 ```
 
 即 `[mysqld]` → `[server]` → `[mysqld-8.0]`；**命令行优先级最高**。
+
+```mermaid
+flowchart TD
+    A["my_search_option_files() 开始"] --> B["① 先从【命令行】取出<br/>--defaults-file / --defaults-extra-file<br/>--defaults-group-suffix / --login-path"]
+
+    B --> C{"② 给了 --no-defaults?"}
+    C -->|是| C1["found_no_defaults = true<br/>★ 后面整个目录扫描被跳过"]
+    C1 --> Z["结束（只读命令行）"]
+    C -->|否| D
+
+    D{"③ conf_file 含目录?<br/>（--defaults-file 给了路径）"} -->|是| D1["★ 只读这一个文件（独占语义）"]
+    D1 --> Z
+    D -->|否| E{"④ my_defaults_file 已设?"}
+    E -->|是| E1["只读它"]
+    E1 --> Z
+    E -->|否| F
+
+    F["⑤ 遍历 default_directories"] --> F1["datadir / 各平台默认路径<br/>（由 init_variable_default_paths() 建立）"]
+    F1 --> F2["逐目录读 my.cnf"]
+    F2 --> F3["遍历到【空字符串条目】时<br/>插入读一次 my_defaults_extra_file"]
+    F3 --> G{"⑥ my_defaults_read_login_file?"}
+    G -->|"mysqld 显式置 false"| G1["★ 不读 mylogin.cnf"]
+    G -->|真| G2["读 login file"]
+    G1 --> Z
+    G2 --> Z
+
+    Z --> H["最终优先级（高 → 低）"]
+    H --> H1["1. 命令行参数"]
+    H1 --> H2["2. --defaults-extra-file"]
+    H2 --> H3["3. --defaults-file（独占时只有它）"]
+    H3 --> H4["4. 目录扫描到的 my.cnf（后读的覆盖先读的）"]
+    H4 --> H5["5. 编译期默认值"]
+    H5 --> H6["★ 自动调整还会【覆盖】以上结果：<br/>open_files → max_connections<br/>→ table_cache → table_def_cache"]
+
+    style D1 fill:#ffebee
+    style C1 fill:#ffebee
+    style H6 fill:#fff3e0
+```
+
+两处红色是运维最容易踩的坑：**`--defaults-file` 是独占语义**（给了它，`/etc/my.cnf` 等目录里的文件一律不读）；`--no-defaults` 会跳过全部配置文件。黄色那层是"启动期自动调整"——它会**静默下调** `max_connections` 等（见 1.3）。
 
 #### 1.3 启动期的自动调整（四个联动公式）
 
@@ -492,6 +677,34 @@ mysqld_main
 | 无 | 有 | 无 | 5.7→8.0 in-place 升级（`DICT_INIT_UPGRADE_57_FILES`） |
 | 无 | 无 | — | **报错 `ER_DD_UPGRADE_FAILED_FIND_VALID_DATA_DIR` 退出** |
 
+```mermaid
+flowchart TD
+    A["upgrade_57::do_pre_checks_and_initialize_dd()"] --> B{"mysql.ibd 存在?"}
+
+    B -->|否| C{"mysql/plugin.frm 存在?"}
+    C -->|否| C1["★ ER_DD_UPGRADE_FAILED_FIND_VALID_DATA_DIR<br/>退出（既不象重启也不象升级）"]
+    C -->|是| C2["5.7 → 8.0 in-place 升级"]
+    C2 --> C3{"MYSQL_VERSION_ID >= 90000?"}
+    C3 -->|是| C4["★ ER_INVALID_SERVER_UPGRADE_NOT_LTS<br/>禁止 5.7 直接升到 9.x"]
+    C3 -->|否| C5["DDSE_dict_init(DICT_INIT_UPGRADE_57_FILES)"]
+    C5 --> C6["srv_start(false) + srv_is_upgrade_mode = true<br/>→ 额外一轮：dict_load_tablespaces_for_upgrade<br/>→ 提前启 purge 并等清空"]
+
+    B -->|是| D{"upgrade status 文件存在?"}
+    D -->|否| D1["★ 普通重启 / 8.0→8.0 升级<br/>restart_dictionary() → bootstrap::restart()"]
+    D -->|是| D2["按 Upgrade_status::enum_stage 崩溃续跑<br/>（上次升到一半崩了）"]
+
+    D1 --> E["DDSE_dict_init(DICT_INIT_CHECK_FILES)"]
+    E --> F["srv_start(false) → ★ 崩溃恢复"]
+    F --> G["sync_meta_data()<br/>（内存 C++ 表定义 ↔ 磁盘 DD 对象比对同步）"]
+    G --> H["upgrade::do_server_upgrade_checks()<br/>upgrade::upgrade_tables()"]
+    H --> I["repopulate_charsets_and_collations()<br/>verify_contents() → update_versions()"]
+
+    style C1 fill:#ffebee
+    style C4 fill:#ffebee
+    style D1 fill:#e8f5e9
+    style F fill:#fff3e0
+```
+
 外层报错：
 
 ```cpp
@@ -650,6 +863,8 @@ int ha_init() {
 
 #### 4.2 InnoDB：`srv_start(false)` 的恢复分支
 
+`srv_start()` 是 InnoDB 生命周期的总入口，一个 `bool` 参数决定建库还是重启。下面先给出恢复分支的入口代码，然后逐段展开它的**完整前段**（4.3~4.5）、**ARIES 三阶段**（4.6~4.8）与**线程启动**（4.9）。
+
 ```cpp
   } else {                                   // create_new_db == false
     err = dblwr::v1::init();
@@ -695,7 +910,833 @@ int ha_init() {
 - `dict_boot()` 与初始化路径的 `dict_create()` 对应：一个读、一个建。
 - `srv_force_recovery >= SRV_FORCE_NO_LOG_REDO` 时跳过 redo 应用；`== 0` 时才检查缺失表空间。
 
-#### 4.3 Component vs Plugin：两套并存的可扩展框架
+#### 4.3 `srv_start()` 公共前段全景
+
+两条分支（建库 / 恢复）共享同一段前置初始化，顺序如下（完整阶段表）：
+
+| # | 调用 | 做了什么 / 为什么在这里 |
+|---|---|---|
+| 1 | `srv_start_state = SRV_START_STATE_NONE` | 重置启动状态位掩码 |
+| 2 | upgrade mode 的守卫检查 | `srv_force_recovery != 0` 或 `srv_read_only_mode` 时直接拒绝升级 |
+| 3 | `ut_d(sync_check_enable())` | 打开 latch order 校验（debug） |
+| 4 | `srv_boot()` | 建 `srv_sys`、各类全局 mutex/event |
+| 5 | `os_create_block_cache()` | 块缓存（压缩页用） |
+| 6 | `fil_init(innobase_get_open_files_limit())` | 文件层初始化 |
+| 7 | `fil_set_scan_dir()` × 4 | 登记要扫描的目录（见 4.4） |
+| 8 | `clone_init()` | **必须在扫描之前**——clone 恢复要把文件替换掉 |
+| 9 | `fil_scan_for_tablespaces()` | 把磁盘上的 `.ibd`/`.ibu` 扫成 `fil_space_t` |
+| 10 | `os_aio_init()` + `os_aio_start_threads()` | AIO 子系统与 IO 线程 |
+| 11 | `buf_pool_init(srv_buf_pool_size, srv_buf_pool_instances)` | buffer pool（要在 AIO 之后） |
+| 12 | `fsp_init` / `pars_init` / `recv_sys_create` / `recv_sys_init` | 恢复用的内存结构（先于 redo 文件） |
+| 13 | `trx_sys_create()` / `lock_sys_create(srv_lock_table_size)` | 事务系统与锁系统 |
+| 14 | `buf_flush_page_cleaner_init()` | 注释：即使只读模式也可能有 intrinsic table 的刷脏任务 |
+| 15 | `srv_start_state_set(SRV_START_STATE_IO)` | ★ 能力就绪标记：从这一刻起恢复过程可以发起 I/O |
+| 16 | `srv_sys_space.open_or_create()` | 打开/建 `ibdata1`，读出 `flushed_lsn` |
+| 17 | `dict_persist_init()` / `mtr_t::s_logging.init()` | 动态元数据持久化模块 |
+| 18 | `dblwr::open()` | **在 `log_sys_init` 之前**——redo 初始化过程中就可能要写页 |
+| 19 | `log_sys_init(create_new_db, flushed_lsn, new_files_lsn)` | 建/开 redo |
+| 20 | `arch_init()` | archiver |
+
+第 16 步有一个关键判据：
+
+```cpp
+  if (flushed_lsn < LOG_START_LSN) {
+    ut_ad(!create_new_db);
+    /* Data directory hasn't been initialized yet. */
+    ib::error(ER_IB_MSG_DATA_DIRECTORY_NOT_INITIALIZED_OR_CORRUPTED);
+    return srv_init_abort(DB_ERROR);
+  }
+```
+
+**`flushed_lsn < LOG_START_LSN` = "数据目录没初始化"**。注意这正是 [`03_shutdown.md`](03_shutdown.md) 里讲的 `innodb_fast_shutdown=2` 故意不写的那个字段——**同一个字段既表达"是否初始化过"，又表达"上次是否干净关闭"**。
+
+#### 4.4 目录扫描：四个来源与 `fil_scan_for_tablespaces()`
+
+```cpp
+  /* This is the default directory for IBD and IBU files. Put it first
+  in the list of known directories. */
+  fil_set_scan_dir(MySQL_datadir_path.path());
+
+  /* Add --innodb-data-home-dir as a known location for IBD and IBU files
+  if it is not already there. */
+  fil_set_scan_dir(Fil_path::remove_quotes(srv_data_home));
+
+  /* Add --innodb-directories as known locations for IBD and IBU files. */
+  if (srv_innodb_directories != nullptr && *srv_innodb_directories != 0) {
+    fil_set_scan_dirs(Fil_path::remove_quotes(srv_innodb_directories));
+  }
+
+  /* Note whether the undo path is different (not the same or under)
+  from all other known directories. ... */
+  MySQL_undo_path_is_unique = !fil_path_is_known(MySQL_undo_path.path());
+  if (MySQL_undo_path_is_unique) {
+    fil_set_scan_dir(Fil_path::remove_quotes(MySQL_undo_path));
+  }
+  ib::info(ER_IB_MSG_378) << "Directories to scan '" << fil_get_dirs() << "'";
+```
+
+四个来源：`datadir` / `innodb_data_home_dir` / `innodb_directories` / `innodb_undo_directory`（仅当它是独立路径时）。
+
+**这段是 8.0 相对 5.7 最重要的恢复优化**：5.6/5.7 时代恢复需要**打开所有表**才能确定 `space_id → 文件` 的映射，表多时（几十上百万）恢复会 hang 在 "Reading tablespace information from the .ibd files…"。8.0 改成**扫文件系统 + 读 redo 里的 `MLOG_FILE_OPEN` 记录**，完全不打开表。
+
+演进链：5.7 用 `MLOG_FILE_NAME`（WL#7142）→ **8.0.1 起被 `MLOG_FILE_OPEN` 取代**（`include/log0types.h` 原文：`Remove MLOG_FILE_NAME and MLOG_CHECKPOINT, introduce MLOG_FILE_OPEN redo log record.`）。
+
+#### 4.5 buffer pool / log / dblwr 的初始化顺序
+
+```cpp
+  if (!os_aio_init(srv_n_read_io_threads, srv_n_write_io_threads)) { ... }
+  err = buf_pool_init(srv_buf_pool_size, srv_buf_pool_instances);
+  if (err != DB_SUCCESS) { ib::error(ER_IB_MSG_1131); return srv_init_abort(DB_ERROR); }
+  ...
+  fsp_init();
+  pars_init();
+  recv_sys_create();
+  recv_sys_init();
+  trx_sys_create();
+  lock_sys_create(srv_lock_table_size);
+
+  /* Create i/o-handler threads: */
+  os_aio_start_threads();
+
+  /* Even in read-only mode there could be flush job generated by
+  intrinsic table operations. */
+  buf_flush_page_cleaner_init();
+
+  srv_start_state_set(SRV_START_STATE_IO);
+```
+
+顺序理由：AIO 必须先于 buffer pool（刷脏/读页都走 AIO）；`recv_sys` 只是内存结构，可以先于 redo 文件建立。
+
+```cpp
+  srv_startup_is_before_trx_rollback_phase = !create_new_db;
+
+  if (create_new_db) {
+    recv_sys_free();      // 新建库不需要恢复结构，直接释放
+  }
+```
+
+#### 4.6 ARIES 三阶段在 InnoDB 的落地
+
+##### 阶段一 Analysis：`recv_recovery_from_checkpoint_start()`
+
+先处理 8.0.30 的 redo 格式升级分支：
+
+```cpp
+    ut_a(log_sys->m_format <= Log_format::CURRENT);
+    const bool log_upgrade = log_sys->m_format < Log_format::CURRENT;
+
+    if (log_upgrade) {
+      if (srv_read_only_mode) {
+        ib::error(ER_IB_MSG_LOG_UPGRADE_IN_READ_ONLY_MODE, ulong{to_int(log_sys->m_format)});
+        return srv_init_abort(DB_ERROR);
+      }
+      /* Check if the redo log from an older known redo log
+      version is from a clean shutdown. */
+      err = recv_verify_log_is_clean_pre_8_0_30(*log_sys);
+      if (err != DB_SUCCESS) return srv_init_abort(err);
+
+      /* Redo logs are clean. We need to recreate REDO files */
+      err = recreate_redo_files(flushed_lsn);
+      if (err != DB_SUCCESS) return srv_init_abort(err);
+    }
+```
+
+**设计要点**：老格式 redo **只有在确认"逻辑为空"（干净关闭）时才允许升级**。若老 redo 里还有未应用的日志，直接拒绝启动——因为新旧格式的写入语义不同，混写会产生非法文件。这是"宁可拒绝启动也不做有损转换"。
+
+然后是恢复主调用：
+
+```cpp
+    err = recv_recovery_from_checkpoint_start(*log_sys, flushed_lsn);
+    if (err != DB_SUCCESS) return srv_init_abort(err);
+
+    if (err == DB_SUCCESS) {
+      arch_page_sys->post_recovery_init();
+      /* Initialize the change buffer. */
+      err = dict_boot();
+    }
+```
+
+`dict_boot()` 与建库分支的 `dict_create()` 对应：一个**读**四棵内部系统表，一个**建**它们。
+
+##### 阶段二 Redo：`recv_apply_hashed_log_recs()`
+
+```cpp
+    const bool redo_writes_allowed = !srv_read_only_mode;
+    ut_a(srv_force_recovery < SRV_FORCE_NO_LOG_REDO || !redo_writes_allowed);
+
+    if (redo_writes_allowed) {
+      /* We need to start log threads now, because recovery
+      could result in execution of ibuf merges. These merges
+      could result in new redo records. In the read-only mode
+      we do not need log threads, because we disallow new redo
+      records in such mode. If upgrade was forced, or the data
+      directory was cloned, we will start redo threads later. */
+      log_start_background_threads(*log_sys);
+    }
+
+    if (srv_force_recovery < SRV_FORCE_NO_LOG_REDO) {
+      RECOVERY_CRASH(2);
+
+      /* Don't allow IBUF operations for cloned database
+      recovery as it would add extra redo log and we may
+      not have enough margin.
+      Don't allow IBUF operations when redo is written
+      in the older format than the current, because we
+      would write new redo records in the current fmt,
+      and end up with file in both formats = invalid. */
+      err = recv_apply_hashed_log_recs(*log_sys,
+                                       !recv_sys->is_cloned_db && !log_upgrade);
+      if (recv_sys->found_corrupt_log || err != DB_SUCCESS) {
+        err = DB_ERROR;
+        return (srv_init_abort(err));
+      }
+      /* Recovery complete, start verifying the page LSN on read. */
+      recv_lsn_checks_on = true;
+    }
+```
+
+三条要点：
+
+1. **redo 线程必须在应用日志之前启动**——恢复过程里的 ibuf merge 会产生**新的 redo**。恢复不是只读过程。
+2. 第二个参数就是"是否允许 ibuf 操作"：clone 恢复和格式升级时都为 false。
+3. `recv_lsn_checks_on = true`：恢复完成后才打开"读页时校验 lsn"。**恢复期故意放宽、恢复后收紧**。
+
+##### 恢复收尾与动态元数据的鸡生蛋问题
+
+```cpp
+    if (srv_force_recovery == 0 && fil_check_missing_tablespaces()) {
+      ib::error(ER_IB_MSG_1139);
+      auto p = recv_recovery_from_checkpoint_finish(true);
+      ut_a(p == nullptr);
+      return (srv_init_abort(DB_ERROR));
+    }
+    if (recv_sys->found_corrupt_log) ib::warn(ER_IB_MSG_RECOVERY_CORRUPT);
+    if (!srv_force_recovery && !srv_read_only_mode) buf_flush_sync_all_buf_pools();
+
+    RECOVERY_CRASH(3);
+    auto *dict_metadata = recv_recovery_from_checkpoint_finish(false);
+    ut_a(dict_metadata != nullptr);
+
+    /* We need to save the dynamic metadata collected from redo log to DD
+    buffer table here. This is to make sure that the dynamic metadata is not
+    lost by any future checkpoint. Since DD and data dictionary in memory
+    objects are not fully initialized at this point, the usual mechanism to
+    persist dynamic metadata at checkpoint wouldn't work. */
+    if (!recv_sys->is_cloned_db && !dict_metadata->empty()) {
+      ut_a(redo_writes_allowed);
+      /* ... 因为 DD 还没起来，只能用内部 API 直接打开 mysql.ibd ... */
+      fil_space_t *space = fil_space_acquire_silent(dict_sys_t::s_dict_space_id);
+      if (space == nullptr) {
+        dberr_t error = fil_ibd_open(true, FIL_TYPE_TABLESPACE,
+                                     dict_sys_t::s_dict_space_id, predefined_flags,
+                                     dict_sys_t::s_dd_space_name,
+                                     dict_sys_t::s_dd_space_file_name, true, false);
+        if (error != DB_SUCCESS) { ib::error(ER_IB_MSG_1142); return srv_init_abort(DB_ERROR); }
+      } else {
+        fil_space_release(space);
+      }
+      dict_persist->table_buffer = ut::new_withkey<DDTableBuffer>(UT_NEW_THIS_FILE_PSI_KEY);
+      dict_metadata->store();
+      log_buffer_flush_to_disk(*log_sys);
+    }
+    ut::delete_(dict_metadata);
+
+    RECOVERY_CRASH(4);
+    log_sys->m_allow_checkpoints.store(true, std::memory_order_release);
+```
+
+两个设计点：
+
+- **动态元数据（autoinc 等）从 redo 恢复出来后必须写回 `mysql.ibd`**，否则后续 checkpoint 会把它丢掉。但此刻 **DD 还没起来**，所以只能用内部 API（`fil_ibd_open` + `dict_metadata->store()`）绕过 DD 层直接操作。
+- `m_allow_checkpoints` 在恢复完成**之后**才置 true——恢复期间禁止写 checkpoint，否则会把"还没重放完"的状态固化。
+
+##### 阶段三 Undo：`trx_sys_init_at_db_start()`
+
+```cpp
+    err = srv_undo_tablespaces_init(false);
+    if (err != DB_SUCCESS && srv_force_recovery < SRV_FORCE_NO_UNDO_LOG_SCAN) {
+      return (srv_init_abort(err));
+    }
+    trx_purge_sys_mem_create();
+    purge_queue = trx_sys_init_at_db_start();
+    ...
+    trx_purge_sys_initialize(srv_threads.m_purge_workers_n, purge_queue);
+```
+
+`trx_sys_init_at_db_start()` 完成 Undo 的前两步（重建 rseg/undo 链表 + 重建事务状态）。**第三步（真正回滚）被推迟到 server 侧**，见 4.7。
+
+##### 数据流总览
+
+```
+                        ┌──────────────────── redo 文件 ────────────────────┐
+                        │  #innodb_redo/#ib_redoN（环形，按需增长）          │
+                        └───────────────────────┬──────────────────────────┘
+                                                │ 每次读 RECV_SCAN_SIZE = 4×UNIV_PAGE_SIZE
+                                                ▼
+   ┌────────────────────────────────────────────────────────────────────┐
+   │ 【Analysis】recv_recovery_from_checkpoint_start()                   │
+   │                                                                    │
+   │  1. recv_find_max_checkpoint()                                     │
+   │       文件内：HEADER_1 / HEADER_2 取 lsn 大者（坏域跳过）            │
+   │       文件间：再取大者 + 校验 lsn 落在该文件区间内                   │
+   │                        ↓ checkpoint_lsn                            │
+   │  2. if (checkpoint_lsn != flush_lsn) → recv_init_crash_recovery()   │
+   │        （flush_lsn 来自系统表空间 page 0 偏移 26）                   │
+   │                        ↓                                           │
+   │  3. recv_recovery_begin() 循环：                                    │
+   │       recv_read_log_seg() ──→ recv_scan_log_recs()                 │
+   │                                   │                                │
+   │                                   ├─ recv_parse_log_recs()         │
+   │                                   │    解析出 (space_id, page_no)  │
+   │                                   │    single_rec / multi_rec      │
+   │                                   │    （multi 需 MLOG_MULTI_REC_END）│
+   │                                   ↓                                │
+   │                            recv_sys->spaces                        │
+   │                        std::unordered_map<space_id, Space>         │
+   │                        每页一个链表，★ 按 lsn 从小到大              │
+   │                                   │                                │
+   │                                   ├─ if (recv_heap_used() > max_mem)│
+   │                                   │     ★ 中途 recv_apply_hashed…() │
+   │                                   │       （之后 recv_no_ibuf_ops） │
+   └───────────────────────────────────┼────────────────────────────────┘
+                                       │
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────┐
+   │ 【Redo】recv_apply_hashed_log_recs()                                │
+   │   遍历哈希表 → 读页（recv_read_in_area 合并 32 页的 I/O）            │
+   │   → 逐条应用，★ 只应用 redo_lsn > page_lsn 的（幂等）                │
+   │   → 脏页挂 flush list（用 rbtree 加速定位插入点）                    │
+   │   完成后 recv_lsn_checks_on = true                                  │
+   └───────────────────────────────────┬────────────────────────────────┘
+                                       │ recv_recovery_from_checkpoint_finish()
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────┐
+   │ 【Undo】trx_sys_init_at_db_start() + trx_rollback_or_clean_recovered│
+   │   扫 undo → 重建 rseg / undo 链表 → 重建崩溃时的事务                 │
+   │   → ACTIVE 回滚 / PREPARED 交 server 与 binlog 裁决                  │
+   │   ★ DD 事务必须先回滚（srv_dict_recover_on_restart）                │
+   └────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.7 恢复的"后半段"：为什么 DD 事务必须优先回滚
+
+```cpp
+void srv_dict_recover_on_restart() {
+  /* Resurrect locks for dictionary transactions */
+  trx_resurrect_locks(false);
+
+  /* Roll back any recovered data dictionary transactions, so
+  that the data dictionary tables will be free of any locks. ... */
+  if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO && trx_sys_need_rollback()) {
+    trx_rollback_or_clean_recovered(false);
+  }
+
+  /* Resurrect locks for non-dictionary transactions only after rolling back all
+  dictionary transactions. ... */
+  trx_resurrect_locks(true);
+  trx_clear_resurrected_table_ids();
+
+  /* Do after all DD transactions recovery, to get consistent metadata */
+  apply_dynamic_metadata();
+
+  if (srv_force_recovery < SRV_FORCE_NO_IBUF_MERGE) {
+    srv_sys_tablespaces_open = true;
+  }
+}
+```
+
+**`trx_resurrect_locks` 被调用两次**（先只 resurrect DD 事务的锁，回滚完再 resurrect 其余）。源码里那段超长注释解释了一个真实 bug：
+
+```cpp
+  /* Resurrect locks for non-dictionary transactions only after rolling back all
+  dictionary transactions. This is required as of today since we read
+  uncommitted data while constructing table object in dd_table_open_on_id_low.
+  ...
+  TODO-1: dd_table_open_on_id_low : Reading uncommitted data doesn't seem
+  correct and needs to be analyzed and possibly fixed.
+  ...
+  2. Not able to load innodb dict_* object for the table involved in the DDL.
+     This could result in much more serious issue when binary log is enabled
+     and crash happens after the transaction is prepared. Currently in binlog
+     transaction recovery path no session THD is created and we rely on cached
+     dict_* object to find out if a table is dropped. If the dict_table_t
+     object is not already loaded, the table is considered dropped and undo
+     apply is skipped. This would further result in uncommitted but prepared
+     transaction data being committed and persisted.
+
+  TODO-2: Have session (THD) while doing binary log recovery. ...
+  Note: The current work around fixes both issues but ideally should not be
+  required if base issues [TODOs] are fixed. */
+```
+
+即：恢复锁时要读未提交数据去构造表对象，必须先让 DDL 事务回滚干净。否则在"**binlog 已写 + 崩溃发生在 prepare 之后**"的场景下，可能把未提交事务的数据**错误提交**。这是**用顺序约束掩盖设计缺陷**的实例，两条 `TODO` 都还挂着。
+
+#### 4.8 线程体系：24 个 `IB_thread` 与四批启动
+
+`srv_threads`（`include/srv0srv.h`）的全部成员：
+
+| 成员 | 职责 |
+|---|---|
+| `m_master` | 后台任务：ibuf merge、background drop tables、shutdown 期任务 |
+| `m_purge_coordinator` / `m_purge_workers[]` | purge 协调者与工作者（**`workers[0]` 就是 coordinator**，少起一个线程） |
+| `m_page_cleaner_coordinator` | 刷脏 |
+| `m_buf_dump` / `m_buf_resize` | buffer pool dump/load、在线 resize |
+| `m_dict_stats` / `m_fts_optimize` / `m_ts_alter_encrypt` | 统计收集、全文 optimize、加密变更 |
+| `m_lock_wait_timeout` / `m_monitor` / `m_error_monitor` | 锁超时、Monitor 输出、长信号量等待告警 |
+| `m_log_writer` / `m_log_flusher` | redo 写 / fsync |
+| `m_log_write_notifier` / `m_log_flush_notifier` | redo 通知等待者 |
+| `m_log_checkpointer` / `m_log_files_governor` | 周期性 checkpoint / redo 文件管理（8.0.30 `innodb_redo_log_capacity` 引入） |
+| `m_log_archiver` / `m_backup_log_archiver` / `m_page_archiver` | 归档 |
+| `m_recv_writer` / `m_trx_recovery_rollback` | 恢复期刷脏 / 恢复后回滚事务（**临时线程**） |
+| `m_gtid_persister` | clone 用的 GTID 持久化 |
+
+`IB_thread` 封装 `std::thread`，提供 `start()` / `is_active()` / `wait()`——**"线程是否已退出"成为可查询状态**，这是 [`03_shutdown.md`](03_shutdown.md) 里关闭轮询机制的基础。
+
+**为什么要分四批启动**（因为有些线程会访问 DD，而 DD 此刻可能还没好）：
+
+| 批次 | 函数 | 起了什么 | 为什么在这批 |
+|---|---|---|---|
+| 1 | `srv_start` 内联 | `lock_wait_timeout` / `error_monitor` / `monitor` / `buf_resize` | 不依赖 DD |
+| 2 | `srv_start_purge_threads()` | purge coordinator + workers | 升级时可能提前调用；purge 会读 undo 并改用户表 |
+| 3 | `srv_start_threads()` | `buf_resize` / master / `dict_stats` / `fts_optimize` | 在 `srv_dict_recover_on_restart()` 之后 |
+| 4 | `srv_start_threads_after_ddl_recovery()` | `trx_recovery_rollback` | **必须等 DD 事务回滚完** |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as 主线程
+    participant SV as server 侧<br/>init_server_components
+    participant I as InnoDB<br/>srv_start / post_recover
+    participant DD as Data Dictionary
+
+    Note over SV,I: ── 批次 1：不依赖 DD 的线程 ──
+    SV->>I: plugin_register_builtin_and_init_core_se()<br/>→ innodb_init(hton)（只登记回调）
+    SV->>I: dd::init(DD_RESTART_OR_UPGRADE)
+    I->>I: srv_start(false) → 崩溃恢复（ARIES 三阶段）
+    I->>I: 【批 1】lock_wait_timeout / error_monitor / monitor / buf_resize
+    I->>I: 【批 2】srv_start_purge_threads()<br/>purge coordinator + workers
+    I->>I: srv_start_wait_for_purge_to_start() ★ 同步等 purge 就绪
+
+    Note over SV,DD: ── DD 恢复完成 ──
+    SV->>SV: dd::reset_tables_and_tablespaces()
+    SV->>I: ha_post_recover() → innobase_post_recover()
+    I->>I: log_ddl->recover()（回放 DDL 日志）
+    I->>I: undo / redo 加密处理
+    I->>DD: dd_tablespace_update_cache() ★ 读 DD 刷新表空间缓存
+
+    Note over I: ── 批次 3 ──
+    I->>I: srv_start_threads()
+    I->>I: periodical_checkpoints_enabled = true ★★
+    I->>I: 【批 3】master / dict_stats / fts_optimize
+
+    Note over I,DD: ── DD 事务回滚（必须由 InnoDB 自己做）──
+    SV->>I: srv_dict_recover_on_restart()
+    I->>I: trx_resurrect_locks(false)  ← 第 1 次：只 DD 事务
+    I->>I: trx_rollback_or_clean_recovered(false)
+    I->>I: trx_resurrect_locks(true)   ← 第 2 次：其余事务
+    I->>I: apply_dynamic_metadata()
+
+    Note over I: ── 批次 4 ──
+    I->>I: srv_start_threads_after_ddl_recovery()
+    I->>I: 【批 4】trx_recovery_rollback
+    I->>M: os_event_set(recovery_lock_taken) ★ 同步
+    Note right of M: 主线程等它拿到所有待回滚表的<br/>shared MDL 之后才继续
+
+    rect rgb(232, 245, 233)
+        Note over I: ★★ 周期性 checkpoint 直到【批 3】才允许
+        为了让启动期可预测（好写 mtr、少分支）
+    end
+```
+
+`srv_start_threads()` 里有一处很能说明问题的注释——**周期性 checkpoint 被推迟到这一刻才打开**：
+
+```cpp
+    /* Before 8.0, it was master thread that was doing periodical
+    checkpoints (every 7s). Since 8.0, it is the log checkpointer
+    thread, which is owned by log_sys, that is responsible for
+    periodical checkpoints (every innodb_log_checkpoint_every ms).
+    Note that the log checkpointer thread was created earlier and
+    is already active, but the periodical checkpoints were disabled.
+    ...
+    The reason was to make the situation more deterministic during
+    the startup, because then:
+            - it is easier to write mtr tests,
+            - there are less possible flows - smaller risk of bug.
+    Now we start allowing periodical checkpoints! Since now, it's
+    hard to predict when checkpoints are written! */
+    log_limits_mutex_enter(*log_sys);
+    log_sys->periodical_checkpoints_enabled = true;
+    log_limits_mutex_exit(*log_sys);
+```
+
+即：**为了让启动期可预测，故意让 checkpoint 线程早起但"不开工"**。这是把可测试性直接写进启动设计的例子。
+
+`srv_start_threads_after_ddl_recovery()` 里还有一次启动期同步：
+
+```cpp
+    srv_threads.m_trx_recovery_rollback = os_thread_create(
+        trx_recovery_rollback_thread_key, 0, trx_recovery_rollback_thread);
+    srv_threads.m_trx_recovery_rollback.start();
+    /* Wait till shared MDL is taken by background thread for all tables,
+    for which rollback is to be performed. */
+    os_event_wait(recovery_lock_taken);
+```
+
+**主线程要等回滚线程把待回滚的表都拿到 shared MDL 之后才继续**——否则 server 可能先打开这些表，让用户看到不一致的数据。
+
+#### 4.9 启动失败：`srv_init_abort()`
+
+```cpp
+#ifdef UNIV_DEBUG
+#define srv_init_abort(_db_err) \
+  srv_init_abort_low(create_new_db, __FILE__, __LINE__, _db_err)
+#else
+#define srv_init_abort(_db_err) srv_init_abort_low(create_new_db, _db_err)
+#endif
+```
+
+**注意它带 `create_new_db` 参数**——清理动作取决于"刚才是在建库还是在恢复"：建库失败可以删掉刚建的文件，恢复失败则不能动数据。
+
+`srv_start` 里有 30 余处 `return srv_init_abort(...)`，全部走同一条清理路径，最终把错误码交给 `innobase_init_files()` → `innodb_init_abort()` → server 侧 `unireg_abort()`。
+
+#### 4.10 `buf_pool_init()`：为什么实际大小总比配置的大
+
+进入 `buf_pool_init()` 之前，请求大小已经被**两层对齐**改过：
+
+```cpp
+  srv_buf_pool_chunk_unit = buf_pool_adjust_chunk_unit(srv_buf_pool_chunk_unit);
+  srv_buf_pool_size = buf_pool_size_align(srv_buf_pool_size);
+```
+
+```cpp
+static inline ulint buf_pool_size_align(ulint size) {
+  const ulint m = srv_buf_pool_instances * srv_buf_pool_chunk_unit;
+  size = std::max(size, srv_buf_pool_min_size);
+  if (size % m == 0) return (size);
+  else return ((size / m + 1) * m);        // 向上取整到 instances × chunk_unit 的整数倍
+}
+```
+
+即：**`innodb_buffer_pool_size` 会被上调到 `instances × chunk_unit` 的整数倍**。这是 `SHOW VARIABLES` 里看到的值与配置值不符的第一个原因。
+
+第二个原因在 `buf_chunk_init()`：
+
+```cpp
+  mem_size = ut_2pow_round(mem_size, UNIV_PAGE_SIZE);
+  /* Reserve space for the block descriptors. */
+  mem_size += ut_2pow_round(
+      (mem_size / UNIV_PAGE_SIZE) * (sizeof *block) + (UNIV_PAGE_SIZE - 1),
+      UNIV_PAGE_SIZE);                                  // 额外预留 buf_block_t 描述符
+  ...
+  /* Align a pointer to the first frame. Note that when os_large_page_size is
+  smaller than UNIV_PAGE_SIZE, we may allocate one fewer block than requested.
+  When it is bigger, we may allocate more blocks than requested. */
+  chunk->size = ut::large_page_allocation_size(...) / UNIV_PAGE_SIZE - (frame != chunk->mem);
+
+  /* Subtract the space needed for block descriptors. */
+  {
+    ulint size = chunk->size;
+    while (frame < (byte *)(chunk->blocks + size)) { frame += UNIV_PAGE_SIZE; size--; }
+    chunk->size = size;                                 // 扣掉被描述符占用的页
+  }
+```
+
+即：每个 chunk 还要为 `buf_block_t` 描述符预留内存（向上取整到页），并从可用页数里扣掉；启用 large page 时实际页数还可能**多于**请求。两者叠加 → `buf_pool->curr_size`（真实页数）与用户配置值不同，而 `page_hash` / `zip_hash` 都按 `curr_size` 建。
+
+**chunk 存在的意义**：把一大块连续内存切成 `srv_buf_pool_chunk_unit` 大小的块，使 `innodb_buffer_pool_size` 能**在线 resize**（按 chunk 增删），而不必重新 malloc 整块。
+
+多实例是**均分 + 并行创建**：
+
+```cpp
+  const ulint size = total_size / n_instances;
+  ...
+  for (i = 0; i < n_instances; /* no op */) {
+    ulint n = i + n_cores;                              // 每批 = CPU 核数（≤8）
+    if (n > n_instances) { n = n_instances; }
+    for (ulint id = i; id < n; ++id)
+      threads.emplace_back(std::thread(buf_pool_create, &buf_pool_ptr[id], size, id, &m, std::ref(errs[id])));
+    ...
+    if (err != DB_SUCCESS) {
+      for (size_t id = 0; id < n; ++id)
+        if (buf_pool_ptr[id].chunks != nullptr) buf_pool_free_instance(&buf_pool_ptr[id]);  // 回滚
+      buf_pool_free();
+      return (err);
+    }
+```
+
+启动日志里那两行就来自这里：`ER_IB_MSG_1130` "Initializing buffer pool, total size = %.3f%c, instances = %lu, chunk size = %.3f%c" 与 `ER_IB_MSG_1132` "Completed initialization of buffer pool"。
+
+#### 4.11 `fil_scan_for_tablespaces()`：只建索引，不建对象
+
+一个容易误解的点：**扫描阶段并没有创建 `fil_space_t`**。`Tablespace_dirs::scan()` 只做三件事：
+
+1. 遍历所有已登记目录（`Dir_Walker::walk`），按后缀把文件分成 `.ibd` 与 undo 两类；
+2. **多线程**读每个文件的头几页，取出 `space_id`（`Fil_system::get_tablespace_id()`）；
+3. 把 `space_id → 相对文件名` 记进目录索引（`Dir::add()`），并检测冲突。
+
+```cpp
+  if (!duplicates.empty()) {
+    ib::error(ER_IB_MSG_384) << "Multiple files found for the same tablespace ID:";
+    print_duplicates(duplicates);
+    err = DB_FAIL;
+  }
+```
+
+**space_id 冲突直接导致启动中止**（`DB_FAIL` → `srv_init_abort`）；单个文件打不开或 space_id 非法只打 warning 跳过。
+
+`fil_space_t` 的真正创建发生在**崩溃恢复阶段**的 `Fil_system::open_for_recovery(space_id)`：
+
+```cpp
+  if (!lookup_for_recovery(space_id)) return DB_FAIL;      // 扫描表里没有 → 失败
+  const auto result = get_scanned_filename_by_space_id(space_id);
+```
+
+> **辨析**：`fil_space_open()` 是另一个东西——它只把**已存在**的 `fil_space_t` 的文件句柄打开（`Fil_shard::space_open`），前提是对象已在 cache 中。发现 ≠ 打开，两条路径。
+
+#### 4.12 `recv_recovery_from_checkpoint_start()` 的六个阶段
+
+> **先纠正三处常见误记**（这些在 5.7 及更早的资料里成立，8.0.39 已变）：
+> ① `recv_group_scan_log_recs` **不存在**，真实名是 `recv_scan_log_recs()`；
+> ② 恢复主路径里**没有 `MLOG_CHECKPOINT` 检查**——checkpoint 已改为 redo 文件里的独立 header，由 `log_checkpoint_header_read()` 读取；
+> ③ `recv_sys->spaces` **不是固定容量的 `hash_table_t`**，而是 `std::unordered_map`，因此没有教科书里那个"按 buffer pool 大小算哈希桶数"的容量计算。
+
+按代码控制流，该函数分六步：
+
+| 阶段 | 动作 | 关键代码 / 判据 |
+|---|---|---|
+| 0 | `buf_flush_init_flush_rbt()` + force_recovery 短路 | `if (srv_force_recovery >= SRV_FORCE_NO_LOG_REDO) return DB_SUCCESS;` |
+| 1 | 找最新 checkpoint | `recv_find_max_checkpoint(log, checkpoint)` |
+| 2 | 读并校验 checkpoint header | `ut_a(checkpoint_lsn == checkpoint_header.m_checkpoint_lsn)` |
+| 3 | **判定是否需要崩溃恢复** | `if (checkpoint_lsn != flush_lsn) → recv_init_crash_recovery()` |
+| 4 | 扫描 + 解析 + 聚合 | `recv_recovery_begin(log, checkpoint_lsn)` |
+| 5 | 一致性断言 / 损坏判定 | `found_corrupt_log` / `found_corrupt_fs` |
+| 6 | 启动 log 系统 + 冗余写 checkpoint | `log_start(...)` + `log_files_next_checkpoint(...)` |
+
+**第 3 步是"干净关闭"判定的唯一公式**：
+
+```cpp
+  if (checkpoint_lsn != flush_lsn) {
+    if (checkpoint_lsn < flush_lsn) {
+      ib::warn(ER_IB_MSG_RECOVERY_CHECKPOINT_FROM_BEFORE_CLEAN_SHUTDOWN, ...);
+    }
+    if (!recv_needed_recovery) {
+      ib::info(ER_IB_MSG_RECOVERY_IS_NEEDED, ulonglong{flush_lsn}, ulonglong{checkpoint_lsn});
+      if (srv_read_only_mode) { ib::error(ER_IB_MSG_RECOVERY_IN_READ_ONLY); return DB_ERROR; }
+      recv_init_crash_recovery();
+    }
+  }
+```
+
+即 **`checkpoint_lsn == flush_lsn` ⟺ 干净关闭**。`flush_lsn` 就是 [`03_shutdown.md`](03_shutdown.md) 里讲的、由 `fil_write_flushed_lsn()` 写进系统表空间 page 0 的那个值。
+
+**第 1 步的双层 max**——checkpoint 域双写的落地：
+
+```cpp
+  for (auto checkpoint_header_no : {Log_checkpoint_header_no::HEADER_1,
+                                    Log_checkpoint_header_no::HEADER_2}) {
+    const dberr_t err = log_checkpoint_header_read(file_handle, checkpoint_header_no, checkpoint_header);
+    if (err != DB_SUCCESS) { ut_a(err == DB_CORRUPTION); continue; }   // 坏掉的域跳过
+    const lsn_t checkpoint_lsn = checkpoint_header.m_checkpoint_lsn;
+    if (checkpoint_lsn == 0) { continue; }
+    if (!found || checkpoint_lsn > checkpoint.m_checkpoint_lsn) { ... }  // 取更大的
+  }
+```
+
+外层再遍历所有 redo 文件取全局最大，并且**要求 checkpoint_lsn 必须落在该文件的 LSN 区间内**，否则丢弃（`ER_IB_MSG_RECOVERY_CHECKPOINT_OUTSIDE_LOG_FILE`）。这比 5.6 时代的"两域轮流写"多了一层几何校验。
+
+**第 4 步的内存上限与"中途应用"**：
+
+```cpp
+  ulint max_mem = UNIV_PAGE_SIZE * (buf_pool_get_n_pages() -
+                    (recv_n_pool_free_frames * srv_buf_pool_instances));
+  lsn_t start_lsn = ut_uint64_align_down(checkpoint_lsn, OS_FILE_LOG_BLOCK_SIZE);
+  while (!finished) {
+    const lsn_t end_lsn = recv_read_log_seg(log, log.buf, start_lsn, start_lsn + RECV_SCAN_SIZE);
+    finished = recv_scan_log_recs(log, max_mem, log.buf, end_lsn - start_lsn, start_lsn, &log.m_scanned_lsn);
+    start_lsn = end_lsn;
+  }
+```
+
+`RECV_SCAN_SIZE = 4 * UNIV_PAGE_SIZE`（每次读 64KB redo）。在 `recv_scan_log_recs()` 内部：
+
+```cpp
+    if (recv_heap_used() > max_memory) {
+      recv_apply_hashed_log_recs(log, false);      // ★ 内存不够，中途应用一轮并清空哈希表
+    }
+```
+
+中途应用过一次之后，`recv_no_ibuf_operations = true`——后续 apply 不再允许 change buffer 操作，恢复结束必须 invalidate buffer pool。这是"内存不够"这个简化假设的代价。
+
+#### 4.13 `innobase_post_recover()`：为什么 DD 恢复之后还要再来一轮
+
+`ha_post_recover()` 遍历所有引擎调 `hton->post_recover()`，位置在 `dd::reset_tables_and_tablespaces()` 之后——**即 DD 已经完全可用之后**。
+
+`innobase_post_recover()` 做的事：
+
+```cpp
+  if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO) {
+    dberr_t err = log_ddl->recover();                 // ① 回放 DDL 日志（原子 DDL 的收尾）
+    if (err != DB_SUCCESS) ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
+  }
+  fil_free_scanned_files();                            // ② 释放启动扫描的目录索引
+  if (srv_undo_log_encrypt) { ... srv_enable_undo_encryption(); buf_flush_sync_all_buf_pools(); }
+  if (srv_redo_log_encrypt) { ... srv_enable_redo_encryption(); }
+  if (srv_read_only_mode || srv_force_recovery >= SRV_FORCE_NO_BACKGROUND) {
+    purge_sys->state = PURGE_STATE_DISABLED;
+    return;
+  }
+  Auto_THD thd;
+  if (dd_tablespace_update_cache(thd.thd)) { ut_d(ut_error); }   // ③ 用 DD 刷新表空间缓存
+  srv_start_threads_after_ddl_recovery();                        // ④ 起 trx_recovery_rollback
+  if (!opt_initialize) { if (!log_pfs_create_tables()) { ... } } // ⑤ 建 PFS 表
+```
+
+**为什么必须推迟到这一轮**：在 `srv_start()` 返回的那个时间点，InnoDB 只是把 DD 表空间打开了，**server 层的 DD 还没恢复**，用户表也还不能按名字打开。而这轮里的四件事全都依赖 DD：
+- DDL log 回放要按表名找表空间；
+- `dd_tablespace_update_cache()` 直接读 DD 的表空间定义；
+- undo/redo 加密要按 DD 记录逐个处理，且要保证首 page 落盘（注释：恢复时读首 page 不 apply redo，加密标志读不到就会误判为未加密）。
+
+#### 4.14 `innobase_init_files()`：四种 `dict_init_mode_t` 怎么走
+
+```cpp
+  ut_ad(dict_init_mode == DICT_INIT_CREATE_FILES ||
+        dict_init_mode == DICT_INIT_CHECK_FILES ||
+        dict_init_mode == DICT_INIT_UPGRADE_57_FILES);
+
+  bool create = (dict_init_mode == DICT_INIT_CREATE_FILES);
+  dberr_t err = srv_sys_space.check_file_spec(create, MIN_EXPECTED_TABLESPACE_SIZE);
+  srv_is_upgrade_mode = (dict_init_mode == DICT_INIT_UPGRADE_57_FILES);
+  err = srv_start(create);
+```
+
+| 模式 | `create` | 走法 |
+|---|---|---|
+| `DICT_INIT_CREATE_FILES` | **true** | 校验 → `srv_start(true)` 建库 → `dd_create_hardcoded()` 建 `mysql.ibd` |
+| `DICT_INIT_CHECK_FILES` | false | 校验 → `srv_start(false)` → `dd_open_hardcoded()` |
+| `DICT_INIT_UPGRADE_57_FILES` | false（随后 `create \|= true`） | `srv_start(false)` + upgrade 专属段 → 因 `create` 被置真，走 `dd_create_hardcoded()` |
+| `DICT_INIT_IGNORE_FILES` | — | **本函数不支持**（`ut_ad` 排除），全仓库未核实到调用点 |
+
+`check_file_spec()` 只做**静态检查**，不真正打开或创建文件：文件数 < 1000、总大小 ≥ 5MB（`MIN_EXPECTED_TABLESPACE_SIZE`）、逐个文件的存在性/读写权限、以及"新建时不允许部分文件已存在"；最后还检查首个文件是否够放 dblwr（`TRX_SYS_DOUBLEWRITE_BLOCK_SIZE * 3`）。
+
+**5.7 升级的额外一轮**（`srv_is_upgrade_mode`）：
+
+```cpp
+  if (srv_is_upgrade_mode) {
+    if (!dict_sys_table_id_build()) return innodb_init_abort();     // 重建 table_id 映射
+    if (trx_sys->found_prepared_trx) { ... return innodb_init_abort(); }  // 不能有残留 prepared XA
+    bool old_btr_search_value = btr_search_enabled;
+    btr_search_enabled = false;                                     // 加载期间关 AHI
+    dict_load_tablespaces_for_upgrade();                             // 全量加载表空间
+    srv_start_purge_threads();                                       // ★ 提前启 purge
+    while ((rseg_history_len = trx_sys->rseg_history_len.load()) != 0) {
+      ib::info(ER_IB_MSG_547) << "Waiting for purge to become empty: ...";
+      sleep(1);
+    }
+    buf_flush_sync_all_buf_pools();
+    dict_upgrade_evict_tables_cache();                               // 清空缓存
+  }
+```
+
+**为什么必须这样**：5.7→8.0 升级时，InnoDB 自己的字典（`SYS_TABLES` 等）会在升级过程中**被删除**，所以必须在删除之前把 purge 全部做完、ibuf 合并完、表空间全部预加载——否则 purge 后续无法通过 table_id 找表（所有 table_id 会被加上固定 offset）。
+
+**两个 abort 的区别**：
+
+| | `srv_init_abort`（宏） | `innodb_init_abort()` |
+|---|---|---|
+| 层次 | InnoDB 内核（`srv0start.cc` 内 30 余处早退点） | handler 层，返回给 server |
+| 返回 | `dberr_t` 错误码，继续冒泡 | `int` = 1 |
+| 清理 | `clone_files_error()` + `srv_shutdown_exit_threads()` | 额外 `innodb_space_shutdown()` + 释放 component/plugin service handles |
+| 日志 | `ER_IB_MSG_1104`（新建失败）/ `1105`（打开失败），带 `create_new_db` 区分 | 不打自己的日志 |
+
+#### 4.15 `srv_start()` 的收尾：`srv_is_being_started` 与三组校验
+
+公共后段走完之后，`srv_start` 还有五步收尾。
+
+**(1) `fil_encryption_rotate()`——恢复中续转密钥**
+
+```cpp
+  /* Rotate the encryption key for recovery. It's because
+  server could crash in middle of key rotation. Some tablespace
+  didn't complete key rotation. Here, we will resume the rotation. */
+  if (!srv_read_only_mode && !create_new_db &&
+      srv_force_recovery < SRV_FORCE_NO_LOG_REDO) {
+    size_t fail_count = fil_encryption_rotate();
+    if (fail_count > 0) {
+      ib::info(ER_IB_MSG_1146) << "During recovery, fil_encryption_rotate() failed for "
+                               << fail_count << " tablespace(s).";
+    }
+  }
+```
+
+"rotate" 指的是：InnoDB 的表空间加密是两层——数据用**表空间密钥**加密，表空间密钥再用 **master key（keyring）** 包裹后存在首 page 的 encryption info 里。`ALTER INSTANCE ROTATE INNODB MASTER KEY` 时把每个表空间的密钥用**新 master key 重新包裹**。若 rotate 过程中崩溃，部分表空间还是用旧 master key 包的，`Fil_shard::encryption_rotate()` 用 `needs_encryption_rotate(space)` 识别这类"半成品"并续转。
+
+**`fail_count` 不是致命错误**——只打一条 info，启动继续。
+
+**(2) `srv_is_being_started = false`——启动期特权结束**
+
+这个 bool 在 `srv_start()` 早期置 true，是**大量 latch order / 加锁断言的豁免标志**。核实到的用法包括：
+
+- 升级时创建额外 rseg 会违反锁序，`sync0sync.cc` 用 `srv_is_being_started` 开例外；
+- `log0files_governor.cc` 几十处 `(unless srv_is_being_started)`——redo 文件管理器的 latching 契约在启动期不要求持有 `log_files_mutex`；
+- `log0chkp.cc` / `trx0trx.cc` / `trx0rseg.cc` / `os0file.cc` 里若干 `ut_ad(srv_is_being_started || ...)`。
+
+把它置 false，就是宣布"**此后所有锁序与 mutex 持有契约恢复正常**"。它必须放在所有"单线程豁免"动作（rseg 创建、undo 构建、加密 rotate）之后。
+
+**(3) 两组表空间大小一致性校验（fatal 判据不同）**
+
+```cpp
+  sum_of_data_file_sizes = srv_sys_space.get_sum_of_sizes();      // 磁盘实际大小(页)
+  tablespace_size_in_header = fsp_header_get_tablespace_size();   // page 0 里记录的大小(页)
+
+  /* 分支 A：最后一个文件【不能】自动扩展 */
+  if (!srv_read_only_mode && !srv_sys_space.can_auto_extend_last_file() &&
+      sum_of_data_file_sizes != tablespace_size_in_header) {
+    ib::error(ER_IB_MSG_1147, ...);
+    if (srv_force_recovery == 0 && sum_of_data_file_sizes < tablespace_size_in_header) {
+      /* This is a fatal error, the tail of a tablespace is missing */
+      ib::error(ER_IB_MSG_1148);
+      return (srv_init_abort(DB_ERROR));
+    }
+  }
+
+  /* 分支 B：最后一个文件【能】自动扩展 */
+  if (!srv_read_only_mode && srv_sys_space.can_auto_extend_last_file() &&
+      sum_of_data_file_sizes < tablespace_size_in_header) {
+    ib::error(ER_IB_MSG_1149, ...);
+    if (srv_force_recovery == 0) {
+      ib::error(ER_IB_MSG_1150);
+      return (srv_init_abort(DB_ERROR));
+    }
+  }
+```
+
+| 分支 | 触发 | fatal 判据 | 非 fatal 的情形 |
+|---|---|---|---|
+| A | `!can_auto_extend` 且 `sum != header` | `force_recovery == 0` **且** `sum < header` | `sum > header`（文件比 header 记的大，说明上次扩展后没来得及更新 header）——可容忍 |
+| B | `can_auto_extend` 且 `sum < header` | 只要 `force_recovery == 0` | 无（有自动扩展能力时文件被截断必是故障） |
+
+`ER_IB_MSG_1148` 的原文很有名：`"Cannot start InnoDB. The tail of the system tablespace is missing. Have you edited innodb_data_file_path in my.cnf in an inappropriate way, removing ibdata files from there? ..."`
+
+**(4) `clone_files_recovery(true)`——为什么幂等**
+
+```cpp
+  /* Finish clone files recovery. This call is idempotent and is no op
+  if it is already done before creating new log files. */
+  clone_files_recovery(true);
+```
+
+它操作的是磁盘上的**状态文件**（`CLONE_INNODB_ERROR_FILE` / `CLONE_INNODB_REPLACED_FILES` / `CLONE_INNODB_OLD_FILES`），每次进入先 `file_exists()` 判空；且它在 `srv_start()` 里被调用**两次**（建 redo 文件前一次 `finished=false`，这里一次 `finished=true`），第二次进来时状态已被推进，故为 no-op。
+
+**(5) 最后一行日志**
+
+```cpp
+  ib::info(ER_IB_MSG_1151, INNODB_VERSION_STR, ulonglong{log_get_lsn(*log_sys)});
+  return (DB_SUCCESS);
+```
+
+`ER_IB_MSG_1151` = `"%s started; log sequence number %llu"`，即 error log 里那句 `InnoDB 8.0.39 started; log sequence number xxxxxxxx`。它是 `srv_start()` 成功返回的**最后一行**，可作为"InnoDB 启动完成"的日志锚点。
+
+#### 4.16 Component vs Plugin：两套并存的可扩展框架
 
 ```
 mysqld_main
@@ -1152,7 +2193,13 @@ static void unireg_abort(int exit_code) {
 | 启动到哪一步 / 卡在哪 | error log | `ER_STARTING_INIT`、各子系统失败时的 `ER_*`；配合 `SET GLOBAL log_error_verbosity=3` |
 | "到底起来没有" | error log | `ER_SERVER_STARTUP_MSG`（"ready for connections"）；systemd 下看 `sd_notify` 的 `READY=1` |
 | 启动失败的精确阶段 | error log + 退出码 | `unireg_abort` 前的那条 `ER_ABORTING`；退出码 1 = 别自动重启，16 = 请重启 |
-| 崩溃恢复做了什么 | error log | InnoDB 的恢复日志（`recv_recovery_from_checkpoint_start` 前后）；`SHOW ENGINE INNODB STATUS` |
+| 崩溃恢复做了什么 | error log | `ER_IB_MSG_RECOVERY_IS_NEEDED`（需要恢复）、`ER_IB_MSG_RECOVERY_CHECKPOINT_FOUND`、`ER_IB_MSG_RECOVERY_CORRUPT`；`SHOW ENGINE INNODB STATUS` |
+| InnoDB 是否起来了 | error log | **`ER_IB_MSG_1151`："%s started; log sequence number %llu"** —— `srv_start()` 成功返回的最后一行，是最好的锚点 |
+| 扫了哪些目录 / 扫出多少文件 | error log | `ER_IB_MSG_379`（"Scanning '...'"）、`ER_IB_MSG_383`（"Completed space ID check of N files."） |
+| **space_id 冲突** | error log + 启动中止 | `ER_IB_MSG_384`（"Multiple files found for the same tablespace ID:"）+ 逐个列出 |
+| buffer pool 实际多大 | error log | `ER_IB_MSG_1130`："Initializing buffer pool, total size = %.3f%c, instances = %lu, chunk size = %.3f%c" |
+| 加密密钥续转失败 | error log | `ER_IB_MSG_1146`（非致命，只 info） |
+| 系统表空间被截断 | error log + 启动中止 | `ER_IB_MSG_1147/1148`（不可自动扩展）或 `1149/1150`（可自动扩展） |
 | 插件/组件是否加载成功 | SQL | `information_schema.PLUGINS`、`mysql.component` 表 |
 | 系统表是否被升级 | error log | `STATUS=Server upgrade complete`（sd_notify）、`upgrade_system_schemas` 相关日志 |
 | 配置来源 | SQL | `performance_schema.variables_info`（`arg_source` 字段的对外体现） |
@@ -1169,6 +2216,34 @@ static void unireg_abort(int exit_code) {
 3. **加一种新存储引擎**：实现 `handlerton` + `mysql_declare_plugin`；若希望它在 `dd::init()` 之前可用，必须加到 `plugin_register_builtin_and_init_core_se()` 的白名单（目前只有 4 个）。
 4. **加一种新 acceptor**：实现 `setup_listener` / `listen_for_connection_event` / `close_listener` 三个方法，实例化 `Connection_acceptor<YourListener>`。
 5. **加一种新退出码**：改 `sql/sql_const.h`，并同步 `mysqld_exit()` 的 assert 范围与外部管理者（systemd / mysqld_safe）的语义。
+
+### 外部材料核实记录（重要：纠正阿里内核月报的说法）
+
+已读：**《MySQL · 引擎特性 · InnoDB 崩溃恢复》**，[数据库内核月报 2017/07/01](http://mysql.taobao.org/monthly/2017/07/01/)（作者：韩逸，**代码基于 5.6 分支**）。
+
+该文给了极好的问题视角（ARIES 三阶段的落地、checkpoint 域双写的动机、hash 表与 flush list rbtree 的作用、WL#7142 的表空间发现优化、bug#82937 的解析效率问题）。但**它的函数名与 8.0.39 几乎全部对不上**，逐条纠正：
+
+| 月报里的名字（5.6） | 8.0.39 实际 |
+|---|---|
+| `innobase_start_or_create_for_mysql` | **已删除**。替代：`innobase_init_files()` → `srv_start(bool)` |
+| `recv_recovery_from_checkpoint_start_func` | `recv_recovery_from_checkpoint_start()` |
+| `open_or_create_data_files` | `SysTablespace::open_or_create()` |
+| `fil_open_log_and_system_tablespace_files` | `fil_open_system_tablespace_files()` |
+| `trx_rollback_or_clean_all_recovered` | `trx_rollback_or_clean_recovered()`；后台线程是 `trx_recovery_rollback_thread` |
+| `buf_dblwr_process`（dblwr 半写检查） | 已重构为 `dblwr::v1::init()` / `dblwr::open()`（见 [`../../innodb/dblwr.md`](../../innodb/dblwr.md)） |
+| `buf_flush_page_cleaner_thread` | **`buf_flush_page_coordinator_thread()`**（coordinator）+ `buf_flush_page_cleaner_thread()`（worker）。注意方向与直觉相反：带 cleaner 的是 worker |
+| `recv_group_scan_log_recs` | **不存在**，真实名 `recv_scan_log_recs()` |
+| `trx_rseg_array_init` / `trx_lists_init_at_db_start` | 仍存在，但现在都包在 `trx_sys_init_at_db_start()` 内 |
+| `buf_dblwr_process`（半写检查） | 已重构为 `dblwr::v1::init()` / `dblwr::open()`（见 [`../../innodb/dblwr.md`](../../innodb/dblwr.md)） |
+
+**四处机制级纠正**（不是改名，是真的变了）：
+
+1. **`MLOG_FILE_NAME` 在 8.0.1 已被移除**，改为 `MLOG_FILE_OPEN`（`include/log0types.h` 原文：`Remove MLOG_FILE_NAME and MLOG_CHECKPOINT, introduce MLOG_FILE_OPEN redo log record.`）。月报讲的 WL#7142 方案在 8.0 里已换代；8.0.39 源码里残留的 `MLOG_FILE_NAME` 字样只出现在 **MEB** 专用路径（`MEB_file_name` / `Fil_system::meb_name_process()`），不在恢复主路径。
+2. **"恢复时要打开所有表"这个问题在 8.0 已不存在**：改成 `fil_scan_for_tablespaces()` 扫目录 + redo 里的 `MLOG_FILE_OPEN`。月报描述的"几十上百万张表导致恢复 hang"是 5.6/5.7 的痛点。
+3. **恢复里不再有 `MLOG_CHECKPOINT` 检查**：8.0 起 checkpoint 是 redo 文件里的独立 header（`Log_checkpoint_header`），由 `log_checkpoint_header_read()` 读取；`MLOG_CHECKPOINT` 只留在 `log0types.h` 的定义里，不在恢复主路径。
+4. **"按 buffer pool 大小算 redo 哈希表容量"这个说法在 8.0 已不成立**：`recv_sys->spaces` 是 `std::unordered_map`，按需扩容、无显式容量。真正有上界的是解析 buffer（`RECV_PARSING_BUF_SIZE = 2MB`）、每次扫描量（`RECV_SCAN_SIZE = 4 × UNIV_PAGE_SIZE`）与 `max_mem`（页大小 ×（总页数 − 预留帧 × 实例数））—— 超过 `max_mem` 就中途 `recv_apply_hashed_log_recs()`。月报引用的 bug#53122 是关于旧实现的内存分配，仅作背景。
+
+**月报里仍然成立、已核实保留的结论**：checkpoint 域双写防 512 字节半写；redo 幂等 = 比较页 lsn；hash 表按 (space_id, page_no) 聚合且桶内按 lsn 有序；flush list rbtree 的动机；multi-rec 需要 `MLOG_MULTI_REC_END` 才完整；`innodb_force_recovery` 七档语义（8.0.39 枚举值与月报一致）；bug#53122（hash 表内存）、bug#82937（解析效率）可作背景引用。
 
 ### 坑与已知缺陷
 
@@ -1197,8 +2272,13 @@ static void unireg_abort(int exit_code) {
 
 ## 参考
 
+**论文**
+- C. Mohan et al. *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging*. ACM TODS 1992. —— 三阶段（Analysis/Redo/Undo）+ repeating history 的原型；本篇「理论溯源」给出了 InnoDB 与之的 5 处差异
+
 **官方文档**
 - *MySQL 8.0 Reference Manual → Configuring the Server*（配置文件搜索顺序、选项优先级）
+- *MySQL 8.0 Reference Manual → Tablespace Discovery During Crash Recovery*（8.0 替代"打开所有表"的机制）
+- WorkLog: [WL#7142](https://dev.mysql.com/worklog/task/?id=7142) —— 崩溃恢复的表空间发现优化（`MLOG_FILE_NAME` 的引入；8.0.1 由 `MLOG_FILE_OPEN` 取代）
 - *MySQL 8.0 Reference Manual → The Data Dictionary*
 - *MySQL 8.0 Reference Manual → Upgrading MySQL*（`--upgrade=NONE/MINIMAL/AUTO/FORCE` 语义）
 - *MySQL 8.0 Reference Manual → mysqld — The MySQL Server*（信号、退出码、`--daemonize`）
@@ -1206,14 +2286,18 @@ static void unireg_abort(int exit_code) {
 
 **Bug 论坛**
 - bugs.mysql.com：搜索 "mysqld startup hang" / "unireg_abort" 可查启动期 hang 的报告（多数落在 `wait_till_no_thd` 与 InnoDB 恢复阶段）
+- [Bug #53122](https://bugs.mysql.com/bug.php?id=53122) —— 恢复期 hash 表内存分配大小（阿里内核月报引用）
+- [Bug #82937](https://bugs.mysql.com/bug.php?id=82937) —— redo 解析效率：解析时必须逐字段走完才能确定记录长度，月报称优化后可提速一倍
 
 **内核月报 / 技术文章**
-- 腾讯云数据库内核月报：MySQL 8.0 启动与数据字典专题（注意：月报函数名多基于 5.7 或早期 8.0，需回到 8.0.39 核实）
+- [《MySQL · 引擎特性 · InnoDB 崩溃恢复》](http://mysql.taobao.org/monthly/2017/07/01/)，数据库内核月报 2017/07/01 —— **基于 5.6 分支**。函数名与 8.0.39 的逐条纠正、以及哪些结论仍成立，见本篇「Misc → 外部材料核实记录」
 
 **相关文档**
 - 数据目录初始化：见 [`01_initialize.md`](01_initialize.md)
 - 关闭流程：见 [`03_shutdown.md`](03_shutdown.md)
-- 崩溃恢复细节：见 [`../../innodb/recovery.md`](../../innodb/recovery.md)
+- 崩溃恢复（另一视角：扫描与解析状态机、hash 聚合）：见 [`../../innodb/recovery.md`](../../innodb/recovery.md)
+- redo 物理格式与 checkpoint：见 [`../../innodb/redo_log.md`](../../innodb/redo_log.md)
+- doublewrite（半页写恢复）：见 [`../../innodb/dblwr.md`](../../innodb/dblwr.md)
 - 插件 / 组件框架：见 [`../plugin/plugin.md`](../plugin/plugin.md)、[`../plugin/component.md`](../plugin/component.md)
 - 协议分发与查询执行：见 [`../query/01_protocol_to_dispatch.md`](../query/01_protocol_to_dispatch.md)
 - 系统变量体系：见 [`../infra/variables.md`](../infra/variables.md)

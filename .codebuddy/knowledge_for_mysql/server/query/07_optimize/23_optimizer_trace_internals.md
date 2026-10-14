@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39。本篇剖析 optimizer_trace **基础设施本身**是怎么工作的：`Opt_trace_context`（会话级上下文）与 `Opt_trace_struct`/`Opt_trace_object`/`Opt_trace_array`（RAII 栈）如何协作，让优化器深处的埋点不需要层层传参；`is_started()` 如何做到"未开启时零成本"；trace 如何带 `feature` 分类、如何进 `information_schema.optimizer_trace`，以及那个 SQL SECURITY DEFINER 安全洞是怎么堵的。
 >
-> **边界**：本篇讲"trace 机制怎么实现"。**怎么用 trace 观察优化器**（读哪些节点、排查哪些问题）见 [`../11_explain_and_trace.md`](../11_explain_and_trace.md)。DBUG 通道见 [`../../infra/dbug.md`](../../infra/dbug.md)。
+> **边界**：本篇讲"trace 机制怎么实现"。**怎么用 trace 观察优化器**（读哪些节点、排查哪些问题）见 [`../11_explain_and_trace.md`](../../../infra/observability/explain_trace.md)。DBUG 通道见 [`../../infra/dbug.md`](../../infra/dbug.md)。
 
 ## 目录
 
@@ -142,6 +142,365 @@ MySQL 的独特点在于：**它是一个常驻的、结构化的、可查询（
 
 ### 三、Opt_trace_struct：RAII 栈 + is_started 零成本
 
+#### 3.0 三个类的权威定义（完整源码）
+
+> **勘误（重要）**：8.0.39 的 optimizer trace **不用 `Json_writer`**（全仓唯一的 `class Json_writer` 是 keyring 组件里的无关实现，`sql/` 下零引用），也**没有 DOM/语法树**。它是**流式 `String::append`** + 一个"当前打开结构栈"。所以写进去就改不了，截断只能是硬切。
+
+**累积器 `class Buffer`**（`sql/opt_trace.cc:56`）：
+
+```cpp
+namespace {
+/**
+  A wrapper of class String, for storing query or trace.
+  Any memory allocation error in this class is reported by my_error(), see OOM_HANDLING in opt_trace.h.
+*/
+class Buffer {
+ private:
+  size_t allowed_mem_size;  ///< allowed memory size for this String
+  size_t missing_bytes;     ///< how many bytes could not be added   ★ 截断计数
+  String string_buf;        // ★★ 唯一的"存储"就是一个平铺字符串：没有树、没有节点、没有语法校验
+
+ public:
+  Buffer() : allowed_mem_size(0), missing_bytes(0) {}
+
+  size_t alloced_length() const { return string_buf.alloced_length(); }
+  size_t length() const { return string_buf.length(); }
+  void prealloc();  ///< pro-actively extend buffer if soon short of space
+  char *c_ptr_safe() { return string_buf.c_ptr_safe(); }
+  const char *ptr() const { return string_buf.ptr(); }
+
+  void append(const char *str, size_t length);
+  void append(const char *str) { return append(str, strlen(str)); }
+  /// 与 append() 相同，但对字符串值做 JSON 转义
+  void append_escaped(const char *str, size_t length);
+  void append(char chr);
+
+  size_t get_allowed_mem_size() const { return allowed_mem_size; }
+  size_t get_missing_bytes() const { return missing_bytes; }
+  void set_allowed_mem_size(size_t a) { allowed_mem_size = a; }
+};
+}  // namespace
+```
+
+**`class Opt_trace_stmt`**（`sql/opt_trace.cc:108`）——**一条语句**的 trace（"CALL + 每个子语句"各一份）：
+
+```cpp
+class Opt_trace_stmt {
+ public:
+  Opt_trace_stmt(Opt_trace_context *ctx_arg);
+  void end();                              // ★ 收尾：补 '\0' + DBUG 全文 + 必要时 restore_I_S
+  bool has_ended() const { return ended; }
+  void set_allowed_mem_size(size_t size);
+  void set_query(const char *query, size_t length, const CHARSET_INFO *charset);
+
+  /* 写 */
+  bool open_struct(const char *key, Opt_trace_struct *ots,
+                   bool wants_disable_I_S, char opening_bracket);
+  void close_struct(const char *saved_key, bool has_disabled_I_S,
+                    char closing_bracket);
+  void separator();     /// Put optional comma, newline and indentation
+  void next_line();     /// Put newline and indentation
+  void add(const char *key, const char *val, size_t val_length, bool quotes,
+           bool escape);
+
+  /* 读 */
+  void fill_info(Opt_trace_info *info) const;
+  size_t alloced_length() const {
+    return trace_buffer.alloced_length() + query_buffer.alloced_length();
+  }
+  void missing_privilege();
+  bool support_I_S() const { return I_S_disabled == 0; }
+  void disable_I_S() { ++I_S_disabled; }
+  void restore_I_S() { --I_S_disabled; }
+  const char *make_unknown_key();
+
+ private:
+  bool ended;
+  /**
+    0 <=> this trace should be in information_schema.
+    Once disabled, it must stay disabled until re-enabled at the same stack
+    frame. ... it is sufficient ... to have a counter incremented each time
+    we get a request to disable I_S.
+  */
+  int I_S_disabled;
+  bool missing_priv;
+  Opt_trace_context *ctx;
+  Opt_trace_struct *current_struct;         ///< current open structure
+  Prealloced_array<Opt_trace_struct *, 16> stack_of_current_structs;
+  // ★ 这"栈"就是全部语法状态：缩进 = 2 * size()
+  Buffer trace_buffer;   ///< Where the trace is accumulated
+  Buffer query_buffer;   ///< Where the original query is put
+  uint unknown_key_count;
+  char unknown_key[24];
+};
+```
+
+**`class Opt_trace_struct`**（`sql/opt_trace.h:446`）——object 与 array 的公共基类，**RAII 本体**：
+
+```cpp
+class Opt_trace_struct {
+ protected:
+  Opt_trace_struct(Opt_trace_context *ctx_arg, bool requires_key_arg,
+                   const char *key, Opt_trace_context::feature_value feature)
+      : started(false) {
+    // A first inlined test
+    if (unlikely(ctx_arg->is_started())) {   // ★★ 第一道 inline 快路径：trace 没开 ⇒ 变 dummy
+      do_construct(ctx_arg, requires_key_arg, key, feature);
+    }
+    /* Otherwise, just leave "started" to false, it marks the structure is dummy. */
+  }
+  ~Opt_trace_struct() {
+    if (unlikely(started)) do_destruct();    // ★★ 析构 = 自动写 '}' 或 ']'
+  }
+
+ public:
+  /// RAII 的例外：手动提前结束（end() 后再析构不会重复关闭）
+  void end() {
+    if (unlikely(started)) do_destruct();
+  }
+
+  /* add_alnum：值只含 7-bit 可打印 ASCII（无 " 与 \）时用它，不转义、更快
+     add_utf8：任意 UTF8，会做 JSON 转义，用于表名/WHERE 等来自服务器对象的字符串 */
+  Opt_trace_struct &add_alnum(const char *key, const char *value) {
+    if (likely(!started)) return *this;      // ★ 每个 add 都有这个 inline if ⇒ 关闭时零调用
+    return do_add(key, value, strlen(value), false);
+  }
+  Opt_trace_struct &add_utf8(const char *key, const char *value,
+                             size_t val_length) {
+    if (likely(!started)) return *this;
+    return do_add(key, value, val_length, true);
+  }
+  Opt_trace_struct &add(const char *key, Item *item) {
+    if (likely(!started)) return *this;
+    return do_add(key, item);                // ★ Item 直接 print() 成 SQL 文本
+  }
+  Opt_trace_struct &add(const char *key, bool value) { ... }
+  Opt_trace_struct &add(const char *key, longlong value) { ... }
+  Opt_trace_struct &add(const char *key, ulonglong value) { ... }
+  Opt_trace_struct &add(const char *key, double value) { ... }
+  Opt_trace_struct &add(const char *key, const Cost_estimate &cost) { ... }
+  Opt_trace_struct &add_null(const char *key) { ... }
+  Opt_trace_struct &add_utf8_table(const Table_ref *tab) { ... }
+  Opt_trace_struct &add_select_number(uint select_number) {
+    return add("select#", select_number);
+  }
+
+  bool set_not_empty() {                     // ★ 决定"前面要不要补逗号"
+    const bool old_empty = empty;
+    empty = false;
+    return old_empty;
+  }
+  const char *check_key(const char *key);    // ★ 运行时救错
+
+ private:
+  /// 故意只声明不定义：编译期禁止 add(key, const char*)，逼你用 add_alnum/add_utf8
+  Opt_trace_struct &add(const char *key, const char *value);
+  Opt_trace_struct &add(const char *key);
+
+  bool started;              ///< Whether the structure does tracing or is dummy
+  bool requires_key;         ///< true: object（要求 key）；false: array（禁止 key）
+  bool has_disabled_I_S;     ///< 该结构所属 feature 被关 ⇒ 整棵子树不写 I_S
+  bool empty;
+  Opt_trace_stmt *stmt;
+  const char *saved_key;     ///< 闭括号时要回写 "/* key */"
+#ifndef NDEBUG
+  char previous_key[25];     ///< 检测同一 object 内连续重复 key
+#endif
+};
+```
+
+`Opt_trace_object` / `Opt_trace_array` 只是两个子类，唯一区别是 `requires_key`：
+
+```cpp
+// sql/opt_trace.h:799
+class Opt_trace_object : public Opt_trace_struct {
+ public:
+  Opt_trace_object(Opt_trace_context *ctx, const char *key,
+                   Opt_trace_context::feature_value feature =
+                       Opt_trace_context::MISC)
+      : Opt_trace_struct(ctx, true, key, feature) {}     // requires_key=true ⇒ '{'
+  Opt_trace_object(Opt_trace_context *ctx,
+                   Opt_trace_context::feature_value feature =
+                       Opt_trace_context::MISC)
+      : Opt_trace_struct(ctx, true, nullptr, feature) {}
+};
+
+class Opt_trace_array : public Opt_trace_struct {
+ public:
+  Opt_trace_array(Opt_trace_context *ctx, const char *key, ...)
+      : Opt_trace_struct(ctx, false, key, feature) {}    // requires_key=false ⇒ '['
+  ...
+};
+```
+
+**"写"的实现**（`sql/opt_trace.cc:478-596`）——这就是全部的"JSON 写入器"：
+
+```cpp
+namespace {
+/// opening and closing symbols for arrays ([]) and objects ({})
+const char brackets[] = {'[', '{', ']', '}'};
+inline char opening_bracket(bool requires_key) { return brackets[requires_key]; }
+inline char closing_bracket(bool requires_key) { return brackets[requires_key + 2]; }
+}  // namespace
+
+void Opt_trace_struct::do_construct(Opt_trace_context *ctx,
+                                    bool requires_key_arg, const char *key,
+                                    Opt_trace_context::feature_value feature) {
+  saved_key = key;
+  requires_key = requires_key_arg;
+  stmt = ctx->get_current_stmt_in_gen();
+  has_disabled_I_S = !ctx->feature_enabled(feature);   // ★ feature 关 ⇒ 整棵子树不写 I_S
+  empty = true;
+  if (likely(!stmt->open_struct(key, this, has_disabled_I_S,
+                                opening_bracket(requires_key))))
+    started = true;                                    // ★ open_struct 返回 true（OOM）⇒ 本结构变 dummy
+}
+
+void Opt_trace_struct::do_destruct() {
+  assert(started);
+  stmt->close_struct(saved_key, has_disabled_I_S, closing_bracket(requires_key));
+  started = false;
+}
+
+bool Opt_trace_stmt::open_struct(const char *key, Opt_trace_struct *ots,
+                                 bool wants_disable_I_S, char opening_bracket) {
+  if (support_I_S()) {
+    if (wants_disable_I_S) {
+      /*
+        User requested no tracing for this structure's feature. We are
+        entering a disabled portion; put an ellipsis "..." to alert the user.
+        Disabling applies to all the structure's children.
+      */
+      if (current_struct != nullptr) {
+        if (key != nullptr)
+          current_struct->add_alnum(key, "...");   // ★ feature 被关 ⇒ trace 里是 "key": "..."
+        else
+          current_struct->add_alnum("...");
+      }
+    } else {
+      trace_buffer.prealloc();
+      add(key, &opening_bracket, 1, false, false);
+    }
+  }
+  if (wants_disable_I_S) ctx->disable_I_S_for_this_and_children();
+  ...
+  current_struct = ots;
+  return false;
+}
+
+void Opt_trace_stmt::close_struct(const char *saved_key, bool has_disabled_I_S,
+                                  char closing_bracket) {
+  current_struct = stack_of_current_structs.back();
+  stack_of_current_structs.pop_back();
+  if (support_I_S()) {
+    next_line();
+    trace_buffer.append(closing_bracket);
+    if (ctx->get_end_marker() && saved_key != nullptr) {
+      trace_buffer.append(STRING_WITH_LEN(" /* "));   // ★★ end_markers_in_json=ON ⇒ 写 " /* key */"
+      trace_buffer.append(saved_key);                 //    这是**非法 JSON**，纯为可读性（源码自己承认）
+      trace_buffer.append(STRING_WITH_LEN(" */"));
+    }
+  }
+  if (has_disabled_I_S) ctx->restore_I_S();
+}
+
+void Opt_trace_stmt::separator() {
+  assert(support_I_S());
+  // Put a comma first, if we have already written an object at this level.
+  if (current_struct != nullptr) {
+    if (!current_struct->set_not_empty()) trace_buffer.append(',');
+    next_line();
+  }
+}
+
+const char my_spaces[] = "                    ...";   // 128 个空格
+
+void Opt_trace_stmt::next_line() {
+  if (ctx->get_one_line()) return;             // ★ one_line=ON ⇒ 不换行不缩进
+  trace_buffer.append('\n');
+  size_t to_be_printed = 2 * stack_of_current_structs.size();   // ★★ 缩进完全由栈深决定
+  ...
+}
+
+void Opt_trace_stmt::add(const char *key, const char *val, size_t val_length,
+                         bool quotes, bool escape) {
+  if (!support_I_S()) return;                  // ★ 只写 DBUG 的 trace：这里直接 return
+  separator();
+  if (current_struct != nullptr) key = current_struct->check_key(key);
+  if (key != nullptr) {
+    trace_buffer.append('"');
+    trace_buffer.append(key);
+    trace_buffer.append(STRING_WITH_LEN("\": "));
+  }
+  if (quotes) trace_buffer.append('"');
+  if (escape)
+    trace_buffer.append_escaped(val, val_length);
+  else
+    trace_buffer.append(val, val_length);
+  if (quotes) trace_buffer.append('"');
+}
+```
+
+**标量 → 字符串**（`sql/opt_trace.cc:290-377`，"没有魔法"）：
+
+```cpp
+Opt_trace_struct &Opt_trace_struct::do_add(const char *key, bool val) {
+  const LEX_CSTRING *text = &bool_as_text[val];        // "false" / "true"
+  stmt->add(key, text->str, text->length, false, false);   // quotes=false ⇒ 裸 true/false
+  return *this;
+}
+
+Opt_trace_struct &Opt_trace_struct::do_add(const char *key, double val) {
+  char buf[sizeof("-1.23456e+308")];
+  const int len = std::snprintf(buf, sizeof(buf), "%g", val);
+  // ★★ double 用 %g ⇒ 只有 6 位有效数字！trace 里 cost 的精度损失就源于此
+  stmt->add(key, buf, len, false, false);
+  return *this;
+}
+
+Opt_trace_struct &Opt_trace_struct::do_add(const char *key, Item *item) {
+  char buff[256];
+  String str(buff, sizeof(buff), system_charset_info);
+  str.length(0);
+  if (item != nullptr) {
+    // QT_TO_SYSTEM_CHARSET because trace must be in UTF8
+    item->print(current_thd, &str,
+                enum_query_type(QT_TO_SYSTEM_CHARSET | QT_SHOW_SELECT_NUMBER |
+                                QT_NO_DEFAULT_DB));
+    return do_add(key, str.ptr(), str.length(), true);   // ★ 需要转义
+  } else
+    return do_add_null(key);
+}
+
+Opt_trace_struct &Opt_trace_struct::do_add(const char *key,
+                                           const Cost_estimate &value) {
+  return do_add(key, value.total_cost());      // ★ Cost_estimate → total_cost()
+}
+```
+
+**`check_key()`：运行时救错**（`sql/opt_trace.cc:379`）：
+
+```cpp
+const char *Opt_trace_struct::check_key(const char *key) {
+  stmt->assert_current_struct(this);           // 必须加到最内层结构
+  bool has_key = key != nullptr;
+  if (unlikely(has_key != requires_key)) {
+    // fix the key to produce correct JSON syntax:
+    key = has_key ? nullptr : stmt->make_unknown_key();
+    // ★ 往 array 里传了 key ⇒ 丢掉；往 object 里没传 key ⇒ 造 "unknown_key_N"
+    has_key = !has_key;
+  }
+  if (has_key) {
+    /* Check that we're not having two identical consecutive keys in one object */
+    assert(strncmp(previous_key, key, sizeof(previous_key) - 1) != 0);
+    strncpy(previous_key, key, sizeof(previous_key) - 1);
+  }
+  return key;
+}
+```
+
+⇒ **因为没有 DOM，"写错了改不回来"**：`end_markers_in_json` 的 `/* key */` 是非法 JSON；key 重复、array 带 key 只能运行时补救；截断是硬切。
+
 #### 3.1 构造函数
 
 ```cpp
@@ -220,6 +579,248 @@ bool feature_enabled(feature_value f) const {
 
 ### 五、start/end 生命周期与 OFFSET/LIMIT
 
+#### 5.0 start() / end() / purge_stmts() 完整源码
+
+```cpp
+// sql/opt_trace.cc:818
+bool Opt_trace_context::start(bool support_I_S_arg,
+                              bool support_dbug_or_missing_priv,
+                              bool end_marker_arg, bool one_line_arg,
+                              long offset_arg, long limit_arg,
+                              ulong max_mem_size_arg, ulonglong features_arg) {
+  if (I_S_disabled != 0) {
+    DBUG_PRINT("opt", ("opt_trace is already disabled"));
+    support_I_S_arg = false;      // ★ 上层曾 disable（如 insufficient privilege）⇒ 本语句不进 I_S
+  }
+
+  /*
+    Decide on optimizations possible to realize the requested support. ...
+  */
+  if (!support_I_S_arg && !support_dbug_or_missing_priv) {
+    // The statement will not do tracing.
+    if (likely(pimpl == nullptr) || pimpl->current_stmt_in_gen == nullptr) {
+      /*
+        This should be the most commonly taken branch in a release binary,
+        when the connection rarely has optimizer tracing runtime-enabled.
+        It's thus important that it's optimized: we can short-cut the creation
+        and starting of Opt_trace_stmt ...
+      */
+      return false;               // ★★ 热路径：trace 关闭时零分配直接返回
+    }
+    /*
+      If we come here, there is a parent statement which has a trace.
+      Imagine that we don't create a trace for the child statement here. Then
+      trace structures of the child will be accidentally attached to the
+      parent's trace (as it is still 'current_stmt_in_gen') ... To avoid this,
+      we create a trace for the child but with I_S output disabled.
+    */
+  }
+
+  if (pimpl == nullptr &&
+      ((pimpl = new_nothrow_w_my_error<Opt_trace_context_impl>()) == nullptr))
+    return true;                  // ★ 第一次开 trace 才堆分配 pimpl（THD 体积不受影响）
+
+  if (I_S_disabled == 0) {
+    /*
+      Here we allow a stored routine's sub-statement to enable/disable tracing,
+      or change settings. Thus in a stored routine's body, there can be some
+      'SET OPTIMIZER_TRACE="enabled=[on|off]"' to trace only certain
+      sub-statements.
+    */
+    pimpl->end_marker = end_marker_arg;      // @@end_markers_in_json
+    pimpl->one_line = one_line_arg;          // optimizer_trace 的 one_line flag
+    pimpl->offset = offset_arg;
+    pimpl->limit = limit_arg;
+    pimpl->max_mem_size = max_mem_size_arg;
+    // MISC always on
+    pimpl->features = Opt_trace_context::feature_value(features_arg |
+                                                       Opt_trace_context::MISC);
+    // ★★ MISC 强制 OR 进去：关掉它会连顶层对象一起关 ⇒ 空 trace
+  }
+
+  if (support_I_S_arg && pimpl->offset >= 0) {
+    /* If outside the offset/limit window, no need to support I_S */
+    if (pimpl->since_offset_0 < pimpl->offset) {
+      support_I_S_arg = false;
+    } else if (pimpl->since_offset_0 >= (pimpl->offset + pimpl->limit)) {
+      support_I_S_arg = false;
+    }
+    pimpl->since_offset_0++;      // ★ 只在 offset>=0 时递增
+  }
+  // ★ offset<0 时不做窗口判定 ⇒ 每条都先 trace，靠 purge_stmts() 滑动淘汰
+
+  {
+    /*
+      We don't allocate it in THD's MEM_ROOT as it must survive until a next
+      statement (SELECT) reads the trace.
+    */
+    Opt_trace_stmt *stmt = new_nothrow_w_my_error<Opt_trace_stmt>(this);
+
+    if (unlikely(stmt == nullptr ||
+                 pimpl->stack_of_current_stmts.push_back(
+                     pimpl->current_stmt_in_gen)))   // ★ 父语句压栈（CALL ⇄ 子语句）
+      goto err;
+
+    Opt_trace_stmt_array *list;
+    if (support_I_S_arg)
+      list = &pimpl->all_stmts_for_I_S;      // ★ 进"可见"队列
+    else {
+      stmt->disable_I_S();  // no need to fill a not-shown JSON trace
+      list = &pimpl->all_stmts_to_del;       // ★ 只写 DBUG 的 trace 直接进"待删"队列
+    }
+
+    if (unlikely(list->push_back(stmt))) goto err;
+
+    pimpl->current_stmt_in_gen = stmt;
+
+    // As we just added one trace, maybe the previous ones are unneeded now
+    purge_stmts(false);
+    // This purge may have freed space, compute max allowed size:
+    stmt->set_allowed_mem_size(allowed_mem_size_for_current_stmt());
+    return false;
+  err:
+    delete stmt;
+    assert(0);
+    return true;
+  }
+}
+
+void Opt_trace_context::end() {
+  assert(I_S_disabled >= 0);
+  if (likely(pimpl == nullptr)) return;
+  if (pimpl->current_stmt_in_gen != nullptr) {
+    pimpl->current_stmt_in_gen->end();     // ★ 补 '\0' + DBUG 全文 + 必要时 restore_I_S
+    Opt_trace_stmt *const parent = pimpl->stack_of_current_stmts.back();
+    pimpl->stack_of_current_stmts.pop_back();
+    pimpl->current_stmt_in_gen = parent;   // ★ 弹栈回到父语句（CALL 的 trace）
+    if (parent != nullptr) {
+      /* Parent regains control, now it needs to be told that its child has
+         used space, and thus parent's allowance has shrunk. */
+      parent->set_allowed_mem_size(allowed_mem_size_for_current_stmt());
+    }
+    purge_stmts(false);
+  }
+}
+```
+
+**"只保留最后一条"到底怎么实现**（`sql/opt_trace.cc:991` 的 `purge_stmts()`）：
+
+```cpp
+void Opt_trace_context::purge_stmts(bool purge_all) {
+  if (!purge_all && pimpl->offset >= 0) {
+    /* This case is managed in Opt_trace_context::start() */
+    return;      // ★ offset>=0：窗口在 start() 里判，这里不动
+  }
+  long idx;
+  /*
+    Start from the newest traces (array's end), scroll back in time. This
+    direction is necessary, as we may delete elements from the array ...
+  */
+  for (idx = (pimpl->all_stmts_for_I_S.size() - 1); idx >= 0; idx--) {
+    // offset can be negative, so cast size() to signed!
+    if (!purge_all && ((static_cast<long>(pimpl->all_stmts_for_I_S.size()) +
+                        pimpl->offset) <= idx)) {
+      /* OFFSET mandates that this trace should be kept; move to previous */
+      // ★★ 核心公式：保留条件 idx >= size + offset
+      //    offset=-1 ⇒ 只留 idx == size-1（最后一条）——这就是"覆盖"的真相
+    } else {
+      if (likely(!pimpl->all_stmts_to_del.push_back(
+              pimpl->all_stmts_for_I_S.at(idx))))
+        pimpl->all_stmts_for_I_S.erase(idx);   // 先从"可见队列"摘掉
+      else { /* OOM. Cannot purge ... */ }
+    }
+  }
+  /* Examine list of "to be freed" traces and free what can be */
+  for (idx = (pimpl->all_stmts_to_del.size() - 1); idx >= 0; idx--) {
+    Opt_trace_stmt *stmt = pimpl->all_stmts_to_del.at(idx);
+    if (!stmt->has_ended() || skip_del) {
+      /*
+        This trace is not finished, freeing it now would lead to use of
+        freed memory if a structure is later added to it. ... (CALL + 子语句的例子)
+        So if a trace is not finished, we will wait until it is and
+        re-consider it then (which is why this function is called in
+        Opt_trace_stmt::end() too).
+      */
+    } else {
+      pimpl->all_stmts_to_del.erase(idx);
+      delete stmt;      // ★ 真正 free 的时机：end() 之后（未 end 的 trace 不能删，会 UAF）
+    }
+  }
+}
+```
+
+**内存预算不是"每条 1MB"**（`sql/opt_trace.cc:1075`）：
+
+```cpp
+size_t Opt_trace_context::allowed_mem_size_for_current_stmt() const {
+  size_t mem_size = 0;
+  int idx;
+  for (idx = (pimpl->all_stmts_for_I_S.size() - 1); idx >= 0; idx--) {
+    const Opt_trace_stmt *stmt = pimpl->all_stmts_for_I_S.at(idx);
+    mem_size += stmt->alloced_length();
+  }
+  // Even to-be-deleted traces use memory, so consider them in sum
+  for (idx = (pimpl->all_stmts_to_del.size() - 1); idx >= 0; idx--) {
+    const Opt_trace_stmt *stmt = pimpl->all_stmts_to_del.at(idx);
+    mem_size += stmt->alloced_length();
+  }
+  /* The current statement is in exactly one of the two lists above */
+  mem_size -= pimpl->current_stmt_in_gen->alloced_length();
+  size_t rc =
+      (mem_size <= pimpl->max_mem_size) ? (pimpl->max_mem_size - mem_size) : 0;
+  return rc;   // ★ 预算 = max_mem_size − 其他所有 trace 已占（含待删队列）
+}
+```
+
+**截断判定**（`sql/opt_trace.cc:625` 的 `append_escaped()` / `:713` 的 `append()`）——三个 `append` 版本都是同一套 up-front 丢弃：
+
+```cpp
+void Buffer::append(const char *str, size_t length) {
+  if (alloced_length() >= allowed_mem_size) {
+    missing_bytes += length;      // ★ 只累加"少了多少字节"，不写任何内容
+    return;
+  }
+  string_buf.append(str, length);
+}
+
+void Buffer::append(char chr) {
+  if (alloced_length() >= allowed_mem_size) {
+    missing_bytes++;              // ★★ 连 '}' 都可能被丢 ⇒ JSON 结尾可能不完整
+    return;
+  }
+  string_buf.append(chr);
+}
+```
+
+⇒ 判定用的是 **`alloced_length()`（已分配容量）而非 `length()`（已用长度）**，加上 `prealloc()` 会预留 `ALIGN_SIZE(1)+1` 的安全边距，所以实际写出的 JSON 通常**略小于** `max_mem_size`。
+
+**QUERY 会抢 TRACE 的预算**（`sql/opt_trace.cc:448`，极反直觉）：
+
+```cpp
+void Opt_trace_stmt::set_query(const char *query, size_t length,
+                               const CHARSET_INFO *charset) {
+  assert(query_buffer.ptr() == nullptr);   // Should be called only once per statement
+  query_buffer.set_charset(charset);
+  if (!support_I_S()) return;              // 不进 I_S ⇒ 不浪费资源存 query
+  // We are taking a bit of space from 'trace_buffer'.
+  size_t available = (trace_buffer.alloced_length() >=
+                      trace_buffer.get_allowed_mem_size())
+                         ? 0
+                         : (trace_buffer.get_allowed_mem_size() -
+                            trace_buffer.alloced_length());
+  query_buffer.set_allowed_mem_size(available);
+  query_buffer.append(query, length);
+  // Space which query took is taken out of the trace:
+  const size_t new_allowed_mem_size =
+      (query_buffer.alloced_length() >= trace_buffer.get_allowed_mem_size())
+          ? 0
+          : (trace_buffer.get_allowed_mem_size() -
+             query_buffer.alloced_length());
+  trace_buffer.set_allowed_mem_size(new_allowed_mem_size);
+  // ★ 所以 max_mem_size 很小而 SQL 很长时，TRACE 会是空串
+}
+```
+
 #### 5.1 start 的参数
 
 ```cpp
@@ -281,6 +882,130 @@ if (!(thd->security_context()->check_access((GLOBAL_ACLS & ~GRANT_ACL),
 即：**当 SUID 上下文不是连接用户本人时，让 I_S.OPTIMIZER_TRACE 返回空**，除非该 SUID 上下文拥有全部全局权限（那样它本来就有权 trace 一切）。
 
 ★ 这是一个"优化器 trace 也不放过安全边界"的典型例子——trace 看起来是"只读调试信息"，但它的信息量足以构成侧信道。
+
+#### 6.2.1 I_S 表注册与填充函数（完整源码）
+
+> **勘误**：表**不是** `sql/dd/impl/system_views/optimizer_trace.cc`（该文件不存在），填充函数也**不是** `fill_schema_optimizer_trace`，而是 `fill_optimizer_trace_info`（`sql/opt_trace2server.cc:480`），走的是遗留硬编码 `schema_tables[]`。
+
+```cpp
+// sql/sql_show.cc:5118 —— 遗留式 I_S 表：字段描述 + fill 回调，不走 DD system view
+extern ST_FIELD_INFO optimizer_trace_info[];    // 定义在 opt_trace2server.cc:534
+
+ST_SCHEMA_TABLE schema_tables[] = {
+    {"COLUMN_PRIVILEGES", column_privileges_fields_info,
+     fill_schema_column_privileges, nullptr, nullptr, false},
+    ...
+    {"OPTIMIZER_TRACE", optimizer_trace_info, fill_optimizer_trace_info,
+     nullptr, nullptr, false},
+    ...
+};
+```
+
+```cpp
+// sql/opt_trace2server.cc:480
+int fill_optimizer_trace_info(THD *thd, Table_ref *tables, Item *) {
+  TABLE *table = tables->table;
+  Opt_trace_info info;
+
+  /*
+    When executing a routine which is SQL SECURITY DEFINER, opt-trace specific
+    checks are done with the connected user's privileges; this isn't
+    respecting the meaning of SQL SECURITY DEFINER. If a highly privileged
+    user doesn't know that, he may confidently execute a routine, while this
+    routine nastily uses the connected user's privileges to be allowed to do
+    tracing and gain knowledge about secret objects.
+    This possibility is prevented, by making I_S.OPTIMIZER_TRACE look empty
+    when read from a security context which isn't the connected user's context;
+    with an exception if the SUID security context has all global privileges
+    (in which case the nasty definer has anyway all rights to trace everything).
+    ...
+  */
+  ...（SUID 判定，见 6.2）
+
+  for (Opt_trace_iterator it(&thd->opt_trace); !it.at_end(); it.next()) {
+    it.get_value(&info);
+    restore_record(table, s->default_values);
+    /*
+      We will put the query, which is in character_set_client, into a column
+      using character_set_client; this is better than UTF8 (see BUG#57306).
+    */
+    table->field[0]->store(info.query_ptr,
+                           static_cast<uint>(info.query_length),
+                           info.query_charset);              // ★ 列 0 = QUERY
+    table->field[1]->store(info.trace_ptr,
+                           static_cast<uint>(info.trace_length),
+                           system_charset_info);             // ★ 列 1 = TRACE（被硬截断的 JSON）
+    table->field[2]->store(info.missing_bytes, true);        // ★ 列 2 = MISSING_BYTES_BEYOND_MAX_MEM_SIZE
+    table->field[3]->store(info.missing_priv, true);         // ★ 列 3 = INSUFFICIENT_PRIVILEGES
+    if (schema_table_store_record(thd, table)) return 1;
+  }
+  return 0;
+}
+```
+
+**`missing_bytes` 从 Buffer 走到列**（`sql/opt_trace.cc:598`）：
+
+```cpp
+void Opt_trace_stmt::fill_info(Opt_trace_info *info) const {
+  if (unlikely(info->missing_priv = missing_priv)) {
+    info->trace_ptr = info->query_ptr = "";     // ★ 缺权限 ⇒ 整行看起来是空的
+    info->trace_length = info->query_length = 0;
+    info->query_charset = &my_charset_bin;
+    info->missing_bytes = 0;                    // ★ 缺权限时不报 missing bytes
+  } else {
+    info->trace_ptr = trace_buffer.ptr();
+    info->trace_length = trace_buffer.length();
+    info->query_ptr = query_buffer.ptr();
+    info->query_length = query_buffer.length();
+    info->query_charset = query_buffer.charset();
+    info->missing_bytes =
+        trace_buffer.get_missing_bytes() + query_buffer.get_missing_bytes();
+    // ★ trace 丢的 + query 丢的，两者相加
+  }
+}
+```
+
+⇒ **`"missing_bytes_beyond_max_mem_size": N` 这段 JSON 不存在**（全仓 `sql/` 下只有大写列名 `MISSING_BYTES_BEYOND_MAX_MEM_SIZE` 出现一次）。它是独立的第 3 列；JSON 本身是被硬截断的，通常已不是合法 JSON。
+
+**生命周期终点没有独立函数**——就是 `~Opt_trace_start()` 的析构（RAII）。起点在 `sql/sql_parse.cc:3207`：
+
+```cpp
+  Opt_trace_start ots(thd, all_tables, lex->sql_command, &lex->var_list,
+                      thd->query().str, thd->query().length, nullptr,
+                      thd->variables.character_set_client);
+  // ★ 语句级 trace 的唯一入口；离开作用域（含栈展开）即结束
+
+  Opt_trace_object trace_command(&thd->opt_trace);              // 根对象 '{'
+  Opt_trace_array trace_command_steps(&thd->opt_trace, "steps"); // "steps": [
+```
+
+终点 `Opt_trace_stmt::end()`（`sql/opt_trace.cc:418`）：
+
+```cpp
+void Opt_trace_stmt::end() {
+  assert(stack_of_current_structs.size() == 0);   // ★ 所有结构都已闭合（RAII 保证）
+  assert(I_S_disabled >= 0);
+  ended = true;
+  /*
+    Because allocation is done in big chunks, buffer->Ptr[str_length]
+    may be uninitialized while buffer->Ptr[allocated length] is 0, so we
+    must use c_ptr_safe() as we want a 0-terminated string ...
+  */
+  trace_buffer.c_ptr_safe();   // ★ 补 '\0'：只有 end() 之后 TRACE 才是 0 结尾
+  // Send the full nice trace to DBUG.
+  DBUG_EXECUTE("opt", {
+    const char *trace = trace_buffer.c_ptr_safe();
+    DBUG_LOCK_FILE;
+    fputs("Complete optimizer trace:", DBUG_FILE);
+    fputs(trace, DBUG_FILE);
+    fputs("\n", DBUG_FILE);
+    DBUG_UNLOCK_FILE;
+  });   // ★★ "完整漂亮"的 trace 只送往 DBUG；I_S 里的可能已被截断
+  if (unlikely(missing_priv)) ctx->restore_I_S();
+  // ★ 关键：把 missing_privilege() 加的 I_S 禁用在这里还回去，
+  //   否则"一次缺权限 ⇒ 整个连接余生都没 trace"
+}
+```
 
 #### 6.3 Opt_trace_iterator
 
@@ -414,6 +1139,6 @@ FROM information_schema.optimizer_trace;
 
 **相关文档**
 
-- [`../11_explain_and_trace.md`](../11_explain_and_trace.md) —— 怎么用 trace（读节点、排查）
+- [`../11_explain_and_trace.md`](../../../infra/observability/explain_trace.md) —— 怎么用 trace（读节点、排查）
 - [`15_groupby_distinct_order.md`](15_groupby_distinct_order.md)、[`17_optimizer_decisions.md`](17_optimizer_decisions.md) —— 各决策点埋了哪些 trace 节点
 - [`../../infra/dbug.md`](../../infra/dbug.md) —— DBUG 通道（与 trace 的另一条调试路径）

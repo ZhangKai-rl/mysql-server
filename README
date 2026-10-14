@@ -18,3 +18,169 @@ For additional downloads and the source of MySQL, visit
   http://dev.mysql.com/downloads/
 
 MySQL is brought to you by the MySQL team at Oracle.
+
+# 当发货不传递磁盘类型时，默认使用的磁盘类型
+defaultStorageType: "CLOUD_PREMIUM"
+
+# 1 - vpcgw , 3 - privatelink, 仅 ServiceLink 类型生效
+routeType: 1
+
+# 发货使用的发货策略
+schedulerNodeType: "RequiredCVM"
+# manager.address 应该不再使用，先注释
+#manager:
+#  address: "http://td2c-manager.td2c-system:80"
+# 云巢Eros配置
+eros:
+  address: "http://21.196.225.11:80"
+
+# 中台服务配置，在unioss中没有用到
+#dbs:
+#  address: "http://11.151.227.154:20778/interface_v3"
+
+#备份中配置
+dbsGateway:
+  address: "http://11.141.107.18:39001/interface_v3"
+  region: "ap-guangzhou"
+  encryptPrefix: "dbsPlatform"
+
+# oss服务回调地址
+oss:
+  address: "http://21.196.150.10:6680/interface_v3"
+
+# 本地盘迁移云盘版本使用
+legacyOss:
+  "1":
+    address: "http://21.0.46.226:8080"
+    polaris:
+      name: ""
+      namespace: ""
+
+workflow:
+  localPath: ""
+  tag: "2f536ff9d"
+  prefix: "ccr.ccs.tencentyun.com/gz.cdb.khaos.core"
+  version: "v3"
+
+server:
+  address: "6680"
+  swaggerFilePath: "swagger"
+  name: "td2c-oss-server"
+
+legacy:
+  reconciler:
+    enabled: true
+
+database:
+  logger:
+    level: "all"
+    stdout: true
+  shark:
+    link: "mysql:root:libradb@123@tcp(21.90.218.93:3306)/td2c_oss_search?loc=Local&parseTime=true"
+    debug: true
+  legacy:
+    link: "mysql:root:tmppassQcloud@123@tcp(21.215.235.228:3306)/instance_manager?charset=utf8&loc=Local&parseTime=true"
+  legacy_proxy:
+    link: "mysql:root:tmppassQcloud@123@tcp(21.215.235.228:3306)/proxy_instance_manager_housekeeper?charset=utf8&loc=Local&parseTime=true"
+
+logger:
+  level: "all"
+  stdout: true
+
+crontab:
+  enabled: true
+
+cdb:
+  clusterId: 60021
+  platformLabels:
+    "cluster-id": "cls-kj8p054s"
+  tencentrootWhiteList: "21.196.208.39"
+  defaultSubVersion:
+    "8_0": "20241005"
+    "8_0_30": "20241005"
+    "5_7_44": "20240101"
+    "8_0_35": "20241005"
+  syncParams:
+    skipDefaultValues: true
+  network:
+    vpcservice:
+      enabled: true
+      address: "http://11.141.107.188:39024"
+      operator: "cdb_oss"
+      defaultVpcId: 0
+  metrics:
+    enabled: true
+    projectId: ""
+    city: "gz"
+  proxy:
+    imageBase: "mirrors.tencent.com/cdb_test_ontke_cluster/magpie"
+    imageFlag: '{"1.3.12":"2"}'
+  managerUrl: "http://td2c-manager-60021.td2c-system.svc:80"
+  backup:
+    enabled: true
+  auditLogBaseDir: "/data1/mysql_root/log"
+  gdnServiceUrl: "http://21.196.202.73:28181"
+  regionConfig: |
+    [{"cluster_id":60021,"region":"ap-guangzhou"},
+     {"cluster_id":60023,"region":"ap-guangzhou"}]
+  crossClusterOSSUrls:
+
+# OBS 事件告警中台配置
+obs:
+  address: "http://21.215.204.173:80"
+
+# 磁盘超限设置只读 Handler 配置
+# 对齐老架构 Flink monitor 的开关，用于灰度期"只观察不动作"或应急下线。
+disk_overuse:
+  # 是否真实下发 SET GLOBAL read_only（对齐老架构 opReadOnly 开关）
+  #   true  (默认): Handler 正常执行白名单校验 + 状态机 + op-manager 下发
+  #   false      : Handler 入口短路，只保留通用层的幂等/审计/状态表 upsert，
+  #                不改 instance_disk_flag，也不调用 op-manager
+  op_read_only: true 
+
+# Prometheus配置
+prometheus:
+  address: "http://prometheus.khaos:9090"
+
+tdsql:
+  pgExtraStorage: 0
+  eventPull:
+    address: http://khaos-events.khaos.svc/interface_v3
+    interval: 10
+    set:
+      ha: tdsql-mysql-ha-set
+      verify: tdsql-mysql-backup-set
+  obsoletedReplicasClean:
+    taskCron: "@every 5m"
+    timeInterval: "1m"
+  cloudDiskType:
+    suffix: "SSD"
+  productVersion: 1.0.0
+  isAcrossCluster: true
+  reinstallReplicas:
+    delayThreshold: "10"
+  tcsLBSupported: "false"
+  inplacingUpdateSupported: "true"
+  pgToken: 4OCu1/HPV9BgmeM3SOj/jVYBL/sgK2shF1sq9Zkai15HtJVB4nFM6LD+I5CHvdtJGw/2+Ro6BrEkT1f6pMiqPBGpFEK/IDKX4z1Nb0Nvksbufb8Zvj+B4g6/wIi+pYZ9
+  maintainTimeWindow: "{\"MaintainStartTime\":\"02:00\",\"MaintainDuration\":2,\"MaintainWeekDays\":[\"monday\",\"wednesday\",\"friday\"]}"
+kms:
+  secretId: "TJCjxWZ1aZrZoI1Sgv+Bd2Qu6EvNk35MyP7Uo0Cy3sAjolBZzy2alNoYce63ck7NTB9tMO10SeCMSV4I41rTEBGpFEK/IDKX4z1Nb0Nvksbufb8Zvj+B4g6/wIi+pYZ9"
+  secretKey: "5QkUmToWWjuAnoYURSW3T/s36sco2qTQ3oTQ2JnzndjfyMF1YtgNiH410mz50wQWNOM1O135dHOrv6abpdPNBxGpFEK/IDKX4z1Nb0Nvksbufb8Zvj+B4g6/wIi+pYZ9"
+  kmsServiceUrl: "kms.test.tencentcloudapi.com"
+  stsServiceUrl: "sts.test.tencentcloudapi.com"
+  kmsRegion: "ap-guangzhou"
+  roleName: "Postgres_QCSLinkedRoleInPostgresKms"
+  roleType: ""
+  schemeType: "https"
+  isPrivate: "false"
+
+# ha 同步 kafka
+kafka:
+  consumer:
+    enabled: true                     # 是否启用 Kafka 消费，默认 false
+    brokers:                          # Kafka broker 地址列表
+      - "21.90.19.75:9092"
+    topic: "cdb_ha_topic_0"          # 消费的 Topic 名称，默认 "ha_event"
+    group_id: "cdb-oss-ha-consumer"      # Consumer Group ID，默认 "cdb-oss-ha-consumer"
+    version: "3.2.3"                 # Kafka 版本，默认 "3.2.3"
+    max_retry: 3                     # 消费失败最大重试次数，默认 3   

@@ -1,7 +1,7 @@
 # InnoDB 内部字典（dict_sys）
 
 > **定位**：引擎私有的运行时字典——`dict_table_t` / `dict_index_t` 对象模型、`dict_sys_t` 缓存、DICT_HDR 页、`SYS_*` 内部表，以及**它如何从 server 层 DD 加载**。
-> **边界**：server 层 DD（权威元数据）见 [`dd.md`](dd.md)；表对象（`TABLE`/`TABLE_SHARE`）见 [`../table.md`](../table.md)；`DB_ROW_ID` 计数器与 DICT_HDR 布局见 [`../../innodb/physical/record.md`](../../innodb/physical/record.md)；DDL 执行见 [`../../innodb/ddl.md`](../../innodb/ddl.md)。
+> **边界**：server 层 DD（权威元数据）见 [`dd.md`](dd.md)；表对象（`TABLE`/`TABLE_SHARE`）见 [`../table.md`](../table.md)；`DB_ROW_ID` 计数器与 DICT_HDR 布局见 [`../../innodb/physical/record.md`](../../innodb/physical/record.md)；DDL 执行见 [`../../feat/ddl/ddl.md`](../../feat/ddl/ddl.md)。
 
 > 说明：本工作副本源码带少量中文批注（`// note:` / ASCII 图），引用时已与上游注释区分。
 
@@ -116,6 +116,88 @@ inherit_instant_metadata(&old_part->table(), &new_part->table());
 | `stat_*` | 2220-2325 | 统计（持久化统计另存 `mysql.innodb_table_stats`） |
 | `vc_templ` / `temp_prebuilt` | 2464 / 2474 | 虚拟列模板 / 并行读的 per-reader prebuilt |
 
+**★ instant 相关的完整成员定义**（`dict0mem.h:2071-2166`）：
+
+```cpp
+  /** Number of non-virtual columns defined so far. */
+  unsigned n_def : 10;
+  /** Number of non-virtual columns. */
+  unsigned n_cols : 10;
+  /** Number of non-virtual columns before first instant ADD COLUMN,
+  including the system columns like n_cols. This is used only when table has
+  instant ADD clumns in V1. */
+  unsigned n_instant_cols : 10;      /* ★ 含系统列，所以 get_instant_cols() 要减 get_n_sys_cols()；仅 V1 有意义 */
+  /** Number of total columns (include virtual and non-virtual) */
+  unsigned n_t_cols : 10;
+  ...
+  /** metadata version number of dd::Table::se_private_data() */
+  uint64_t version;
+  /** Current row version in case columns are added/dropped INSTANTly */
+  uint32_t current_row_version{0};   /* ★ 表级唯一的行版本计数器；>0 即 has_row_versions() */
+  /** Initial non-virtual column count */
+  uint32_t initial_col_count{0};     /* ★ instant ADD 前的列数 */
+  /** Current non-virtual column count */
+  uint32_t current_col_count{0};     /* ★ 当前列数 */
+  /** Total non-virtual column count */
+  uint32_t total_col_count{0};       /* ★ 含已被 instant DROP 掉的列 */
+  /** Set if table is upgraded instant table */
+  bool m_upgraded_instant{false};    /* ★ 8.0.29 之前的 V1 instant 表升级上来的标记 */
+```
+
+**★★ 四个判定函数——语义各不相同，极易混淆**：
+
+```cpp
+  /** @returns true if the table has row versions.. */
+  bool has_row_versions() const {
+    if (current_row_version > 0) {
+      ut_ad(has_instant_add_cols() || has_instant_drop_cols());  /* ★ 有 row version 必然发生过 instant add 或 drop */
+      return true;
+    }
+    return false;
+  }
+
+  /** @return if there was any instantly added column. ... */
+  bool has_instant_cols() const {
+    if (is_upgraded_instant() || (n_instant_cols < n_cols)) {
+      /* Instant add col V1 */
+      return true;      /* ★★ 只判 V1 instant ADD，完全不看 instant DROP */
+    }
+    return false;
+  }
+
+  /** Get number of columns added instantly */
+  uint32_t get_n_instant_add_cols() const {
+    ut_ad(total_col_count >= initial_col_count);
+    return total_col_count - initial_col_count;
+  }
+  /** Get number of columns dropped instantly */
+  uint32_t get_n_instant_drop_cols() const {
+    ut_ad(total_col_count >= current_col_count);
+    return total_col_count - current_col_count;
+  }
+  bool has_instant_add_cols() const { return (get_n_instant_add_cols() > 0); }
+  bool has_instant_drop_cols() const { return (get_n_instant_drop_cols() > 0); }
+```
+
+```cpp
+  void set_instant_cols(uint16_t n_inst_cols) {
+    n_instant_cols = static_cast<unsigned>(n_inst_cols) + get_n_sys_cols();
+  }
+  uint16_t get_instant_cols() const {
+    return static_cast<uint16_t>(n_instant_cols - get_n_sys_cols());
+  }
+  ulint get_total_cols() const {
+    if (!has_row_versions()) return n_cols;    /* ★ 无 row version ⇒ 没有 instant drop */
+    ut_ad((total_col_count + get_n_sys_cols()) ==
+          (n_cols + get_n_instant_drop_cols()));
+    return n_cols + get_n_instant_drop_cols();
+  }
+```
+
+> ★★ **`has_instant_cols()` 不涵盖 instant DROP**——drop 由 `has_instant_drop_cols()` / `has_row_versions()` 判定。且 **table 版与 index 版不同义**：table 版算 `is_upgraded_instant() || n_instant_cols < n_cols`；index 版直接返回 bit 字段 `instant_cols`。
+> ⚠️ **不存在 `dict_table_t::is_instant_dropped()`** —— 只有 `dict_col_t::is_instant_dropped()`。
+> ⚠️ **`file_unreadable` 不存在**（8.0 已彻底移除，全仓仅命中 `sql/dd/upgrade_57` 的错误日志字符串，与 `dict_table_t` 无关）。语义最接近的是 **`ibd_file_missing`**（`dict0mem.h:2059`）。
+
 ### 1.4 autoinc 系列（`dict0mem.h:2328-2391`）
 
 `autoinc_lock`（预分配的 AUTOINC 锁实例）、`autoinc_mutex`、`autoinc`（下一个值）、`autoinc_persisted`（已写入 redo/DDTableBuffer 的值）、`autoinc_field_no`、`autoinc_trx`（原子指针，快速判断本 trx 是否已持 AUTOINC）。详见 [`../feat/auto_increment.md`](../../feat/auto_increment.md)。
@@ -181,6 +263,127 @@ bool dict_index_t::is_usable(const trx_t *trx) const {
 
 ★ `get_sys_col_pos(type)`（`dict0mem.cc:716`）：**聚簇索引返回物理位置**（`dict_col_get_clust_pos`），二级索引返回逻辑位置（`get_col_pos`）——所以常见写法是 `ut_ad(get_sys_col_pos(DATA_ROLL_PTR) == trx_id_pos + 1)`（物理上 TRX_ID 紧邻 ROLL_PTR）。
 
+**★ `dict_index_t` 的 instant 相关成员完整定义**（`dict0mem.h:1120-1186`）：
+
+```cpp
+  unsigned n_uniq : 10;               /* ★ 唯一性字段数 */
+  unsigned n_def : 10;                /* 已定义的字段数 */
+  unsigned n_fields : 10;             /* 索引字段数 */
+  unsigned n_total_fields : 10;       /* ★★ 含 INSTANT DROP 字段的总数 —— 取代传说中的 n_core_fields */
+  unsigned n_nullable : 10;
+  unsigned n_instant_nullable : 10;   /* ★★ 首次 instant ADD 前的可空字段数 —— 取代 n_core_null_bytes，单位是"个数"不是字节 */
+  ...
+  unsigned instant_cols : 1;          /* ★ 聚簇索引 && 表有 instant 列 → index 版 has_instant_cols() 直接读此位 */
+  unsigned row_versions : 1;          /* ★ 表有 row versions → index 版 has_row_versions() 直接读此位 */
+  ...
+  dict_field_t *fields;
+  /** Array of field pos sorted as per their physical pos in record. Only
+  needed for clustered index having INSTANT ADD/DROP columns. */
+  std::vector<uint16_t> fields_array; /* ★★ 逻辑位→物理位的映射，仅 row_versions 表使用 */
+  /** Number of nullable columns in each version. */
+  uint32_t nullables[MAX_ROW_VERSION + 1] = {0};   /* ★ MAX_ROW_VERSION = 64 */
+```
+
+```cpp
+/** Maximum number of rows version allowed when columns are added/dropped
+INSTANTly. After this limit is reached, any attempt to do ADD/DROP INSTANT
+column will result in error. */
+const uint8_t MAX_ROW_VERSION = 64;      /* dict0mem.h:323 */
+static inline bool is_valid_row_version(const uint8_t version) {
+  /* NOTE : 0 is also a valid row versions for rows which are inserted after
+  upgrading from earlier INSTANT implemenation */
+  if (version <= MAX_ROW_VERSION) return true;
+  return false;
+}
+```
+
+**★ `has_instant_cols_or_row_versions()` 与 `get_physical_field()`**：
+
+```cpp
+  bool has_instant_cols_or_row_versions() const {
+    if (!is_clustered()) {
+      ut_ad(!has_row_versions() && !has_instant_cols());
+      /* ★★ 二级索引永远不该有 instant/version 标记 */
+      return false;
+    }
+    return (has_row_versions() || has_instant_cols());
+  }
+
+  dict_field_t *get_physical_field(size_t pos) const {
+    if (has_row_versions()) {
+      return get_field(fields_array[pos]);   /* ★★ 有 row version ⇒ 须经 fields_array 做物理→逻辑换算 */
+    }
+    return get_field(pos);                   /* 否则物理位 == 逻辑位 */
+  }
+
+  uint16_t get_field_off_pos(ulint pos) const {
+    return get_field(pos)->get_phy_pos();    /* ★ 只是 dict_field_t::get_phy_pos() 的转发 */
+  }
+
+  uint16_t get_field_phy_pos(ulint pos, uint8_t version) const {
+    uint16_t phy_pos = get_field(pos)->get_phy_pos();
+    if (version == UINT8_UNDEFINED) return phy_pos;
+    uint16_t res = phy_pos;
+    for (size_t i = 0; i < phy_pos; i++) {
+      if (get_field(fields_array[i])->col->is_dropped_in_or_before(version)) {
+        res--;      /* ★ 该版本之前已被 drop 的物理位要从当前位置里扣掉 */
+      }
+    }
+    return res;
+  }
+```
+
+```cpp
+/* dict0mem.ic:92 —— get_instant_fields() 是纯计算，没有 instant_fields 成员 */
+inline uint32_t dict_index_t::get_instant_fields() const {
+  ut_ad(has_instant_cols());
+  size_t n_inst_cols_v1 = table->get_n_instant_added_col_v1();
+  size_t n_drop_cols = table->get_n_instant_drop_cols();
+  size_t n_add_cols = table->get_n_instant_add_cols();
+  return n_fields + n_drop_cols - n_add_cols - n_inst_cols_v1;
+}
+```
+
+> ⚠️ **不存在 `dict_index_t::n_core_fields` / `n_core_null_bytes` / `instant_fields`（成员）** —— 真实组合是 `n_total_fields` + `n_instant_nullable` + `nullables[]`。
+> ⚠️ **不存在 `dict_index_t::is_dropped()`**（`dict0dd.cc:1774` 的 `is_dropped()` 是 DDL 层自由函数）。
+> ⚠️ **不存在 `dict_index_t::get_n_fields()`（成员）** —— 是自由函数 `dict_index_get_n_fields()`（`dict0dict.ic:667`），且**有 row version 时返回 `n_total_fields` 而非 `n_fields`**。
+
+**★ `is_usable()` 的完整实现**（`dict0mem.cc:604`）:
+
+```cpp
+bool dict_index_t::is_usable(const trx_t *trx) const {
+  /* Indexes that are being created are not usable. */
+  if (!is_clustered() && dict_index_is_online_ddl(this)) {
+    return false;                     /* ① 非聚簇 && 正在 online DDL 创建中 */
+  }
+  /* Cannot use a corrupted index. */
+  if (is_corrupted()) {
+    return false;                     /* ② type & DICT_CORRUPT */
+  }
+  /* Check if the specified transaction can see this index. */
+  return (table->is_temporary() || trx_id == 0 ||
+          !MVCC::is_view_active(trx->read_view) ||
+          trx->read_view->changes_visible(trx_id, table->name));
+}                                     /* ③ 可见性 */
+```
+
+**★ `DICT_TF2_*` 完整标志位**（`dict0mem.h:255-302`，⚠️ **`64` 这一位已废弃未使用**）：
+
+```cpp
+constexpr uint32_t DICT_TF2_BITS = 11;
+constexpr uint32_t DICT_TF2_TEMPORARY = 1;                    /* CREATE TEMPORARY TABLE */
+constexpr uint32_t DICT_TF2_FTS_HAS_DOC_ID = 2;               /* 内部定义的 DOC ID 列 */
+constexpr uint32_t DICT_TF2_FTS = 4;
+constexpr uint32_t DICT_TF2_FTS_ADD_DOC_ID = 8;               /* transient，index build 用 */
+constexpr uint32_t DICT_TF2_USE_FILE_PER_TABLE = 16;
+constexpr uint32_t DICT_TF2_DISCARDED = 32;
+/* 64 未使用 */
+constexpr uint32_t DICT_TF2_INTRINSIC = 128;
+constexpr uint32_t DICT_TF2_ENCRYPTION_FILE_PER_TABLE = 256;
+constexpr uint32_t DICT_TF2_AUX = 512;                        /* FTS AUX hidden table */
+constexpr uint32_t DICT_TF2_RESURRECT_PREPARED = 1024;
+```
+
 ---
 
 ## 3. `dict_col_t`（`dict0mem.h:489`）
@@ -194,7 +397,127 @@ set_col_phy_pos(uint16_t pos) { ut_ad(has_prefix_phy_pos()); phy_pos |= pos; }  
 
 即**物理位置的设置顺序有断言保护**：先设前缀位置（置 bit15 标志），再设列位置。
 
+**★★ `dict_col_t` 的完整定义与全部方法**（`dict0mem.h:489-813`）：
+
+```cpp
+struct dict_col_t {
+  /** Default value when this column was added instantly.
+  If this is not a instantly added column then this is nullptr. */
+  dict_col_default_t *instant_default{nullptr};
+  unsigned prtype : 32;
+  unsigned mtype : 8;
+  unsigned len : 16;
+  unsigned mbminmaxlen : 5;
+  unsigned ind : 10;         /* ★ 逻辑列号（表定义顺序） */
+  unsigned ord_part : 1;     /* 是否出现在某个索引的 ordering fields 里 */
+  unsigned max_prefix : 12;
+  bool is_visible;
+
+ private:
+  /* Position of column on physical row.
+  If column prefix is part of PK, it appears twice on row. First 2 bytes are
+  for prefix position and next 2 bytes are for column position on row. */
+/*
+    31                       16      15                     0
+    +------------------------+--------+---------------------+
+    |   prefix_phy_pos       | F      | col_phy_pos         |
+    |   (高16位)              | (15bit)|(低15bit)            |
+    +------------------------+--------+---------------------+
+*/
+  uint32_t phy_pos{UINT32_UNDEFINED};   /* ★★ bit-packed，不是裸偏移 */
+  uint8_t version_added{UINT8_UNDEFINED};    /* ★ 255 = 未设置 */
+  uint8_t version_dropped{UINT8_UNDEFINED};
+
+ public:
+  bool has_prefix_phy_pos() const { return (phy_pos & 0x8000); }        /* ★ bit15 */
+  uint16_t get_prefix_phy_pos() const { return ((uint16_t)(phy_pos >> 16)); }
+  void set_prefix_phy_pos(uint16_t prefix_pos) {
+    phy_pos = prefix_pos; phy_pos = phy_pos << 16; phy_pos |= 0x8000;
+  }
+  uint16_t get_col_phy_pos() const { return ((phy_pos & ~0x8000) & 0xFFFF); }
+  void set_col_phy_pos(uint16_t pos) { ut_ad(has_prefix_phy_pos()); phy_pos |= pos; }
+  uint32_t get_phy_pos() const { return phy_pos; }        /* ★★ 返回整个 32 位元数据，不是列位置 */
+  void set_phy_pos(uint32_t pos) { phy_pos = pos; }
+
+  bool is_instant_added() const {
+    if (version_added != UINT8_UNDEFINED && version_added > 0) return true;
+    return false;       /* ★★ version_added == 0 不算 instant；UINT8_UNDEFINED(255) 是未设置 */
+  }
+  bool is_instant_dropped() const {
+    if (version_dropped != UINT8_UNDEFINED && version_dropped > 0) return true;
+    return false;
+  }
+  ...
+  /** Check if column is dropped before the given version. */
+  bool is_dropped_in_or_before(uint8_t version) const {
+    ut_ad(is_valid_row_version(version));
+    if (!is_instant_dropped()) return false;
+    return (get_version_dropped() <= version);
+  }
+  /** Check if column is added after the current version. */
+  bool is_added_after(uint8_t version) const {
+    ut_ad(is_valid_row_version(version));
+    if (!is_instant_added()) return false;
+    return (get_version_added() > version);
+  }
+  /** Check if a column is visible in given version. */
+  bool is_visible_in_version(uint8_t version) const {
+    ut_ad(is_valid_row_version(version));
+    return (!is_added_after(version) && !is_dropped_in_or_before(version));
+  }
+```
+
+```cpp
+struct dict_field_t {                    /* dict0mem.h:912 */
+  dict_col_t *col;
+  id_name_t name;
+  unsigned prefix_len : 12;
+  unsigned fixed_len : 10;
+  unsigned is_ascending : 1;
+  uint16_t get_phy_pos() const {
+    if (prefix_len != 0) return col->get_prefix_phy_pos();   /* ★ 有前缀 → 高 16 位 */
+    return col->get_col_phy_pos();
+  }
+};
+```
+
+```cpp
+struct dict_col_default_t {              /* dict0mem.h:475 */
+  dict_col_t *col;
+  byte *value;
+  size_t len;
+};
+```
+
+```cpp
+  void dict_col_t::set_default(const byte *value, size_t length, mem_heap_t *heap) {
+    ut_ad(instant_default == nullptr);
+    ut_ad(length == 0 || length == UNIV_SQL_NULL || value != nullptr);
+    instant_default = static_cast<dict_col_default_t *>(
+        mem_heap_alloc(heap, sizeof(dict_col_default_t)));
+    instant_default->col = this;
+    if (length != UNIV_SQL_NULL) {
+      const char *val = (value == nullptr ? "\0" : reinterpret_cast<const char *>(value));
+      instant_default->value = reinterpret_cast<byte *>(mem_heap_strdupl(heap, val, length));
+    } else {
+      ut_ad(!(prtype & DATA_NOT_NULL));   /* ★ NULL 默认值要求列可空 */
+      instant_default->value = nullptr;
+    }
+    instant_default->len = length;
+  }
+```
+
 instant drop 列的命名约定（`dict0mem.h:84-86`）：8.0.29 用后缀 `_dropped_v`、8.0.32 起用前缀 `!hidden!_dropped_`。
+
+```cpp
+constexpr char INSTANT_DROP_SUFFIX_8_0_29[] = "_dropped_v";
+constexpr char INSTANT_DROP_PREFIX_8_0_32[] = "!hidden!_dropped_";
+/* dict_col_t::is_instant_dropped_name() 用它们判断列名是否像"已 drop 列" */
+```
+
+> ⚠️ **不存在 `dict_table_t::get_nth_col()`** —— 成员版本是 `get_col(uint pos)`（`dict0mem.h:2611`）；虚拟列走自由函数 `dict_table_get_nth_v_col`（debug 下是函数、非 debug 下是宏 `((table)->v_cols + (pos))`）。
+> ⚠️ **`get_col_name()` 是走 `col_names` 紧凑串逐个 `strlen(s)+1` 跳过**（`"name1\0name2\0...\0"`），不是数组索引。
+> ⚠️ **不存在 `dict_table_t::space_id()`** —— 表级直接读 `space` 成员，或用 `first_index()->space_id()`（`dict0mem.h:1659`）。
 
 `dict_field_t`（`dict0mem.h:913`）：`col` / `name` / `prefix_len:12` / `fixed_len:10` / `is_ascending:1`；`get_phy_pos()` 在 `prefix_len != 0` 时返回前缀位置。
 
@@ -220,7 +543,160 @@ Table_LRU_list_base table_non_LRU;   // 1052  不可淘汰
 
 ★ **8.0.39 的 dict cache 未分片**——只有一把 `mutex`（`ib_mutex_t`），`hash_table_t` 自身无锁（`HASH_TABLE_SYNC_NONE`）。配合全局 `dict_operation_lock`（rw_lock，**DDL/淘汰时必须先 x-lock 它再进 dict mutex**）。
 
+**★★ `dict_sys_t` 完整定义**（`dict0dict.h:1004`）：
+
+```cpp
+struct dict_sys_t {
+  DictSysMutex mutex;          /* ★ ib_mutex_t（typedef ib_mutex_t DictSysMutex;）
+                                  protects the data dictionary; protects also the
+                                  disk-based dictionary system tables; this mutex
+                                  serializes CREATE TABLE and DROP TABLE, as well as
+                                  reading the dictionary data for a table from
+                                  system tables */
+  row_id_t row_id;             /* ★ the next row id to assign */
+  hash_table_t *table_hash;    /* ★★ 按 name 的哈希表（裸 hash_table_t*，不是专用类型） */
+  hash_table_t *table_id_hash; /* ★★ 按 id 的哈希表 */
+  size_t size;                 /* ★★ 只做【内存记账】，不是淘汰阈值 */
+  /** Handler to sys_* tables, they're only for upgrade */
+  dict_table_t *sys_tables;    /* ★ 注释原文："they're only for upgrade" */
+  dict_table_t *sys_columns;
+  dict_table_t *sys_indexes;
+  dict_table_t *sys_fields;
+  dict_table_t *sys_virtual;
+  /** Permanent handle to mysql.innodb_table_stats */
+  dict_table_t *table_stats;
+  dict_table_t *index_stats;   /* mysql.innodb_index_stats */
+  dict_table_t *ddl_log;       /* mysql.innodb_ddl_log */
+  dict_table_t *dynamic_metadata;  /* ★ mysql.innodb_dynamic_metadata */
+  UT_LIST_BASE_NODE_T(dict_table_t, table_LRU) table_LRU;
+  UT_LIST_BASE_NODE_T(dict_table_t, table_LRU) table_non_LRU;
+  ...
+  static std::set<dd::Object_id> s_dd_table_ids;
+  static constexpr space_id_t s_dict_space_id = 0xFFFFFFFE;   /* ★ mysql.ibd */
+  static constexpr space_id_t s_temp_space_id = 0xFFFFFFFD;
+  static constexpr space_id_t s_log_space_id = 0xFFFFFFF0UL;
+  static constexpr space_id_t s_invalid_space_id = 0xFFFFFFFF;
+  static constexpr dd::Object_id s_dd_dict_space_id = 1;
+  static constexpr dd::Object_id s_dd_sys_space_id = 2;
+  static constexpr dd::Object_id s_dd_temp_space_id = 3;
+  static constexpr table_id_t s_dynamic_meta_table_id = 2;
+  static constexpr space_index_t s_dynamic_meta_index_id = 2;
+};
+```
+
+```cpp
+#define dict_sys_mutex_enter() mutex_enter(&dict_sys->mutex)
+#define dict_sys_mutex_exit() mutex_exit(&dict_sys->mutex)
+#define dict_sys_mutex_own() mutex_own(&dict_sys->mutex)
+```
+
+```cpp
+void dict_init(void) {
+  ...
+  UT_LIST_INIT(dict_sys->table_LRU);
+  UT_LIST_INIT(dict_sys->table_non_LRU);
+  mutex_create(LATCH_ID_DICT_SYS, &dict_sys->mutex);   /* ★ 唯一创建点 */
+  dict_sys->table_hash = ut::new_<hash_table_t>(
+      buf_pool_get_curr_size() / (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+  dict_sys->table_id_hash = ut::new_<hash_table_t>(
+      buf_pool_get_curr_size() / (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+  rw_lock_create(dict_operation_lock_key, dict_operation_lock,
+                 LATCH_ID_DICT_OPERATION);   /* ★★ dict_operation_lock 是另一个锁（rw_lock_t*） */
+}
+constexpr uint32_t DICT_POOL_PER_TABLE_HASH = 512;   /* ★ 桶数 = BP 大小 / (512 * sizeof(void*)) */
+```
+
+> ⚠️ **`table_hash` 的类型是通用 `hash_table_t`（`hash0hash.h:421`），不是 `dict_table_hash_t` / `id_to_hash_map` / `name_to_hash_map`**（全仓 0 命中）。桶数取 `ut::find_prime(n)` 素数，且 `type == HASH_TABLE_SYNC_NONE`——**靠 `dict_sys->mutex` 保护，不是自带分片锁**。
+> ⚠️ **`dict_sys->mutex` 与 `dict_operation_lock` 是两个不同的锁**：前者是 `ib_mutex_t`（互斥），后者是 `rw_lock_t*`。**淘汰时两者都要拿，且顺序固定**：先 `rw_lock_x_lock(dict_operation_lock)`，再 `dict_mutex_enter_for_mysql()`。
+
 ### 4.2 淘汰
+
+**★★ 淘汰的真实触发条件不是 `dict_sys->size`**（`dict0dict.cc:1262`）：
+
+```cpp
+ulint dict_make_room_in_cache(ulint max_tables, ulint pct_check) {
+  ut_ad(dict_sys_mutex_own());
+  ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_X));
+  ut_ad(dict_lru_validate());
+
+  i = len = UT_LIST_GET_LEN(dict_sys->table_LRU);
+  /*  ★★ 阈值判据是【LRU 链表长度】，不是 dict_sys->size */
+
+  if (len < max_tables) {
+    return 0;      /* ★ max_tables = innobase_get_table_cache_size() = table_def_size */
+  }
+
+  check_up_to = len - ((len * pct_check) / 100);
+  /*  ★ 只扫尾部 pct_check% 的节点，不全扫 */
+
+  for (table = UT_LIST_GET_LAST(dict_sys->table_LRU);   /* ★ 从 LRU 尾部（最冷）往前扫 */
+       table != nullptr && i > check_up_to && (len - n_evicted) > max_tables;
+       --i) {
+    dict_table_t *prev_table = UT_LIST_GET_PREV(table_LRU, table);
+    table->lock();
+    if (dict_table_can_be_evicted(table)) {
+      table->unlock();
+      dict_table_remove_from_cache_low(table, true);   /* ★ lru_evict = true */
+      ++n_evicted;
+    } else {
+      table->unlock();
+    }
+    table = prev_table;
+  }
+  return n_evicted;
+}
+```
+
+```cpp
+static bool dict_table_can_be_evicted(dict_table_t *table) {
+  ut_ad(dict_sys_mutex_own());
+  ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_X));   /* ★★ 必须持 X 锁 */
+  ut_a(table->can_be_evicted);
+  ut_a(table->foreign_set.empty());      /* ★ 不能有外键（父子关系） */
+  ut_a(table->referenced_set.empty());
+
+  if (table->get_ref_count() == 0) {
+    if (lock_table_has_locks(table)) return false;      /* ★ 表锁未清空 */
+    for (index = table->first_index(); index != nullptr; index = index->next()) {
+      /* We are not allowed to free the in-memory index struct dict_index_t
+      until all entries in the adaptive hash index that point to any of the
+      page belonging to his b-tree index are dropped. ... */
+      if (index->search_info->ref_count > 0) return false;   /* ★★ AHI 引用未归零 */
+    }
+    return true;
+  }
+  return false;
+}
+```
+
+**★★ 淘汰由 master 线程驱动，不是 open table 路径同步触发**（`srv0srv.cc:2000`）：
+
+```cpp
+static ulint srv_master_evict_from_table_cache(ulint pct_check) {
+  rw_lock_x_lock(dict_operation_lock, UT_LOCATION_HERE);   /* ★ 先 dict_operation_lock X 锁 */
+  dict_mutex_enter_for_mysql();                            /* ★ 再 dict_sys->mutex（顺序不可颠倒） */
+  ulint n_tables_evicted =
+      dict_make_room_in_cache(innobase_get_table_cache_size(), pct_check);
+  dict_mutex_exit_for_mysql();
+  rw_lock_x_unlock(dict_operation_lock);
+  return n_tables_evicted;
+}
+```
+
+```cpp
+/* srv0srv.cc:2365 —— 周期任务，只扫尾部 50% */
+  if (cur_time - last_dict_lru_check > SRV_MASTER_DICT_LRU_INTERVAL) {
+    last_dict_lru_check = cur_time;
+    ulint n_evicted = srv_master_evict_from_table_cache(50);
+    ...
+  }
+/* srv0srv.cc:2426 —— 每轮 loop 无条件 100% 全扫 */
+  ulint n_evicted = srv_master_evict_from_table_cache(100);
+```
+
+> ★★ **`dict_sys->size` 只做内存记账**，全仓不存在任何 `dict_sys->size > 阈值` 判定。它的唯一归零断言在 `dict_close()`（`dict0dict.cc:4712`：`ut_ad(dict_sys->size == 0)`），唯一对外可见处是 `SHOW ENGINE INNODB STATUS` 的 "Dictionary memory allocated"。
+> ★ 对偶操作 `dict_table_add_to_cache()`（`dict0dict.cc:1191`）会 `UT_LIST_ADD_FIRST` 插到 LRU 头，并 `dict_sys->size += mem_heap_get_size(table->heap) + strlen(name) + 1`。
+> ★ 命中时 `dict_move_to_mru()` 把表移到 LRU 头；`dict_table_prevent_eviction()` / `dict_table_ddl_acquire()` 则把它移到 **non-LRU**。
 
 触发者是 **master thread**（`srv0srv.cc:2002` `srv_master_evict_from_table_cache`，周期性检查 `dict_make_room_in_cache`）。
 
@@ -289,6 +765,51 @@ void register_table_handler(const std::string &table_name, dict_table_t *table) 
 3. `dict_intrinsic_table_t` 是 `dict_table_t` 的包装（handler 形式），对内部表提供 handler 接口。
 
 ★ 这就是"内部临时表开表"的快速路径：`ha_innobase::open` 里 intrinsic 表先查这个 map，命中就绕过了 dd_open_table 全链路。
+
+这条转发链里的 `dict_table_add_system_columns` 值得拆开——**intrinsic 表之所以能"绕过全链路"，是因为系统列在这里手工补上了**（正常路径里这一步由 DD 读取时完成）：
+
+```cpp
+// dict0dict.cc
+void dict_table_add_system_columns(dict_table_t *table, mem_heap_t *heap) {
+  ut_ad(table);
+  /* INSTANT DROP columns are added after system columns, so no need to
+  consider drop columns count in following assert. */
+  ut_ad(table->n_def == (table->n_cols - table->get_n_sys_cols()));
+  ut_ad(table->magic_n == DICT_TABLE_MAGIC_N);
+  ut_ad(!table->cached);
+
+  /* NOTE: the system columns MUST be added in the following order
+  (so that they can be indexed by the numerical value of DATA_ROW_ID,
+  etc.) and as the last columns of the table memory object.
+  The clustered index will not always physically contain all system
+  columns.
+  Intrinsic table don't need DB_ROLL_PTR as UNDO logging is turned off
+  for these tables. */
+
+  const uint32_t phy_pos = UINT32_UNDEFINED;
+  const uint8_t v_added = 0;
+  const uint8_t v_dropped = 0;
+
+  dict_mem_table_add_col(table, heap, "DB_ROW_ID", DATA_SYS,
+                         DATA_ROW_ID | DATA_NOT_NULL, DATA_ROW_ID_LEN, ...);
+  dict_mem_table_add_col(table, heap, "DB_TRX_ID", DATA_SYS,
+                         DATA_TRX_ID | DATA_NOT_NULL, DATA_TRX_ID_LEN, ...);
+
+  if (!table->is_intrinsic()) {
+    dict_mem_table_add_col(table, heap, "DB_ROLL_PTR", DATA_SYS,
+                           DATA_ROLL_PTR | DATA_NOT_NULL, DATA_ROLL_PTR_LEN, ...);
+  }
+}
+```
+
+四点都值得记：
+
+1. ★ **顺序是硬约束**（注释明说）：`DB_ROW_ID → DB_TRX_ID → DB_ROLL_PTR` 必须按此顺序加在**所有用户列之后**——因为下游代码用 `DATA_ROW_ID` 等数值**按序索引**系统列，换顺序等于换了布局。
+2. ★ **intrinsic 表少一列 `DB_ROLL_PTR`**——它的 UNDO logging 是关闭的，没有回滚指针；这是 intrinsic 快路径省成本的又一处体现（写不进 undo，也就不需要 roll_ptr）。
+3. **`phy_pos = UINT32_UNDEFINED`**——系统列没有物理列位置：它们不在磁盘记录的列定义里，是**解析记录时按偏移虚拟出来**的。
+4. 断言里的细节：`n_def == n_cols - n_sys_cols`（定义列数 = 总列数 − 系统列数），注释特意说明 **INSTANT DROP 的列加在系统列之后**，所以统计 `n_def` 时不用管它们——这是行版本机制（见 [`../query/07_optimize/`instant_ddl.md](../query/07_optimize/)）与系统列布局的一个交叉点。
+
+源码末尾还有一句提醒注释：*"This check reminds that if a new system column is added to the program, it should be dealt with here"*——`if (!is_intrinsic())` 这个分支本身就是给未来新增系统列留的提醒位。
 
 ### 4.5 ★ index corrupt 的完整闭环
 
@@ -411,7 +932,50 @@ if (!dd_table_match(ib_table, table_def)) {
 }
 ```
 
+**★ `dd_index_match()` 完整源码**（★ 索引级四项校验）：
+
+```cpp
+template <typename Index>
+static bool dd_index_match(const dict_index_t *index, const Index *dd_index) {
+  bool match = true;
+
+  /* Don't check the name for primary index, since internal index
+  name could be variant */
+  if (my_strcasecmp(system_charset_info, index->name(),
+                    dd_index->name().c_str()) != 0 &&
+      strcmp(dd_index->name().c_str(), "PRIMARY") != 0) {
+    /* ★ 校验①：索引名 —— PRIMARY 例外，因为内部可能是 GEN_CLUST_INDEX */
+    match = false;
+  }
+
+  const dd::Properties &p = dd_index->se_private_data();
+  uint64_t id = 0; uint32_t root = 0; uint64_t trx_id = 0;
+
+  ut_ad(p.exists(dd_index_key_strings[DD_INDEX_ID]));
+  p.get(dd_index_key_strings[DD_INDEX_ID], &id);
+  if (id != index->id) { match = false; }               /* ★ 校验②：index id ← se_private_data["id"] */
+
+  ut_ad(p.exists(dd_index_key_strings[DD_INDEX_ROOT]));
+  p.get(dd_index_key_strings[DD_INDEX_ROOT], &root);
+  if (root != index->page) { match = false; }           /* ★ 校验③：root page no */
+
+  ut_ad(p.exists(dd_index_key_strings[DD_INDEX_TRX_ID]));
+  p.get(dd_index_key_strings[DD_INDEX_TRX_ID], &trx_id);
+  /* For DD tables, the trx_id=0 is got from get_se_private_id(). */
+  if (trx_id != 0 && index->trx_id != 0 && trx_id != index->trx_id) {
+    match = false;                                       /* ★ 校验④：创建该索引的 trx_id */
+  }
+  return match;
+}
+```
+
+> ★★ **校验④有个刻意的三重 `!= 0` 判断**：`trx_id == 0` 表示"DD 表"或"启动时已存在的索引"，此时不比对。注释还留了 TODO：*"index->trx_id is not expected to be 0 once Bug#25730513 is fixed"*。
+
 ★ **这就是"字典不一致"的防御闭环**：缓存里的 `dict_table_t` 若与 DD 权威不符（如 DDL 在别的连接改了定义、缓存没跟上），不是"将错就错"，而是**判缓存失效 → 标损坏 → 移除 → 重新从 DD 加载**。第 4.5 节的 index corrupt 闭环与这里是同一个防御体系的两半：corrupt 是"索引损坏"的记录机制，`dd_table_match` 是"缓存与权威不符"的检测机制。
+
+> ⚠️ **`dd_table_fail_when_dd_result_is_inconsistent()` 不存在**（全仓 0 命中）——校验实体就是 `dd_table_match()`，调用点用 `if (!dd_table_match(...))` 或 `ut_ad(dd_table_match(...))`。其余断言点：`ha_innodb.cc:14099`、`handler0alter.cc:1640` 与 `:10600`；分区版在 `ha_innopart.cc:130-164`。
+> ⚠️ **`dict_set_corrupted()` 才是真名**（`dict0dict.cc:4163`），不是 `dict_index_set_corrupted()`；判定是 `dict_index_t::is_corrupted()`（`dict0mem.h:1327`）。
+> ★★ **`dict_set_corrupted()` 故意不持 `dict_sys->mutex`**——注释说明是"便于底层函数直接调用"，且只做 `type |= DICT_CORRUPT` 单向置位。
 
 ## 5. 从 DD 加载（核心链路）
 
@@ -447,6 +1011,93 @@ ha_innobase::open(name, ..., const dd::Table *table_def)      ha_innodb.cc:7177
 | 分区 | `format` / `instant_col` / `discard` |
 | 列 | `default` / `default_null` / `version_added` / `version_dropped` / `physical_pos` |
 | 索引 | `id` / `space_id` / `table_id` / `root` / `trx_id` |
+
+**★ 真实形态是 enum + `const char*[]` 数组，不是散落字面量**（`dict0dd.h:99-274`）：
+
+```cpp
+enum dd_table_keys { DD_TABLE_AUTOINC, DD_TABLE_DATA_DIRECTORY, DD_TABLE_VERSION,
+                     DD_TABLE_DISCARD, DD_TABLE_INSTANT_COLS, DD_TABLE__LAST };
+enum dd_column_keys { DD_INSTANT_COLUMN_DEFAULT, DD_INSTANT_COLUMN_DEFAULT_NULL,
+                      DD_INSTANT_VERSION_ADDED, DD_INSTANT_VERSION_DROPPED,
+                      DD_INSTANT_PHYSICAL_POS, DD_COLUMN__LAST };
+enum dd_partition_keys { DD_PARTITION_ROW_FORMAT, DD_PARTITION_INSTANT_COLS,
+                         DD_PARTITION_DISCARD, DD_PARTITION__LAST };
+enum dd_space_keys { DD_SPACE_FLAGS, DD_SPACE_ID, DD_SPACE_DISCARD,
+                     DD_SPACE_SERVER_VERSION, DD_SPACE_VERSION, DD_SPACE_STATE,
+                     DD_SPACE__LAST };
+enum dd_index_keys { DD_INDEX_ID, DD_INDEX_SPACE_ID, DD_TABLE_ID,
+                     DD_INDEX_ROOT, DD_INDEX_TRX_ID, DD_INDEX__LAST };
+
+const char *const dd_table_key_strings[DD_TABLE__LAST] = {
+    "autoinc", "data_directory", "version", "discard", "instant_col"};
+const char *const dd_column_key_strings[DD_COLUMN__LAST] = {
+    "default", "default_null", "version_added", "version_dropped", "physical_pos"};
+const char *const dd_partition_key_strings[DD_PARTITION__LAST] = {
+    "format", "instant_col", "discard"};
+const char *const dd_space_key_strings[DD_SPACE__LAST] = {
+    "flags", "id", "discard", "server_version", "space_version", "state"};
+const char *const dd_index_key_strings[DD_INDEX__LAST] = {
+    "id", "space_id", "table_id", "root", "trx_id"};
+```
+
+> ⚠️ **索引 id 的 key 字面量是 `"id"` 而不是 `"index_id"`**——这是最容易写错的一处。
+> ⚠️ **`data_file_name` / `index_file_name` 不在 `se_private_data` 里**，它们是 `dd::Partition::options()` 的 key（`dict0dd.h` 的 `data_file_name_key` / `index_file_name_key`）。
+> ★ `dd_space_states` 六值：`normal` / `discarded` / `corrupted` / `active` / `inactive` / `empty`（还有一个 `"unknown"` 兜底值）。
+
+**★ 加载链路的两个入口**（★ 都先查 dict cache，未命中才回 DD）：
+
+```cpp
+dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl, const char *name,
+                                    bool dict_locked, ulint ignore_err, int *error) {
+  /* ① intrinsic 表走 THD 私有 cache，不进 dict_sys */
+  if (thd) table = thd_to_innodb_session(thd)->lookup_table_handler(name);
+  if (table != nullptr) { table->acquire(); return table; }
+  ...
+  /* ★★ 不能持 dict_sys->mutex 去拿 MDL（死锁序），必须先放锁 */
+  if (dict_locked) dict_sys_mutex_exit();
+  bool got_mdl = dd_mdl_acquire(thd, mdl, db_name.c_str(), tbl_name.c_str());
+  if (dict_locked) dict_sys_mutex_enter();
+  ...
+  table = dict_table_check_if_in_cache_low(name);    /* ② 查 name_hash */
+  if (table != nullptr) { table->acquire_with_lock(); ... return table; }
+
+  dict_sys_mutex_exit();                             /* ③ 未命中 → 放锁回 DD */
+  ...
+  /* ④ 分区表：se_private_id 无效，需定位 leaf partition */
+  if (dd_table->se_private_id() == dd::INVALID_OBJECT_ID) { ... }
+  ...
+  /* ⑤ 加载后发现 corrupted 且不允许忽略 → 踢出 cache */
+  if (table && table->is_corrupted() && !(ignore_err & DICT_ERR_IGNORE_CORRUPT)) {
+    dict_sys_mutex_enter();
+    table->release();
+    dict_table_remove_from_cache(table);
+    table = nullptr;
+    dict_sys_mutex_exit();
+  }
+}
+```
+
+```cpp
+dict_table_t *dict_table_open_on_name(const char *table_name, bool dict_locked,
+                                      bool try_drop, dict_err_ignore_t ignore_err) {
+  ...
+  table = dict_table_check_if_in_cache_low(table_str.c_str());   /* ① 查 cache */
+  if (table == nullptr) table = dict_load_table(table_name, true, ignore_err);  /* ② 回 DD */
+  if (table != nullptr) {
+    if (ignore_err == DICT_ERR_IGNORE_NONE && table->is_corrupted()) {
+      /* ★★ Make life easy for drop table. */
+      dict_table_prevent_eviction(table);   /* ★ corrupted 表钉到 non-LRU 并返回 NULL */
+      ... return nullptr;
+    }
+    if (table->can_be_evicted) dict_move_to_mru(table);   /* ③ 命中即提升 MRU */
+    table->acquire();
+  }
+}
+```
+
+> ⚠️ **`dict_table_check_if_in_cache_low()` 在 `dict0priv.ic:68`，不在 `dict0dict.ic`**。
+> ⚠️ **不存在 `dict_table_get_on_id_low()`** —— 按 id 查 cache 的真名是 `dd_table_open_on_id_in_mem()`（`dict0dd.ic:147`）/ `dd_table_open_on_name_in_mem()`（`dict0dd.ic:185`）；`dict_table_get_low()` 存在，在 `dict0priv.ic:38`。
+> ★★ **`dd_table_open_on_id()` 里有个"放 dict mutex → 拿 MDL → 重查"的循环**，注释解释原因：放锁期间表可能被 rename，所以拿到 MDL 后要重查比对名字，不一致就释放 MDL 重来。
 
 ★ 这就是"DD 是权威、dict 是投影"的**具体通道**：InnoDB 把只能自己知道的物理信息（root 页号、`physical_pos`、instant 版本）塞进 `se_private_data` 存回 DD。
 
@@ -540,12 +1191,17 @@ Page 0 的完整布局（16K 页；本工作副本 `dict0dict.h:1110` 有现成�
 [0, 38)      FIL Header（38B）
 [38, 150)    FSP Header（112B）   ← 逐字段偏移见 page_structure.md
 [150, 10390) XDES Array（256 × 40B）  ← 描述 extent 0~255
-[10390, ...) Encryption Info（约 260B）
-[≈10654, +8) SDI Header（8B）= SDI_VERSION(4) + SDI_ROOT_PAGE_NUM(4)
-[≈10662, +5) Encryption Progress Info
+[10390, 10505) Encryption Info（115B = Encryption::INFO_MAX_SIZE）
+[10505, 10513) SDI Header（8B）= SDI_VERSION(4) + SDI_ROOT_PAGE_NUM(4)
+[10513, 10518) Encryption Progress Info（1B + 4B）
 ...
 [16376, 16384) FIL Trailer（8B）
 ```
+
+> ⚠️ **纠错**：SDI Header 的偏移**不是** ≈10654。它由 `fsp_header_get_sdi_offset()` **算出来**：
+> `XDES_ARR_OFFSET(150) + XDES_SIZE(40) × xdes_arr_size(256) + Encryption::INFO_MAX_SIZE(115) = **10505**`
+> （加密信息是 **115B** 不是"约 260B"。）早前引用的 ≈10654 有误——若你手上有别的资料也写 10654，按源码公式修正。
+> SDI 页族三种页的完整 layout（索引页 / 两种溢出页，含精确偏移）见 [`../../feat/sdi.md`](../../feat/sdi.md) 17.
 
 页用途：Page 0 = FSP_HDR、Page 1 = IBUF_BITMAP、Page 2 = 第一个 INODE 页、`Page 3+` = SDI B-tree 根页与各 DD 表的聚簇/二级索引根页及数据页。
 
@@ -646,6 +1302,111 @@ void dict_table_mark_dirty(dict_table_t *table) {
 
 ★ 这解释了一个反直觉现象：**表被从 dict cache 淘汰时还要写一次磁盘**——因为动态元数据只活在内存 + 这张表里，淘汰即"最后一次保存机会"。
 
+**★ `dict_persist_to_dd_table_buffer()` 完整源码**（`dict0dict.cc:4250`，★ checkpoint 的刷元数据入口）：
+
+```cpp
+void dict_persist_to_dd_table_buffer() {
+  bool persisted = false;
+  if (dict_sys == nullptr) {
+    log_set_dict_max_allowed_checkpoint_lsn(*log_sys, 0);
+    return;
+  }
+  mutex_enter(&dict_persist->mutex);
+
+  for (dict_table_t *table : dict_persist->dirty_dict_tables.removable()) {
+    ut_ad(table->dirty_status.load() == METADATA_DIRTY ||
+          table->dirty_status.load() == METADATA_BUFFERED);
+    if (table->dirty_status.load() == METADATA_DIRTY) {
+      /* We should not attempt to write to data pages while shutting down
+      page cleaners. */
+      if (srv_shutdown_state.load() >= SRV_SHUTDOWN_FLUSH_PHASE) {
+        ut_d(ut_error);
+      } else {
+        dict_table_persist_to_dd_table_buffer_low(table);
+        persisted = true;
+      }
+    }
+  }
+  ut_ad(dict_persist->num_dirty_tables == 0);
+
+  /* Get this lsn with dict_persist->mutex held,
+  so no other concurrent dynamic metadata change logs
+  would be before this lsn. */
+  const lsn_t persisted_lsn = log_get_lsn(*log_sys);
+  /* As soon as we release the dict_persist->mutex, new dynamic
+  metadata changes could happen. They would be not persisted
+  until next call to dict_persist_to_dd_table_buffer.
+  We must not remove redo which could allow to deduce them.
+  Therefore the maximum allowed lsn for checkpoint is the current lsn. */
+  log_set_dict_max_allowed_checkpoint_lsn(*log_sys, persisted_lsn);
+  /*  ★★ 给 checkpoint LSN 设上界：元数据必须是"已落盘"的 */
+
+  mutex_exit(&dict_persist->mutex);
+  if (persisted) log_write_up_to(*log_sys, persisted_lsn, true);
+}
+```
+
+**★ `table_dirty_status` 三态枚举完整注释**（`dict0mem.h:1900`）：
+
+```cpp
+enum table_dirty_status {
+  /** Some persistent metadata is now dirty in memory, need to be
+  written back to DDTableBuffer table and(or directly to) DD table.
+  There could be some exceptions, when it's marked as dirty, but
+  the metadata has already been written back to DDTableBuffer.
+  For example, if a corrupted index is found and marked as corrupted,
+  then it gets dropped. At this time, the dirty_status is still of
+  this dirty value. Also a concurrent checkpoint make this bit
+  out-of-date for other working threads, which still think the
+  status is dirty and write-back is necessary.
+  There could be either one row or no row for this table in
+  DDTableBuffer table */
+  METADATA_DIRTY = 0,
+  /** Some persistent metadata is buffered in DDTableBuffer table,
+  need to be written back to DD table. There is must be one row in
+  DDTableBuffer table for this table */
+  METADATA_BUFFERED,
+  /** All persistent metadata are up to date. There is no row
+  for this table in DDTableBuffer table */
+  METADATA_CLEAN
+};
+```
+
+> ★ 注意 `METADATA_DIRTY == 0` 是**枚举首位**，而新入缓存的表被置为 `METADATA_CLEAN`（`dict_table_add_to_cache()` 末尾 `table->dirty_status.store(METADATA_CLEAN)`）。
+
+**★ `dict_persist_t` 与 `Persister` 类体系**（⚠️ 不是数组，是 `std::map`）：
+
+```cpp
+struct dict_persist_t {
+  UT_LIST_BASE_NODE_T(dict_table_t, dirty_dict_tables) dirty_dict_tables;
+  ib_mutex_t mutex;                    /* ★ 保护 dirty_status 与 in_dirty_dict_tables_list */
+  std::atomic<uint32_t> num_dirty_tables;
+  std::atomic<bool> m_persist_immediately;   /* ★ clone 短期开启 */
+  DDTableBuffer *table_buffer;         /* ★ mysql.innodb_dynamic_metadata 的低层访问包装 */
+  Persisters *persisters;
+};
+
+class Persisters {
+  typedef std::map<persistent_type_t, Persister *, std::less<persistent_type_t>,
+                   ut::allocator<std::pair<const persistent_type_t, Persister *>>>
+      persisters_t;      /* ★★ std::map<type, Persister*>，不是数组 */
+  Persister *get(persistent_type_t type) const;
+  Persister *add(persistent_type_t type);
+  ...
+};
+```
+
+```cpp
+/* dict_persist_init() —— 只注册两种活跃类型 */
+  dict_persist->persisters = ut::new_withkey<Persisters>(UT_NEW_THIS_FILE_PSI_KEY);
+  dict_persist->persisters->add(PM_INDEX_CORRUPTED);
+  dict_persist->persisters->add(PM_TABLE_AUTO_INC);
+```
+
+> ⚠️ **`dict0sd.cc` 不存在**；动态元数据代码在 `dict0dict.cc` + `dict0mem.h` + `log0recv.cc`。
+> ⚠️ **不存在 `dict_table_t::update_metadata` / `get_metadata()` / `set_metadata()` / `dict_table_persist_metadata()` / `dict_table_read_metadata()`** —— 真名是 `PersistentTableMetadata` 类 + `dict_init_dynamic_metadata()` + `dict_table_apply_dynamic_metadata()` + `dict_table_read_dynamic_metadata()` + `dict_table_load_dynamic_metadata()` + `dict_table_persist_to_dd_table_buffer[_low]()`。
+> ⚠️ **动态元数据写到 `mysql.innodb_dynamic_metadata`，不是 `mysql.innodb_table_stats`**——后者是持久化统计。
+
 #### ★ 持久化走 redo，不走上层表：`MLOG_TABLE_DYNAMIC_META`
 
 动态元数据为什么不直接写 `mysql.innodb_dynamic_metadata` 表，而是先写 redo？因为**写这张表要拿表锁，而"元数据变化"发生在引擎最底层**（插入一行就要推进 autoinc）——底层代码持有上层系统表的锁，极易与 DDL 形成环。redo 是引擎最底层的设施，任何位置都能写，不存在锁层次问题（月报 2019/12 的原文表述）。
@@ -680,6 +1441,122 @@ void Persister::write_log(table_id_t id,
 ```
 
 ★ **压缩设计**：table id 与 version 都是变长编码（1..11 字节），autoinc 计数器这种高频写入的元数据，一次 mtr 只多几十字节。`Persister` 是按类型分发的抽象——`AutoIncPersister` / `CorruptedIndexPersister` / `UpdateTimePersister` 各自实现 `write()`（序列化）与 `read()`（反序列化）。
+
+> ⚠️ **勘误：`UpdateTimePersister` 不存在**！8.0.39 只有 **2 种活跃类型**，第三种至今是 TODO：
+
+```cpp
+enum persistent_type_t {
+  PM_SMALLEST_TYPE = 0,
+  /** Persistent Metadata type for corrupted indexes */
+  PM_INDEX_CORRUPTED = 1,
+  /** Persistent Metadata type for autoinc counter */
+  PM_TABLE_AUTO_INC = 2,
+  /* TODO: Will add following types
+  PM_TABLE_UPDATE_TIME = 3,
+  Maybe something tablespace related
+  PM_TABLESPACE_SIZE = 4,
+  PM_TABLESPACE_MAX_TRX_ID = 5, */
+  PM_BIGGEST_TYPE = 3
+};
+class PersistentTableMetadata {
+  ...
+  /* TODO: We will add update_time, etc. here and APIs accordingly */
+};
+```
+
+> ★★ 所以 **`dict_table_t::update_time` 虽然存在（2442），但完全不参与动态元数据持久化**——重启后它会重置。
+
+**★ `PersistentTableMetadata` 与 `Persister` 接口**：
+
+```cpp
+class Persister {
+ public:
+  virtual ~Persister() = default;
+  virtual ulint write(const PersistentTableMetadata &metadata, byte *buffer,
+                      ulint size) const = 0;
+  virtual ulint get_write_size(const PersistentTableMetadata &metadata) const = 0;
+  virtual ulint read(PersistentTableMetadata &metadata, const byte *buffer,
+                     ulint size, bool *corrupt) const = 0;
+  /** Aggregate metadata entries into a single metadata instance, considering
+  version numbers */
+  virtual void aggregate(PersistentTableMetadata &metadata,
+                         const PersistentTableMetadata &new_entry) const = 0;
+  void write_log(table_id_t id, const PersistentTableMetadata &metadata,
+                 mtr_t *mtr) const;
+};
+```
+
+**★ `aggregate()` 的两种语义**（★ 这是"多条 redo 如何合并"的关键）：
+
+```cpp
+void CorruptedIndexPersister::aggregate(PersistentTableMetadata &metadata,
+                                        const PersistentTableMetadata &new_entry) const {
+  for (auto id : new_entry.get_corrupted_indexes()) {
+    metadata.add_corrupted_index(id);      /* ★ 损坏列表：直接累加，无版本概念 */
+  }
+}
+
+void AutoIncPersister::aggregate(PersistentTableMetadata &metadata,
+                                 const PersistentTableMetadata &new_entry) const {
+  if (new_entry.get_version() > metadata.get_version()) {
+    metadata.set_autoinc(new_entry.get_autoinc());
+    metadata.set_version(new_entry.get_version());
+    /* ★ 版本更新 → 覆盖 */
+  } else if (new_entry.get_version() == metadata.get_version()) {
+    metadata.set_autoinc_if_bigger(new_entry.get_autoinc());
+    /* ★ 同版本 → 取大 */
+  }
+  /* ★ 版本更旧 → 忽略（ALTER 回滚的幂等保证） */
+}
+```
+
+```cpp
+bool dict_table_apply_dynamic_metadata(dict_table_t *table,
+                                       const PersistentTableMetadata *metadata) {
+  ...
+  /* Here is how version play role. Basically, version would be increased
+  by one during every DDL. So applying metadata here should only be
+  done when the versions match. ...
+  If the metadata version is bigger than the one in table.
+  it could be that an ALTER TABLE has been rolled back, so metadata
+  in new version should be ignored too. */
+  if (table->version != metadata->get_version()) {
+    return get_dirty;      /* ★★ version 不匹配直接丢弃 autoinc —— DDL 回滚的幂等关键 */
+  }
+  uint64_t autoinc = metadata->get_autoinc();
+  if (autoinc > table->autoinc_persisted) {
+    table->autoinc = autoinc;
+    table->autoinc_persisted = autoinc;
+    get_dirty = true;
+  }
+  return get_dirty;
+}
+```
+
+**★ redo 记录的编解码**：
+
+```cpp
+static inline byte *mlog_write_initial_dict_log_record(mlog_id_t type,
+                                                       table_id_t id,
+                                                       uint64_t version,
+                                                       byte *log_ptr, mtr_t *mtr) {
+  ut_ad(type <= MLOG_BIGGEST_TYPE);
+  ut_ad(type == MLOG_TABLE_DYNAMIC_META);
+  mach_write_to_1(log_ptr, type);   log_ptr++;            /* 1B: 62 */
+  log_ptr += mach_u64_write_much_compressed(log_ptr, id);      /* 1~11B */
+  log_ptr += mach_u64_write_much_compressed(log_ptr, version); /* 1~11B */
+  mtr->added_rec();
+  return log_ptr;
+}
+```
+
+```
+CorruptedIndex 布局： 1B(PM_INDEX_CORRUPTED) | 1B(个数) | 12B×(space_id 4B + index_id 8B)
+AutoInc 布局：       1B(PM_TABLE_AUTO_INC)   | 1~11B(autoinc 变长压缩)
+```
+
+> ★ `CorruptedIndexPersister::INDEX_ID_LENGTH = 12`；`AutoIncPersister::get_write_size()` **恒返回 12**（注释：*"We just return the max possible size ... so we don't calculate every time"*）。
+> ⚠️ **`dict_set_corrupted()` 会强制 `log_write_up_to(...)` 同步落盘**；而 `dict_table_autoinc_log()` 明确注释 *"No need to flush due to performance reason"*——两种动态元数据的持久性保证强度不同。
 
 `CorruptedIndexPersister::write`（`:5515`）的格式就是个例子：
 
@@ -729,6 +1606,58 @@ case MLOG_TABLE_DYNAMIC_META:
 写入：dict_table_mark_dirty → (mtr) Persister::write_log → redo
 快照：checkpoint 时 dict_persist_to_dd_table_buffer → mysql.innodb_dynamic_metadata
 恢复：redo 扫描 parseMetadataLog → table_buffer → dict_table_load_dynamic_metadata
+```
+
+**★★ "checkpoint 刷数据页，不刷元数据"的准确表述——其实是"紧邻的前置强制动作"**（`log0chkp.cc:959`）：
+
+```cpp
+static void log_consider_checkpoint(log_t &log) {
+  ut_ad(log_checkpointer_mutex_own(log));
+  if (!log_should_checkpoint(log)) return;
+
+  /* It's clear that a new checkpoint should be written.
+  So do write back the dynamic metadata. Since the checkpointer
+  mutex is low-level one, it has to be released first. */
+  log_checkpointer_mutex_exit(log);
+
+  if (log_test == nullptr) {
+    dict_persist_to_dd_table_buffer();   /* ★★ 证据：checkpoint 之前先刷动态元数据 */
+  }
+
+  log_checkpointer_mutex_enter(log);
+
+  /* We need to re-check if checkpoint should really be written, because
+  we re-acquired the checkpointer_mutex. ... */
+  if (!log_should_checkpoint(log)) return;
+
+  log_checkpoint(log);   /* ★ checkpoint 本体只刷数据页 */
+}
+```
+
+> ★★ 修正一个常见误读：**checkpoint 自身只刷页**，但元数据不是"不管"，而是在 `log_checkpoint()` **之前**由 `log_consider_checkpoint()` 显式调用 `dict_persist_to_dd_table_buffer()` 完成——因为 checkpoint 之后 redo 可被回收，元数据必须先落表。
+> ★ 这个顺序还有一个**死锁约束**：`log_stop_background_threads()` 注释说明"不能在持 `log.sn_lock_inst` X 锁时停后台线程"，因为 `dict_persist_to_dd_table_buffer()` 要写 redo，而 checkpointer 线程在等它。
+> ★ shutdown 阶段有两处兜底调用（`srv0start.cc:2998` 与 `:3015`，后者注释解释"master thread 的操作可能产生元数据"）。
+
+**★ redo 恢复期的写入**（`MetadataRecover::store()`，`log0recv.cc:684`）：
+
+```cpp
+void MetadataRecover::store() {
+  ut_ad(dict_sys->dynamic_metadata != nullptr);
+  ut_ad(dict_persist->table_buffer != nullptr);
+  DDTableBuffer *table_buffer = dict_persist->table_buffer;
+  if (empty()) return;
+
+  mutex_enter(&dict_persist->mutex);
+  for (auto meta : m_tables) {
+    byte buffer[REC_MAX_DATA_SIZE];
+    size_t size = dict_persist->persisters->write(*meta.second, buffer);
+    dberr_t error = table_buffer->replace(meta.first,
+                                          meta.second->get_version(), buffer, size);
+    if (error != DB_SUCCESS) ut_d(ut_error);
+  }
+  mutex_exit(&dict_persist->mutex);
+}
+/*  ★ 调用点 srv0start.cc:2120，之后立即 log_buffer_flush_to_disk() */
 ```
 
 #### `mysql.innodb_ddl_log`：物理资源的原子性
@@ -796,6 +1725,151 @@ record.set_deletable(false);
 
 `replay()` 对每条记录做的是"**把物理世界恢复到记录期望的状态**"：`FREE_TREE_LOG` → 若树还在就删、已删则跳过（幂等）；`DELETE_SPACE_LOG` → 若文件还在就删。每条 replay 都是"检查-执行"而非"盲目重放"——这正是幂等的实现方式。
 
+**★ `Log_DDL` 三个入口的完整源码**：
+
+```cpp
+dberr_t Log_DDL::recover() {
+  if (srv_read_only_mode || srv_force_recovery > 0) return DB_SUCCESS;
+  ib::info(ER_IB_MSG_662) << "DDL log recovery : begin";
+  thread_local_ddl_log_replay = true;
+  s_in_recovery = true;
+  dberr_t err = replay_all();
+  thread_local_ddl_log_replay = false;
+  s_in_recovery = false;
+  ib::info(ER_IB_MSG_663) << "DDL log recovery : end";
+  return err;
+}
+
+dberr_t Log_DDL::replay_all() {
+  ut_ad(is_in_recovery());
+  DDL_Log_Table ddl_log;
+  DDL_Records records;
+  dberr_t err = ddl_log.search_all(records);   /* ★ 全表扫描，只在 recovery 用 */
+  ut_ad(err == DB_SUCCESS);
+  for (auto record : records) {
+    err = log_ddl->replay(*record);
+    if (err != DB_SUCCESS) break;
+  }
+  if (err != DB_SUCCESS) return err;
+  err = delete_by_ids(records);   /* ★★ 回放完立刻删除 —— 幂等 */
+  ut_ad(err == DB_SUCCESS || err == DB_TOO_MANY_CONCURRENT_TRXS);
+  for (auto record : records) {
+    if (record->get_deletable()) ut::delete_(record);
+  }
+  return err;
+}
+
+dberr_t Log_DDL::post_ddl(THD *thd) {
+  if (skip(nullptr, thd)) return DB_SUCCESS;
+  if (srv_read_only_mode || srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN) {
+    return DB_SUCCESS;
+  }
+  ulint thread_id = thd_get_thread_id(thd);
+  thread_local_ddl_log_replay = true;    /* ★ 回放期间禁止再写 DDL log */
+  dberr_t err = replay_by_thread_id(thread_id);
+  thread_local_ddl_log_replay = false;
+  return err;
+}
+```
+
+```cpp
+inline bool Log_DDL::skip(const dict_table_t *table, THD *thd) {
+  return (recv_recovery_on || thread_local_ddl_log_replay ||
+          (table != nullptr && table->is_temporary()) ||
+          thd_is_bootstrap_thread(thd));
+}
+/*  ★★ 四种跳过情形：恢复期 / 正在回放 / 临时表 / bootstrap 线程 */
+
+inline uint64_t Log_DDL::next_id() {
+  /*  ★★ DDL log 的 id 来自 mysql.innodb_ddl_log 表自己的 AUTOINC 列 */
+  dict_table_autoinc_lock(dict_sys->ddl_log);
+  uint64_t autoinc = dict_table_autoinc_read(dict_sys->ddl_log);
+  ++autoinc;
+  dict_table_autoinc_update_if_greater(dict_sys->ddl_log, autoinc);
+  dict_table_autoinc_unlock(dict_sys->ddl_log);
+  return autoinc;
+}
+```
+
+**★ 两种写入模式**（★ 这是理解 DDL log 的核心）：
+
+```cpp
+/* ① DROP_LOG：只写不删 —— 等 post_ddl/recover 才真正执行 */
+dberr_t Log_DDL::write_drop_log(trx_t *trx, const table_id_t table_id) {
+  if (skip(nullptr, trx->mysql_thd)) return DB_SUCCESS;
+  trx->ddl_operation = true;
+  uint64_t id = next_id();
+  ulint thread_id = thd_get_thread_id(trx->mysql_thd);
+  return insert_drop_log(trx, id, thread_id, table_id);
+  /*  ★ 注意：这里【不】调 delete_by_id —— DROP 的收尾交给回放 */
+}
+
+/* ② RENAME_TABLE_LOG：insert 后立即 delete —— DDL log 只在崩溃窗口内有效 */
+dberr_t Log_DDL::write_rename_table_log(dict_table_t *table, const char *old_name,
+                                        const char *new_name) {
+  ...
+  dberr_t err = insert_rename_table_log(id, thread_id, table->id, old_name, new_name);
+  if (err != DB_SUCCESS) return err;
+  err = delete_by_id(trx, id, true);   /* ★★ 成功路径立即删除 */
+  ut_ad(err == DB_SUCCESS || err == DB_TOO_MANY_CONCURRENT_TRXS);
+  return err;
+}
+```
+
+> ⚠️ **`Log_DDL::insert_drop_table_log()` 不存在** —— 真名 `write_drop_log()`（`log0ddl.cc:1258`）+ 私有 `insert_drop_log()`（1283）。`insert_rename_table_log()` 确实存在。
+> ⚠️ **`create_ddl_log_table()` 不存在** —— 表定义在 `innobase_ddse_dict_init()` 里用 `dd::Object_table` 注册（`ha_innodb.cc:13025-13042`），由 server 层 DD bootstrap 建表。
+
+**★ 表定义与 `Log_Type`**（★ `mysql.innodb_ddl_log` 是**隐藏表**）：
+
+```cpp
+  dd::Object_table *innodb_ddl_log = dd::Object_table::create_object_table();
+  innodb_ddl_log->set_hidden(true);      /* ★ SHOW TABLES 看不到 */
+  def->set_table_name("innodb_ddl_log");
+  def->add_field(0, "id", "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT");
+  def->add_field(1, "thread_id", "thread_id BIGINT UNSIGNED NOT NULL");
+  def->add_field(2, "type", "type INT UNSIGNED NOT NULL");
+  def->add_field(3, "space_id", "space_id INT UNSIGNED");
+  def->add_field(4, "page_no", "page_no INT UNSIGNED");
+  def->add_field(5, "index_id", "index_id BIGINT UNSIGNED");
+  def->add_field(6, "table_id", "table_id BIGINT UNSIGNED");
+  def->add_field(7, "old_file_path", "old_file_path VARCHAR(512) COLLATE UTF8MB3_BIN");
+  def->add_field(8, "new_file_path", "new_file_path VARCHAR(512) COLLATE UTF8MB3_BIN");
+  def->add_index(0, "index_pk", "PRIMARY KEY(id)");
+  def->add_index(1, "index_k_thread_id", "KEY(thread_id)");
+  /*  ★★ post_ddl() 的 replay_by_thread_id() 走的就是这个二级索引 */
+```
+
+```cpp
+enum class Log_Type : uint32_t {   /* 4 字节，对应 type 列 */
+  SMALLEST_LOG = 1,
+  FREE_TREE_LOG = 1,               /* 删索引树 */
+  DELETE_SPACE_LOG,                /* 删文件 */
+  RENAME_SPACE_LOG,                /* 重命名文件 */
+  DROP_LOG,                        /* 删 innodb_table_metadata 里的条目 */
+  RENAME_TABLE_LOG,                /* 改 dict cache 里的表名 */
+  REMOVE_CACHE_LOG,                /* 从 dict cache 移除表 */
+  ALTER_ENCRYPT_TABLESPACE_LOG,
+  ALTER_UNENCRYPT_TABLESPACE_LOG,
+  BIGGEST_LOG = ALTER_UNENCRYPT_TABLESPACE_LOG
+};
+```
+
+**★ `DROP_LOG` 的回放内容——与动态元数据的交汇点**（`log0ddl.cc:1805`）：
+
+```cpp
+void Log_DDL::replay_drop_log(const table_id_t table_id) {
+  mutex_enter(&dict_persist->mutex);
+  ut_d(dberr_t error =) dict_persist->table_buffer->remove(table_id);
+  /*  ★★ DROP_LOG 回放 = 从 mysql.innodb_dynamic_metadata 删掉该表整行 */
+  ut_ad(error == DB_SUCCESS);
+  mutex_exit(&dict_persist->mutex);
+  DBUG_INJECT_CRASH("ddl_log_crash_after_replay", crash_after_replay_counter++);
+}
+```
+
+> ★★ 两处 `recovery 时跳过`：`replay_rename_table_log()` 与 `replay_remove_cache_log()` 都在 `is_in_recovery()` 时直接 return——因为 **recovery 时 dict cache 是空的，没有"表在缓存里"这回事**，这两类记录只在 `post_ddl()` 路径有意义。
+> ★ 写入用 `BTR_NO_LOCKING_FLAG`（`DDL_Log_Table::insert`）——注释暗示"每个线程只碰自己的记录"，故不加行锁。
+
 ---
 
 ## 9. 与其它模块的接口
@@ -822,6 +1896,60 @@ record.set_deletable(false);
 - **启动不重建缓存**，是惰性构建。
 
 ### 待补清单
+
+---
+
+## ★★ 真名勘误全表
+
+| 常见说法 / 想当然 | 8.0.39 真相 |
+|---|---|
+| `dict_table_t::n_mysql_handles_opened` | **不存在** → `n_ref_count`（`std::atomic<uint64_t>`，`dict0mem.h:2420`；非 debug 下是 `private`） |
+| `dict_table_t::instant_drop_version` | **不存在** → 表级只有 `current_row_version`；drop 版本分散在每列的 `dict_col_t::version_dropped` |
+| `dict_table_t::file_unreadable` | **不存在**（8.0 已彻底移除）→ 语义最接近的是 **`ibd_file_missing`**（`dict0mem.h:2059`） |
+| `dict_table_t::is_instant_dropped()` | **不存在** → 只有 `dict_col_t::is_instant_dropped()` |
+| `dict_table_t::get_nth_col()` / `get_nth_v_col()`（成员形式） | **不存在** → `get_col(uint pos)`；虚拟列走自由函数 `dict_table_get_nth_v_col`（非 debug 下是宏） |
+| `dict_table_t::space_id()` | **不存在** → 直接读 `space` 成员，或用 `first_index()->space_id()`（`dict0mem.h:1659`） |
+| `dict_index_t::n_core_fields` / `n_core_null_bytes` | **均不存在** → `n_total_fields`（1131）+ `n_instant_nullable`（1138）+ `nullables[MAX_ROW_VERSION+1]`（1186） |
+| `dict_index_t::instant_fields`（成员） | **不存在** → `get_instant_fields()` 是纯计算函数（`dict0mem.ic:92`） |
+| `dict_index_t::is_dropped()` | **不存在**（`dict0dd.cc:1774` 的 `is_dropped()` 是 DDL 层自由函数） |
+| `dict_index_t::get_n_fields()`（成员形式） | **不存在** → 自由函数 `dict_index_get_n_fields()`（`dict0dict.ic:667`），**有 row version 时返回 `n_total_fields`** |
+| `dict_col_t::phy_pos` 是列偏移 | **错** → bit-packed 的 `uint32_t`：bit15=是否有前缀、bit31..16=prefix_phy_pos、bit0..14=col_phy_pos |
+| `dict_col_t::get_phy_pos()` 返回列物理位置 | **不准确** → 它返回整个 32 位元数据；真正位置是 `get_col_phy_pos()` |
+| `version_added == 0` 表示 instant 添加 | **错** → `UINT8_UNDEFINED`(255) 是未设置，且 `is_instant_added()` 要求 `version_added > 0` |
+| table 与 index 的 `has_instant_cols()` 同义 | **不同义** → table 版算 `is_upgraded_instant() \|\| n_instant_cols < n_cols`；index 版直接返回 bit 字段 `instant_cols` |
+| `has_instant_cols()` 涵盖 instant drop | **不涵盖** → drop 由 `has_instant_drop_cols()` / `has_row_versions()` 判定 |
+| `dict_sys->table_hash` 类型是 `dict_table_hash_t` / `id_to_hash_map` | **都不存在**（全仓 0 命中）→ 通用 **`hash_table_t`**（`hash0hash.h:421`），且 `type == HASH_TABLE_SYNC_NONE`（靠 `dict_sys->mutex` 保护） |
+| `dict_sys_t::mutex` 与 `dict_operation_lock` 同一个 | **不是** → 前者 `ib_mutex_t`，后者 `rw_lock_t*`；淘汰时**先 X 锁后者再进前者**，顺序固定 |
+| `dict_mutex_enter_for_mysql()` 是老版本残留 | **真实存在**（`dict0dict.cc:308`），是一行薄封装 |
+| 淘汰阈值是 `dict_sys->size` | **错** → `size` 只做内存记账；真实阈值是 **LRU 链表长度** `>= table_def_size` |
+| 淘汰由 open table 路径同步触发 | **错** → 由 **master 线程**驱动（`srv_master_evict_from_table_cache`，周期 50% + 每轮 100%） |
+| `dict_table_check_if_in_cache_low()` 在 `dict0dict.ic` | **不在** → `dict0priv.ic:68` |
+| `dict_table_get_on_id_low()` | **不存在** → `dd_table_open_on_id_in_mem()`（`dict0dd.ic:147`）/ `dd_table_open_on_name_in_mem()`（185） |
+| `dd_table_fail_when_dd_result_is_inconsistent()` | **不存在** → `dd_table_match()` + `dict_set_corrupted()` + `dict_table_remove_from_cache()` |
+| `dict_index_set_corrupted()` / `dict_index_is_corrupted()` | **不存在** → `dict_set_corrupted()`（`dict0dict.cc:4163`）/ `dict_index_t::is_corrupted()`（`dict0mem.h:1327`） |
+| `dict_table_t::corrupted` 成员 | **不存在** → 方法 `is_corrupted()`，语义 = **聚簇索引**被置 `DICT_CORRUPT`；二级索引损坏不算表损坏 |
+| `dict_table_t::flags2` 的 `64` 位 | **已废弃未使用**（`DICT_TF2_*` 从 1/2/4/8/16/32 直接跳到 128） |
+| `dict0sd.cc` 存动态元数据 | **不存在**（目录下只有 `dict0stats.cc` / `dict0sdi.cc` / `dict0dd.cc`） |
+| `dict_table_t::update_metadata` / `get_metadata()` / `set_metadata()` | **均不存在** → `PersistentTableMetadata` + `dict_init_dynamic_metadata()` + `dict_table_apply_dynamic_metadata()` |
+| `dict_table_persist_metadata()` / `dict_table_read_metadata()` | **不存在** → `dict_table_persist_to_dd_table_buffer[_low]()` / `dict_table_read_dynamic_metadata()` / `dict_table_load_dynamic_metadata()` |
+| `persisters` 是数组 | **不是** → `std::map<persistent_type_t, Persister*>` |
+| 动态元数据写 `mysql.innodb_table_stats` | **错** → 写 **`mysql.innodb_dynamic_metadata`**（后者是持久化统计） |
+| `UpdateTimePersister` 存在 | **不存在** → 8.0.39 只有 2 种活跃类型；`PM_TABLE_UPDATE_TIME = 3` 至今是 TODO，`update_time` 不持久化 |
+| `create_ddl_log_table()` | **不存在** → 表定义在 `innobase_ddse_dict_init()` 里注册，由 server 层 DD bootstrap 建表 |
+| `Log_DDL::insert_drop_table_log()` | **不存在** → `write_drop_log()`（1258）+ 私有 `insert_drop_log()`（1283） |
+| `dict_stats_update_if_needed` | **不存在** → `dict_stats_update()`（`dict0stats.cc:2817`） |
+| `dict_table_t::stats_` / `dict_stats_` 成员 | **不存在这两个名字** → `stat_n_rows` / `stat_clustered_index_size` / `stat_sum_of_other_index_sizes` / `stats_last_recalc` 等独立成员 |
+| 启动时重建 dict cache | **不重建** → `dict_create()` 只做 `dict_hdr_create()` + `dict_boot()`；SYS_* 四表的内存定义**仅当 `srv_is_upgrade_mode`** 才构造 |
+
+**★ 三个"结构性事实"**
+
+1. **淘汰的三道闸门**：`dict_table_can_be_evicted()` 要求 `foreign_set.empty()` && `referenced_set.empty()` && `get_ref_count()==0` && `!lock_table_has_locks()` && **所有索引的 `search_info->ref_count == 0`**（AHI 引用归零）。而触发判据是 LRU 链表长度而非内存量——**这是"表定义缓存"与"buffer pool"在淘汰策略上的根本差异**（后者按页的 LRU + 脏页刷盘，前者按对象个数）。
+
+2. **`dict_sys->size` 是纯记账，却决定了两类安全边界**：① 淘汰/删除时 `dict_sys->size -= ...`，`dict_close()` 断言归零——记错账会导致 shutdown 断言失败；② 它对外只出现在 `SHOW ENGINE INNODB STATUS` 的 "Dictionary memory allocated"。
+
+3. **动态元数据的三态机是"内存 → buffer table → DD"的三级下推**：`METADATA_CLEAN`（无行）→ `METADATA_DIRTY`（内存脏，可能有行也可能无行）→ `METADATA_BUFFERED`（一定有行，等待回写）。而 `dict_persist_to_dd_table_buffer()` 在 `dict_persist->mutex` 保护下取 `log_get_lsn()` 并 `log_set_dict_max_allowed_checkpoint_lsn()`——**这一行是整套机制与 redo 回收的唯一耦合点**：checkpoint 的 LSN 上界由"元数据最后落盘时刻"决定。
+
+> 注：`dict0mem.h` / `dict0dict.h` / `mtr0types.h` 中的部分 `// 中文` 与 `/** ... */` 块为本工作区人工批注，非 Oracle 上游原文。
 
 （全部完成，暂无待补）
 

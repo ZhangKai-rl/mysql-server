@@ -15,6 +15,9 @@
 - [七、derived table：merge 还是 materialize](#七derived-tablemerge-还是-materialize)
 - [八、窗口函数 setup](#八窗口函数-setup)
 - [九、prepare 之后才存在的东西](#九prepare-之后才存在的东西)
+- [十、权限检查：列级权限全链路](#十权限检查列级权限全链路)（★ 权限沿树下推：`want_privilege` / `check_grant_column` / 权限↔位图合流 / `any_privileges`）
+- [十一、name resolution 规则](#十一name-resolution-规则)（★ 三条链 / ON 可见表 / `find_field_in_tables` 歧义判定 / USING-NATURAL / 别名 `Item_ref`）
+- [十二、窗口函数 setup](#十二窗口函数-setup)（★ `setup_windows1/2` 时机 / 命名 vs 匿名 / 边界两次检查 / 与 HAVING 的位图）
 - [核心调用栈](#核心调用栈)
 
 ---
@@ -727,6 +730,8 @@ bool Item_func::fix_fields(THD *thd, Item **) {
 
 ### 4.2 Item_field::fix_fields —— 列名 → Field*
 
+> ★ `Field` 的完整剖析（含 `set_field()` 的属性单向快照、`find_field_in_tables()` → `find_field_in_table()` 的解析链）见 [`../field.md`](../field.md) 5.1.3。本节只讲**名字解析视角**——`fix_fields()` 在 resolver 流程里的位置与算法。
+
 **定义 `item.cc:5690`**，算法伪码在注释 `item.cc:5648-5671`：
 
 ```cpp
@@ -1135,6 +1140,543 @@ bool Query_block::merge_derived(THD *thd, Table_ref *derived_table) {
 | `Query_expression::prepared = true` | `set_prepared` `sql_lex.h:1158`，调用点 `sql_union.cc:874` |
 
 **反例**（不是 prepare 产物，用于对照）：`JOIN` 对象（`sql_resolver.cc:183` 有 `assert(join == nullptr)`，它在 optimize 阶段才创建）、`AccessPath` 树、`sql_const_folding.cc` 的结果 —— 都是 optimize 产物。
+
+---
+
+## 十、权限检查：列级权限全链路
+
+> 源码坐标：`[R1] sql/sql_resolver.cc` · `[R2] sql/sql_base.cc` · `[R4] sql/auth/sql_authorization.cc` · `[R5] sql/sql_select.cc` · `[R7] sql/item.h·cc` · `[R8] sql/table.cc` · `[R9] sql/thd_raii.h`
+>
+> ★ **先纠正一个名字**：8.0.39 **没有 `check_privilege()`**（5.x 旧名）。权限检查被拆成三层，真正干活的地方在 name resolution 的**叶子**上。
+
+### 10.1 结论先行：权限是"沿树递归下推"，不是"集中检查"
+
+```
+表级权限   check_view_privileges()      → check_single_table_access() → check_access()/check_grant()
+列级权限   find_field_in_table_ref()    → check_column_grant_in_table_ref() → check_grant_column()
+集中补扫   Query_block::check_column_privileges()  → item->walk(&Item::check_column_privileges)
+```
+
+⇒ **列级权限 99% 是在 `Item_field::fix_fields()` 里、由 `find_field_in_tables()` 顺手做完的**——**权限检查和 name resolution 是同一趟遍历**：找到列的同时查权限、标 `read_set`。所以 prepare 里看不到一处显眼的"权限检查步骤"。
+
+### 10.2 权限检查在 prepare 中的位置（时间轴）
+
+```
+Query_block::prepare()  [R1]
+│
+├─ 234: thd->mark_used_columns = check_privs ? MARK_COLUMNS_READ : MARK_COLUMNS_NONE;
+├─ 235: Access_bitmask want_privilege_saved = thd->want_privilege;   ★ 压栈保存外层需求
+├─ 236: thd->want_privilege = check_privs ? SELECT_ACL : 0;          ★ 本层需求生效
+│        └─ 派生表 body 解析期间关掉（还不知道父查询是读还是写）
+│
+├─ 246: setup_tables()                  → 建 leaf_tables
+├─ 249: resolve_placeholder_tables()    → 派生表/表函数展开
+├─ 254: check_view_privileges(SELECT_ACL, SELECT_ACL)   ★① 表级（视图合并后补查）
+├─ 261: setup_natural_join_row_types()  → mark_common_columns()      ★② USING 列权限
+├─ 278: setup_wild()                    → '*' 展开，逐列查权限
+├─ 279: setup_base_ref_items()
+├─ 281: setup_fields(thd, thd->want_privilege, ...)
+│        └─ Column_privilege_tracker column_privilege(thd, want_privilege)   ★③ RAII 切权限
+│           └─ item->fix_fields() → Item_field::fix_fields()
+│                └─ find_field_in_tables(..., thd->want_privilege, ...)
+│                     └─ find_field_in_table_ref()
+│                          ├─ check_column_grant_in_table_ref()   ★④ 列级权限真身
+│                          │    └─ check_grant_column()           ★⑤ 查 ACL 缓存
+│                          └─ fld->table->mark_column_used(fld, thd->mark_used_columns)  ★位图
+├─ 295: thd->want_privilege = SELECT_ACL   ★ 之后所有子句一律按"读"查
+├─ 298: setup_conds() → 302: setup_group() → 325: HAVING → 366: ORDER BY
+├─ 409: Window::setup_windows1()           → 窗口 PARTITION/ORDER 同样经 fix_fields 查权限
+├─ 420: thd->want_privilege = want_privilege_saved;   ★ 出栈恢复
+└─（语句级）INSERT/UPDATE/DELETE 的 Sql_cmd::prepare：
+     sl->check_column_privileges(thd)                       ★⑥ 集中式补扫
+     TABLE::mark_columns_needed_for_insert/update/delete()  ★⑦ 触发器/FK/CHECK 偷偷加列
+```
+
+⇒ **为什么 236 行必须最早**：`*` 展开（`setup_wild`，278）会一次性创建 N 个 `Item_field`，那一刻就要知道"查什么权限"。
+
+### 10.3 ★ `want_privilege` 的下推机制
+
+`thd->want_privilege` 是**线程级上下文**，不靠函数参数层层传——**谁想下需求就在自己作用域开头写 `thd->want_privilege = X`，结尾恢复；下层 `fix_fields()` 自己来读**。
+
+```cpp
+// [R1] Query_block::prepare 的压栈/出栈
+  const bool check_privs = !thd->derived_tables_processing ||
+                           master_query_expression()->item != nullptr;
+  thd->mark_used_columns = check_privs ? MARK_COLUMNS_READ : MARK_COLUMNS_NONE;
+  Access_bitmask want_privilege_saved = thd->want_privilege;   // 保存父层
+  thd->want_privilege = check_privs ? SELECT_ACL : 0;          // 本层压栈
+  ...  // 中间所有 setup_*() / fix_fields() 直接读 thd->want_privilege
+  thd->want_privilege = want_privilege_saved;                  // 出栈恢复
+```
+
+★ 注意 `check_privs` 的第二个条件 `master_query_expression()->item != nullptr`——**子查询里的 SELECT 列表永远按"要读"处理**（子查询的列必然被父查询消费）。
+
+**RAII 载体**（`[R9]`）：
+
+```cpp
+class Column_privilege_tracker {
+ public:
+  Column_privilege_tracker(THD *thd, Access_bitmask privilege)
+      : m_thd(thd), m_saved_privilege(thd->want_privilege) {
+    thd->want_privilege = privilege;
+  }
+  ~Column_privilege_tracker() { m_thd->want_privilege = m_saved_privilege; }
+};
+```
+
+**★ 权限 ↔ 位图的耦合**（`[R2] setup_fields()`）：
+
+```cpp
+  // 列级权限只有三种取值——这行 assert 就是"各语句需要什么权限"的答案
+  assert(want_privilege == 0 || want_privilege == SELECT_ACL ||
+         want_privilege == INSERT_ACL || want_privilege == UPDATE_ACL);
+  assert(!(column_update && (want_privilege & SELECT_ACL)));
+
+  // ★ 权限种类直接决定标注哪个位图
+  if (want_privilege & SELECT_ACL)
+    thd->mark_used_columns = MARK_COLUMNS_READ;
+  else if (want_privilege & (INSERT_ACL | UPDATE_ACL) && !column_update)
+    thd->mark_used_columns = MARK_COLUMNS_WRITE;
+  else
+    thd->mark_used_columns = MARK_COLUMNS_NONE;
+```
+
+⇒ 传 `thd->want_privilege` 这一个动作，同时传达了**权限语义**和**位图语义**两件事。
+
+### 10.4 表级：`check_view_privileges()` 与 SQL SECURITY
+
+```cpp
+// [R1]
+bool Query_block::check_view_privileges(THD *thd,
+                                        Access_bitmask want_privilege_first,
+                                        Access_bitmask want_privilege_next) {
+  Access_bitmask want_privilege = want_privilege_first;
+  Internal_error_handler_holder<View_error_handler, Table_ref> view_handler(thd, true, leaf_tables);
+  for (Table_ref *tl = leaf_tables; tl; tl = tl->next_leaf) {
+    // ★ 沿 referencing_view 链向上：叶子基表 → 引用它的视图 → … → 最外层视图
+    for (Table_ref *ref = tl; ref->referencing_view; ref = ref->referencing_view)
+      if (check_single_table_access(thd, want_privilege, ref, false)) return true;
+    want_privilege = want_privilege_next;   // ★ 只有第一个叶子用 first，其余降级
+  }
+  return false;
+}
+```
+
+★ `want_privilege_first` vs `_next` 的经典差异：`DELETE` 场景是 `check_view_privileges(thd, DELETE_ACL, SELECT_ACL)`——**只有第一个叶子（删除目标表）要 `DELETE_ACL`，其余叶子（USING/FROM）只要 `SELECT_ACL`**。
+
+```cpp
+// [R4] —— SQL SECURITY 与 no_errors
+  Security_context *backup_ctx = thd->security_context();
+  if (all_tables->security_ctx)              // ★ DEFINER 视图：临时切换身份
+    thd->set_security_context(all_tables->security_ctx);   // INVOKER（默认）时为 nullptr
+  if (check_access(thd, privilege, all_tables->db, ..., false, no_errors)) goto deny;
+  if (check_grant(thd, privilege, all_tables, false, 1, no_errors)) goto deny;
+  thd->set_security_context(backup_ctx);     // ★ 两条出口都要还原
+```
+
+⇒ **`no_errors`**（`true` 时不调 `my_error()`，只返回 `true`）服务于 `SHOW CREATE VIEW` / `SHOW FIELDS` / I_S 这类"**只探查不报错**"的场景。
+
+### 10.5 ★ 列级权限真身：`check_grant_column()`
+
+```cpp
+// [R4]
+bool check_grant_column(THD *thd, GRANT_INFO *grant, ..., Security_context *sctx,
+                        Access_bitmask want_privilege) {
+  // ★★ 短路优化：整表级权限已覆盖所需权限 → 直接放行，连 ACL 缓存锁都不加
+  want_privilege &= ~grant->privilege;
+  if (!want_privilege) return false;  // Already checked
+  ...
+  if (grant->version != grant_version) {        // grant_version 变了才重新 hash
+    grant->grant_table = table_hash_search(...);
+    grant->version = grant_version;
+  }
+  if (!(grant_table = grant->grant_table)) goto err;
+  grant_column = column_hash_search(grant_table, name, length);
+  if (grant_column && !(~grant_column->rights & want_privilege)) return false;
+err:
+  my_error(ER_COLUMNACCESS_DENIED_ERROR, ...);
+  return true;
+}
+```
+
+⇒ 这就是"**只检查被真正引用的列**"的性能保证：绝大多数应用只做表级 GRANT，靠 `want_privilege &= ~grant->privilege` 一行直接放行；真正的列级 hash 查找只发生在"表级权限不完整"时。
+
+分派层 `check_column_grant_in_table_ref()` 还有三类特例：临时表/内部表/I_S 表**直接放行**；视图列走 `VIEW_ANY_ACL`（`SHOW COLUMNS` 场景）；**NATURAL/USING join 递归到每个操作数**查（合并列在物理上属于两张表）。
+
+### 10.6 ★ 权限与位图的合流点
+
+```cpp
+// [R2] find_field_in_table_ref() 尾部
+  if (fld) {
+    if (want_privilege) {
+      if (fld != view_ref_found) {
+        if (check_column_grant_in_table_ref(thd, *actual_table, name, length, want_privilege))
+          return WRONG_GRANT;      // ★ 哨兵值：找到了但没权限
+      } else {
+        // 视图列：背后是整棵表达式 → 递归 walk 去查
+        Column_privilege_tracker tracker(thd, want_privilege);
+        if ((*ref)->walk(&Item::check_column_privileges, enum_walk::PREFIX, (uchar *)thd))
+          return WRONG_GRANT;
+      }
+    }
+    // ★ 紧邻的下一行就是位图标注
+    if (fld == view_ref_found) { Mark_field mf(thd->mark_used_columns);
+      (*ref)->walk(&Item::mark_field_in_map, enum_walk::SUBQUERY_POSTFIX, (uchar *)&mf);
+    } else
+      fld->table->mark_column_used(fld, thd->mark_used_columns);
+  }
+```
+
+⇒ **`WRONG_GRANT` 是哨兵指针**（`((Field*) 1)`）区别于 `NULL`（没找到）。调用方发现它立刻返回，不再继续搜索其它表——避免"某表有权、另一表无权"被误判成"找到了"。
+⇒ 三步不可分：**找到列 → 查权限 → 标位图**。这就是"位图既给引擎用、也给权限用"的物理证据。
+⇒ 派生表**跳过**列级检查（`[R7] Item_view_ref::check_column_privileges`：`if (cached_table->is_derived()) return false;`）——派生表没有自己的 ACL，安全性由定义它的基表保证。
+
+### 10.7 集中式补扫（唯一"遍历式"检查，**不在 prepare 里**）
+
+`[R5] Query_block::check_column_privileges()` 用 `Column_privilege_tracker tracker(thd, SELECT_ACL)` 强制只读视角，然后 `walk(&Item::check_column_privileges)` 扫 8 处：SELECT 列表 → ON 条件（`check_privileges_for_join` 递归嵌套 join）→ WHERE → GROUP BY → HAVING → 窗口 PARTITION/ORDER → ORDER BY → 递归子查询。
+
+⇒ **为什么还需要补扫**：NATURAL/USING join 合成的条件在 `mark_common_columns()` 里就地产生，可能没走 `fix_fields()`。
+
+### 10.8 ★ `mark_columns_needed_for_*()`：偷偷追加的列（**执行期**）
+
+```cpp
+// [R8] sql/table.cc（在执行阶段调用，不在 prepare 里）
+void TABLE::mark_columns_needed_for_delete(THD *thd) {
+  mark_columns_per_binlog_row_image(thd);                    // binlog_row_image 前镜像
+  if (triggers && triggers->mark_fields(TRG_EVENT_DELETE)) return;  // ★ 触发器引用的列
+  ... if (vfield) mark_generated_columns(true);              // ★ 虚列也要读
+}
+void TABLE::mark_columns_needed_for_update(THD *thd, bool mark_binlog_columns) {
+  ...
+  if (table_check_constraint_list != nullptr) mark_check_constraint_columns(true);  // ★ CHECK 约束
+}
+```
+
+⇒ **这些追加发生在位图上，但权限检查早已在 prepare 期做完了**——所以触发器/CHECK 约束引用的列**不会额外触发权限检查**。这划出了"只检查被真正引用的列"的边界：**只检查 SQL 文本引用到的列，不检查因执行机制被间接读取的列**。
+
+### 10.9 `any_privileges`：只探查不报错
+
+```cpp
+// [R7] Item_field::fix_fields() 尾部
+  if (any_privileges) {   // ★ 仅在视图定义规范化时置真
+    if (!(have_privileges = (get_column_grant(thd, &table_ref->grant, db, tab, field_name) &
+                             VIEW_ANY_ACL))) {
+      my_error(ER_COLUMNACCESS_DENIED_ERROR, MYF(0), "ANY", ...);   // 权限名显示为 "ANY"
+      return true;
+    }
+  }
+```
+
+⇒ `CREATE VIEW` / `SHOW CREATE VIEW` 的目的不是"执行这条 SELECT"，而是"把定义存下来/打印出来"——只要对该列**有任何一点**权限即可。配套的"关闭一切"开关在 `sql/sql_view.cc`：`thd->want_privilege = 0; thd->mark_used_columns = MARK_COLUMNS_NONE;`。
+
+### 10.10 双向关系总结
+
+```
+                    thd->want_privilege
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+  check_column_grant_in_table_ref()   thd->mark_used_columns
+          │                               │
+          ▼                               ▼
+  check_grant_column()            mark_column_used(field, mark)
+   → ACL 缓存比对                 ├─ READ  → read_set
+   → ER_COLUMNACCESS_DENIED_ERROR ├─ WRITE → write_set
+                                  └─ NONE  → 不动
+  ★ 权限→位图：只有权限通过的列才会被 mark_column_used（被拒的列返回 WRONG_GRANT 提前中断）
+  ★ 单向例外：mark_columns_needed_for_*() 会加列但不触发权限检查
+```
+
+---
+
+## 十一、name resolution 规则
+
+> 源码坐标：`[R7] sql/item.h`（★ `Name_resolution_context` 定义在 **item.h**，不是 sql_lex.h）· `[R2] sql/sql_base.cc` · `[R11] sql/sql_parse.cc`
+
+### 11.1 `Name_resolution_context` 的三条链
+
+```cpp
+// [R7]
+struct Name_resolution_context {
+  Name_resolution_context *outer_context;              // ★ 链 A：外层查询（纵向）
+  Name_resolution_context *next_context;               // ★ 链 C：同 QB 的兄弟 context
+  Table_ref *table_list;                               // FROM 全列表
+  Table_ref *first_name_resolution_table;              // ★ 链 B 起点：可见表子树
+  Table_ref *last_name_resolution_table;               // ★ 链 B 终点（不含）
+  Query_block *query_block;
+  bool resolve_in_select_list;                         // ★ 别名可见性开关
+  Security_context *security_ctx;                      // 视图 DEFINER（呼应 10.4）
+};
+```
+
+| 链 | 字段 | 含义 |
+|---|---|---|
+| **A. 外层链** | `outer_context` | 纵向：子查询 → 父查询 → …（每个子查询是独立命名空间） |
+| **B. 可见表链** | `first/last_name_resolution_table` | 横向（本 QB 内）：**当前作用域看得见的表子集**——"当前可见表链"的真身 |
+| **C. 兄弟链** | `next_context` | 同一 QB 的多个 context（FROM / ON / …），用于 cleanup |
+
+⇒ **关键区分**：`table_list` 是 FROM 的**完整列表**，`first/last_name_resolution_table` 是**当前作用域可见的子树**。查找用的是后者。
+
+### 11.2 ★ "当前可见表链"如何随 ON 子句变化
+
+```cpp
+// [R11] push_new_name_resolution_context()
+  on_context->first_name_resolution_table = left_op->first_leaf_for_name_resolution();
+  on_context->last_name_resolution_table  = right_op->last_leaf_for_name_resolution();
+  on_context->outer_context = thd->lex->current_context()->outer_context;  // ★ 继承，可关联引用
+```
+
+⇒ 这就是 SQL 标准"**ON 只能看见它自己那个 JOIN 的操作数**"的实现：
+
+```sql
+SELECT * FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t1.b = t3.b;
+--                    ↑ 可见 {t1,t2}          ↑ 可见 {t1,t2,t3}
+-- 所以 ON t1.a = t3.a 会报 Unknown column 't3.a' in 'on clause'
+```
+
+### 11.3 ★ `find_field_in_tables()`：搜索算法
+
+```cpp
+// [R2]（节选）
+  // ★ allow_rowid：带表名限定，或可见链只有一张表时才允许
+  allow_rowid = table_name || (first_table && !first_table->next_local);
+
+  // ★ 快速路径：PS 重执行，用 item->cached_table 直接查
+  if (item->cached_table) { ... }
+
+  // ★ LATERAL 派生表边界收窄
+  if (first_table && first_table->query_block &&
+      first_table->query_block->end_lateral_table)
+    last_table = first_table->query_block->end_lateral_table;
+  else if (last_table)
+    last_table = last_table->next_name_resolution_table;   // ★ 开区间
+
+  // ══ 沿"当前可见表链"线性扫描 ══
+  for (cur_table = first_table; cur_table != last_table;
+       cur_table = cur_table->next_name_resolution_table) {
+    Field *cur_field = find_field_in_table_ref(...);
+    if ((cur_field == nullptr && thd->is_error()) || cur_field == WRONG_GRANT)
+      return nullptr;                        // ★ 权限失败立刻放弃
+    if (cur_field) {
+      if (db) return cur_field;              // ★ 完全限定 → 唯一，直接返回
+      if (found) {                           // ★ 第二个候选 → 歧义
+        my_error(ER_NON_UNIQ_ERROR, MYF(0), table_name ? item->full_name() : name, thd->where);
+        return nullptr;
+      }
+      found = cur_field;                     // 记第一个候选，继续扫（为检测歧义）
+    }
+  }
+  if (found) return found;
+  // ══ 当前 QB 完全没找到 ══
+  if (table_name && (cur_table == first_table) && ...) {
+    my_error(ER_UNKNOWN_TABLE, ...);         // 带限定符但一张表都没遍历到
+  } else if (...) {
+    // ★★ 安全设计：先确认用户对该表有权限，才肯报"列不存在"；否则报 access denied（避免泄露 schema）
+    if (!first_table || (want_privilege == 0) ||
+        !check_column_grant_in_table_ref(thd, first_table, name, length, want_privilege))
+      my_error(ER_BAD_FIELD_ERROR, MYF(0), item->full_name(), thd->where);
+  } else found = not_found_field;            // ★ IGNORE_ERRORS：交给外层继续试
+```
+
+**★ "两遍"的真相**：`find_field_in_tables()` 自己只有一遍扫描。三级顺序是靠 `report_error` 参数在**两次调用**间传递状态实现的：
+
+```
+第 1 遍（IGNORE_EXCEPT_NON_UNIQUE）→ 在当前 QB 找唯一匹配（顺带判歧义 ER_NON_UNIQ_ERROR）
+        没找到 → not_found_field，不报错
+   ├─ ② find_item_in_list()：本 QB 的 SELECT 列表别名（命中 → 造 Item_ref 替换）
+   ├─ ③ fix_outer_field()：爬 outer_context 链（每层也先试外层别名）
+   └─ 都没命中 → ER_BAD_FIELD_ERROR
+```
+
+`allow_rowid` 特例（`[R2] find_field_in_table()`）：`_rowid` 不是真实列，是引擎行号伪列，只有 `table->s->rowid_field_offset != 0` 时才有；**多表且无限制时 `SELECT _rowid FROM t1,t2` 直接失败**（两表各有一个，无法判定）。
+
+### 11.4 ★ 搜索顺序图
+
+```
+        Item_field::fix_fields()  [R7]
+                 │
+   ┌─────────────┴─────────────────────────────────────────┐
+   │ ① 本 QB 的可见表链                                      │
+   │    find_field_in_tables(first/last_name_resolution_     │
+   │      table, IGNORE_EXCEPT_NON_UNIQUE)                   │
+   │    for (tr = first; tr != last;                         │
+   │         tr = tr->next_name_resolution_table)            │
+   │      └─ find_field_in_table_ref()                       │
+   │           ├─ 视图      → find_field_in_view()           │
+   │           ├─ 基表      → find_field_in_table()          │
+   │           └─ NATURAL/USING → find_field_in_natural_join()│
+   │    恰好 1 → Field*  ｜ ≥2 → ER_NON_UNIQ_ERROR ｜ 0 → ②   │
+   └─────────────┬─────────────────────────────────────────┘
+   ┌─────────────┴─────────────────────────────────────────┐
+   │ ② 本 QB 的 SELECT 列表 / GROUP BY（别名）                │
+   │    仅当 qb->is_item_list_lookup                         │
+   │    find_item_in_list() → RESOLVED_AGAINST_ALIAS 等四种   │
+   │    命中 → 造 Item_ref 替换掉 Item_field                  │
+   └─────────────┬─────────────────────────────────────────┘
+   ┌─────────────┴─────────────────────────────────────────┐
+   │ ③ 外层 context 链（fix_outer_field）                     │
+   │    for (outer = ctx->outer_context; outer;              │
+   │         outer = outer->outer_context)                   │
+   │      ├─ 非 LATERAL 派生表看不见宿主表 → continue          │
+   │      ├─ 命中 → accumulate_used_tables(map)              │
+   │      │         + mark_as_dependent()（UNCACHEABLE_DEPENDENT）│
+   │      └─ 每层先试外层 SELECT 列表别名（select_alias_referencable）│
+   └─────────────┬─────────────────────────────────────────┘
+                 ▼ ER_BAD_FIELD_ERROR（无权限时改报 access denied）
+```
+
+### 11.5 ★ USING / NATURAL JOIN：为什么 `SELECT *` 只出现一次该列
+
+`[R2] store_natural_using_join_columns()` 把列分成两类，**`is_common` 的列只 push 一次**：
+
+```cpp
+    if (nj_col_1->is_common) {
+      natural_using_join->join_columns->push_back(nj_col_1);   // ★ 合并列只出现一次
+      nj_col_1->is_common = false;
+    } else ...
+```
+
+⇒ 结果列 = `[t1 独有] + [合并列 ×1] + [t2 独有]`。`setup_wild()` 遍历的是这张**合并后的行类型**（由 `setup_natural_join_row_types()` 在 prepare 260 行预计算），而不是先遍历 t1 所有列再遍历 t2：
+
+```sql
+SELECT * FROM t1 NATURAL JOIN t2;    -- 同名列 id 只出现一次，且排在最前
+SELECT * FROM t1 JOIN t2 USING (id); -- 同理
+SELECT * FROM t1 JOIN t2;            -- 两列都在，出现两次
+```
+
+⇒ 也解释了 `find_field_in_table_ref()` 里"不带限定符直接查 `find_field_in_natural_join()`"——查的是合并列清单，天然唯一、不会歧义。三张表都有同名列时报 `ER_NON_UNIQ_ERROR`。
+
+### 11.6 ★ 别名解析：`resolve_in_select_list` 与 `Item_ref`
+
+```cpp
+// [R1] prepare 中的开关
+  is_item_list_lookup = false;        // 建表期间禁止别名查找
+  if (setup_tables(thd, get_table_list(), false)) return true;
+  is_item_list_lookup = true;         // ★ 从 SELECT 列表开始允许
+// [R2] setup_fields() 内部又临时关掉（SELECT a AS b, b+1 里的 b 不能指自己）
+  bool save_is_item_list_lookup = select->is_item_list_lookup;
+  select->is_item_list_lookup = false;
+```
+
+命中后（`[R7]`）：若 SELECT 列表里那项是 `Item_field` 就**直接复用同一个 `Field*`**；否则造 `Item_ref` 指向 `base_ref_items[counter]` 并**把 `Item_field` 从树上摘下来替换掉**。
+
+⇒ **为什么 HAVING/ORDER BY 能引用别名而 WHERE 不能**：WHERE 逻辑上先于 SELECT 列表求值。
+
+```sql
+SELECT a+b AS s FROM t WHERE s > 1;   -- ✗ Unknown column 's' in 'where clause'
+SELECT a+b AS s FROM t HAVING s > 1;  -- ✓
+SELECT a+b AS s FROM t ORDER BY s;    -- ✓
+```
+
+⇒ 若别名指向的表达式含窗口函数且当前上下文禁止窗口函数，报 `ER_WINDOW_INVALID_WINDOW_FUNC_ALIAS_USE`——**通过别名间接引用窗口函数也会被拦**。
+
+---
+
+## 十二、窗口函数 setup
+
+> 源码坐标：`[R6] sql/window.h·cc` · `[R1] sql/sql_resolver.cc` · `[R3] sql/sql_lex.h`
+>
+> ⚠️ **8.0.39 没有 `setup_windows()`**——实际是 `Window::setup_windows1()` / `setup_windows2()`。
+
+### 12.1 调用时机（卡在 `setup_order()` 与 `setup_order_final()` 之间）
+
+```cpp
+// [R1]
+  /*
+    Set up windows after setup_order() (as the query's ORDER BY may contain
+    window functions), and before setup_order_final() (as such function needs
+    to know about implicit grouping which may be induced by an aggregate
+    function in the window's PARTITION or ORDER clause).
+  */
+  const size_t fields_cnt = fields.size();
+  if (m_windows.elements != 0 && Window::setup_windows1(thd, this, base_ref_items,
+                                                        get_table_list(), &fields, &m_windows))
+    return true;
+  bool added_new_sum_funcs = fields.size() > fields_cnt;   // ★ 窗口 setup 可能往 fields 追加
+```
+
+- **在 `setup_order()` 之后**：`ORDER BY ROW_NUMBER() OVER w` 需要窗口对象已就位
+- **在 `setup_order_final()` 之前**：窗口的 `PARTITION BY` 里若有聚合函数会**隐式引入分组**，`setup_order_final()` 需要这个信息
+
+### 12.2 命名窗口 vs 匿名窗口
+
+```cpp
+// [R6] resolve_reference()
+  if (!(*m_window)->is_reference()) {          // 匿名窗口：直接登记函数
+    (*m_window)->m_functions.push_back(wf);
+    return false;
+  }
+  for (Window &w : curr->m_windows) {          // 命名窗口引用：按名字找定义
+    if (w.name() == nullptr) continue;         // ★ 匿名窗口不能被引用
+    if (my_strcasecmp(system_charset_info, (*m_window)->printable_name(),
+                      w.printable_name()) == 0) {
+      (*m_window)->~PT_window();               // ★ 销毁引用占位，换成定义对象
+      (*m_window) = static_cast<PT_window *>(&w);
+      (*m_window)->m_functions.base_list::push_back(wf);
+      return false;
+    }
+  }
+  my_error(ER_WINDOW_NO_SUCH_WINDOW, MYF(0), (*m_window)->printable_name());
+```
+
+⇒ **一个 `Window` ↔ 多个窗口函数**（`m_functions` 是 `List<Item_sum>`）：`SELECT ROW_NUMBER() OVER w, SUM(x) OVER w FROM t WINDOW w AS (ORDER BY y)` 共享同一个 Window 实例。
+
+`setup_windows1()` 还处理**窗口间继承**（`m_inherit_from`）：用 `AdjacencyList` 建模，先查环（`ER_WINDOW_CIRCULARITY_IN_WINDOW_GRAPH`），再查 SQL 2011 三条规则——只有根能写 PARTITION BY、继承路径上 ORDER BY 不能重复定义、被继承者不能带 frame。
+
+### 12.3 窗口里的列必须在当前 QB 可见（**没有专门检查代码**）
+
+```cpp
+// [R6] resolve_window_ordering()（节选）
+  if (oi->type() == Item::INT_ITEM && oi->basic_const_item()) {
+    my_error(ER_WINDOW_ILLEGAL_ORDER_BY, MYF(0), printable_name());   // ★ OVER (ORDER BY 1) 非法
+    return true;
+  }
+  if (find_order_in_list(thd, ref_item_array, tables, order, fields, false, true)) return true;
+  if (order->used_alias) {
+    my_error(ER_BAD_FIELD_ERROR, MYF(0), oi->item_name.ptr(), thd->where);  // ★ 不能引用 SELECT 别名
+    return true;
+  }
+  if (!oi->fixed && oi->fix_fields(thd, order->item)) return true;   // ★ 真正的 name resolution + 权限
+  if (oi->has_wf()) {
+    my_error(ER_WINDOW_NESTED_WINDOW_FUNC_USE_IN_WINDOW_SPEC, ...); // ★ 不能嵌套窗口
+    return true;
+  }
+  if (oi->has_aggregation() && oi->type() != Item::SUM_FUNC_ITEM)
+    oi->split_sum_func(thd, ref_item_array, fields);                 // ★ PARTITION BY SUM(x)
+```
+
+⇒ 可见性是 `fix_fields()` 的**副产品**（传入的 `tables` 就是 `select->get_table_list()`），没有专门的可见性检查代码。
+
+### 12.4 ★ frame 边界求值分两次（最容易踩的坑）
+
+| 检查 | 阶段 | 能查什么 |
+|---|---|---|
+| `check_border_sanity1()` | **prepare**（`setup_windows1` 内） | 语法合法性、边界类型组合、常量表达式（`ROWS 5 PRECEDING`） |
+| `check_border_sanity2()` | **执行期**（`setup_windows2`） | `?` 占位符的值、`RANGE N PRECEDING` 里 N 的实际值 |
+
+⇒ 原因：PS 里 `ROWS ? PRECEDING` 的 `?` 在 prepare 时还是 `Item_param`，值未知。源码注释明说 *"In execution of PS we need to check again in case ? parameters are used for window borders"*。同理 `check_window_functions1`（静态语义/优化可行性）与 `check_window_functions2`（收集 LEAD/LAG/NTH_VALUE 的 offset 值，需要求值）。
+
+`RANGE` 帧还需 `setup_range_expressions(thd)` 先构造比较器（要知道排序列类型）。
+
+### 12.5 与 GROUP BY / 聚合的交互（两个独立位图）
+
+```cpp
+// [R1] prepare 中的位操作
+  thd->lex->allow_sum_func &= ~((nesting_map)1 << nest_level);   // WHERE / GROUP BY 禁聚合
+  thd->lex->allow_sum_func |=  (nesting_map)1 << nest_level;     // HAVING / ORDER BY 允许
+  thd->lex->m_deny_window_func |= (nesting_map)1 << nest_level;  // ★ HAVING 禁窗口
+  thd->lex->m_deny_window_func = save_deny_window_func;          // 出了 HAVING 恢复
+```
+
+| 子句 | 聚合 `allow_sum_func` | 窗口 `m_deny_window_func` |
+|---|---|---|
+| ON / WHERE | ✗ | ✗ |
+| GROUP BY | ✗ | ✗ |
+| SELECT 列表 | ✓ | ✓ |
+| **HAVING** | ✓ | **✗** |
+| ORDER BY | ✓ | ✓ |
+
+⇒ 两个独立位图因为**规则不同**：HAVING 在逻辑上"在窗口之后"求值——所以能用 `SUM()` 但不能用 `ROW_NUMBER()`（错误 `ER_WINDOW_INVALID_WINDOW_FUNC_USE`）。
 
 ---
 

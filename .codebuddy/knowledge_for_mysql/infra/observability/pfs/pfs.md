@@ -1,12 +1,13 @@
 # Performance Schema（PFS）：MySQL 内建可观测性框架
 
-> 本篇聚焦 **PFS 可观测性**。内存分配器矩阵见 [memory.md](memory.md)；读源码通用知识地图与共享术语/论文见 [README.md](README.md)。
+> 本篇聚焦 **PFS 可观测性框架**。内存主题三篇分工：[allocator.md](../../memory/allocator.md)（分配器矩阵 + **memory 表族的埋点与聚合机制**：`PFS_metadata` 前缀、`UT_NEW_THIS_FILE_PSI_KEY`、`pfs_memory_alloc_vc` 三道闸、`high_alloc` 峰值语义）、[memory_architecture.md](../../memory/memory_architecture.md)（各内存区总账 + OOM 排查）、[jemalloc.md](../../memory/jemalloc.md)（★生产重点篇——PFS 覆盖不到时用 jemalloc 账本与 prof）；读源码通用知识地图与共享术语/论文见 [README.md](../../../server/infra/README.md)。
 > 基于 MySQL 8.0 源码（`storage/perfschema`、`include/mysql/psi` 等模块）。
 
 ## 目录
 
 - [摘要](#摘要)
 - [一、Performance Schema](#一performance-schema)
+  - [1.10 ★ PFS 的表不是固定的：静态内置 + 插件动态注册](#110--pfs-的表不是固定的静态内置--插件动态注册)（★ 查不到 `clone_progress` 先查插件装没装）
 - [二、PFS 模块涉及的设计模式](#二pfs-模块涉及的设计模式)
 - [三、插件系统涉及的设计模式](#三插件系统涉及的设计模式)
 - [四、核心术语中英文对照（可观测性）](#四核心术语中英文对照可观测性)
@@ -368,7 +369,7 @@ PFS 与 Pin/Dyninst 的区别在于：PFS 的 instrumentation 代码在**编译�
 
 ### 1.9 PFS 的变量与状态表实现（SHOW VARIABLES/STATUS 的幕后）
 
-PFS 不只是埋点框架——**8.0 起它还是 `SHOW VARIABLES` / `SHOW STATUS` 的实际实现者**（两条 SHOW 语句在语法分析阶段被重写成 `SELECT ... FROM performance_schema.global_variables / global_status`）。这也是"描述符与值分离"（见 [`variables.md`](variables.md)）在监控层的复用：三类变量（系统/状态/用户）都被统一成 `SHOW_VAR` 中间格式，走同一条管线。
+PFS 不只是埋点框架——**8.0 起它还是 `SHOW VARIABLES` / `SHOW STATUS` 的实际实现者**（两条 SHOW 语句在语法分析阶段被重写成 `SELECT ... FROM performance_schema.global_variables / global_status`）。这也是"描述符与值分离"（见 [`variables.md`](../../../server/infra/variables.md)）在监控层的复用：三类变量（系统/状态/用户）都被统一成 `SHOW_VAR` 中间格式，走同一条管线。
 
 #### 三阶段管线
 
@@ -496,6 +497,233 @@ ulonglong table_flags() const override {
   m_cache[i] → make_row → 输出
   —— 不碰 hash、不碰 global_system_variables、不再求值
 ```
+
+#### 代码证据：物化只在 `rnd_init` 发生一次
+
+`storage/perfschema/table_global_variables.cc:114-134`：
+
+```cpp
+int table_global_variables::rnd_init(bool /* scan */) {
+  /*
+    Build a list of system variables from the global system variable hash.
+    Filter by scope.
+  */
+  m_sysvar_cache.materialize_global();
+
+  return 0;
+}
+
+int table_global_variables::rnd_next() {
+  for (m_pos.set_at(&m_next_pos); m_pos.m_index < m_sysvar_cache.size();
+       m_pos.next()) {
+    const System_variable *system_var = m_sysvar_cache.get(m_pos.m_index);
+    if (system_var != nullptr) {
+      m_next_pos.set_after(&m_pos);
+      return make_row(system_var);
+    }
+  }
+  return HA_ERR_END_OF_FILE;
+}
+```
+
+/* 【注】★ `rnd_next` 里**只有三个纯读操作**：`size()` / `get(index)` / `make_row()`，
+   完全没有再次物化、没有再碰 hash。这就是"cache 生命周期 = 一次表扫描"的代码证据。 */
+
+还有一层**幂等守卫**（`storage/perfschema/pfs_variable.h:517-527`）：
+
+```cpp
+template <class Var_type>
+int PFS_variable_cache<Var_type>::materialize_global() {
+  if (is_materialized()) {
+    return 0;
+  }
+
+  return do_materialize_global();
+}
+```
+
+#### cache 就是游标对象的一个成员
+
+`storage/perfschema/table_global_variables.h:104-120`：
+
+```cpp
+ private:
+  /** Table share lock. */
+  static THR_LOCK m_table_lock;
+  /** Table definition. */
+  static Plugin_table m_table_def;
+
+  /** Current THD variables. */
+  PFS_system_variable_cache m_sysvar_cache;
+  /** Current row. */
+  row_global_variables m_row;
+  /** Current position. */
+  pos_t m_pos;
+  /** Next position. */
+  pos_t m_next_pos;
+
+  PFS_index_global_variables *m_opened_index;
+};
+```
+
+而游标对象是**每次扫描 `new`、扫描结束 `delete`**（`storage/perfschema/table_global_variables.cc:89-91`、`:103-107`）：
+
+```cpp
+PFS_engine_table *table_global_variables::create(PFS_engine_table_share *) {
+  return new table_global_variables();
+}
+```
+
+```cpp
+table_global_variables::table_global_variables()
+    : PFS_engine_table(&m_share, &m_pos),
+      m_sysvar_cache(false),
+      m_pos(0),
+      m_next_pos(0) {}
+```
+
+`storage/perfschema/ha_perfschema.cc:1684-1714`、`:1613-1626`：
+
+```cpp
+int ha_perfschema::rnd_init(bool scan) {
+  int result;
+  DBUG_TRACE;
+
+  assert(m_table_share);
+  assert(m_table_share->m_open_table != nullptr);
+
+  stats.records = 0;
+  if (m_table == nullptr) {
+    m_table = m_table_share->m_open_table(m_table_share);
+  } else {
+    m_table->reset_position();
+  }
+
+  if (m_table != nullptr) {
+    m_table->rnd_init(scan);
+  }
+
+  result = m_table ? 0 : HA_ERR_OUT_OF_MEM;
+  return result;
+}
+
+int ha_perfschema::rnd_end() {
+  DBUG_TRACE;
+  assert(m_table);
+  delete m_table;
+  m_table = nullptr;
+  return 0;
+}
+```
+
+```cpp
+int ha_perfschema::close() {
+  DBUG_TRACE;
+
+  /* Only for table added by plugin/components */
+  if (!IS_NATIVE_TABLE(m_table_share)) {
+    dec_ref_count(m_table_share);
+  }
+
+  m_table_share = nullptr;
+  delete m_table;
+  m_table = nullptr;
+
+  return 0;
+}
+```
+
+/* 【注】★ `m_open_table` 是 share 上的一枚**函数指针**（`pfs_open_table_t`），
+   内置表指向 `table_xxx::create`（裸 `new`），插件表指向 `table_plugin_table::create`。
+   所以"cache 随游标一起生、一起死"是**对象生命周期**层面的事实，不是靠某个清理函数。 */
+
+#### 物化的三个动作：枚举 → 取值 → 转文本
+
+**枚举**（`sql/set_var.cc:1101-1138`）——注意它产出的是 `System_variable_tracker`，**不是** SHOW_VAR：
+
+```cpp
+/**
+  Constructs an array of system variables for display to the user.
+  ...
+  @note Requires r/o lock on LOCK_system_variables_hash.
+*/
+bool System_variable_tracker::enumerate_sys_vars(
+    bool sort, enum enum_var_type query_scope, bool strict,
+    System_variable_tracker::Array *output) {
+  assert(output != nullptr);
+  assert(query_scope == OPT_SESSION || query_scope == OPT_GLOBAL);
+  int count = get_system_variable_count();
+
+  /* Resize array if necessary. */
+  if (output->reserve(count + 1)) return true;
+
+  if (enumerate_sys_vars_in_hash(static_system_variable_hash, query_scope,
+                                 strict, output) ||
+      enumerate_sys_vars_in_hash(dynamic_system_variable_hash, query_scope,
+                                 strict, output))
+    return true;  // OOM
+
+  if (sort)
+    std::sort(
+        output->begin(), output->end(),
+        [](const System_variable_tracker &a, const System_variable_tracker &b) {
+          return my_strcasecmp(system_charset_info, a.get_var_name(),
+                               b.get_var_name()) < 0;
+        });
+
+  return false;
+}
+```
+
+/* 【注】① 两个 hash **分别遍历**后**统一排序**——这解释了你看到的"变量按字母序输出"；
+   ② 预分配 `SYSTEM_VARIABLE_PREALLOC = 200`（`set_var.h:855`），超出才 reserve。 */
+
+**取值**（`sql/set_var.cc:429-443`）：
+
+```cpp
+const uchar *sys_var::value_ptr(THD *running_thd, THD *target_thd,
+                                enum_var_type type,
+                                std::string_view keycache_name) {
+  if (type == OPT_GLOBAL || type == OPT_PERSIST || scope() == GLOBAL) {
+    mysql_mutex_assert_owner(&LOCK_global_system_variables);
+    AutoRLock lock(guard);
+    return global_value_ptr(running_thd, keycache_name);
+  } else
+    return session_value_ptr(running_thd, target_thd, keycache_name);
+}
+```
+
+/* 【注】`mysql_mutex_assert_owner(&LOCK_global_system_variables)` 这条断言就是
+   "取全局值必须先持那把锁"的硬契约。 */
+
+**转文本**（`storage/perfschema/pfs_variable.cc:686-735`，节选）：
+
+```cpp
+  /* Block remote target thread from updating this system variable. */
+  if (target_thd != current_thread) {
+    mysql_mutex_lock(&target_thd->LOCK_thd_sysvar);
+  }
+  /* Block system variable additions or deletions. */
+  mysql_mutex_lock(&LOCK_global_system_variables);
+
+  auto *system_var = (sys_var *)show_var->value;
+  assert(system_var != nullptr);
+  m_charset = system_var->charset(target_thd);
+  m_type = system_var->show_type();
+  m_scope = system_var->scope();
+
+  /* Get the value of the system variable. */
+  const char *value;
+  value = get_one_variable_ext(current_thread, target_thd, show_var,
+                               query_scope, show_var_type, nullptr, &m_charset,
+                               m_value_str, &m_value_length);
+  ...
+  m_initialized = true;
+}
+```
+
+/* 【注】看别的线程的会话变量时，还要额外锁目标线程的 `LOCK_thd_sysvar`——
+   这是"跨线程看变量"的代价，也是高频查 `variables_by_thread` 特别慢的原因之一。 */
 
 **所以不是"rnd_next 进 hash 再索引到 global"**——那是 `rnd_init` 干的事，且只干一次。`rnd_next` 读的是物化时定格的**文本快照**（这就是快照一致性的来源：迭代期间值被别的线程 SET 也影响不到本次扫描）。
 
@@ -788,6 +1016,152 @@ THD_ptr Global_THD_manager::find_thd(Find_THD_Impl *func) {
 
 #### 锁竞争：`LOCK_plugin_delete` 是真实瓶颈
 
+**定义**（`sql/sql_plugin.cc:433-437`）：
+
+```cpp
+/*
+  A mutex LOCK_plugin_delete must be acquired before calling plugin_del
+  function.
+*/
+mysql_mutex_t LOCK_plugin_delete;
+```
+
+/* 【注】定义在 `sql_plugin.cc`（不是 `mutex_lock.h`），声明在 `sql/sql_plugin.h:48`；
+   PFS 侧另有一处 extern：`storage/perfschema/pfs_variable.h:160`。 */
+
+**为什么需要它——官方的锁优先级表**（`storage/perfschema/pfs_variable.h:118-131`）：
+
+```cpp
+  LOCK PRIORITIES
+  ---------------
+  System Variables
+    LOCK_plugin_delete              (block plugin delete)
+     LOCK_system_variables_hash
+     LOCK_thd_data                  (block THD delete)
+     LOCK_thd_sysvar                (block system variable updates,
+  alloc_and_copy_thd_dynamic_variables)
+       LOCK_global_system_variables (very briefly held)
+
+  Status Variables
+    LOCK_status
+      LOCK_thd_data                 (block THD delete)
+*/
+```
+
+/* 【注】★ `LOCK_plugin_delete` 在这张表里是**最外层**——它保护的是
+   "变量集合本身不变"（插件装卸会增删 dyn hash 里的条目），
+   而 `LOCK_system_variables_hash` 保护的是"hash 结构不变"。两者是包含关系。 */
+
+物化路径上的加锁与那句"为什么"（`storage/perfschema/pfs_variable.cc:153-191`）：
+
+```cpp
+/**
+  Build a GLOBAL system variable cache.
+*/
+int PFS_system_variable_cache::do_materialize_global() {
+  /* Block plugins from unloading. */
+  mysql_mutex_lock(&LOCK_plugin_delete);
+
+  m_materialized = false;
+
+  /*
+     Build array of SHOW_VARs from system variable hash. Do this within
+     LOCK_plugin_delete to ensure that the hash table remains unchanged
+     during materialization.
+   */
+  if (!m_external_init) {
+    init_show_var_array(OPT_GLOBAL, true);
+  }
+
+  /* Resolve the value for each SHOW_VAR in the array, add to cache. */
+  for (const System_variable_tracker &i : m_sys_var_tracker_array) {
+    auto f = [this](const System_variable_tracker &, sys_var *sysvar) -> void {
+      /* Match the system variable scope to the target scope. */
+      if (match_scope(sysvar->scope())) {
+        const SHOW_VAR show_var{sysvar->name.str, pointer_cast<char *>(sysvar),
+                                SHOW_SYS, SHOW_SCOPE_UNDEF};
+        /* Resolve value, convert to text, add to cache. */
+        const System_variable system_var(m_current_thd, &show_var,
+                                         m_query_scope);
+        m_cache.push_back(system_var);
+      }
+    };
+    (void)i.access_system_variable(m_current_thd, f,
+                                   Suppress_not_found_error::YES);
+  }
+
+  m_materialized = true;
+  mysql_mutex_unlock(&LOCK_plugin_delete);
+  return 0;
+}
+```
+
+/* 【注】★ 锁的范围是**整个物化循环**——不是"枚举时锁一下"，而是
+   "枚举 + N 次取值 + N 次格式化"全程持有。N ≈ 变量总数（几百），
+   所以这一段的持锁时间是 O(N)，这就是"高频查 PFS 变量表会撞锁"的机制。 */
+
+连 `get_row_count()` 也要持它（`storage/perfschema/table_global_variables.cc:93-101`）：
+
+```cpp
+ha_rows table_global_variables::get_row_count() {
+  mysql_mutex_lock(&LOCK_plugin_delete);
+  mysql_mutex_assert_not_owner(&LOCK_plugin);
+  mysql_rwlock_rdlock(&LOCK_system_variables_hash);
+  const ha_rows system_var_count = get_system_variable_count();
+  mysql_rwlock_unlock(&LOCK_system_variables_hash);
+  mysql_mutex_unlock(&LOCK_plugin_delete);
+  return system_var_count;
+}
+```
+
+而它返回的**只是上界**（`sql/set_var.cc:1013-1020`）：
+
+```cpp
+/*
+  Number of records in the system_variable_hash.
+  Requires r/o lock on LOCK_system_variables_hash.
+*/
+ulong get_system_variable_count(void) {
+  return static_system_variable_hash->size() +
+         dynamic_system_variable_hash->size();
+}
+```
+
+/* 【注】两个 hash 的**全部条目数**，而实际输出行还会被 scope 过滤
+   （`match_scope`）、敏感变量过滤（`is_sensitive()`，非 `SENSITIVE_VARIABLES_OBSERVER`
+   就跳过）、不可见变量过滤（`not_visible()`）。所以必然是**上界**。 */
+
+还有一条"版本漂移就告警"的兜底（`storage/perfschema/pfs_variable.cc:1564-1573`）：
+
+```cpp
+/**
+  Warning issued if the version of the system variable hash table changes
+  during a query. This can happen when a plugin is loaded or unloaded.
+*/
+void system_variable_warning() {
+  THD *thd = current_thd;
+  assert(thd != nullptr);
+  push_warning(thd, ER_WARN_TOO_FEW_RECORDS);
+  push_warning(thd, ER_SYSVAR_CHANGE_DURING_QUERY);
+}
+```
+
+/* 【注】★ 这说明 `LOCK_plugin_delete` 也**没能做到绝对封闭**：插件变量是**延迟解析**的
+   （tracker 只存名字，`access_system_variable` 时才去查），仍可能中途发现 hash 变了，
+   于是用 `m_version` 前后比对 + 抛 warning 来兜。 */
+
+配套的"插件不能被卸载"断言（`sql/sql_plugin.cc:1150-1155`）：
+
+```cpp
+static void plugin_del(st_plugin_int *plugin) {
+  DBUG_TRACE;
+  mysql_mutex_assert_owner(&LOCK_plugin);
+  mysql_mutex_assert_owner(&LOCK_plugin_delete);
+  /* Free allocated strings before deleting the plugin. */
+  delete_dynamic_system_variable_chain(plugin->system_vars);
+  restore_pluginvar_names(plugin->system_vars);
+```
+
 三把锁的**类型与持有范围**决定了谁会成为瓶颈：
 
 | 锁 | 类型 | 持有范围 | 并发性 |
@@ -814,9 +1188,416 @@ THD_ptr Global_THD_manager::find_thd(Find_THD_Impl *func) {
 
 #### 12 张变量表与 ACL
 
-`global_variables`/`session_variables`/`variables_info`/`global_status`/`session_status` 用 `pfs_readonly_world_acl`（人人可读）；`variables_by_thread`/`user_variables_by_thread` 用 `pfs_readonly_acl`（**需显式授权**——能看到别人的会话变量是敏感能力）；`status_by_*`/`persisted_variables` 走常规授权。全表清单与语义见 [`variables.md` 的 H 节](variables.md#h-与-pfs--i_s-系统表的关系)。
+`global_variables`/`session_variables`/`variables_info`/`global_status`/`session_status` 用 `pfs_readonly_world_acl`（人人可读）；`variables_by_thread`/`user_variables_by_thread` 用 `pfs_readonly_acl`（**需显式授权**——能看到别人的会话变量是敏感能力）；`status_by_*`/`persisted_variables` 走常规授权。全表清单与语义见 [`variables.md` 的 H 节](../../../server/infra/variables.md#h-与-pfs--i_s-系统表的关系)。
 
 ---
+
+### 1.10 ★ PFS 的表**不是固定的**：静态内置 + 插件动态注册
+
+> ⚠️ 常见误解：把 `performance_schema` 的表数当成固定值（如"112 张"）。
+> 实际上它是 **静态内置（随 server 启动就在）** + **插件/组件动态注册（装了才有）** 两部分之和。
+> 这个区分直接决定一件事：**查不到某张表时，先确认插件装没装**——不是"表存在但没数据"，而是**压根没有这张表**。
+
+#### 机制：`pfs_plugin_table_v1` 组件服务
+
+PFS 把"注册一张表"的能力**作为组件服务暴露出去**，插件/组件调用它即可向 `performance_schema` 下新增表。
+
+- 服务定义：`include/mysql/components/services/pfs_plugin_table_service.h`
+- 表服务：`BEGIN_SERVICE_DEFINITION(pfs_plugin_table_v1)`
+- 配套的列类型服务族（每张插件表要声明列的类型）：
+  `pfs_plugin_column_{tiny,small,medium,integer,bigint,decimal,float,double}_v1`、`pfs_plugin_column_string_v2`
+
+⇒ 这也解释了 README 1.1 里说的"**第七类：可扩展观测出口**"——企业版与第三方监控新增的观测能力，有一部分就是走这条路长出来的。
+
+#### 8.0.39 里实际在用的插件表
+
+| 插件 | 贡献的表 | 源码位置 |
+|---|---|---|
+| **clone** | `clone_status`、`clone_progress` | `plugin/clone/src/clone_status.cc`（表名赋值处：`m_table_name = "clone_status"` / `"clone_progress"`） |
+| **Group Replication** | `replication_group_member_actions`<br>`replication_group_configuration_version`<br>`replication_group_communication_information` | `plugin/group_replication/src/perfschema/table_*.cc` |
+| **NDB** | 若干 | `storage/ndb/plugin/ndb_pfs_init.cc` |
+
+⚠️ 这些表**在 `storage/perfschema/` 下 grep 不到**——它们不在 PFS 引擎的代码里，而在各自插件的代码里。这是"按目录穷举会漏"的典型场景。
+
+#### 静态 vs 动态：怎么区分
+
+| | 静态内置表 | 插件动态表 |
+|---|---|---|
+| 定义位置 | `storage/perfschema/table_*.cc` | 各自插件目录（如 `plugin/clone/`、`plugin/group_replication/`） |
+| 何时可见 | server 启动即有 | **插件/组件加载后才有** |
+| 卸载后 | 仍在 | **消失** |
+| 例子 | `events_waits_*`、`memory_summary_*`、`threads` | `clone_status`、`replication_group_*` |
+
+#### 枚举自己实例上的 PFS 表（别照抄文档的表数）
+
+```sql
+-- 当前实例的 PFS 表总数
+SELECT COUNT(*) AS pfs_table_count
+  FROM information_schema.TABLES
+ WHERE TABLE_SCHEMA = 'performance_schema';
+
+-- 列名出来看（想找"有没有 clone / replication_group 相关"）
+SELECT TABLE_NAME
+  FROM information_schema.TABLES
+ WHERE TABLE_SCHEMA = 'performance_schema'
+   AND (TABLE_NAME LIKE '%clone%' OR TABLE_NAME LIKE '%replication_group%')
+ ORDER BY TABLE_NAME;
+
+-- 已加载的组件/插件（判断插件装没装）
+SELECT * FROM mysql.component;
+SHOW PLUGINS;
+```
+
+⇒ **排障顺序**：文档说有 `clone_progress` 但你查不到 → 先 `SELECT * FROM mysql.component` 确认 clone 插件是否加载，而不是怀疑权限或版本。
+
+---
+### 静态注册表：`all_shares[]`
+
+`storage/perfschema/pfs_engine_table.cc:482-606`：
+
+```cpp
+static PFS_engine_table_share *all_shares[] = {
+    &table_cond_instances::m_share,
+    &table_error_log::m_share,
+    &table_events_waits_current::m_share,
+    ... /* 省略：约 100 行同类 &table_XXX::m_share 条目 */
+    &table_keyring_component_status::m_share,
+    nullptr};
+```
+
+遍历入口（`pfs_engine_table.cc:628-655`）：
+
+```cpp
+PFS_dynamic_table_shares pfs_external_table_shares;
+
+/** Get all the core performance schema tables. */
+void PFS_engine_table_share::get_all_tables(List<const Plugin_table> *tables) {
+  PFS_engine_table_share **current;
+
+  for (current = &all_shares[0]; (*current) != nullptr; current++) {
+    tables->push_back((*current)->m_table_def);
+  }
+}
+
+/** Initialize all the table share locks. */
+void PFS_engine_table_share::init_all_locks() {
+  PFS_engine_table_share **current;
+
+  for (current = &all_shares[0]; (*current) != nullptr; current++) {
+    thr_lock_init((*current)->m_thr_lock_ptr);
+  }
+}
+```
+
+DD 建表入口消费它（`ha_perfschema.cc:1379-1390`）：
+
+```cpp
+  PFS_engine_table_share::get_all_tables(tables);
+  return false;
+}
+```
+
+一个内置 share 的完整静态初始化（`table_sync_instances.cc:478-508`）——把"表定义 + 函数指针 + 锁"绑成一条：
+
+```cpp
+THR_LOCK table_cond_instances::m_table_lock;
+
+Plugin_table table_cond_instances::m_table_def(
+    /* Schema name */
+    "performance_schema",
+    /* Name */
+    "cond_instances",
+    /* Definition */
+    "  NAME VARCHAR(128) not null,\n"
+    "  OBJECT_INSTANCE_BEGIN BIGINT unsigned not null,\n"
+    "  PRIMARY KEY (OBJECT_INSTANCE_BEGIN) USING HASH,\n"
+    "  KEY (NAME) USING HASH\n",
+    /* Options */
+    " ENGINE=PERFORMANCE_SCHEMA",
+    /* Tablespace */
+    nullptr);
+
+PFS_engine_table_share table_cond_instances::m_share = {
+    &pfs_readonly_acl,
+    table_cond_instances::create,
+    nullptr, /* write_row */
+    nullptr, /* delete_all_rows */
+    table_cond_instances::get_row_count,
+    sizeof(PFS_simple_index),
+    &m_table_lock,
+    &m_table_def,
+    false, /* perpetual */
+    PFS_engine_table_proxy(),
+    {0},
+    false /* m_in_purgatory */
+};
+```
+
+### share 本体：一张函数指针表
+
+`storage/perfschema/pfs_engine_table.h:353-393`：
+
+```cpp
+/**
+
+  A PERFORMANCE_SCHEMA table share.
+  This data is shared by all the table handles opened on the same table.
+*/
+struct PFS_engine_table_share {
+  static void get_all_tables(List<const Plugin_table> *tables);
+  static void init_all_locks();
+  static void delete_all_locks();
+
+  /** Get the row count. */
+  ha_rows get_row_count() const;
+  /** Write a row. */
+  int write_row(PFS_engine_table *pfs_table, TABLE *table, unsigned char *buf,
+                Field **fields) const;
+  /** Table Access Control List. */
+  const ACL_internal_table_access *m_acl;
+  /** Open table function. */
+  pfs_open_table_t m_open_table;
+  /** Write row function. */
+  pfs_write_row_t m_write_row;
+  /** Delete all rows function. */
+  pfs_delete_all_rows_t m_delete_all_rows;
+  /** Get rows count function. */
+  pfs_get_row_count_t m_get_row_count;
+  /** Length of the @c m_pos position structure. */
+  uint m_ref_length;
+  /** The lock, stored on behalf of the SQL layer. */
+  THR_LOCK *m_thr_lock_ptr;
+  /** Table definition. */
+  const Plugin_table *m_table_def;
+  /** Table is available even if the Performance Schema is disabled. */
+  bool m_perpetual;
+
+  /* Interface to be implemented by plugin who adds its own table in PFS. */
+  PFS_engine_table_proxy m_st_table;
+  /* Number of table objects using this share currently. */
+  std::atomic<int> m_ref_count;
+  /* is marked to be deleted? */
+  bool m_in_purgatory;
+};
+```
+
+/* 【注】★ 结构里**没有** `m_name` 成员——表名从 `m_table_def->get_name()` 取。
+   `m_in_purgatory` 是"软删除标记"（见下），配合 `m_ref_count` 实现安全卸载。 */
+
+查找：`PFS_engine_table::find_engine_table_share()`（`pfs_engine_table.cc:701-725`）——**先查静态、再查动态**：
+
+```cpp
+/**
+  Find a table share by name.
+  @param name             The table name
+  @return table share
+*/
+PFS_engine_table_share *PFS_engine_table::find_engine_table_share(
+    const char *name) {
+  DBUG_TRACE;
+  PFS_engine_table_share *result;
+
+  /* First try to find in native performance schema table shares */
+  PFS_engine_table_share **current;
+
+  for (current = &all_shares[0]; (*current) != nullptr; current++) {
+    if (compare_table_names(name, (*current)->m_table_def->get_name()) == 0) {
+      return *current;
+    }
+  }
+
+  /* Now try to find in non-native performance schema tables shares */
+  result = pfs_external_table_shares.find_share(name, false);
+
+  // FIXME : here we return an object that could be destroyed, unsafe.
+  return result;
+}
+```
+
+/* 【注】末尾那句 FIXME 是上游自己的诚实标注：外部 share 可能在返回后被销毁。
+   这正是 `m_ref_count` / `m_in_purgatory` 存在的理由（见下节注销流程）。 */
+
+### 动态注册：不是类，是一个**组件服务**
+
+★ `pfs_plugin_table` **不是类**（不存在 `class pfs_plugin_table`），8.0.39 的形态是组件服务 **`pfs_plugin_table_v1`**。服务定义（`include/mysql/components/services/pfs_plugin_table_service.h:485-497`）：
+
+```cpp
+/**
+  Definition of pfs_plugin_table_v1 service and its methods.
+*/
+BEGIN_SERVICE_DEFINITION(pfs_plugin_table_v1)
+DECLARE_METHOD(int, add_tables,
+               (PFS_engine_table_share_proxy * *st_share,
+                unsigned int share_count));
+
+DECLARE_METHOD(int, delete_tables,
+               (PFS_engine_table_share_proxy * *st_share,
+                unsigned int share_count));
+DECLARE_METHOD(unsigned int, get_parts_found, (PSI_key_reader * reader));
+END_SERVICE_DEFINITION(pfs_plugin_table_v1)
+```
+
+插件传入的"share 代理"（`pfs_plugin_table_service.h:459-483`）：
+
+```cpp
+struct PFS_engine_table_share_proxy {
+ public:
+  /* Callback functions list of APIs */
+  PFS_engine_table_proxy m_proxy_engine_table;
+
+  /* Name of the table to be added */
+  const char *m_table_name;
+  /* Length of the table name */
+  unsigned int m_table_name_length;
+
+  /* Table Columns definition */
+  const char *m_table_definition;
+  unsigned int m_ref_length;
+
+  /* Access allowed on the table */
+  enum Access_control m_acl;
+
+  delete_all_rows_t delete_all_rows;
+
+  get_row_count_t get_row_count;
+};
+```
+
+把代理翻译成真正的 share（`storage/perfschema/pfs_plugin_table.cc:267-343`，节选）：
+
+```cpp
+  /* Set acl */
+  switch (proxy_share->m_acl) {
+    case READONLY:
+      share->m_acl = &pfs_readonly_acl;
+      break;
+    case TRUNCATABLE:
+      share->m_acl = &pfs_truncatable_acl;
+      break;
+    case UPDATABLE:
+      share->m_acl = &pfs_updatable_acl;
+      break;
+    case EDITABLE:
+      share->m_acl = &pfs_editable_acl;
+      break;
+    default: /* Unknown ACL */
+      share->m_acl = &pfs_unknown_acl;
+      break;
+  }
+
+  /* Open table pointer to open a table with share provided */
+  share->m_open_table = table_plugin_table::create;
+
+  share->m_write_row = write_row;
+  share->m_delete_all_rows = proxy_share->delete_all_rows;
+  share->m_get_row_count = proxy_share->get_row_count;
+
+  share->m_ref_length = proxy_share->m_ref_length;
+
+  share->m_thr_lock_ptr = new THR_LOCK();
+
+  share->m_table_def =
+      new Plugin_table("performance_schema", proxy_share->m_table_name,
+                       proxy_share->m_table_definition,
+                       "ENGINE = 'PERFORMANCE_SCHEMA'", nullptr);
+```
+
+/* 【注】★ 插件表的 `m_open_table` 一律是 `table_plugin_table::create`——
+   真正的行读写回调在 `m_st_table`（`PFS_engine_table_proxy`）里，由插件实现。
+   这是 PFS 与插件之间的**稳定 ABI 边界**。 */
+
+### 注销用"purgatory"两阶段
+
+`storage/perfschema/pfs_plugin_table.cc:459-527`（节选）：
+
+```cpp
+  /* ============== CRITICAL SECTION 1 (begin) ================= */
+  pfs_external_table_shares.lock_share_list();
+
+  /* Check if any of the table, in the list, doesn't exist. */
+  for (uint i = 0; i < share_list_count; i++) {
+    ...
+    PFS_engine_table_share *temp_share =
+        pfs_external_table_shares.find_share(temp_st_share->m_table_name, true);
+
+    if (temp_share != nullptr) {
+      /* If share found in global list,
+       *  - Move it to purgatory.
+       *  - Add it to the list of shares to be removed.
+       */
+      temp_share->m_in_purgatory = true;
+      share_list.push_back(temp_share);
+    }
+  }
+
+  pfs_external_table_shares.unlock_share_list();
+  /* ============== CRITICAL SECTION 1 ( end ) ================= */
+
+  /* At this point, all 'to be removed' shares are moved to purgatory. So no
+   * new thread would be able to search them in global shares list, therefore
+   * no new query could be run on these tables.
+   *
+   * Now traverse share_list and drop tables using DD API.
+   */
+  for (auto *share : share_list) {
+    if (drop_native_table_for_pfs(PERFORMANCE_SCHEMA_str.str,
+                                  share->m_table_def->get_name())) {
+      return 1;
+    }
+  }
+  ...
+  for (auto *share : share_list) {
+    pfs_external_table_shares.remove_share(share);
+    destroy_table_share(share);
+  }
+```
+
+以及 `find_share` 里那句"跳过 purgatory"的判定（`pfs_engine_table.cc:871-884`）：
+
+```cpp
+  for (auto *it : shares_vector) {
+    if ((compare_table_names(table_name, it->m_table_def->get_name()) == 0) &&
+        (!it->m_in_purgatory || is_dead_too)) {
+      return it;
+    }
+  }
+  return nullptr;
+```
+
+/* 【注】★ 两阶段的意义：先把 share 标成 purgatory（**立刻对新查询不可见**），
+   再用 DD API 落表删除，最后才真正 `delete`。这样"正在跑的查询"不会因为
+   share 被提前释放而崩——`m_ref_count` 配合 `inc_ref_count/dec_ref_count`
+   （`ha_perfschema.cc:966`、`:995`）就是这个用途。 */
+
+动态 share 容器（`pfs_engine_table.h:395-426`）：
+
+```cpp
+class PFS_dynamic_table_shares {
+ public:
+  ...
+  void lock_share_list() { mysql_mutex_lock(&LOCK_pfs_share_list); }
+
+  void unlock_share_list() { mysql_mutex_unlock(&LOCK_pfs_share_list); }
+
+  void add_share(PFS_engine_table_share *share) {
+    mysql_mutex_assert_owner(&LOCK_pfs_share_list);
+    shares_vector.push_back(share);
+  }
+
+  PFS_engine_table_share *find_share(const char *table_name, bool is_dead_too);
+
+  void remove_share(PFS_engine_table_share *share);
+
+ private:
+  std::vector<PFS_engine_table_share *> shares_vector;
+  mysql_mutex_t LOCK_pfs_share_list;
+};
+
+/* List of table shares added by plugin/component */
+extern PFS_dynamic_table_shares pfs_external_table_shares;
+```
+
+★ **真名对照**：`PFS_engine_table_share::get_table_share()` / `find_table_share()` / `get_share_list()` / `pfs_table_registry` / `insert_table_share()` / `delete_table_share()` / `ha_perfschema::discover_table_structure` **全部不存在**（全仓 0 命中）。真实入口是 `PFS_engine_table::find_engine_table_share()`、`PFS_engine_table_share::get_all_tables()`、`all_shares[]` + `pfs_external_table_shares`、`pfs_add_tables_v1()` / `pfs_delete_tables_v1()`、`create_native_table_for_pfs()`（`sql/pfs_priv_util.h:29`）。
 
 ## 二、PFS 模块涉及的设计模式
 
@@ -938,6 +1719,323 @@ psi_mutex_service->start_mutex_wait = pfs_start_mutex_wait_v1;
 **中文关键词检索：** "桥接模式" / "Bridge Pattern" / "handle-body idiom" / "Pimpl idiom"
 
 ---
+
+### Strategy 的载体：每类插桩一个"服务指针 + 函数指针表"
+
+★ `psi_service_v1` / `psi_service_v2` 与全局 `PSI_server` **在 8.0.39 都不存在**（全仓 0 命中）。真实形态是**按插桩类别拆分**：每类一个 `PSI_xxx_service_t *` 指针，指向一张函数指针表。以 mutex 为例（`include/mysql/psi/psi_mutex.h:45-84`）：
+
+```cpp
+/** Entry point for the performance schema interface. */
+struct PSI_mutex_bootstrap {
+  /**
+    ABI interface finder.
+    Calling this method with an interface version number returns either
+    an instance of the ABI for this version, or NULL.
+    @sa PSI_MUTEX_VERSION_1
+    @sa PSI_MUTEX_VERSION_2
+    @sa PSI_CURRENT_MUTEX_VERSION
+  */
+  void *(*get_interface)(int version);
+};
+
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+
+/**
+  Performance Schema Mutex Interface, version 1.
+  @since PSI_MUTEX_VERSION_1
+*/
+struct PSI_mutex_service_v1 {
+  /** @sa register_mutex_v1_t. */
+  register_mutex_v1_t register_mutex;
+  /** @sa init_mutex_v1_t. */
+  // @usage PSI_MUTEX_CALL(init_mutex)(params)
+  init_mutex_v1_t init_mutex;
+  /** @sa destroy_mutex_v1_t. */
+  destroy_mutex_v1_t destroy_mutex;
+  /** @sa start_mutex_wait_v1_t. */
+  start_mutex_wait_v1_t start_mutex_wait;
+  /** @sa end_mutex_wait_v1_t. */
+  end_mutex_wait_v1_t end_mutex_wait;
+  /** @sa unlock_mutex_v1_t. */
+  unlock_mutex_v1_t unlock_mutex;
+};
+
+typedef struct PSI_mutex_service_v1 PSI_mutex_service_t;
+
+extern MYSQL_PLUGIN_IMPORT PSI_mutex_service_t *psi_mutex_service;
+
+#endif /* HAVE_PSI_MUTEX_INTERFACE */
+```
+
+/* 【注】★ 这样的服务指针共 **17 个**（`psi_mutex_service` / `psi_rwlock_service` /
+   `psi_cond_service` / `psi_thread_service` / `psi_file_service` / `psi_statement_service` /
+   `psi_memory_service` / `psi_mdl_service` / …）。所谓"PFS 的接口"不是一张大表，
+   而是 **17 张小表**——这是 8.0 把 PSI 拆细后的形态。 */
+
+### 空实现（Strategy 的"不插桩"那一档）：`mysys/psi_noop.cc`
+
+★ 真名不是 `PSI_server_stub`（不存在），而是 `mysys/psi_noop.cc` 里的空服务表。文件头把 18 个 `HAVE_PSI_*_INTERFACE` 全部强制打开（`psi_noop.cc:29-54`）：
+
+```cpp
+/**
+  @file mysys/psi_noop.cc
+  Always provide the noop performance interface, for plugins.
+*/
+
+#define HAVE_PSI_MUTEX_INTERFACE
+#define HAVE_PSI_RWLOCK_INTERFACE
+#define HAVE_PSI_COND_INTERFACE
+#define HAVE_PSI_FILE_INTERFACE
+#define HAVE_PSI_THREAD_INTERFACE
+...
+```
+
+典型空函数（`psi_noop.cc:92-113`）：
+
+```cpp
+static void register_thread_noop(const char *, PSI_thread_info *, int) {
+  return;
+}
+
+static int spawn_thread_noop(PSI_thread_key, unsigned int,
+                             my_thread_handle *thread,
+                             const my_thread_attr_t *attr,
+                             my_start_routine start_routine, void *arg) {
+  return my_thread_create(thread, attr, start_routine, arg);
+}
+
+static PSI_thread *new_thread_noop(PSI_thread_key, unsigned int, const void *,
+                                   ulonglong) {
+  return nullptr;
+}
+
+static void set_thread_id_noop(PSI_thread *, ulonglong) { return; }
+```
+
+以及"可替换的全局指针"（`psi_noop.cc:268-281`）：
+
+```cpp
+static void end_mutex_wait_noop(PSI_mutex_locker *, int) { return; }
+
+static void unlock_mutex_noop(PSI_mutex *) { return; }
+
+static PSI_mutex_service_t psi_mutex_noop = {
+    register_mutex_noop,   init_mutex_noop,     destroy_mutex_noop,
+    start_mutex_wait_noop, end_mutex_wait_noop, unlock_mutex_noop};
+
+struct PSI_mutex_bootstrap *psi_mutex_hook = nullptr;
+PSI_mutex_service_t *psi_mutex_service = &psi_mutex_noop;
+
+void set_psi_mutex_service(void *psi) {
+  psi_mutex_service = (PSI_mutex_service_t *)psi;
+}
+```
+
+/* 【注】★ 默认 `psi_mutex_service` 就指向空表——"没有 PFS 时不是 if 判断，
+   而是**所有调用都落到一个空函数**"。这就是"零开销"的第一层。 */
+
+### "零开销"的第二层：server 内直接静态调用，跳过函数指针
+
+`include/pfs_mutex_provider.h:37-63`：
+
+```cpp
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+#if defined(MYSQL_SERVER) || defined(PFS_DIRECT_CALL)
+#ifndef MYSQL_DYNAMIC_PLUGIN
+#ifndef WITH_LOCK_ORDER
+
+#include "my_inttypes.h"
+#include "my_macros.h"
+#include "mysql/psi/psi_mutex.h"
+
+#define PSI_MUTEX_CALL(M) pfs_##M##_v1
+
+void pfs_register_mutex_v1(const char *category, PSI_mutex_info_v1 *info,
+                           int count);
+
+PSI_mutex *pfs_init_mutex_v1(PSI_mutex_key key, const void *identity);
+
+void pfs_destroy_mutex_v1(PSI_mutex *mutex);
+
+PSI_mutex_locker *pfs_start_mutex_wait_v1(PSI_mutex_locker_state *state,
+                                          PSI_mutex *mutex,
+                                          PSI_mutex_operation op,
+                                          const char *src_file, uint src_line);
+
+void pfs_unlock_mutex_v1(PSI_mutex *mutex);
+
+void pfs_end_mutex_wait_v1(PSI_mutex_locker *locker, int rc);
+```
+
+三条宏分支（`include/mysql/psi/mysql_mutex.h:67-74`）：
+
+```cpp
+#if defined(MYSQL_SERVER) || defined(PFS_DIRECT_CALL)
+/* PSI_MUTEX_CALL() as direct call. */
+#include "pfs_mutex_provider.h"  // IWYU pragma: keep
+#endif
+
+#ifndef PSI_MUTEX_CALL
+#define PSI_MUTEX_CALL(M) psi_mutex_service->M
+#endif
+```
+
+组件侧是第三条（`include/mysql/components/services/psi_mutex.h:36`）：
+
+```cpp
+#define PSI_MUTEX_CALL(M) mysql_service_psi_mutex_v1->M
+```
+
+★ **三档并存**：① server 内部 → **直接静态调用** `pfs_xxx_v1`（可内联、无间接跳转）；
+② 组件 → 走组件服务指针；③ 插件 → 走 `psi_mutex_service` 函数指针（为的是**不硬编码符号**，
+让插件二进制与实现解耦）。
+
+官方对"零开销"的完整解释（`storage/perfschema/pfs.cc:797-820`）：
+
+```
+  When the performance schema is disabled at runtime, the @c m_psi pointer
+  is @c NULL, so the extra overhead is one if statement.
+
+  When the performance schema is enabled at runtime, the @c m_psi pointer
+  points to the actual instrumentation added to the mutex,
+  and two extra calls are present on the code path:
+  - a call to @c pfs_start_mutex_wait_v1() before the operation
+  - a call to @c pfs_end_mutex_wait_v1() after the operation
+
+  Both these calls are static, and point directly to the
+  performance_schema implementation.
+
+  @section PFS_PSI_PLUGIN Instrumentation for a plugin
+
+  Inside a plugin, @c PSI_MUTEX_CALL expands to a call using a function pointer.
+  This is to decouple the plugin binary from the implementation,
+  to avoid having hard coded references to symbols like
+  pfs_start_mutex_wait_v1()
+  from the plugin library (either shared or static).
+```
+
+### Bridge 的落点：版本分发，而不是"转换层"
+
+★ `pfs_psi_v1_v2` / `psi_v1_v2` **不存在**（没有转换层文件）。真实的"版本桥接"是
+`get_interface(version)` 分发（`storage/perfschema/pfs.cc:9666-9684`）：
+
+```cpp
+static void *get_mutex_interface(int version) {
+  switch (version) {
+    case PSI_MUTEX_VERSION_1:
+      return &pfs_mutex_service_v1;
+    default:
+      return nullptr;
+  }
+}
+
+static void *get_rwlock_interface(int version) {
+  switch (version) {
+    case PSI_RWLOCK_VERSION_1:
+      return nullptr;
+    case PSI_RWLOCK_VERSION_2:
+      return &pfs_rwlock_service_v2;
+    default:
+      return nullptr;
+  }
+}
+```
+
+/* 【注】★ 注意 `get_rwlock_interface` 对 **v1 返回 nullptr** ——rwlock 的 v1 接口
+   在 8.0.39 **已经不可用**（只有 mutex 还保留 v1）。这就是"版本化 ABI"能真正
+   **废弃旧接口**的机制：不提供实现 = 让调用方自己失败。 */
+
+v1 / v2 的实际签名差别（rwlock 是本树唯一保留双版本的 sync 插桩，
+`include/mysql/components/services/bits/psi_rwlock_bits.h:279-291`）：
+
+```cpp
+/**
+  Record a rwlock instrumentation unlock event.
+  @param rwlock the rwlock instrumentation
+*/
+typedef void (*unlock_rwlock_v1_t)(struct PSI_rwlock *rwlock);
+
+/**
+  Record a rwlock instrumentation unlock event.
+  @param rwlock the rwlock instrumentation
+  @param op the unlock operation performed
+*/
+typedef void (*unlock_rwlock_v2_t)(struct PSI_rwlock *rwlock,
+                                   enum PSI_rwlock_operation op);
+```
+
+同一份实现同时挂到"插件表"和"组件服务表"两处（`storage/perfschema/pfs.cc:9336-9352`）：
+
+```cpp
+PSI_mutex_service_v1 pfs_mutex_service_v1 = {
+    /* Old interface, for plugins. */
+    pfs_register_mutex_v1,   pfs_init_mutex_v1,     pfs_destroy_mutex_v1,
+    pfs_start_mutex_wait_v1, pfs_end_mutex_wait_v1, pfs_unlock_mutex_v1};
+
+SERVICE_TYPE(psi_mutex_v1)
+SERVICE_IMPLEMENTATION(performance_schema, psi_mutex_v1) = {
+    /* New interface, for components. */
+    pfs_register_mutex_v1,   pfs_init_mutex_v1,     pfs_destroy_mutex_v1,
+    pfs_start_mutex_wait_v1, pfs_end_mutex_wait_v1, pfs_unlock_mutex_v1};
+
+PSI_rwlock_service_v2 pfs_rwlock_service_v2 = {
+    /* Old interface, for plugins. */
+    pfs_register_rwlock_v2,   pfs_init_rwlock_v2,
+    pfs_destroy_rwlock_v2,    pfs_start_rwlock_rdwait_v2,
+    pfs_end_rwlock_rdwait_v2, pfs_start_rwlock_wrwait_v2,
+    pfs_end_rwlock_wrwait_v2, pfs_unlock_rwlock_v2};
+```
+
+/* 【注】★ 两张表指向**同一组函数**——插件 ABI 与组件服务在 PFS 侧是**同一实现的两个入口**，
+   这是 8.0 从 plugin 迁移到 component 过程中的双轨设计，也是 Bridge 模式最实在的体现。 */
+
+### 编译期摘除插桩：`PFS_SKIP_BUFFER_MUTEX_RWLOCK`
+
+定义**默认开启**（`storage/innobase/include/sync0sync.h:73-81`）：
+
+```cpp
+#if defined UNIV_PFS_MUTEX || defined UNIV_PFS_RWLOCK
+
+/* By default, buffer mutexes and rwlocks will be excluded from
+instrumentation due to their large number of instances. */
+#define PFS_SKIP_BUFFER_MUTEX_RWLOCK
+
+/* By default, event->mutex will also be excluded from instrumentation */
+#define PFS_SKIP_EVENT_MUTEX
+#endif
+```
+
+三处消费点：
+
+```cpp
+#ifdef UNIV_PFS_MUTEX
+/* Key to register autoinc_mutex with performance schema */
+mysql_pfs_key_t autoinc_mutex_key;
+mysql_pfs_key_t autoinc_persisted_mutex_key;
+#ifndef PFS_SKIP_BUFFER_MUTEX_RWLOCK
+mysql_pfs_key_t buffer_block_mutex_key;
+#endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
+#endif
+```
+
+```cpp
+#ifdef PFS_SKIP_BUFFER_MUTEX_RWLOCK
+  LATCH_ADD_MUTEX(BUF_BLOCK_MUTEX, SYNC_BUF_BLOCK, PFS_NOT_INSTRUMENTED);
+#else
+  LATCH_ADD_MUTEX(BUF_BLOCK_MUTEX, SYNC_BUF_BLOCK, buffer_block_mutex_key);
+#endif /* PFS_SKIP_BUFFER_MUTEX_RWLOCK */
+```
+
+```cpp
+#ifndef PFS_SKIP_BUFFER_MUTEX_RWLOCK
+    PSI_MUTEX_KEY(buffer_block_mutex, 0, 0, PSI_DOCUMENT_ME),
+#endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
+```
+
+/* 【注】★ 理由写在注释里："due to their **large number of instances**"——
+   缓冲池有几十万个 block，每个都插桩会把 PFS 的实例数撑爆。这是"零开销"之外的
+   另一条路：**不是让探针变便宜，而是干脆不装**。代价是 `buf_block` 的锁等待
+   在 PFS 里**看不到**（表现为 `PFS_NOT_INSTRUMENTED`）。 */
 
 ## 三、插件系统涉及的设计模式
 
@@ -1114,4 +2212,4 @@ struct PSI_mutex_bootstrap {
 
 ---
 
-*本文基于 MySQL 8.0 源码分析撰写。内存分配器部分见 [memory.md](memory.md)，读源码通用知识地图见 [README.md](README.md)。*
+*本文基于 MySQL 8.0 源码分析撰写。内存分配器部分见 [allocator.md](../../memory/allocator.md)，读源码通用知识地图见 [README.md](../../../server/infra/README.md)。*

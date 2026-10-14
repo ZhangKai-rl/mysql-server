@@ -18,8 +18,10 @@
   - 为什么需要一层物理 IR
   - 三个设计选择
   - 统一 IR 才可能并行跑两个优化器
+  - 他库对照：结构不独特，独特的是"两个优化器共用一份"
 - [核心实现](#核心实现)
   - 类型体系：44 种节点
+  - ★ 生成规则：什么查询形态产出哪类节点
   - 参数 union 与断言访问器
   - 重点类型详解
   - 代价三字段与过滤前后两套值
@@ -36,7 +38,7 @@
   - ★ 本机制里的工程实现技法
   - 扩展点：新增一个类型要动七处
   - 容易误读的点
-  - 坑与已知缺陷
+  - 失效与退化场景
 - [参考](#参考)
 
 ---
@@ -116,6 +118,26 @@ AccessPath 是一棵**物理计划树**的节点类型，定义在 `sql/join_opt
 
 这也解释了为什么 AccessPath 上会同时存在两套"风格不同"的字段：`Item` 树风格的 `condition`（旧优化器用）与位图风格的 `filter_predicates`（hypergraph 用）——它们服务于两个产出方，最终在后处理里被统一（见「后处理」）。
 
+### 他库对照：结构不独特，独特的是"两个优化器共用一份"
+
+| | PostgreSQL | Oracle | MySQL 8.0 |
+|---|---|---|---|
+| 计划表示 | `PlannedStmt` → `Plan` 树（`Scan` / `Join` / `Sort`… 节点，带类型标签） | 执行计划的"行源（row source）"树，`EXPLAIN PLAN` 写入 `PLAN_TABLE` | `AccessPath` 树（44 种类型） |
+| 执行载体 | `ExecInitNode()` 建 `PlanState`（计划 → 状态对象，1:1） | `qer*` 行源算子 | `CreateIteratorFromAccessPath()` 建 `RowIterator`（1:1） |
+| 计划 / 执行分离程度 | 部分（Plan 与 PlanState 分离，但执行逻辑在同一模块内） | 编译期绑定 | **完全分离**：计划是纯数据结构，执行是独立类体系 |
+| 优化器数量 | 1 | 1 | **2**（经典 + hypergraph，共用这份 IR） |
+
+★ 三者是**同构**的——"物理算子树 + 每个算子一个执行对象"是关系型执行器的通行解法，MySQL 在这点上没有发明新东西。**它的特殊之处不在结构，而在动机**：它是唯一一个**为"渐进替换优化器"而设计**的计划 IR。PG 与 Oracle 只有一个优化器，不需要"两个产出方共用一份计划表示"这个约束。
+
+这个约束解释了很多"看起来多余"的设计：
+
+| 现象 | 归因 |
+|---|---|
+| `condition`（Item 树）与 `filter_predicates`（位图）并存 | 两个优化器各自的谓词表达习惯 |
+| `CACHE_INVALIDATOR` vs `parameter_tables` | LATERAL 依赖的两种表达（旧优化器 / hypergraph） |
+| `New*` 工厂 vs Propose 栈上构造 | 两种产出方式（事后翻译 / 搜索即构造） |
+| 后处理要"统一"两套表示 | 两个产出方的差异必须在翻译成执行器之前收敛 |
+
 ---
 
 ## 核心实现
@@ -132,6 +154,57 @@ AccessPath 是一棵**物理计划树**的节点类型，定义在 `sql/join_opt
 | **复合** | 15 | `FILTER, SORT, AGGREGATE, TEMPTABLE_AGGREGATE, LIMIT_OFFSET, STREAM, MATERIALIZE, MATERIALIZE_INFORMATION_SCHEMA_TABLE, APPEND, WINDOW, WEEDOUT, REMOVE_DUPLICATES, REMOVE_DUPLICATES_ON_INDEX, ALTERNATIVE, CACHE_INVALIDATOR` |
 | **修改表** | 2 | `DELETE_ROWS, UPDATE_ROWS` |
 
+#### ★ 生成规则：什么查询形态产出哪类节点
+
+枚举表只能查名字，真正有用的是**"输入什么 SQL / 优化器做了什么决策 → 产出哪个节点"**。按形态重排：
+
+| 形态 | 产出节点 | 判据 / 谁产出 |
+|---|---|---|
+| **基表访问** | | |
+| 无可用索引 | `TABLE_SCAN` | 访问方法选择的兜底 |
+| 覆盖索引全扫（不回表） | `INDEX_SCAN` | 索引列包含全部所需列 |
+| 非唯一索引等值 | `REF` | `Key_use` 匹配连续 keypart |
+| 唯一索引等值（至多一行） | `EQ_REF` | 唯一键 + 全部 keypart 有值 |
+| ref 但还要额外查 NULL | `REF_OR_NULL` |  keypart 可空且需要 `IS NULL` |
+| 范围条件 | `INDEX_RANGE_SCAN` | range optimizer 产出 `SEL_TREE` |
+| 参数化 range（每个外层行重算范围） | `DYNAMIC_INDEX_RANGE_SCAN` | "range checked for each record" → `DynamicRangeIterator` |
+| 多索引合并 | `INDEX_MERGE` / `ROWID_INTERSECTION` / `ROWID_UNION` | index merge 三种算法 |
+| BKA（按 rowid 排序后批量读） | `MRR` | `UseBKA()` |
+| 跳过索引前缀的扫描 | `INDEX_SKIP_SCAN` | skip scan |
+| 聚合的松索引扫描 | `GROUP_INDEX_SKIP_SCAN` | LIS（**仅经典优化器**） |
+| 递归 CTE 自引用 | `FOLLOW_TAIL` | `is_recursive_reference()` |
+| 优化期已求值的常量表 | `CONST_TABLE` | const table |
+| 全文检索 | `FULL_TEXT_SEARCH` | `MATCH ... AGAINST` |
+| 条件下推到二级引擎 | `PUSHED_JOIN_REF` | 二级引擎接管 |
+| `information_schema` 表（先填充再扫） | `MATERIALIZE_INFORMATION_SCHEMA_TABLE` | `schema_table->fill_table` 非空 |
+| **非表来源** | | |
+| `VALUES` 行构造器 | `TABLE_VALUE_CONSTRUCTOR` | VALUES 子句 |
+| 顶层外连接左臂的"假单行表" | `FAKE_SINGLE_ROW` | 第一张表就是外连接内侧 |
+| 恒假条件 | `ZERO_ROWS` / `ZERO_ROWS_AGGREGATED` | 无 GROUP BY / 有聚合（聚合要返回一行） |
+| JSON_TABLE 等表函数 | `MATERIALIZED_TABLE_FUNCTION` | `is_table_function()` |
+| 无 WHERE 的 `COUNT(*)` | `UNQUALIFIED_COUNT` | 可跳过建迭代器 |
+| **连接** | | |
+| 默认嵌套循环 | `NESTED_LOOP_JOIN` | 不开 BKA / hash join |
+| 批量键访问 | `BKA_JOIN` | `UseBKA()` |
+| 哈希连接 | `HASH_JOIN` | `UseHashJoin()`（含经典优化器把 BNL 替换成 hash join） |
+| 多表 LooseScan | `NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL` | 多表半连接去重 |
+| **复合** | | |
+| WHERE / HAVING 谓词 | `FILTER` | 条件无法下推进访问方法 |
+| ORDER BY / filesort | `SORT` | 需要排序 |
+| GROUP BY | `AGGREGATE` / `TEMPTABLE_AGGREGATE` | 能流式聚合 / 必须落临时表 |
+| LIMIT / OFFSET | `LIMIT_OFFSET` | 有 LIMIT |
+| 派生表 / CTE / 物化 semi-join | `MATERIALIZE` | 需要多次读或隔离 |
+| 只需单趟顺序扫的"伪物化" | `STREAM` | 优化器后判定不必真落盘 |
+| UNION ALL | `APPEND` | 多子块串联 |
+| 窗口函数 | `WINDOW` | 有窗口函数 |
+| semi-join 去重 | `WEEDOUT` / `REMOVE_DUPLICATES` / `REMOVE_DUPLICATES_ON_INDEX` | 三种去重策略（见 [`07_optimize/logical/03_semijoin.md`](07_optimize/logical/03_semijoin.md)） |
+| ref 访问可能因 NULL 而非法 | `ALTERNATIVE` | `cond_guards` 存在，执行期二选一 |
+| LATERAL 缓存失效 | `CACHE_INVALIDATOR` | **仅经典优化器** |
+| **DML** | | |
+| DELETE / UPDATE | `DELETE_ROWS` / `UPDATE_ROWS` | 修改表 |
+
+★ 读表方法：**不要背类型名，从 SQL 形态反推**。看到 `EXPLAIN` 里的某个节点，先问"这个 SQL 形态需要什么操作"，再对照上表——比查枚举表快得多。
+
 **关键成员**（与类型无关，每个节点都有）：
 
 | 成员 | 说明 |
@@ -143,6 +216,275 @@ AccessPath 是一棵**物理计划树**的节点类型，定义在 `sql/join_opt
 | `num_output_rows()` | 期望输出行数（`kUnknownRowCount = -1.0`） |
 | `union {...} u` | 类型专用参数 |
 | `count_examined_rows` | 本节点读的行是否计入 `EXPLAIN ANALYZE` 的 rows examined |
+
+#### `struct AccessPath` 本体：源码长什么样
+
+上表是语义分类，源码本体在 `sql/join_optimizer/access_path.h`：
+
+```cpp
+struct AccessPath {
+  // Most of the members are declared with initializers, but bit fields cannot
+  // be declared with initializers until C++20, so we need to define a
+  // constructor to initialize those fields.
+  AccessPath() : count_examined_rows(false)
+#### ★ 44 种类型的完整枚举与语义分类（源码全谱）
+
+> 源码坐标：`[A1] sql/join_optimizer/access_path.h` · `[A2] sql/join_optimizer/access_path.cc` · `[A3] sql/join_optimizer/join_optimizer.cc`
+
+**分类树**
+
+```
+AccessPath::Type  (enum Type : uint8_t, 8.0.39 共 44 种)
+│
+├─A. 单表扫描类 (17) ──────────── 都对应"某一张基表"的取数方式
+│  ├─ 无索引/全索引      TABLE_SCAN  INDEX_SCAN  CONST_TABLE  MRR  FOLLOW_TAIL
+│  ├─ 索引等值查找        REF  REF_OR_NULL  EQ_REF  PUSHED_JOIN_REF  FULL_TEXT_SEARCH
+│  ├─ 区间/range          INDEX_RANGE_SCAN  DYNAMIC_INDEX_RANGE_SCAN
+│  ├─ range 合并          INDEX_MERGE  ROWID_INTERSECTION  ROWID_UNION
+│  └─ 跳跃扫描            INDEX_SKIP_SCAN  GROUP_INDEX_SKIP_SCAN
+│
+├─B. 无表类 (6) ───────────────── GetBasicTable() 返回 nullptr
+│     TABLE_VALUE_CONSTRUCTOR  FAKE_SINGLE_ROW  ZERO_ROWS
+│     ZERO_ROWS_AGGREGATED     MATERIALIZED_TABLE_FUNCTION  UNQUALIFIED_COUNT
+│
+├─C. 连接类 (4)
+│     NESTED_LOOP_JOIN  NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL
+│     BKA_JOIN          HASH_JOIN
+│
+├─D. 后处理类 (5) ────────────── 单子，对行流做逐行/分组变换
+│     FILTER  SORT  AGGREGATE  TEMPTABLE_AGGREGATE  LIMIT_OFFSET
+│
+├─E. 物化与流式类 (3) ─────────── 跨 query block 的边界节点
+│     STREAM  MATERIALIZE  MATERIALIZE_INFORMATION_SCHEMA_TABLE
+│
+├─F. 集合运算类 (1)
+│     APPEND            （UNION ALL 的流式拼接；UNION/INTERSECT/EXCEPT 走 E 类）
+│
+├─G. 去重与窗口类 (4)
+│     WINDOW  WEEDOUT  REMOVE_DUPLICATES  REMOVE_DUPLICATES_ON_INDEX
+│
+├─H. 适配/控制类 (2) ──────────── 不改变行数，只控制"选谁/何时失效"
+│     ALTERNATIVE        （优化期建两条，执行期选一条）
+│     CACHE_INVALIDATOR  （旧优化器的"何时清空派生表缓存"信号）
+│
+└─I. 修改类 (2)
+      DELETE_ROWS  UPDATE_ROWS
+```
+
+**完整枚举原码**（`[A1]`，注意是 `enum Type : uint8_t` 不是 `enum class`）
+
+```cpp
+  enum Type : uint8_t {
+    // Basic access paths (those with no children, at least nominally).
+    // NOTE: When adding more paths to this section, also update GetBasicTable()
+    // to handle them.
+    TABLE_SCAN,
+    INDEX_SCAN,
+    REF,
+    REF_OR_NULL,
+    EQ_REF,
+    PUSHED_JOIN_REF,
+    FULL_TEXT_SEARCH,
+    CONST_TABLE,
+    MRR,
+    FOLLOW_TAIL,
+    INDEX_RANGE_SCAN,
+    INDEX_MERGE,
+    ROWID_INTERSECTION,
+    ROWID_UNION,
+    INDEX_SKIP_SCAN,
+    GROUP_INDEX_SKIP_SCAN,
+    DYNAMIC_INDEX_RANGE_SCAN,
+
+    // Basic access paths that don't correspond to a specific table.
+    TABLE_VALUE_CONSTRUCTOR,
+    FAKE_SINGLE_ROW,
+    ZERO_ROWS,
+    ZERO_ROWS_AGGREGATED,
+    MATERIALIZED_TABLE_FUNCTION,
+    UNQUALIFIED_COUNT,
+
+    // Joins.
+    NESTED_LOOP_JOIN,
+    NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL,
+    BKA_JOIN,
+    HASH_JOIN,
+
+    // Composite access paths.
+    FILTER,
+    SORT,
+    AGGREGATE,
+    TEMPTABLE_AGGREGATE,
+    LIMIT_OFFSET,
+    STREAM,
+    MATERIALIZE,
+    MATERIALIZE_INFORMATION_SCHEMA_TABLE,
+    APPEND,
+    WINDOW,
+    WEEDOUT,
+    REMOVE_DUPLICATES,
+    REMOVE_DUPLICATES_ON_INDEX,
+    ALTERNATIVE,
+    CACHE_INVALIDATOR,
+
+    // Access paths that modify tables.
+    DELETE_ROWS,
+    UPDATE_ROWS,
+  } type;
+```
+
+**逐类说明**
+
+**A. 单表扫描类（17 种）**
+
+| 类型 | 用途 | 备注 |
+|---|---|---|
+| `TABLE_SCAN` | 全表扫描 | `count_examined_rows=true` 时计入 `examined_rows` |
+| `INDEX_SCAN` | 覆盖索引全扫 | `use_order`/`reverse` 两个开关 |
+| `REF` | 非唯一索引等值查找 | 可返回多行 |
+| `REF_OR_NULL` | `ref` 再加 `<=> NULL` 变体 | 用于 `t1.x = t2.x OR t2.x IS NULL` |
+| `EQ_REF` | 唯一索引等值查找 | 至多一行 |
+| `PUSHED_JOIN_REF` | NDB 的 pushed join | `is_unique` 决定是否至多一行 |
+| `FULL_TEXT_SEARCH` | 全文索引 | 额外带 `Item_func_match *ft_func` |
+| `CONST_TABLE` | 优化期已求值的常量表 | 工厂直接写死 `num_output_rows=1.0, cost=0.0` |
+| `MRR` | Multi-Range Read | **只作为 `BKA_JOIN` 的内层**被创建 |
+| `FOLLOW_TAIL` | 递归 CTE 的自引用读 | hypergraph 中由 `ProposeTableScan` 对 `is_recursive_reference()` 表产出 |
+| `INDEX_RANGE_SCAN` | range 优化器结果 | 携带 `QUICK_RANGE **ranges` |
+| `INDEX_MERGE` / `ROWID_INTERSECTION` / `ROWID_UNION` | 多 range 的交/并 | 子节点必须是 `INDEX_RANGE_SCAN` |
+| `INDEX_SKIP_SCAN` / `GROUP_INDEX_SKIP_SCAN` | 跳跃扫描 / loose index scan for group | 参数大，拆到单独分配 |
+| `DYNAMIC_INDEX_RANGE_SCAN` | **旧优化器专属**：range 在运行时才定 | 参数里带 `QEP_TAB *qep_tab` |
+
+**B. 无表类（6 种）**：`TABLE_VALUE_CONSTRUCTOR`（`VALUES ROW(...)`）、`FAKE_SINGLE_ROW`（`SELECT 1` 的伪单行）、`ZERO_ROWS`（矛盾条件下整块剪枝，**子节点只记录被剪掉的表**，`WalkAccessPaths` 不访问它）、`ZERO_ROWS_AGGREGATED`（剪枝但仍需产出聚合结果的一行）、`MATERIALIZED_TABLE_FUNCTION`（JSON_TABLE）、`UNQUALIFIED_COUNT`（无 WHERE 的 `COUNT(*)` 走 handler 直接返回，对应 bug#112767，避免大宽表时负优化）。
+
+**C. 连接类（4 种）**
+
+| 类型 | 用途 | 归属 |
+|---|---|---|
+| `NESTED_LOOP_JOIN` | 通用嵌套循环，支持 INNER/OUTER/ANTI/SEMI | 两个优化器都用 |
+| `NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL` | semijoin + 去重合一（NLJ 与 `RemoveDuplicatesOnIndex` 的融合体） | **旧优化器专属** |
+| `BKA_JOIN` | Batched Key Access，内层必须是 `MRR` | **旧优化器专属** |
+| `HASH_JOIN` | 哈希连接 | hypergraph 主力；旧优化器把 BNL 改造成它 |
+
+**D. 后处理类（5 种）**：`FILTER`（`Item *condition` 逐行过滤）、`SORT`（`Filesort *`）、`AGGREGATE`（流式聚合，带 `rollup`）、`TEMPTABLE_AGGREGATE`（临时表聚合，两个子：`subquery_path` + `table_path`）、`LIMIT_OFFSET`（`limit`/`offset`/`count_all_rows`/`reject_multiple_rows`）。
+
+**E. 物化与流式类（3 种）**：`MATERIALIZE` 真正把结果写进临时表；`STREAM` 只做字段拷贝后透传（不落盘）；`MATERIALIZE_INFORMATION_SCHEMA_TABLE` 在扫描前先填充 I_S 表。
+
+**F. 集合运算类（1 种）**：`APPEND` 把多个 query block 的结果**流式**首尾相接。
+
+**G. 去重与窗口类（4 种）**：`WINDOW`（`needs_buffering` 决定 `BufferingWindowIterator` 还是 `WindowIterator`）、`WEEDOUT`（semijoin 的 Duplicate Weedout）、`REMOVE_DUPLICATES`（按 `group_items` 去重）、`REMOVE_DUPLICATES_ON_INDEX`（LooseScan，沿索引跳过重复）。
+
+**H/I**：`ALTERNATIVE`、`CACHE_INVALIDATOR`、`DELETE_ROWS`、`UPDATE_ROWS`。
+
+#### ★ 三条"归属"判据（纠正一个常见误解）
+
+**判据一：44 种类型与迭代器是 1:1 的，没有"纯优化期类型"。**
+
+`[A1]` 的头注释把这条写成了设计契约：
+
+```cpp
+/**
+  Access paths are a query planning structure that correspond 1:1 to iterators,
+  in that an access path contains pretty much exactly the information
+  needed to instantiate given iterator, plus some information that is only
+  needed during planning, such as costs. ...
+*/
+```
+
+`[A2]` 的 `CreateIteratorFromAccessPath()` 里 `switch (path->type)` 恰好覆盖全部 44 个 case，一个都不少。**不存在"执行期不会出现"的 `AccessPath::Type`**。
+
+**判据二：真正"优化期专用"的是字段，不是类型。** 三类信息在创建迭代器前被消耗掉/展开掉：
+- `filter_predicates` / `delayed_predicates` 位图 → 由 `ExpandSingleFilterAccessPath()` 展开成显式 `FILTER` 节点；
+- `applied_sargable_join_predicates()` / `subsumed_sargable_join_predicates()` → 只用于避免选择性重复计算；
+- `parameter_tables` / `ordering_state` / `safe_for_rowid` → 只用于剪枝与代价。
+
+**判据三：旧优化器专属 vs hypergraph 专属**
+
+| 归属 | 类型 |
+|---|---|
+| **旧优化器专属** | `DYNAMIC_INDEX_RANGE_SCAN`、`MRR`、`BKA_JOIN`、`NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL`、`WEEDOUT`、`CACHE_INVALIDATOR`、`TEMPTABLE_AGGREGATE` |
+| **hypergraph 专属/主力** | `HASH_JOIN`、`INDEX_SKIP_SCAN`、`GROUP_INDEX_SKIP_SCAN`、`FOLLOW_TAIL`（递归 CTE） |
+| 两者共用 | 其余全部 |
+
+`WEEDOUT` 的归属在 `[A3]` 有明确注释：「when we need row IDs for weedout, which doesn't preclude streaming. **The hypergraph optimizer does not use weedout.**」`CACHE_INVALIDATOR` 同理——`[A2]` 的 `HASH_JOIN` case 写着「The old optimizer had a concept of _when_ to clear derived tables (invalidators)… If it becomes a performance issue, consider reintroducing them.」
+#ifndef NDEBUG
+      , forced_by_dbug(false)
+#endif
+  {}
+
+  enum Type : uint8_t {
+    // Basic access paths (those with no children, at least nominally).
+    // NOTE: When adding more paths to this section, also update GetBasicTable()
+    TABLE_SCAN, INDEX_SCAN, REF, REF_OR_NULL, EQ_REF, PUSHED_JOIN_REF,
+    FULL_TEXT_SEARCH, CONST_TABLE, MRR, FOLLOW_TAIL, INDEX_RANGE_SCAN,
+    INDEX_MERGE, ROWID_INTERSECTION, ROWID_UNION, INDEX_SKIP_SCAN,
+    GROUP_INDEX_SKIP_SCAN, DYNAMIC_INDEX_RANGE_SCAN,
+
+    // Basic access paths that don't correspond to a specific table.
+    TABLE_VALUE_CONSTRUCTOR, FAKE_SINGLE_ROW, ZERO_ROWS,
+    ZERO_ROWS_AGGREGATED, MATERIALIZED_TABLE_FUNCTION,
+    // https://bugs.mysql.com/bug.php?id=112767 . 大宽表 count(*)时为负优化
+    UNQUALIFIED_COUNT,
+
+    // Joins.
+    NESTED_LOOP_JOIN, NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL,
+    BKA_JOIN, HASH_JOIN,
+
+    // Composite access paths.
+    FILTER, SORT, AGGREGATE, TEMPTABLE_AGGREGATE, LIMIT_OFFSET, STREAM,
+    MATERIALIZE, MATERIALIZE_INFORMATION_SCHEMA_TABLE, APPEND, WINDOW,
+    WEEDOUT, REMOVE_DUPLICATES, REMOVE_DUPLICATES_ON_INDEX, ALTERNATIVE,
+    CACHE_INVALIDATOR,
+
+    // Access paths that modify tables.
+    DELETE_ROWS, UPDATE_ROWS,
+  } type;
+```
+
+三点值得记：
+
+- **`uint8_t` 承载 44 种类型**，且源码注释本身就是分类依据——五段注释与上表五类一一对应；注释还要求新增类型时同步更新 `GetBasicTable()`，否则"基础表访问"会漏判。
+- **构造函数只为 bit field 而存在**：C++20 才允许 bit field 带初始化器，所以这里手写（源码留了 TODO：上 C++20 后改用编译器生成的默认构造）。
+- `UNQUALIFIED_COUNT` 挂着 **bug#112767**——大宽表 `count(*)` 时它反而是负优化。
+
+#### ★ rowid 安全性：`Safety` 三级与沿树向上传播
+
+`AccessPath` 里还有一个容易被忽略的成员，它决定"**能不能从这个路径上取 rowid 做排序**"：
+
+```cpp
+  /// A general enum to describe the safety of a given operation.
+  /// Currently we only use this to describe row IDs, but it can easily
+  /// be reused for safety of updating a table we're reading from
+  /// (the Halloween problem), or just generally unreproducible results.
+  /// Less safe values have higher numerical values.
+  enum Safety : uint8_t {
+    SAFE = 0,
+    /// safe if scanned once, but not if scanned multiple times (e.g. used on
+    /// the inner side of a nested-loop join). A typical example is a derived
+    /// table or CTE that is rematerialized on each scan, so that references
+    /// to the old values (such as row IDs) are no longer valid.
+    SAFE_IF_SCANNED_ONCE = 1,
+    UNSAFE = 2
+  };
+  Safety safe_for_rowid = SAFE;
+
+  /// Whether this access path counts as one that scans a base table,
+  /// and thus should be counted towards examined_rows. ... the only
+  /// canonical reference is the tests.
+  bool count_examined_rows : 1;
+```
+
+★ 关键设计是"**数值越大越不安全**"——这让传播规则可以直接用 `max`/比较表达。源码四处消费者构成完整的向上传播链：
+
+| 场景 | 规则 | 源码 |
+|---|---|---|
+| 一般传递 | 直接继承子路径 | `cost_model.cc`：`path->safe_for_rowid = child.safe_for_rowid;` |
+| join 合并 | 取左右较不安全者 | `join_optimizer.cc`：`std::max(left->safe_for_rowid, right->safe_for_rowid)` |
+| 特定 join 形态 | 右路径不安全 → 整体 UNSAFE | `join_optimizer.cc`：`if (right != SAFE) join.safe_for_rowid = UNSAFE;` |
+| **物化** | **置回 SAFE** | `join_optimizer.cc`：`materialize_path->safe_for_rowid = AccessPath::SAFE;` |
+
+⇒ **物化是"消毒剂"**：把派生表/CTE 物化后 rowid 就稳定了，不再每次重扫都变。这解释了一个实际优化行为——当优化器需要从某路径取 rowid 排序、而该路径是 `SAFE_IF_SCANNED_ONCE`（典型：每次重扫都 rematerialize 的派生表）时，会插入 `MATERIALIZE` 节点把安全性"洗"回 SAFE。反过来也说明了前文那条：一旦 `rematerialize=true` 被迫置 `SAFE_IF_SCANNED_ONCE`，失效机制就不再有意义。
+
+`count_examined_rows` 的注释也值得录：某个路径是否计入 `examined_rows` 有时显得随意，**唯一权威参考是测试**（源码原话 *the only canonical reference is the tests*）。
 
 ### 参数 union 与断言访问器
 
@@ -165,6 +507,442 @@ path->table_scan().table = table;      // 内含 assert(type == TABLE_SCAN)
 
 这是"union + 类型标签 + 断言访问器"的经典 C++ 手法：空间上是 union（所有类型共享一段内存），语义上靠标签区分，debug 构建用 assert 兜住误取。
 
+#### ★ `struct AccessPath` 内存布局与设计动机
+
+```
+ AccessPath  (static_assert(sizeof(AccessPath) <= 144))
+ ┌──────────────────────────────────────────────────────────────┐
+ │ 基类区 (~96B): type / safe_for_rowid / count_examined_rows    │
+ │   immediate_update_delete_table / ordering_state / iterator   │
+ │   cost / init_cost / init_once_cost / num_output_rows(私有)    │
+ │   *_before_filter / filter_predicates / delayed_predicates    │
+ │   parameter_tables / secondary_engine_data                    │
+ ├──────────────────────────────────────────────────────────────┤
+ │ 变体区 u (union, ~48B): 44 种类型各自的参数 struct            │
+ │   同一时刻只有一个成员有效 —— 由断言访问器保证                │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+★ 为什么**不用继承**而用固定大小 + union（`[A1]` 原文）：
+
+```cpp
+/*
+  AccessPath objects build on a variant, ie., they can hold an access path of
+  any type (table scan, filter, hash join, sort, etc.), although only one at the
+  same time. Currently, they contain 32 bytes of base information that is common
+  to any access path (type identifier, costs, etc.), and then up to 40 bytes
+  that is type-specific (e.g. for a table scan, the TABLE object). It would be
+  nice if we could squeeze it down to 64 and fit a cache line exactly, but it
+  does not seem to be easy without fairly large contortions.
+
+  We could have solved this by inheritance, but the fixed-size design makes it
+  possible to replace an access path when a better one is found, without
+  introducing a new allocation, which will be important when using them as a
+  planning structure.
+*/
+```
+
+⇒ **关键动机**：规划期会不断"发现更好的路径并替换"，固定大小才能**就地覆盖**而不产生新分配。
+
+#### ★ 非-union 成员（完整）
+
+```cpp
+struct AccessPath {
+  enum Type : uint8_t { /* 44 种 */ } type;
+
+  /// A general enum to describe the safety of a given operation.
+  /// Less safe values have higher numerical values.
+  enum Safety : uint8_t {
+    SAFE = 0,               // 任意次扫描都安全
+    SAFE_IF_SCANNED_ONCE = 1, // 只扫一次才安全（派生表会重化物化，rowid 失效）
+    UNSAFE = 2              // 永远不安全，通常得先物化
+  };
+  Safety safe_for_rowid = SAFE;
+
+  /// 是否计入 examined_rows
+  bool count_examined_rows : 1;
+
+  /// For UPDATE and DELETE: 可"边读边改"的表的 node index，-1 表示没有。
+  int8_t immediate_update_delete_table{-1};
+
+  /// 该路径产出的行遵循哪个有序性（LogicalOrderings::StateIndex）
+  int ordering_state = 0;
+
+  /// 若已为本路径实例化了迭代器，指向它。用于需要互相通信的迭代器
+  /// （递归 CTE、BKA join），也用于 EXPLAIN ANALYZE 定位耗时信息。
+  RowIterator *iterator = nullptr;
+
+  /// 读完整棵路径一次的期望代价；-1.0 表示未知。
+  double cost{-1.0};
+  /// 初始化代价：读 N 行中的 k 行 = init_cost + (k/N)*(cost - init_cost)。
+  double init_cost{-1.0};
+  /// init_cost 中有多少是"每个 query block 只需做一次"的。
+  double init_once_cost{0.0};
+  /// 第二次及以后扫描的代价。存 init_once_cost 可省掉大量重复赋值。
+  double rescan_cost() const { return cost - init_once_cost; }
+
+  /// 过滤前的值（无过滤器时与 num_output_rows / cost 相同）
+  double num_output_rows_before_filter{kUnknownRowCount},
+      cost_before_filter{-1.0};
+
+  /// 本路径上应用的 WHERE 谓词位图。只在 planning 期用；
+  /// 创建迭代器前会加 FILTER 节点代替它。
+  OverflowBitset filter_predicates{0};
+
+  /// 已被 ref access 应用过、不应再计选择性的 sargable 连接谓词位图。
+  /// 与 filter_predicates 引用同一数组，故绝不重叠 —— 复用同一块内存
+  /// （不能用 union，因为 OverflowBitset 有非平凡默认构造）。
+  /// 若 N = num_where_predicates，则 bit 0..N-1 属 filter_predicates，
+  /// 其余属 applied_sargable_join_predicates。
+  OverflowBitset &applied_sargable_join_predicates() {
+    return filter_predicates;
+  }
+
+  /// 已 join 进来但还不能应用的 WHERE 谓词（引用了别的表，
+  /// 或无法下推到外连接的 nullable 侧）。只在 planning 期使用。
+  OverflowBitset delayed_predicates{0};
+
+  /// 已被应用且将被"完全吸收"的 sargable 谓词：不仅选择性不重复计，
+  /// 谓词本身都冗余、无需再当 filter 应用。
+  OverflowBitset &subsumed_sargable_join_predicates() {
+    return delayed_predicates;
+  }
+
+  /// 非零时：这些表的行必须先被加载，本路径才能求值 —— 即本路径必须
+  /// 放在 nested-loop 的内侧、且外侧包含所有这些表。
+  /// 只要 parameter_tables != 0，就不能做 hash join 的右侧。
+  /// 特例：RAND_TABLE_BIT 表示完全不可缓存。
+  hypergraph::NodeMap parameter_tables{0};
+
+  /// 二级存储引擎在优化/执行期自由使用的辅助数据
+  void *secondary_engine_data{nullptr};
+
+  double num_output_rows() const { return m_num_output_rows; }
+  void set_num_output_rows(double val) { m_num_output_rows = val; }
+
+ private:
+  double m_num_output_rows{kUnknownRowCount};
+
+  // We'd prefer if this could be an std::variant, but we don't have C++17 yet.
+  // It is private to force all access to be through the type-checking accessors.
+  union { /* 见下 */ } u;
+};
+
+static_assert(std::is_trivially_destructible<AccessPath>::value,
+              "AccessPath must be trivially destructible, as it is allocated "
+              "on the MEM_ROOT and not wrapped in unique_ptr_destroy_only"
+              "(because multiple candidates during planning could point to "
+              "the same access paths, and refcounting would be expensive)");
+```
+
+#### ★ 参数 union（代表性 20+ 种）
+
+```cpp
+ private:
+  union {
+    struct { TABLE *table; } table_scan;                       // TABLE_SCAN
+    struct {
+      TABLE *table; int idx; bool use_order; bool reverse;
+    } index_scan;                                              // INDEX_SCAN
+    struct {
+      TABLE *table; Index_lookup *ref; bool use_order; bool reverse;
+    } ref;                                                     // REF
+    struct { TABLE *table; Index_lookup *ref; } eq_ref;        // EQ_REF
+    struct { TABLE *table; Index_lookup *ref; } const_table;   // CONST_TABLE
+    struct {
+      TABLE *table; Index_lookup *ref;
+      AccessPath *bka_path;   // 创建 BKA 迭代器时才回填
+      int mrr_flags;
+      bool keep_current_rowid;
+    } mrr;                                                     // MRR
+    struct { TABLE *table; } follow_tail;                      // FOLLOW_TAIL
+
+    struct {
+      // 表对象不直接存，而是从 used_key_parts[0].field->table 取，
+      // 以免撑爆 AccessPath 大小限制。
+      KEY_PART *used_key_part;
+      QUICK_RANGE **ranges; unsigned num_ranges;
+      unsigned mrr_flags; unsigned mrr_buf_size;
+      unsigned index; unsigned num_used_key_parts;
+      bool can_be_used_for_ror : 1;         // 能否按 rowid 序返回
+      bool need_rows_in_rowid_order : 1;
+      bool can_be_used_for_imerge : 1;
+      bool reuse_handler : 1;
+      bool geometry : 1;
+      bool reverse : 1;
+      bool using_extended_key_parts : 1;
+    } index_range_scan;                                        // INDEX_RANGE_SCAN
+
+    struct {
+      TABLE *table; bool forced_by_hint;
+      bool allow_clustered_primary_key_scan;
+      Mem_root_array<AccessPath *> *children;
+    } index_merge;                                             // INDEX_MERGE
+    struct {
+      TABLE *table; Mem_root_array<AccessPath *> *children;
+      AccessPath *cpk_child;                // 聚簇主键扫描，可无
+      bool forced_by_hint; bool retrieve_full_rows;
+      bool need_rows_in_rowid_order; bool reuse_handler;
+      bool is_covering;                     // true = 无需回表
+    } rowid_intersection;                                      // ROWID_INTERSECTION
+    struct {
+      TABLE *table; unsigned index; unsigned num_used_key_parts;
+      bool forced_by_hint;
+      IndexSkipScanParameters *param;   // 大且有非平凡析构，单独分配
+    } index_skip_scan;                                         // INDEX_SKIP_SCAN
+    struct {
+      TABLE *table;
+      QEP_TAB *qep_tab;  // 仅用于 buffering
+    } dynamic_index_range_scan;                                // DYNAMIC_INDEX_RANGE_SCAN
+
+    struct {
+      TABLE *table; Table_function *table_function; AccessPath *table_path;
+    } materialized_table_function;
+    struct { } unqualified_count;
+    struct { /* 无成员 */ } fake_single_row;
+    struct {
+      // 子路径可选，仅用于记录本路径剪掉了哪些表，且只在外连接内侧才需要。
+      // WalkAccessPaths() 不会访问 ZERO_ROWS 的子节点。
+      AccessPath *child;
+      const char *cause;   // 仅 EXPLAIN 用
+    } zero_rows;
+
+    struct {
+      AccessPath *outer, *inner;
+      const JoinPredicate *join_predicate;
+      bool allow_spill_to_disk;
+      bool store_rowids;   // 是否在 weedout 之下
+      bool rewrite_semi_to_inner;
+      table_map tables_to_get_rowid_for;
+    } hash_join;                                               // HASH_JOIN
+    struct {
+      AccessPath *outer, *inner; JoinType join_type;
+      unsigned mrr_length_per_rec; float rec_per_key;
+      bool store_rowids; table_map tables_to_get_rowid_for;
+    } bka_join;                                                // BKA_JOIN
+    struct {
+      AccessPath *outer, *inner;
+      JoinType join_type;
+      bool pfs_batch_mode;
+      bool already_expanded_predicates;
+      const JoinPredicate *join_predicate;
+      OverflowBitset equijoin_predicates;
+      // NOTE: 因 equijoin_predicates 有非平凡构造，本 struct 必须带初值
+    } nested_loop_join = {nullptr, nullptr, JoinType::INNER, false, false,
+                          nullptr, {}};                        // NESTED_LOOP_JOIN
+
+    struct {
+      AccessPath *child; Item *condition;
+      // 这个参数（几乎唯一的一个）不传给迭代器本身：若为 true，表示创建
+      // 迭代器时应把 condition 里所有可物化子查询物化掉（先去掉 in2exists）。
+      bool materialize_subqueries;
+    } filter;                                                  // FILTER
+    struct {
+      AccessPath *child; Filesort *filesort;
+      table_map tables_to_get_rowid_for;
+      ORDER *order; ha_rows limit;
+      bool remove_duplicates; bool unwrap_rollup; bool force_sort_rowids;
+    } sort;                                                    // SORT
+    struct { AccessPath *child; bool rollup; } aggregate;      // AGGREGATE
+    struct {
+      AccessPath *subquery_path; Temp_table_param *temp_table_param;
+      TABLE *table; AccessPath *table_path; int ref_slice;
+    } temptable_aggregate;                                     // TEMPTABLE_AGGREGATE
+    struct {
+      AccessPath *child; ha_rows limit; ha_rows offset;
+      bool count_all_rows; bool reject_multiple_rows;
+      // 仅 UNION + SQL_CALC_FOUND_ROWS 时使用
+      ha_rows *send_records_override;
+    } limit_offset;                                            // LIMIT_OFFSET
+    struct {
+      AccessPath *child; JOIN *join;
+      Temp_table_param *temp_table_param; TABLE *table;
+      bool provide_rowid;   // 由 FindTablesToGetRowidFor() 后置设置
+      int ref_slice;
+    } stream;                                                  // STREAM
+    struct {
+      // NOTE: table_path 里合法的类型只有 TABLE_SCAN / REF / REF_OR_NULL /
+      // EQ_REF / ALTERNATIVE / CONST_TABLE / INDEX_SCAN /
+      // DYNAMIC_INDEX_SCAN（实现还额外接受 LIMIT_OFFSET 与 INDEX_RANGE_SCAN）
+      AccessPath *table_path;
+      MaterializePathParameters *param;   // 大且有非平凡析构，单独分配
+      double subquery_cost;
+    } materialize;                                             // MATERIALIZE
+    struct { Mem_root_array<AppendPathParameters> *children; } append;
+    struct {
+      AccessPath *child; Window *window; TABLE *temp_table;
+      Temp_table_param *temp_table_param; int ref_slice;
+      bool needs_buffering;
+    } window;                                                  // WINDOW
+    struct {
+      AccessPath *child; SJ_TMP_TABLE *weedout_table;
+      table_map tables_to_get_rowid_for;
+    } weedout;                                                 // WEEDOUT
+    struct {
+      AccessPath *child; Item **group_items; int group_items_size;
+    } remove_duplicates;
+    struct {
+      AccessPath *child; TABLE *table; KEY *key;
+      unsigned loosescan_key_len;
+    } remove_duplicates_on_index;
+    struct {
+      AccessPath *table_scan_path;   // 分支 B：退化为全表扫
+      AccessPath *child;             // 分支 A：原 ref/EQ_REF 路径
+      Index_lookup *used_ref;        // 决定选哪个：看它的 cond_guards
+    } alternative;                                             // ALTERNATIVE
+    struct { AccessPath *child; const char *name; } cache_invalidator;
+    struct {
+      AccessPath *child; table_map tables_to_delete_from; table_map immediate_tables;
+    } delete_rows;
+    struct {
+      AccessPath *child; table_map tables_to_update; table_map immediate_tables;
+    } update_rows;
+  } u;
+```
+
+#### ★ 断言访问器：真实实现与动机
+
+```cpp
+  auto &table_scan() {
+    assert(type == TABLE_SCAN);
+    return u.table_scan;
+  }
+  const auto &table_scan() const {
+    assert(type == TABLE_SCAN);
+    return u.table_scan;
+  }
+  auto &ref() { assert(type == REF); return u.ref; }
+  auto &hash_join() { assert(type == HASH_JOIN); return u.hash_join; }
+  auto &materialize() { assert(type == MATERIALIZE); return u.materialize; }
+  auto &alternative() { assert(type == ALTERNATIVE); return u.alternative; }
+  // ... 其余 38 个类型完全同构 ...
+```
+
+**为什么用断言访问器而不是直接访问 union 成员？**
+
+1. **union 是 `private` 的**——源码注释直接写明动机：`It is private to force all access to be through the type-checking accessors.` "不能直接访问"不是风格建议，而是**编译期强制**。
+2. **union 天然类型不安全**：C++ union 不记录当前活跃成员；`path->u.hash_join.outer` 在 `type == TABLE_SCAN` 时是把 `TABLE*` 重新解释成的指针，属于 UB。`assert(type == ...)` 把这类错误在 debug 构建里立刻暴露。
+3. **用 `auto &` 推导返回类型**：44 个匿名 struct 没有名字（写不出返回类型），`auto &` 让编译器从 `u.xxx` 推导，同时保留引用语义。
+4. **const 重载成对**：只读遍历（`WalkAccessPaths`、EXPLAIN）拿 `const auto &`，构建期拿 `auto &`。
+5. **零成本抽象**：release 下 `assert()` 消失、访问器内联，等价于直接访问。
+
+#### ★ 特殊节点：`MATERIALIZE` / `STREAM` / `CACHE_INVALIDATOR` 三者的分工
+
+```
+   ┌─────────────────────────────────────────────────────────┐
+   │  MATERIALIZE        : 真的写进临时表，可多次扫、可去重      │
+   │  STREAM             : 不落盘，只做字段投影后透传           │
+   │  CACHE_INVALIDATOR  : 控制信号，告诉上面的 MATERIALIZE     │
+   │                       "该清空了"                         │
+   └─────────────────────────────────────────────────────────┘
+```
+
+| | `MATERIALIZE` | `STREAM` | `CACHE_INVALIDATOR` |
+|---|---|---|---|
+| 是否落临时表 | 是 | 否 | 否（纯控制） |
+| 可扫描次数 | 可多次（`rematerialize` 控制） | 逻辑上"流过一次" | 不改变行数 |
+| 归属 | 两个优化器都用 | 两个优化器都用 | **旧优化器专属** |
+| rowid 安全性 | `rematerialize=true` → `SAFE_IF_SCANNED_ONCE` | 自己提供 rowid | 继承子节点 |
+
+`MATERIALIZE` 的 `param` 拆出去单独分配（太大），里面最精妙的是 `rematerialize` 与 `invalidators` 的互斥、以及 INTERSECT/EXCEPT 的 `limit_rows`：
+
+```cpp
+  param->query_blocks = std::move(query_blocks);
+  if (rematerialize) {
+    // 反正每次都重物化，加失效器没有意义。
+    param->invalidators = nullptr;
+  } else {
+    param->invalidators = invalidators;
+  }
+  ...
+  param->limit_rows = (table == nullptr || table->is_union_or_table()
+                           ? limit_rows
+                           : // INTERSECT, EXCEPT: 由 TableScanIterator 强制
+                           HA_POS_ERROR);
+  ...
+  if (rematerialize) {
+    // 每次重扫内容都变，rowid 只在"只扫一次"时才安全。
+    path->safe_for_rowid = AccessPath::SAFE_IF_SCANNED_ONCE;
+  } else {
+    path->safe_for_rowid = AccessPath::SAFE;
+  }
+```
+
+`CACHE_INVALIDATOR` 在 `[A4] sql/sql_executor.cc` 里被"注册"到被依赖表，之后由 `NewMaterializeAccessPath()` 接走：
+
+```cpp
+static AccessPath *NewInvalidatorAccessPathForTable(
+    THD *thd, AccessPath *path, QEP_TAB *qep_tab,
+    plan_idx table_index_to_invalidate) {
+  AccessPath *invalidator =
+      NewInvalidatorAccessPath(thd, path, qep_tab->table()->alias);
+  invalidator->set_num_output_rows(path->num_output_rows());   // Copy costs
+  invalidator->cost = path->cost;
+
+  QEP_TAB *tab2 = &qep_tab->join()->qep_tab[table_index_to_invalidate];
+  if (tab2->invalidators == nullptr) {
+    tab2->invalidators =
+        new (thd->mem_root) Mem_root_array<const AccessPath *>(thd->mem_root);
+  }
+  tab2->invalidators->push_back(invalidator);   // ← 交给 MATERIALIZE 的 param
+  return invalidator;
+}
+```
+
+#### ★ `ALTERNATIVE`：44 种里唯一"一对多"的 plan→iterator 映射
+
+```
+        ALTERNATIVE
+        ├── child            = REF / EQ_REF 路径（优化期算出的最优）
+        ├── table_scan_path  = TABLE_SCAN 路径（退化分支）
+        └── used_ref         → cond_guards[]：执行期依据它二选一
+```
+
+动机（源码注释）：`IN→EXISTS` 改写会给每个 key part 装一个"条件守卫"（指向 bool 的指针，说明 `<expr>` 是否为 NULL）。守卫做两件事：① 禁用被下推的 WHERE 子句；② **把 REF/REF_OR_NULL 改成全表扫**。② 改变了计划，所以必须插入 `AlternativeIterator` 在执行期二选一。
+
+```cpp
+  if (used_ref != nullptr) {
+    for (unsigned key_part_idx = 0; key_part_idx < used_ref->key_parts;
+         ++key_part_idx) {
+      if (used_ref->cond_guards[key_part_idx] != nullptr) {
+        AccessPath *table_scan_path = NewTableScanAccessPath(
+            join()->thd, table(), /*count_examined_rows=*/true);
+        table_scan_path->set_num_output_rows(table()->file->stats.records);
+        table_scan_path->cost = table()->file->table_scan_cost().total_cost();
+        path = NewAlternativeAccessPath(join()->thd, path, table_scan_path,
+                                        used_ref);
+        break;
+      }
+    }
+  }
+```
+
+⇒ **优化期"建"两条候选（代价只按 ref 那条算），执行期"选"一条跑**。`chosen` 不在 AccessPath 里，由迭代器在 `Init()` 时按 `cond_guard` 决定。
+
+#### `WEEDOUT` vs `REMOVE_DUPLICATES`：semijoin 去重的两种实现
+
+| | `WEEDOUT`（Duplicate Weedout） | `REMOVE_DUPLICATES` / `_ON_INDEX` |
+|---|---|---|
+| 去重键 | **rowid**（`SJ_TMP_TABLE` 存各表 rowid 组合） | **值**（`group_items[]`）/ **索引前缀**（LooseScan） |
+| 需要 rowid | 是 —— `tables_to_get_rowid_for` 由 `FindTablesToGetRowidFor()` 回填 | 否 |
+| 额外内存 | 需要去重临时表 | `_ON_INDEX` 完全无额外内存 |
+| 能否被 LIMIT 1 替代 | **能**（confluent weedout） | 不能 |
+| 归属 | **旧优化器专属** | hypergraph 用 `REMOVE_DUPLICATES` |
+
+```cpp
+static AccessPath *CreateWeedoutOrLimitAccessPath(THD *thd, AccessPath *path,
+                                                  SJ_TMP_TABLE *weedout_table) {
+  if (weedout_table->is_confluent) {
+    // “confluent” weedout 指对所有字段都去重。此时可以丢掉
+    // WeedoutIterator 的复杂度，直接插一个 LIMIT 1。
+    return NewLimitOffsetAccessPath(thd, path, 1, 0, false, false, nullptr);
+  } else {
+    AccessPath *weedout_path = NewWeedoutAccessPath(thd, path, weedout_table);
+    FindTablesToGetRowidFor(weedout_path);   // ← rowid 需求在这里回填
+    return weedout_path;
+  }
+}
+```
 ### 重点类型详解
 
 挑复杂、易踩坑的七个讲透。
@@ -261,6 +1039,174 @@ double rescan_cost() const { return cost - init_once_cost; }
 | 物化（`rematerialize=false`） | 第一次物化 + 读 | 物化 + 读第一行 | ≈物化代价（第二次 Init 免了物化） |
 | const 表 | 0 | 0 | 0 |
 
+#### ★ 五个代价/行数字段的关系
+
+```
+    ┌──────────────── 过滤前（"裸算子"的估计） ─────────────┐
+    │  num_output_rows_before_filter                       │
+    │  cost_before_filter                                  │
+    └───────────────┬──────────────────────────────────────┘
+                    │  ApplyPredicatesForBaseTable() 逐条
+                    │  乘 selectivity、加 filter 代价
+                    ▼
+    ┌──────────────── 过滤后（"对外可见"的估计） ───────────┐
+    │  num_output_rows()  →  m_num_output_rows (私有)       │
+    │  cost                                                │
+    └──────────────────────────────────────────────────────┘
+
+   init_cost        初始化代价（读第一行所需）
+   init_once_cost   init_cost 中"整个 query block 只做一次"的部分
+   rescan_cost()  = cost - init_once_cost       ← 第二/N 次扫描的真实代价
+```
+
+```cpp
+  /// 读完整棵路径一次的期望代价；-1.0 表示未知。
+  double cost{-1.0};
+
+  /// 初始化代价：读 N 行中的 k 行 = init_cost + (k/N)*(cost - init_cost)。
+  /// 注意 EXPLAIN 打印的是"读第一行"的代价（对用户更直观），
+  /// 但用纯初始化代价做计算更方便，所以这里存的是后者。
+  double init_cost{-1.0};
+
+  /// init_cost 中有多少只需每个 query block 做一次（这是代价不是比例）。
+  /// 典型：rematerialize=false 的物化表，第二次 Init() 是 no-op。
+  /// 目前不出现在 EXPLAIN 里，只进 optimizer trace。
+  double init_once_cost{0.0};
+
+  /// 第二次及以后扫描的代价。存 init_once_cost 可省掉大量重复赋值。
+  double rescan_cost() const { return cost - init_once_cost; }
+
+  /// 过滤前的值（无过滤器时与 num_output_rows / cost 相同）。
+  /// init_cost 永远相同（过滤器的初始化代价为零）。
+  double num_output_rows_before_filter{kUnknownRowCount},
+      cost_before_filter{-1.0};
+```
+
+一致性由 `[A3]` 的断言守住（仅 debug 构建）：
+
+```cpp
+      assert(path->init_cost <= path->cost);
+      if (!IsEmpty(path->filter_predicates)) {
+        assert(path->num_output_rows() <= path->num_output_rows_before_filter);
+        assert(path->cost_before_filter <= path->cost);
+      }
+```
+
+#### ★ 四个谓词位图（两个是别名！）
+
+| 字段（含别名） | 内存 | 语义 |
+|---|---|---|
+| `filter_predicates` | 独立 | **本节点上**要应用的 WHERE 谓词集合（多位则 AND）。只在 planning 期用；创建迭代器前被展开成显式 `FILTER` 节点。 |
+| `applied_sargable_join_predicates()` | **别名 → `filter_predicates` 高位** | 已被 ref access 应用过、**选择性不应再乘一次**的 sargable 谓词。 |
+| `delayed_predicates` | 独立 | 涉及的表已 join 进来、但**还不能在此应用**的谓词（引用别的表，或无法下推到外连接 nullable 侧）。 |
+| `subsumed_sargable_join_predicates()` | **别名 → `delayed_predicates`** | 已被 ref access **完全吸收**的 sargable 谓词：不仅选择性不重复计，谓词本身冗余。 |
+
+★ 两个别名是**同一内存的两种解释**——源码解释了为什么用别名而不能用 union：
+
+```cpp
+  /// Since these refer to the same array as filter_predicates, they will
+  /// never overlap with filter_predicates, and so we can reuse the same
+  /// memory using an alias (a union would not be allowed, since OverflowBitset
+  /// is a class with non-trivial default constructor), even though the meaning
+  /// is entirely separate. If N = num_where_predicates in the hypergraph, then
+  /// bits 0..(N-1) belong to filter_predicates, and the rest to
+  /// applied_sargable_join_predicates.
+  OverflowBitset &applied_sargable_join_predicates() {
+    return filter_predicates;
+  }
+```
+
+```
+ OverflowBitset 位布局（hypergraph）
+ ┌───────────────────────────┬──────────────────────────────────┐
+ │ 0 .. num_where_predicates-1│ num_where_predicates .. size()-1  │
+ │ filter_predicates          │ applied_sargable_join_predicates  │
+ └───────────────────────────┴──────────────────────────────────┘
+ delayed_predicates / subsumed_sargable_join_predicates 同理（另一块内存）
+```
+
+#### hypergraph：从"过滤前"推出"过滤后"
+
+```cpp
+void CostingReceiver::ApplyPredicatesForBaseTable(
+    int node_idx, OverflowBitset applied_predicates,
+    OverflowBitset subsumed_predicates, bool materialize_subqueries,
+    AccessPath *path, FunctionalDependencySet *new_fd_set) {
+  const NodeMap my_map = TableBitmap(node_idx);
+  path->set_num_output_rows(path->num_output_rows_before_filter);
+  path->cost = path->cost_before_filter;          // ← 从"过滤前"起步
+  for (size_t i = 0; i < m_graph->num_where_predicates; ++i) {
+    if (IsBitSet(i, subsumed_predicates)) {
+      // 被 ref access 完全吸收：只应用与本表相关的函数依赖
+      if (m_graph->predicates[i].total_eligibility_set == my_map) {
+        *new_fd_set |= m_graph->predicates[i].functional_dependencies;
+      } else {
+        // 多表 WHERE 谓词被当作连接条件吸收，另一侧会标记 delayed，
+        // 这里也必须标记 delayed，否则函数依赖永远不会被应用。
+        delayed_predicates.SetBit(i);
+      }
+      continue;
+    }
+    if (m_graph->predicates[i].total_eligibility_set == my_map) {
+      filter_predicates.SetBit(i);                // ← 本节点能吃下这条谓词
+      FilterCost cost =
+          EstimateFilterCost(m_thd, path->num_output_rows(),
+                             m_graph->predicates[i].contained_subqueries);
+      path->cost += cost.cost_if_not_materialized;
+      path->init_cost += cost.init_cost_if_not_materialized;
+      if (!IsBitSet(i, applied_predicates)) {
+        // ★ 计算 ref access 选择性时已乘过的话，这里不再重复乘
+        path->set_num_output_rows(path->num_output_rows() *
+                                  m_graph->predicates[i].selectivity);
+      }
+      *new_fd_set |= m_graph->predicates[i].functional_dependencies;
+    } else if (Overlaps(m_graph->predicates[i].total_eligibility_set, my_map)) {
+      delayed_predicates.SetBit(i);               // ← 涉及别的表，延后
+    }
+  }
+  path->filter_predicates = std::move(filter_predicates);
+  path->delayed_predicates = std::move(delayed_predicates);
+```
+
+#### 旧优化器：用 `is_after_filter` 布尔参数模拟两套值
+
+```cpp
+void SetCostOnTableAccessPath(const Cost_model_server &cost_model,
+                              const POSITION *pos, bool is_after_filter,
+                              AccessPath *path) {
+  double num_rows_after_filtering = pos->rows_fetched * pos->filter_effect;
+  if (is_after_filter) {
+    path->set_num_output_rows(num_rows_after_filtering);
+  } else {
+    path->set_num_output_rows(pos->rows_fetched);
+  }
+  // 注意这里不为过滤做调整；代价按整表估计。
+  double cost =
+      pos->read_cost + cost_model.row_evaluate_cost(num_rows_after_filtering);
+  if (pos->prefix_rowcount <= 0.0) {
+    path->cost = cost;
+  } else {
+    // 把代价缩放到"只算一次循环"，以匹配实测值。
+    path->cost = cost * num_rows_after_filtering / pos->prefix_rowcount;
+  }
+}
+```
+
+⇒ 旧优化器**两次调用**这个函数（一次 `is_after_filter=false`、一次 `true`）来模拟 hypergraph 的"过滤前/过滤后两套值"。
+
+#### 换壳保留代价的标准工具
+
+```cpp
+inline void CopyBasicProperties(const AccessPath &from, AccessPath *to) {
+  to->set_num_output_rows(from.num_output_rows());
+  to->cost = from.cost;
+  to->init_cost = from.init_cost;
+  to->init_once_cost = from.init_once_cost;
+  to->parameter_tables = from.parameter_tables;
+  to->safe_for_rowid = from.safe_for_rowid;
+  to->ordering_state = from.ordering_state;
+}
+```
 ### 参数化：parameter_tables 与四个谓词位图
 
 这两个是 hypergraph 在规划期操作 AccessPath 的抓手（旧优化器用 `Item` 树，不用位图）。
@@ -838,12 +1784,337 @@ todo->push_back({outer, join, false, &job->children[0], {}});   // outer 传 fal
 
 ---
 
+#### ★ `CreateIteratorFromAccessPath()`：显式栈 + 两阶段（完整机制）
+
+> 源码坐标：`[A2] sql/join_optimizer/access_path.cc` · `[A6] sql/iterators/timing_iterator.h`
+> **分工导航**：本节只讲 **AccessPath → RowIterator 的"翻译"**（怎么分配、怎么连孩子、什么参数传进去、什么被延迟）。每个迭代器自身的 `Init()` / `Read()` 语义、批处理、行锁与 `UnlockRow()` 属于 [`09_executor_iterator.md`](09_executor_iterator.md)。
+
+**翻译流程图**
+
+```
+ CreateIteratorFromAccessPath(top_path)
+ │
+ └─ todo = Mem_root_array<IteratorToBeCreated>   ← 显式栈，不用递归
+    push({top_path, join, batch, &ret, children=NULL})
+ │
+ while (!todo.empty()):
+    job = todo.back(); pop();
+    │
+    ├─ 阶段判断：job.children.is_null() ?
+    │     ├─ 是（第一次弹出）→ 【阶段一】
+    │     │     为每个孩子 push 子 job（孩子先做）
+    │     │     再把自己 push 回去（重推自己）
+    │     │     continue;                        ← 本轮不创建迭代器
+    │     │
+    │     └─ 否（第二次弹出）→ 【阶段二】
+    │           孩子已在 job.children[] 就位
+    │           switch(path->type) { ... } 真正 NewIterator<>()
+    │
+    └─ path->iterator = iterator.get();          ← 回填，供互相通信/EXPLAIN
+       *job.destination = std::move(iterator);   ← 写回父节点的 children[i]
+```
+
+**栈元素与"为什么用显式栈"**
+
+```cpp
+struct IteratorToBeCreated {
+  AccessPath *path;
+  JOIN *join;
+  bool eligible_for_batch_mode;
+  unique_ptr_destroy_only<RowIterator> *destination;
+  Bounds_checked_array<unique_ptr_destroy_only<RowIterator>> children;
+
+  void AllocChildren(MEM_ROOT *mem_root, int num_children) {
+    children =
+        Bounds_checked_array<unique_ptr_destroy_only<RowIterator>>::Alloc(
+            mem_root, num_children);
+  }
+};
+
+void SetupJobsForChildren(MEM_ROOT *mem_root, AccessPath *outer,
+                          AccessPath *inner, JOIN *join,
+                          bool inner_eligible_for_batch_mode,
+                          IteratorToBeCreated *job,
+                          Mem_root_array<IteratorToBeCreated> *todo) {
+  // ★ 先 push inner 再 push outer，这样左边先于右边被创建
+  //   （物化访问路径里的 invalidator 依赖这个顺序，旧 join 优化器用到）。
+  job->AllocChildren(mem_root, 2);
+  todo->push_back(*job);
+  todo->push_back(
+      {inner, join, inner_eligible_for_batch_mode, &job->children[1], {}});
+  todo->push_back({outer, join, false, &job->children[0], {}});
+}
+```
+
+```cpp
+  // The access path trees can be pretty deep, and the stack frames can be big
+  // on certain compilers/setups, so instead of explicit recursion, we push jobs
+  // onto a MEM_ROOT-backed stack. This uses a little more RAM (the MEM_ROOT
+  // typically lives to the end of the query), but reduces the stack usage
+  // greatly.
+  //
+  // The general rule is that if an iterator requires any children, it will push
+  // jobs for their access paths at the end of the stack and then re-push
+  // itself. When the children are instantiated and we get back to the original
+  // iterator, we'll actually instantiate it. (We distinguish between the two
+  // cases on basis of whether job.children has been allocated or not...)
+  while (!todo.empty()) {
+    IteratorToBeCreated job = todo.back();
+    todo.pop_back();
+    ...
+    // ★ examined_rows 绑定：只有 count_examined_rows 为真且属于某个 JOIN 时，
+    //   才把 &join->examined_rows 传进迭代器，由它自己去累加。
+    ha_rows *examined_rows = nullptr;
+    if (path->count_examined_rows && join != nullptr) {
+      examined_rows = &join->examined_rows;
+    }
+
+    switch (path->type) {
+      /* ---- 44 个 case ---- */
+    }
+
+    // 回填：供需要互相通信的迭代器（递归 CTE、BKA）使用，
+    // 也供 EXPLAIN ANALYZE 定位计时信息。
+    path->iterator = iterator.get();
+    *job.destination = std::move(iterator);
+  }
+```
+
+**代表性 case**
+
+```cpp
+      case AccessPath::TABLE_SCAN: {
+        const auto &param = path->table_scan();
+        iterator = NewIterator<TableScanIterator>(
+            thd, mem_root, param.table, path->num_output_rows(), examined_rows);
+        break;
+      }
+      case AccessPath::INDEX_SCAN: {
+        // ★ reverse 编译期就定死（模板参数），避免每次 Read() 分支判断
+        const auto &param = path->index_scan();
+        if (param.reverse) {
+          iterator = NewIterator<IndexScanIterator<true>>(
+              thd, mem_root, param.table, param.idx, param.use_order,
+              path->num_output_rows(), examined_rows);
+        } else {
+          iterator = NewIterator<IndexScanIterator<false>>(
+              thd, mem_root, param.table, param.idx, param.use_order,
+              path->num_output_rows(), examined_rows);
+        }
+        break;
+      }
+      case AccessPath::HASH_JOIN: {
+        const auto &param = path->hash_join();
+        if (job.children.is_null()) {
+          SetupJobsForChildren(mem_root, param.outer, param.inner, join,
+                               /*inner_eligible_for_batch_mode=*/true, &job,
+                               &todo);
+          continue;                       // ← 阶段一：只排孩子
+        }
+        const JoinPredicate *join_predicate = param.join_predicate;
+        vector<HashJoinCondition> conditions;
+        for (Item_eq_base *cond : join_predicate->expr->equijoin_conditions) {
+          conditions.emplace_back(cond, thd->mem_root);
+        }
+        const bool probe_input_batch_mode =
+            eligible_for_batch_mode && ShouldEnableBatchMode(param.outer);
+        double estimated_build_rows = param.inner->num_output_rows();
+        if (param.inner->num_output_rows() < 0.0) {
+          // 并非所有访问路径都正确传播了代价，选一个相当安全的估计（宁大勿小）
+          estimated_build_rows = 1048576.0;
+        }
+        JoinType join_type{JoinType::INNER};
+        switch (join_predicate->expr->type) {
+          case RelationalExpression::LEFT_JOIN:  join_type = JoinType::OUTER; break;
+          case RelationalExpression::ANTIJOIN:   join_type = JoinType::ANTI;  break;
+          case RelationalExpression::SEMIJOIN:
+            join_type =
+                param.rewrite_semi_to_inner ? JoinType::INNER : JoinType::SEMI;
+            break;
+          ...
+        }
+        // ★ 能否让哈希表在多次 Init() 之间保留内容：
+        //   旧优化器有时会把引用外层表的连接条件下推到 hash 之下，因此无法
+        //   逐个分析；hypergraph 会正确设置 parameter_tables，故检查它即可。
+        uint64_t *hash_table_generation =
+            (thd->lex->using_hypergraph_optimizer() &&
+             path->parameter_tables == 0)
+                ? &join->hash_table_generation
+                : nullptr;
+
+        iterator = NewIterator<HashJoinIterator>(
+            thd, mem_root, std::move(job.children[1]),      // inner
+            GetUsedTables(param.inner, /*include_pruned_tables=*/true),
+            estimated_build_rows, std::move(job.children[0]),  // outer
+            GetUsedTables(param.outer, /*include_pruned_tables=*/true),
+            param.store_rowids, param.tables_to_get_rowid_for,
+            thd->variables.join_buff_size, std::move(conditions),
+            param.allow_spill_to_disk, join_type,
+            join_predicate->expr->join_conditions, probe_input_batch_mode,
+            hash_table_generation);
+        break;
+      }
+      case AccessPath::FILTER: {
+        const auto &param = path->filter();
+        if (job.children.is_null()) {
+          SetupJobsForChildren(mem_root, param.child, join,
+                               eligible_for_batch_mode, &job, &todo);
+          continue;
+        }
+        // ★ 唯一一个在翻译期会"改 plan"的 case：
+        //   若本 FILTER 被标记为"要物化子查询"，此刻才真正去物化 ——
+        //   必须等整个 plan 就绪，否则内层子查询会被不可逆地物化。
+        if (FinalizeMaterializedSubqueries(thd, join, path)) {
+          return nullptr;
+        }
+        iterator = NewIterator<FilterIterator>(
+            thd, mem_root, std::move(job.children[0]), param.condition);
+        break;
+      }
+      case AccessPath::SORT: {
+        const auto &param = path->sort();
+        if (job.children.is_null()) {
+          SetupJobsForChildren(mem_root, param.child, join,
+                               eligible_for_batch_mode, &job, &todo);
+          continue;
+        }
+        ha_rows num_rows_estimate = param.child->num_output_rows() < 0.0
+                                        ? HA_POS_ERROR
+                                        : lrint(param.child->num_output_rows());
+        Filesort *filesort = param.filesort;
+        iterator = NewIterator<SortingIterator>(
+            thd, mem_root, filesort, std::move(job.children[0]),
+            num_rows_estimate, param.tables_to_get_rowid_for, examined_rows);
+        // ★ 反向链接：Filesort 需要知道自己的迭代器（去重 vs 排序两条路径）
+        if (filesort->m_remove_duplicates) {
+          filesort->tables[0]->duplicate_removal_iterator =
+              down_cast<SortingIterator *>(iterator->real_iterator());
+        } else {
+          filesort->tables[0]->sorting_iterator =
+              down_cast<SortingIterator *>(iterator->real_iterator());
+        }
+        break;
+      }
+      case AccessPath::MATERIALIZE: {
+        // ★ table_path 必须是"单个迭代器"而非子树（ALTERNATIVE 也算单个）
+        assert(
+            path->materialize().table_path->type == AccessPath::TABLE_SCAN ||
+            path->materialize().table_path->type == AccessPath::LIMIT_OFFSET ||
+            path->materialize().table_path->type == AccessPath::REF ||
+            path->materialize().table_path->type == AccessPath::EQ_REF ||
+            path->materialize().table_path->type == AccessPath::ALTERNATIVE ||
+            path->materialize().table_path->type == AccessPath::INDEX_SCAN ||
+            path->materialize().table_path->type == AccessPath::INDEX_RANGE_SCAN ||
+            path->materialize().table_path->type ==
+                AccessPath::DYNAMIC_INDEX_RANGE_SCAN);
+
+        MaterializePathParameters *param = path->materialize().param;
+        if (job.children.is_null()) {
+          // 1 个 table_path + N 个 query block
+          job.AllocChildren(mem_root, param->query_blocks.size() + 1);
+          todo.push_back(job);
+          todo.push_back({path->materialize().table_path, join,
+                          eligible_for_batch_mode, &job.children[0], {}});
+          for (size_t i = 0; i < param->query_blocks.size(); ++i) {
+            const MaterializePathParameters::QueryBlock &from =
+                param->query_blocks[i];
+            todo.push_back({from.subquery_path, from.join,
+                            /*eligible_for_batch_mode=*/true,
+                            &job.children[i + 1], {}});
+          }
+          continue;
+        }
+        unique_ptr_destroy_only<RowIterator> table_iterator =
+            std::move(job.children[0]);
+        Mem_root_array<materialize_iterator::QueryBlock> query_blocks(
+            thd->mem_root, param->query_blocks.size());
+        for (size_t i = 0; i < param->query_blocks.size(); ++i) {
+          ...
+          if (to.is_recursive_reference) {
+            // ★ 递归 CTE 的后期绑定：找到指向我们自己的 FOLLOW_TAIL 迭代器
+            RowIterator *recursive_reader = FindSingleIteratorOfType(
+                from.subquery_path, AccessPath::FOLLOW_TAIL);
+            if (recursive_reader == nullptr) {
+              // 递归引用被优化掉了（例如 WHERE 条件矛盾）
+              to.is_recursive_reference = false;
+            } else {
+              to.recursive_reader =
+                  down_cast<FollowTailIterator *>(recursive_reader);
+            }
+          }
+        }
+        iterator = unique_ptr_destroy_only<RowIterator>(
+            materialize_iterator::CreateIterator(
+                thd, std::move(query_blocks), param, std::move(table_iterator),
+                subjoin));
+        break;
+      }
+      case AccessPath::DELETE_ROWS: {
+        const auto &param = path->delete_rows();
+        if (job.children.is_null()) {
+          // ★ 必须在创建子迭代器之前做：某些子迭代器构造时要看到最终 read set，
+          //   放到 DeleteRowsIterator 的构造函数或 Init() 里都太晚。
+          SetUpTablesForDelete(thd, join);
+          SetupJobsForChildren(mem_root, param.child, join,
+                               eligible_for_batch_mode, &job, &todo);
+          continue;
+        }
+        iterator = NewIterator<DeleteRowsIterator>(
+            thd, mem_root, std::move(job.children[0]), join,
+            param.tables_to_delete_from, param.immediate_tables);
+        break;
+      }
+```
+
+#### `NewIterator` 模板与 `examined_rows` 绑定（`[A6]`）
+
+```cpp
+// Allocates a new iterator on the given MEM_ROOT. ...
+// If we are in EXPLAIN ANALYZE, the iterator is wrapped in a TimingIterator<T>,
+// so that it collects timing information. For this reason, nearly all
+// instantiations of iterators should go through this function.
+
+template <class RealIterator, class... Args>
+unique_ptr_destroy_only<RowIterator> NewIterator(THD *thd, MEM_ROOT *mem_root,
+                                                 Args &&... args) {
+  if (thd->lex->is_explain_analyze) {
+    return unique_ptr_destroy_only<RowIterator>(
+        new (mem_root)
+            TimingIterator<RealIterator>(thd, std::forward<Args>(args)...));
+  } else {
+    return unique_ptr_destroy_only<RowIterator>(
+        new (mem_root) RealIterator(thd, std::forward<Args>(args)...));
+  }
+}
+```
+
+三个要点：
+
+1. **返回类型擦除为 `unique_ptr_destroy_only<RowIterator>`**：所有 case 的 `iterator` 变量同类型，switch 才能统一。需要具体类型时用 `iterator->real_iterator()`（`TimingIterator::real_iterator()` 保证穿透包装），如 `SORT` case 的 `down_cast<SortingIterator *>`。
+2. **`TimingIterator<T>` 是编译期包装**：`RealIterator m_iterator;` 是**成员而非指针**，所以 `Init()`/`Read()` 可被内联；只有 `EXPLAIN ANALYZE` 才付代价。
+3. **`examined_rows` 只在翻译期决定，不进 AccessPath**：那一行 `if (path->count_examined_rows && join != nullptr)` 是唯一绑定点。
+
+#### 翻译边界：什么被延迟到执行期
+
+```
+ 翻译期（CreateIteratorFromAccessPath 内完成）        执行期（Init/Read 时才定）
+ ─────────────────────────────────────────────────────────────────────────
+ · 选择迭代器具体类（含 <true>/<false> 模板实例化）    · ALTERNATIVE 选哪条分支
+ · 分配（placement new 到 MEM_ROOT）                     （按 used_ref->cond_guards）
+ · 组装父子指针（unique_ptr move 进 children[]）      · DYNAMIC_INDEX_RANGE_SCAN 的
+ · 绑定 &join->examined_rows / &join->send_records        range（每轮重算）
+ · 绑定 &join->hash_table_generation                  · MATERIALIZE 是否重物化
+ · 展开 FILTER 里的可物化子查询                          （rematerialize / invalidators）
+ · 递归 CTE 的 FOLLOW_TAIL 迭代器后期绑定              · hash 表是否溢盘
+ · DELETE_ROWS 前先 SetUpTablesForDelete()             · SORT 是否走 rowid 排序
+ · UPDATE_ROWS 前先 FinalizeOptimizationForUpdate()    · LIMIT 何时提前终止
+```
 ## 可观测性
 
 | 想看什么 | 手段 |
 |---|---|
 | 计划树的形状 | `EXPLAIN FORMAT=TREE`（`--><--` 缩进树，最直观）、`EXPLAIN FORMAT=JSON` |
-| EXPLAIN 怎么把树打印出来 | ★ 权威在 [`11_explain_and_trace.md`](11_explain_and_trace.md)（EXPLAIN 是第一主语：`ExplainChild` 结构、TREE/JSON 构造器、传统表格与 `opt_explain_*` 的分工）。本篇只从 AccessPath 视角交代"输出的信息从哪来" |
+| EXPLAIN 怎么把树打印出来 | ★ 权威在 [`11_explain_and_trace.md`](../../infra/observability/explain_trace.md)（EXPLAIN 是第一主语：`ExplainChild` 结构、TREE/JSON 构造器、传统表格与 `opt_explain_*` 的分工）。本篇只从 AccessPath 视角交代"输出的信息从哪来" |
 | 每个节点的估算代价 | `EXPLAIN` 的 cost 列 / `FORMAT=JSON` 的 `query_cost`——**注意打印的是 `init_cost` 不是 `cost`** |
 | 实际耗时与行数 | `EXPLAIN ANALYZE`（靠 `TimingIterator` 包装 + `iterator` 反向指针回填） |
 | `init_once_cost` | 只在 **optimizer trace** 里（`SET optimizer_trace="enabled=on"`），EXPLAIN 不打印 |
@@ -903,18 +2174,50 @@ todo->push_back({outer, join, false, &job->children[0], {}});   // outer 传 fal
 - **`ConnectJoins` 有 3 个递归传递的 vector**（不是 4 个），另两个是 `qep_tab_map*` / `table_map*`。
 - **`parameter_tables != 0` 不能做 hash join 的右侧**；`RAND_TABLE_BIT` 是"永远不能"的哨兵。
 
-### 坑与已知缺陷
+### 失效与退化场景
 
-| 坑 | 说明 |
+按"哪一层会出问题"分五类——这也是排查计划类问题时**建议的检查顺序**（从结构 → 优化器 → 代价 → 阶段 → 遗留）：
+
+#### ① 计划表示自身的限制
+
+| 场景 | 说明 |
 |---|---|
-| 遍历 switch 与翻译 switch 是手写 44 分支 | 新增类型漏改 = 静默失效（无编译错误） |
-| `first_sj_inner()` 不随 join 重排更新 | 检测 semijoin 必须绕用 `firstmatch_return` |
-| 过滤不减代价 | `SetCostOnTableAccessPath` 注释自承 "we don't try to adjust for the filtering here" |
-| 排序总落真实表 | `streaming_allowed` 条件 A 是遗留决定，注释自陈 `We could probably be more intelligent here now` |
+| 两个 44 分支 switch 是手写的 | 新增类型漏改 `WalkAccessPaths` / `CreateIteratorFromAccessPath` = **静默失效**——无编译错误，只是后处理/EXPLAIN 看不到子节点、迭代器建不出来 |
+| `first_sj_inner()` 不随 join 重排更新 | 检测 semijoin 必须绕用 `firstmatch_return`。★ 通例：凡是"存了下标/指针"的地方，都要问一句"join 重排后它还对吗" |
+| 显式栈翻译是"内存换栈空间" | 深树（几十层物化嵌套）下任务栈与 `children` 数组的内存占用上升，但换来了不爆调用栈 |
+
+#### ② 两个优化器的能力差异（同一 SQL 换优化器，计划就变）
+
+| 场景 | 说明 |
+|---|---|
+| **hypergraph 不支持 LooseScan / LIS** | 带 `DISTINCT` 的聚合一律 `DISTINCT_AGGREGATOR`（源码注释 "We don't support loose index scan yet"）——两个优化器计划性能差异的已知来源 |
+| **hypergraph 不创建 `CACHE_INVALIDATOR`** | LATERAL 改用 `rematerialize` + `parameter_tables`——同一条 SQL 的缓存失效机制完全不同 |
+| `REMOVE_DUPLICATES_ON_INDEX` 只服务经典优化器 | hypergraph 用 `REMOVE_DUPLICATES` + 排序表达同样语义 |
+
+#### ③ 代价模型的已知粗略（会导致选错计划）
+
+| 场景 | 说明 |
+|---|---|
+| **过滤不减代价** | `SetCostOnTableAccessPath` 注释自承 "we don't try to adjust for the filtering here"——FILTER 上下方的 cost 相同，只有行数变 |
 | I_S 表物化的代价是 `Rudimentary` | `ProposeTableScan` 里作者自承粗略 |
-| Halloween 防护用整条命令判定 | INSERT/REPLACE SELECT 一律不流式，TODO 指向 bug #23022426 建议改用 `OPTION_BUFFER_RESULT` |
-| hypergraph 不支持 LIS | 带 DISTINCT 的聚合一律 `DISTINCT_AGGREGATOR`，是性能差异来源 |
-| 翻译失败不报用户错误 | switch 无 default，返回 nullptr，调用点只转布尔——视为内部不变量破坏 |
+| 代价被缩放到"单次循环" | 为与 `EXPLAIN ANALYZE` 可比而做的近似换算 |
+| ★ EXPLAIN 打印 `init_cost` 而非 `cost` | 展示层与内部层不同——"全量代价高但首行快"的计划在 EXPLAIN 上显得比实际便宜（见「可观测性」） |
+
+#### ④ 阶段限制（某些事只能在特定阶段做）
+
+| 场景 | 说明 |
+|---|---|
+| `WalkAccessPaths` 的 policy 会截断遍历 | `STOP_AT_MATERIALIZATION` 下后处理**看不到** MATERIALIZE 内部的节点——选错 policy 会漏处理 |
+| const 表在 hypergraph 下必须推迟到执行期物化 | 注释明说优化期物化会让 hypergraph "confused and crash" |
+| `FinalizePlanForQueryBlock` 只能调一次 | 破坏性操作；重复调用在 debug 构建触发 assert |
+| 翻译失败不报用户错误 | switch 无 default，返回 nullptr，调用点只转布尔——源码视其为内部不变量破坏，不是面向用户的错误路径 |
+
+#### ⑤ 历史遗留（源码自陈"可以更好"）
+
+| 场景 | 说明 |
+|---|---|
+| 排序总落真实表 | `streaming_allowed` 条件 A 是遗留决定，注释自陈 "We could probably be more intelligent here now" |
+| Halloween 防护用整条命令判定 | INSERT/REPLACE SELECT 一律不流式；TODO 指向 bug #23022426，建议改用 `OPTION_BUFFER_RESULT` |
 
 ---
 

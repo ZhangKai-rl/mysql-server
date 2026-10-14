@@ -12,7 +12,7 @@
 - [核心实现二：穷人版多态（函数指针）](#核心实现二穷人版多态函数指针)
 - [核心实现三：生命周期与状态机](#核心实现三生命周期与状态机)
 - [核心实现四：关键算法逐段剖析](#核心实现四关键算法逐段剖析)
-- [核心实现五：延迟创建文件（file == -1 的妙用）](#核心实现五延迟创建文件file--1-的妙用)
+- [核心实现五：延迟创建文件（file == -1 的妙用）](#核心实现五延迟创建文件file---1-的妙用)
 - [核心实现六：不是文件的 IO_CACHE（NET / FIFO / 内存）](#核心实现六不是文件的-io_cachenet--fifo--内存)
 - [核心实现七：透明加解密](#核心实现七透明加解密)
 - [核心实现八：★ server 层 I/O 的类继承体系](#核心实现八-server-层-io-的类继承体系)
@@ -57,6 +57,131 @@
 ### 设计思想与权衡
 
 #### 一、★ 为什么用函数指针而不是 C++ 虚函数
+
+**`init_functions()` —— 穷人版多态的绑定表总源头**（`mysys/mf_iocache.cc:128`）：
+
+```cpp
+static void init_functions(IO_CACHE *info) {
+  enum cache_type type = info->type;
+  switch (type) {
+    case READ_NET:
+      /*
+        Must be initialized by the caller. The problem is that
+        _my_b_net_read has to be defined in sql directory because of
+        the dependency on THD, and therefore cannot be visible to
+        programs that link against mysys but know nothing about THD, such
+        as myisamchk
+      */
+      break;                                            // ★ 此处不绑定，调用方（sql/ 层）必须自己填
+    case SEQ_READ_APPEND:
+      info->read_function = _my_b_seq_read;             // ★ 三阶段读：buffer → fd → append buffer
+      info->write_function = nullptr; /* Force a core if used */  // ★★ 故意置空！
+      break;
+    default:
+      info->read_function = info->share ? _my_b_read_r : _my_b_read;
+      info->write_function = _my_b_write;
+  }
+  setup_io_cache(info);   // ★ 顺带按 type 设定 current_pos / current_end
+}
+```
+
+**绑定表（8.0.39 实际值）**：
+
+| type | `read_function` | `write_function` |
+|---|---|---|
+| `READ_CACHE` | `_my_b_read`（`share != nullptr` 时为 `_my_b_read_r`） | `_my_b_write` |
+| `WRITE_CACHE` | 同上 | `_my_b_write` |
+| `SEQ_READ_APPEND` | `_my_b_seq_read` | **`nullptr`**（故意，用了必 core） |
+| `READ_FIFO` | `_my_b_read` | `_my_b_write` |
+| `READ_NET` | **调用方自填**（`_my_b_net_read`，在 `sql/` 目录） | `_my_b_write` |
+| `WRITE_NET` | `_my_b_read` | `_my_b_write` |
+
+```cpp
+// include/my_sys.h:402,407 —— 只有两个函数指针成员
+  int (*read_function)(IO_CACHE *, uchar *, size_t){nullptr};
+  int (*write_function)(IO_CACHE *, const uchar *, size_t){nullptr};
+```
+
+> ⚠️ **不存在 `cache_my_read` / `cache_simple_read`**（全仓 grep 0 命中，是虚构名）。
+> ★★ SEQ_READ_APPEND 的 `write_function = nullptr` 意味着：**对它调 `my_b_write()` 必崩**，必须走 `my_b_append()` / `my_b_safe_write()`。
+
+**`setup_io_cache()`（`:117`）——IO_CACHE 被 memcpy "拷贝"后必须手工再调一次**：
+
+```cpp
+/*
+  Setup internal pointers inside IO_CACHE
+  ...
+  NOTES
+    This is called on automatically on init or reinit of IO_CACHE
+    It must be called externally if one moves or copies an IO_CACHE
+    object.
+*/
+void setup_io_cache(IO_CACHE *info) {
+  /* Ensure that my_b_tell() and my_b_bytes_in_cache works */
+  if (info->type == WRITE_CACHE) {
+    info->current_pos = &info->write_pos;    // ★ WRITE_CACHE：tell 看 write_pos
+    info->current_end = &info->write_end;
+  } else {
+    info->current_pos = &info->read_pos;     // ★ 其他：tell 看 read_pos
+    info->current_end = &info->read_end;
+  }
+}
+```
+
+**为什么不是虚函数：因为调用点是宏/内联，命中缓存时根本不走到函数指针**（`include/my_sys.h:495`）：
+
+```cpp
+constexpr int my_b_EOF = INT_MIN;
+
+inline int my_b_read(IO_CACHE *info, uchar *buffer, size_t count) {
+  if (info->read_pos + count <= info->read_end) {      // ★ 快路径：全在缓冲区
+    memcpy(buffer, info->read_pos, count);
+    info->read_pos += count;
+    return 0;
+  }
+  return (*info->read_function)(info, buffer, count);  // ★ 慢路径才间接调用
+}
+
+inline int my_b_write(IO_CACHE *info, const uchar *buffer, size_t count) {
+  if (info->write_pos + count <= info->write_end) {
+    memcpy(info->write_pos, buffer, count);
+    info->write_pos += count;
+    return 0;
+  }
+  return (*info->write_function)(info, buffer, count);
+}
+
+extern int _my_b_get(IO_CACHE *info);
+inline int my_b_get(IO_CACHE *info) {
+  if (info->read_pos != info->read_end) {
+    info->read_pos++;
+    return info->read_pos[-1];
+  }
+  return _my_b_get(info);
+}
+
+inline my_off_t my_b_tell(const IO_CACHE *info) {
+  return info->pos_in_file + *info->current_pos - info->request_pos;
+  //  ★ 不是 pos_in_file + (read_pos - buffer)！减的是 request_pos
+}
+```
+
+> ★★ 这解释了为什么 `my_sys.h:400` 的注释明说 `read_function` **绝不可被直接调用**——绕过宏就绕过了快路径与 `request_pos` 的语义。
+>
+> ★ 若是虚函数，命中缓存时也要付一次间接调用；宏 + inline 让 `my_b_get()` 在热路径上就是两条指令。这是 C 时代"零成本抽象"的做法。
+
+**`_my_b_get()`（`:1219`）——慢路径 + 钩子**：
+
+```cpp
+int _my_b_get(IO_CACHE *info) {
+  uchar buff;
+  IO_CACHE_CALLBACK pre_read, post_read;
+  if ((pre_read = info->pre_read)) (*pre_read)(info);     // ★ LOAD DATA 的 block-create 钩子
+  if ((*(info)->read_function)(info, &buff, 1)) return my_b_EOF;   // ★ INT_MIN
+  if ((post_read = info->post_read)) (*post_read)(info);
+  return (int)(uchar)buff;
+}
+```
 
 `IO_CACHE` 里有 `read_function` / `write_function` 两个函数指针，这是**手工实现的 vtable**，只装 1~2 个 slot。为什么不用 C++ 虚类？
 
@@ -501,6 +626,178 @@ enum cache_type {
 
 ### `init_io_cache_ext` 的六个关键点
 
+⚠️ **勘误**：`init_io_cache()` **不是主实现**——它只是 4 行 wrapper（`mf_iocache.cc:312`），唯一差别是补一个 PSI `file_key`。全部逻辑在 `init_io_cache_ext()`（`:176`）。
+
+```cpp
+int init_io_cache(IO_CACHE *info, File file, size_t cachesize,
+                  enum cache_type type, my_off_t seek_offset, bool use_async_io,
+                  myf cache_myflags) {
+  return init_io_cache_ext(
+      info, file, cachesize, type, seek_offset, use_async_io, cache_myflags,
+      info->file_key != PSI_NOT_INSTRUMENTED ? info->file_key
+                                             : key_file_io_cache);
+}
+```
+
+**关键点①：`type` 故意先置 `TYPE_NOT_SET`**（`:192`）
+
+```cpp
+  info->file = file;
+  info->file_key = file_key;
+  info->type = TYPE_NOT_SET; /* Don't set it until mutex are created */
+  //  ★ 避免中途失败时被当作合法 cache
+  info->pos_in_file = seek_offset;
+  info->pre_close = info->pre_read = info->post_read = nullptr;
+  info->arg = nullptr;
+  info->alloced_buffer = false;
+  info->buffer = nullptr;
+  info->seek_not_done = false;
+
+  if (file >= 0) {
+    pos = mysql_file_tell(file, MYF(0));
+    if ((pos == (my_off_t)-1) && (my_errno() == ESPIPE)) {
+      /*
+         This kind of object doesn't support seek() or tell(). Don't set a
+         flag that will make us again try to seek() later and fail.
+      */
+      info->seek_not_done = false;     // ★ 管道/socket/FIFO 永不 seek
+      assert(seek_offset == 0);
+    } else
+      info->seek_not_done = (seek_offset != pos);
+      //  ★★ 初始 seek_not_done 的唯一真实来源：请求偏移 ≠ 当前 fd 偏移
+  }
+  info->disk_writes = 0;
+  info->share = nullptr;               // ★ init 阶段恒为 nullptr，share 靠 init_io_cache_share() 后绑
+```
+
+**关键点②：cachesize 的对齐粒度不是 `IO_SIZE`，是 `min_cache`**（`:222`）
+
+```cpp
+  min_cache = use_async_io ? IO_SIZE * 4 : IO_SIZE * 2;
+  //  ★ IO_SIZE = 4096（include/my_io.h:159）；故 async=16K，否则 8K
+  if (type == READ_CACHE || type == SEQ_READ_APPEND) {
+    if (!(cache_myflags & MY_DONT_CHECK_FILESIZE)) {
+      end_of_file = mysql_encryption_file_seek(info, 0L, MY_SEEK_END, MYF(0));
+      info->seek_not_done = !(end_of_file == seek_offset);   // ★ 刚 seek 过，重算
+      if (end_of_file < seek_offset) end_of_file = seek_offset;
+      /* Trim cache size if the file is very small */
+      if ((my_off_t)cachesize > end_of_file - seek_offset + IO_SIZE * 2 - 1) {
+        cachesize = (size_t)(end_of_file - seek_offset) + IO_SIZE * 2 - 1;
+        use_async_io = false;
+      }
+    }
+  }
+  cache_myflags &= ~MY_DONT_CHECK_FILESIZE;
+```
+
+**关键点③：分配失败按 3/4 降级重试**（`:239`）
+
+```cpp
+  if (type != READ_NET && type != WRITE_NET) {     // ★ NET 类型由调用方自备 buffer
+    cachesize = ((cachesize + min_cache - 1) & ~(min_cache - 1));  // ★ 向上对齐到 min_cache
+    for (;;) {
+      size_t buffer_block;
+      myf flags = (myf)(cache_myflags & ~(MY_WME | MY_WAIT_IF_FULL));
+      if (cachesize < min_cache) cachesize = min_cache;
+      buffer_block = cachesize;
+      if (type == SEQ_READ_APPEND) buffer_block *= 2;   // ★★ 一次 malloc 装两个 buffer
+      if (cachesize == min_cache) flags |= (myf)MY_WME; // ★ 已最小尺寸还失败才报错
+
+      if ((info->buffer = (uchar *)my_malloc(key_memory_IO_CACHE, buffer_block,
+                                             flags)) != nullptr) {
+        info->write_buffer = info->buffer;
+        if (type == SEQ_READ_APPEND)
+          info->write_buffer = info->buffer + cachesize;   // ★★ 写缓冲在后半段
+        info->alloced_buffer = true;                       // ★ 决定 end_io_cache() 是否 my_free
+        break;
+      }
+      if (cachesize == min_cache) return 2;
+      cachesize = (cachesize * 3 / 4 & ~(min_cache - 1));  // ★ 按 3/4 降级，仍保持对齐
+    }
+  }
+```
+
+**关键点④：三种 type 的缓冲区布局**（`:270`）——★ `buffer_length` 是**单个** buffer 大小，不含 SEQ_READ_APPEND 的 ×2 部分：
+
+```cpp
+  info->read_length = info->buffer_length = cachesize;
+  info->myflags = cache_myflags & ~(MY_NABP | MY_FNABP);
+  info->request_pos = info->read_pos = info->write_pos = info->buffer;
+
+  if (type == SEQ_READ_APPEND) {
+    info->append_read_pos = info->write_pos = info->write_buffer;
+    info->write_end = info->write_buffer + info->buffer_length;   // ★ 无 IO_SIZE 扣减
+    mysql_mutex_init(key_IO_CACHE_append_buffer_lock,
+                     &info->append_buffer_lock, MY_MUTEX_INIT_FAST);
+    //  ★ 只有 SEQ_READ_APPEND 才初始化 mutex
+  }
+#if defined(SAFE_MUTEX)
+  else {
+    /* Clear mutex so that safe_mutex will notice that it's not initialized */
+    new (&info->append_buffer_lock) mysql_mutex_t();
+  }
+#endif
+
+  if (type == WRITE_CACHE)
+    info->write_end =
+        info->buffer + info->buffer_length - (seek_offset & (IO_SIZE - 1));
+    //  ★★ 扣掉块内偏移，保证每次 flush 落在 IO_SIZE 边界
+  else
+    info->read_end = info->buffer; /* Nothing in cache */
+    //  ★ READ_CACHE 起始为空，首次 my_b_read 必触发读盘
+
+  info->end_of_file = end_of_file;    // ★ 默认 ~(my_off_t)0
+  info->error = 0;
+  info->type = type;                  // ★ 到这一刻才真正设定 type
+  init_functions(info);               // ★ 绑定函数指针 + setup_io_cache
+  return 0;
+}
+```
+
+**关键点⑤：`end_of_file` 默认是"无限大"**
+
+```cpp
+  my_off_t end_of_file = ~(my_off_t)0;
+```
+只有 `READ_CACHE` / `SEQ_READ_APPEND` 且**未设** `MY_DONT_CHECK_FILESIZE` 时才会被真实 EOF 覆盖。`_my_b_write()` 开头的 EFBIG 检查就靠它：
+```cpp
+  if (pos_in_file + info->buffer_length > info->end_of_file) {
+    errno = EFBIG; set_my_errno(EFBIG); return info->error = -1;
+  }
+```
+
+**关键点⑥：`end_io_cache()` 不关闭 fd**（`:1519`）
+
+```cpp
+int end_io_cache(IO_CACHE *info) {
+  int error = 0;
+  IO_CACHE_CALLBACK pre_close;
+  /* Every thread must call remove_io_thread(). ... */
+  assert(!info->share || !info->share->total_threads);
+
+  if ((pre_close = info->pre_close)) {
+    (*pre_close)(info);
+    info->pre_close = nullptr;              // ★ 置空保证可重入
+  }
+  if (info->alloced_buffer) {
+    info->alloced_buffer = false;           // ★ 先清标志 → 二次调用直接跳过
+    if (info->file != -1) /* File doesn't exist */
+      error = my_b_flush_io_cache(info, 1); // ★ file==-1 表示临时文件从未真正打开
+    my_free(info->buffer);
+    info->buffer = info->read_pos = (uchar *)nullptr;   // ★ 置空后 my_b_inited() 返回 false
+  }
+  if (info->m_encryptor != nullptr) delete info->m_encryptor;
+  if (info->m_decryptor != nullptr) delete info->m_decryptor;
+  if (info->type == SEQ_READ_APPEND) {
+    info->type = TYPE_NOT_SET;              // ★ 先改类型再销毁 mutex
+    mysql_mutex_destroy(&info->append_buffer_lock);
+  }
+  return error;
+}
+```
+
+> ⚠️ **`end_io_cache()` 不 close(fd)**——fd 由调用方自己关（见 `IO_CACHE_ostream::close()`：`end_io_cache` + `mysql_file_close`）。
+
 ```c
   info->type = TYPE_NOT_SET; /* Don't set it until mutex are created */
 ```
@@ -823,6 +1120,208 @@ int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count) {
 - ESPIPE 断言引用了历史 bug（Bugs#25807 和 #22828：对 FIFO 不该尝试 seek）。
 
 ### 4.4 `reinit_io_cache`（`mysys/mf_iocache.cc:328-392`）：READ ↔ WRITE 切换
+
+⚠️ **勘误**：**不存在 READ → SEQ_READ_APPEND 切换**。函数开头 `assert` 直接禁止：
+
+```cpp
+  /* One can't do reinit with the following types */
+  assert(type != READ_NET && info->type != READ_NET && type != WRITE_NET &&
+         info->type != WRITE_NET && type != SEQ_READ_APPEND &&
+         info->type != SEQ_READ_APPEND);
+```
+
+**完整源码**（`mf_iocache.cc:328`）：
+
+```cpp
+/*
+  Use this to reset cache to re-start reading or to change the type
+  between READ_CACHE <-> WRITE_CACHE
+  If we are doing a reinit of a cache where we have the start of the file
+  in the cache, we are reusing this memory without flushing it to disk.
+*/
+bool reinit_io_cache(IO_CACHE *info, enum cache_type type, my_off_t seek_offset,
+                     bool use_async_io [[maybe_unused]], bool clear_cache) {
+  /* ... assert 见上 ... */
+
+  /* If the whole file is in memory, avoid flushing to disk */
+  if (!clear_cache && seek_offset >= info->pos_in_file &&
+      seek_offset <= my_b_tell(info)) {
+    /* Reuse current buffer without flushing it to disk */
+    uchar *pos;
+    if (info->type == WRITE_CACHE && type == READ_CACHE) {        // ★ 情形 1：WRITE → READ
+      info->read_end = info->write_pos;      // ★ 已写未落盘的数据变成"可读区"
+      info->end_of_file = my_b_tell(info);   // ★ EOF 截断到当前写位置
+      /*
+        Trigger a new seek only if we have a valid
+        file handle.
+      */
+      info->seek_not_done = (info->file != -1);
+      //  ★★ 仅当真有 fd 才置延迟 seek（file==-1 表示尚未 real_open_cached_file）
+    } else if (type == WRITE_CACHE) {                             // ★ 情形 2：→ WRITE
+      if (info->type == READ_CACHE) {
+        info->write_end = info->write_buffer + info->buffer_length;
+        info->seek_not_done = true;   // ★★ READ→WRITE 必置位：fd 位置已被读操作带跑
+      }
+      info->end_of_file = ~(my_off_t)0;   // ★ 写缓存 EOF 视为无限
+    }
+    pos = info->request_pos + (seek_offset - info->pos_in_file);
+    if (type == WRITE_CACHE) info->write_pos = pos;
+    else                     info->read_pos  = pos;
+  } else {                                                        // ★ 慢路径：落盘重来
+    /*
+      If we change from WRITE_CACHE to READ_CACHE, assume that everything
+      after the current positions should be ignored
+    */
+    if (info->type == WRITE_CACHE && type == READ_CACHE)
+      info->end_of_file = my_b_tell(info);
+    /* flush cache if we want to reuse it */
+    if (!clear_cache && my_b_flush_io_cache(info, 1)) return true;
+    //  ★ clear_cache=true 表示丢弃内容，不 flush
+    info->pos_in_file = seek_offset;          // ★ pos_in_file 直接重置
+    /* Better to do always do a seek */
+    info->seek_not_done = true;               // ★ 慢路径无条件置位
+    info->request_pos = info->read_pos = info->write_pos = info->buffer;
+    if (type == READ_CACHE) {
+      info->read_end = info->buffer; /* Nothing in cache */
+    } else {
+      info->write_end =
+          (info->buffer + info->buffer_length - (seek_offset & (IO_SIZE - 1)));
+      //  ★ 与 init_io_cache_ext 同一套 IO_SIZE 对齐扣减
+      info->end_of_file = ~(my_off_t)0;
+    }
+  }
+  info->type = type;
+  info->error = 0;
+  init_functions(info);   // ★★ 重绑 read_function/write_function 并重设 current_pos/current_end
+  return false;
+}
+```
+
+**状态切换小结**：
+
+| 切换 | `pos_in_file` | `end_of_file` | `read_pos/read_end` | `write_pos/write_end` | `seek_not_done` |
+|---|---|---|---|---|---|
+| WRITE→READ（命中缓存） | 不变 | = `my_b_tell(info)` | `read_end = write_pos`；`read_pos` = 目标点 | — | `file != -1` |
+| WRITE→READ（未命中） | = `seek_offset` | = `my_b_tell(info)` | `= buffer`（空） | `= buffer` | `true` |
+| READ→WRITE（命中缓存） | 不变 | `~0` | — | `write_end = write_buffer + buffer_length` | `true` |
+| →WRITE（未命中 / clear） | = `seek_offset` | `~0` | `= buffer` | `write_end = buffer + buffer_length - (seek_offset & IO_SIZE-1)` | `true` |
+| →READ（未命中 / clear） | = `seek_offset` | 保持 | `= buffer`（空） | `= buffer` | `true` |
+
+> ★★ **"命中缓存"判据是 `seek_offset <= my_b_tell(info)`** —— 即目标偏移还在已缓冲区间内。此时**不落盘**，直接把缓冲区复用成读区。这正是 `my_b_copy_to_file()` 能零 I/O 地把缓存倒出来的原因。
+
+**`my_b_seek()` —— 延迟 seek 的落点**（`mysys/mf_iocache2.cc:94`）：
+
+```cpp
+void my_b_seek(IO_CACHE *info, my_off_t pos) {
+  my_off_t offset;
+  if (info->type == SEQ_READ_APPEND) (void)flush_io_cache(info);
+  //  ★ SEQ_READ_APPEND 必须先落盘，否则读写视图不一致
+
+  offset = (pos - info->pos_in_file);
+
+  if (info->type == READ_CACHE || info->type == SEQ_READ_APPEND) {
+    if ((ulonglong)offset < (ulonglong)(info->read_end - info->buffer)) {
+      /* The read is in the current buffer; Reuse it */
+      info->read_pos = info->buffer + offset;
+      return;                        // ★ 命中缓冲区：只挪指针，不置 seek_not_done
+    } else {
+      /* Force a new read on next my_b_read */
+      info->read_pos = info->read_end = info->buffer;
+    }
+  } else if (info->type == WRITE_CACHE) {
+    if ((ulonglong)offset <= (ulonglong)(info->write_end - info->write_buffer)) {
+      info->write_pos = info->write_buffer + offset;
+      return;                        // ★ 同理
+    }
+    (void)flush_io_cache(info);
+    /* Correct buffer end so that we write in increments of IO_SIZE */
+    info->write_end =
+        (info->write_buffer + info->buffer_length - (pos & (IO_SIZE - 1)));
+  }
+  info->pos_in_file = pos;
+  info->seek_not_done = true;        // ★★ 只打标记，真正的 lseek 由后续 read/write/fill/flush 兑现
+}
+```
+
+**`seek_not_done` 的全部置位 / 清零点**：
+
+| 位置 | 动作 |
+|---|---|
+| `mf_iocache.cc:197,206,214` | init 时按 `seek_offset != mysql_file_tell()`；ESPIPE 则恒 false |
+| `mf_iocache.cc:229` | READ_CACHE/SEQ_READ_APPEND 探测 EOF 后按 `end_of_file == seek_offset` 重算 |
+| `mf_iocache.cc:351,355,375` | reinit 的三种情形 |
+| `mf_iocache2.cc:133` | `my_b_seek()` 未命中缓冲区 |
+| `mf_iocache2.cc:222` | `my_b_filelength()` 非 WRITE_CACHE（因 seek 到尾部） |
+| `mf_iocache.cc:450,1271,1467` | `_my_b_read()` / `_my_b_write()` / `my_b_flush_io_cache()` **兑现后清 false** |
+| `mf_iocache.cc:1005,1114` | `_my_b_read_r()` / `_my_b_seq_read()` seek 后清 false |
+| `mf_iocache2.cc:159` | `my_b_fill()` seek 后清 false |
+
+**`my_b_flush_io_cache()` 完整源码**（`:1430`）——⚠️ 是**两参**函数，单参 `flush_io_cache(info)` 是宏：
+
+```cpp
+#define flush_io_cache(info) my_b_flush_io_cache((info), 1)   // my_sys.h:756
+
+#define LOCK_APPEND_BUFFER   if (need_append_buffer_lock) lock_append_buffer(info);
+#define UNLOCK_APPEND_BUFFER if (need_append_buffer_lock) unlock_append_buffer(info);
+
+int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
+  size_t length;
+  my_off_t pos_in_file;
+  bool append_cache = (info->type == SEQ_READ_APPEND);
+  if (!append_cache) need_append_buffer_lock = 0;
+  //  ★ my_b_append() 自己已持锁，故传 0，避免自死锁
+
+  if (info->type == WRITE_CACHE || append_cache) {
+    if (info->file == -1) {                       // ★ open_cached_file：此刻才真正建临时文件
+      if (real_open_cached_file(info)) return (info->error = -1);
+    }
+    LOCK_APPEND_BUFFER;
+
+    if ((length = (size_t)(info->write_pos - info->write_buffer))) {
+      if (info->share) copy_to_read_buffer(info, info->write_buffer, length);
+      //  ★ 共享 cache：写缓冲 → 读缓冲直接拷贝，让读线程并行
+      pos_in_file = info->pos_in_file;
+      /*
+        If we have append cache, we always open the file with
+        O_APPEND which moves the pos to EOF automatically on every write
+      */
+      if (!append_cache && info->seek_not_done) {  // ★ 延迟 seek 的兑现点
+        if (mysql_encryption_file_seek(info, pos_in_file, MY_SEEK_SET, MYF(0))
+            == MY_FILEPOS_ERROR) { UNLOCK_APPEND_BUFFER; return (info->error = -1); }
+        if (!append_cache) info->seek_not_done = false;
+      }
+      if (!append_cache) info->pos_in_file += length;
+      info->write_end = (info->write_buffer + info->buffer_length -
+                         ((pos_in_file + length) & (IO_SIZE - 1)));
+      //  ★★ 每次 flush 后重算写区上界，保持 IO_SIZE 对齐
+
+      if (mysql_encryption_file_write(info, info->write_buffer, length,
+                                      info->myflags | MY_NABP))
+        info->error = -1;
+      else
+        info->error = 0;
+      if (!append_cache) {
+        info->end_of_file = std::max(info->end_of_file, (pos_in_file + length));
+      } else {
+        info->end_of_file += (info->write_pos - info->append_read_pos);
+        assert(info->end_of_file == mysql_file_tell(info->file, MYF(0)));
+      }
+      info->append_read_pos = info->write_pos = info->write_buffer;
+      if (info->disk_sync) {
+        if (mysql_file_sync(info->file, MYF(MY_WME))) { UNLOCK_APPEND_BUFFER; return -1; }
+        if (info->disk_sync_delay) my_sleep(info->disk_sync_delay * 1000);
+      }
+      ++info->disk_writes;                 // ★ 驱动 binlog_cache_disk_use 等状态变量
+      UNLOCK_APPEND_BUFFER;
+      return info->error;
+    }
+  }
+  UNLOCK_APPEND_BUFFER;
+  return 0;
+}
+```
+
+> ★ `disk_sync` / `disk_sync_delay` 只在 flush 时生效——这是 `sync_binlog` 相关行为落到 IO_CACHE 层的点。
 
 **两条路径**：
 
@@ -1641,6 +2140,115 @@ binlog cache 是纯顺序的，却被迫实现一个返回错误的 `seek()`。�
 
 ### 9.2 所有权与生命周期：`unique_ptr` 的装饰器链
 
+⚠️ **勘误**：链**不是**用 `std::make_unique(...)` 组装的——8.0.39 全是 `new` + `unique_ptr` 立即接管（必须先构造下游、再把下游"吞"进上游，`make_unique` 表达不了）。
+
+**写侧（新建文件）** — `sql/binlog.cc:415-427`（`MYSQL_BIN_LOG::Binlog_ofile::open()`）：
+
+```cpp
+    std::unique_ptr<IO_CACHE_ostream> file_ostream(new IO_CACHE_ostream);
+    if (file_ostream->open(log_file_key, binlog_name, flags)) return true;
+
+    m_pipeline_head = std::move(file_ostream);       // ★ 第 1 层：IO_CACHE_ostream
+
+    /* Setup encryption for new files if needed */
+    if (!existing && rpl_encryption.is_enabled()) {
+      std::unique_ptr<Binlog_encryption_ostream> encrypted_ostream(
+          new Binlog_encryption_ostream());
+      if (encrypted_ostream->open(std::move(m_pipeline_head))) return true;
+      //                          ★★ 把第 1 层「吞进去」当下游 → 装饰器链成形
+      m_encrypted_header_size = encrypted_ostream->get_header_size();
+      m_pipeline_head = std::move(encrypted_ostream);   // ★ 第 2 层：加密层
+    }
+```
+
+**写侧（打开已有加密文件）** — `sql/binlog.cc:480-489`（`open_existing()`）：
+
+```cpp
+    if (header != nullptr) {
+      /* Add the encryption stream on top of IO_CACHE */
+      std::unique_ptr<Binlog_encryption_ostream> encrypted_ostream(
+          new Binlog_encryption_ostream);
+      ret_ofile->m_encrypted_header_size = header->get_header_size();
+      encrypted_ostream->open(std::move(ret_ofile->m_pipeline_head),
+                              std::move(header));     // ★ 复用已有 header/密码的重载
+      ret_ofile->m_pipeline_head = std::move(encrypted_ostream);
+      ret_ofile->set_encrypted();
+    }
+```
+
+**读侧** — `sql/binlog_istream.cc:150-155`（`Basic_binlog_ifile::read_binlog_magic()`）：
+
+```cpp
+    std::unique_ptr<Binlog_encryption_istream> encryption_istream{
+        new Binlog_encryption_istream()};
+    if (encryption_istream->open(std::move(m_istream), m_error)) return true;
+
+    /* Setup encryption stream pipeline */
+    m_istream = std::move(encryption_istream);
+```
+
+**链形与级联析构**：
+
+```
+写：m_pipeline_head = Binlog_encryption_ostream
+                        └─ m_down_ostream(unique_ptr) = IO_CACHE_ostream
+                             └─ IO_CACHE m_io_cache        ← 值成员
+读：m_istream       = Binlog_encryption_istream
+                        └─ m_down_istream(unique_ptr) = IO_CACHE_istream
+                             └─ IO_CACHE m_io_cache        ← 值成员
+```
+
+```cpp
+// Binlog_ofile::close() —— 只 reset 头节点，整条链级联析构
+  void close() {
+    m_pipeline_head.reset(nullptr);   // ★ IO_CACHE_ostream::~ 会 close IO_CACHE + fd
+    m_position = 0;
+    m_encrypted_header_size = 0;
+  }
+
+// Binlog_encryption_ostream::close() —— 逆序释放
+void Binlog_encryption_ostream::close() {
+  m_encryptor.reset(nullptr);       // ① cipher
+  m_header.reset(nullptr);          // ② 加密头
+  m_down_ostream.reset(nullptr);    // ③ 下游流（析构时 close IO_CACHE）
+}
+```
+
+**★ 整条链所有权"移交"的出口**（rotate 时用）：
+
+```cpp
+  std::unique_ptr<Truncatable_ostream> get_pipeline_head() {
+    return std::move(m_pipeline_head);   // ★ 把链头的所有权交出去
+  }
+```
+
+> ★ `Binlog_ofile::m_position` 是**明文逻辑位置**（不含加密头）；`get_real_file_size()` 才返回 `m_position + m_encrypted_header_size`。逻辑/物理两套偏移的分离，是这套装饰器能成立的前提。
+
+**`Basic_ostream` 的极窄接口**（`sql/basic_ostream.h:37`）——只有**一个**纯虚函数 + 虚析构：
+
+```cpp
+class Basic_ostream {
+ public:
+  virtual bool write(const unsigned char *buffer, my_off_t length) = 0;
+  virtual ~Basic_ostream() = default;
+  // ★ 拷贝/移动构造/赋值全都由编译器隐式生成，本类并没有 = delete
+};
+
+// sql/basic_ostream.h:58 —— Truncatable_ostream 也在这里，不在 binlog_ostream.h
+class Truncatable_ostream : public Basic_ostream {
+ public:
+  virtual bool truncate(my_off_t offset) = 0;
+  virtual bool seek(my_off_t offset) = 0;
+  virtual bool flush() = 0;
+  virtual bool sync() = 0;
+  ~Truncatable_ostream() override = default;
+};
+```
+
+> ⚠️ **勘误**：**`Basic_ostream` / `Truncatable_ostream` 没有 `= delete` 的拷贝/移动**。删拷贝的是**叶子子类**（`IO_CACHE_ostream` / `IO_CACHE_istream` / `IO_CACHE_binlog_cache_storage` / `Basic_binlog_ifile`），且**只删了拷贝，没人删移动**。
+>
+> ⚠️ 也不存在 `sql/binlog_file.h`；`Binlog_ofile` 是 **嵌套类** `MYSQL_BIN_LOG::Binlog_ofile`，完整定义在 `sql/binlog.cc:375`，`sql/binlog.h:141` 只有前向声明。且它继承的是 **`Basic_ostream`**（不是 `Truncatable_ostream`），自己另提供**非虚**的 `truncate/flush/sync`。
+
 `Binlog_ofile::open()` 是整条链的组装现场（`sql/binlog.cc:414-428`）：
 
 ```cpp
@@ -1764,6 +2372,28 @@ bool stream_copy(ISTREAM *istream, OSTREAM *ostream,
 **它不靠继承约束类型，而是靠结构化类型（duck typing）**：
 
 - `ISTREAM` 只要有 `begin()` / `next()`——而这两个是 `IO_CACHE_binlog_cache_storage` 的**非虚公有方法**，根本不在 `Basic_istream` 接口里。这是**刻意的零拷贝设计**：`begin`/`next` 直接把 `m_io_cache.read_pos` 交出去。
+
+**“零拷贝”具体怎么做的，看 `next()` 本体**（`binlog_ostream.cc:184`）：
+
+```cpp
+bool IO_CACHE_binlog_cache_storage::next(unsigned char **buffer,
+                                         my_off_t *length) {
+  my_b_fill(&m_io_cache);                        // ① 缓冲空则读盘填充
+
+  *buffer = m_io_cache.read_pos;                 // ② ★ 直接交出内部指针
+  *length = my_b_bytes_in_cache(&m_io_cache);    // ③ 本块可读字节数
+
+  m_io_cache.read_pos = m_io_cache.read_end;     // ④ ★ 一次把整块标记为读完
+
+  return m_io_cache.error;
+}
+```
+
+★ 第 ④ 行是零拷贝设计的**必然约束**，也是最容易读漏的一点：既然把内部缓冲指针直接交给了调用方，就不能“只读一半”——下次 `my_b_fill` 会复用同一块缓冲把内容覆盖掉。所以 `next()` 一次调用**必然消费掉整块**（`read_pos` 直接推到 `read_end`），调用方必须在下一次 `next()` 之前用完这批数据。
+
+配套看 `begin()`（`binlog_ostream.cc:151`）：它先 `reinit_io_cache(&m_io_cache, READ_CACHE, 0, false, false)` —— 把刚写完的 `WRITE_CACHE` **原地切换成 `READ_CACHE`**（倒带），然后直接 `return next(buffer, length)`。⇒ binlog cache 的“写后读”就是靠这一次 `reinit_io_cache` 换模式完成的，中间没有任何数据搬移。
+
+（`my_b_fill` 本身是 `IO_CACHE` 的填充原语：缓冲耗尽时从文件补一块；`my_b_bytes_in_cache` = `read_end - read_pos`。这正是上文“直接暴露内部缓冲指针”的落点。）
 - `OSTREAM` 只要有 `write()`。所以 `Truncatable_ostream*` 和 `Basic_ostream*` 都能传（压缩场景传的就是 `Compressed_ostream*`，它只有 `Basic_ostream` 一个基类）。
 
 **保证**：零虚调用开销（编译期绑定）+ 零内存拷贝（直接暴露内部缓冲指针）。
@@ -1912,6 +2542,197 @@ class Compressor {
 `get_header()` 从流里读版本号 → 实例化对应版本子类 → 委托反序列化。**把 `switch(version)` 关在工厂里**，是版本化格式 + 多态的经典组合。
 
 ### 9.7 ★ C 与 C++ 的边界：C 结构如何被安全地包进 C++ 类
+
+**★ 核心事实：C++ 包装类从不持 `IO_CACHE *`，一律是 `IO_CACHE` 值成员**：
+
+| 类 | 持有方式 | 证据 |
+|---|---|---|
+| `IO_CACHE_ostream` | **成员对象（值）** `IO_CACHE m_io_cache;` | `sql/basic_ostream.h:151`；构造 `basic_ostream.cc:31` `= default`（**无初始化列表**） |
+| `IO_CACHE_istream` | **成员对象（值）** | `sql/basic_istream.h:125`；`basic_istream.cc:30` |
+| `IO_CACHE_binlog_cache_storage` | **成员对象（值）** | `sql/binlog_ostream.h:142`；`open_cached_file(&m_io_cache, ...)` |
+| `Stdin_istream` | **成员对象（值）** | `sql/basic_istream.h:157` |
+| `MYSQL_BIN_LOG` | **裸指针（拥有）** `Binlog_ofile *m_binlog_file;` | `sql/binlog.h:152`；`new` at `binlog.cc:3629`，`delete` at `binlog.cc:3648` |
+| `Binlog_cache_storage` | 值成员 + **非拥有裸指针** `Truncatable_ostream *m_pipeline_head` | `sql/binlog_ostream.h:237-238` |
+| 加密 cipher 交给 C 层 | **裸指针 new/delete**（`IO_CACHE::m_encryptor/m_decryptor`） | `binlog_ostream.cc:217-218`(`release()`) / `224-231`(`delete`) |
+
+**`IO_CACHE_ostream` 完整实现**（`sql/basic_ostream.cc:31-90`）——边界技法全在这里：
+
+```cpp
+IO_CACHE_ostream::IO_CACHE_ostream() = default;
+//  ★ 无初始化列表：IO_CACHE 是 C 的 POD，默认构造不初始化它
+//    未 open 时 my_b_inited() == false，靠这个区分"已打开/未打开"
+IO_CACHE_ostream::~IO_CACHE_ostream() { close(); }
+//  ★ 析构只做 RAII 收尾，没有 delete —— 因为对象就在自己肚子里
+
+bool IO_CACHE_ostream::open(PSI_file_key log_file_key, const char *file_name,
+                            myf flags) {
+  File file = -1;
+  if ((file = mysql_file_open(log_file_key, file_name, O_CREAT | O_WRONLY,
+                              MYF(MY_WME))) < 0)
+    return true;
+  if (init_io_cache(&m_io_cache, file, IO_SIZE, WRITE_CACHE, 0, false, flags)) {
+    mysql_file_close(file, MYF(0));
+    return true;
+  }
+  return false;
+}
+
+bool IO_CACHE_ostream::close() {
+  if (my_b_inited(&m_io_cache)) {
+    int ret = end_io_cache(&m_io_cache);
+    ret |= mysql_file_close(m_io_cache.file, MYF(MY_WME));   // ★ fd 自己关
+    return ret != 0;
+  }
+  return false;
+}
+
+bool IO_CACHE_ostream::seek(my_off_t offset) {
+  assert(my_b_inited(&m_io_cache));
+  return reinit_io_cache(&m_io_cache, WRITE_CACHE, offset, false, true);
+}
+
+bool IO_CACHE_ostream::write(const unsigned char *buffer, my_off_t length) {
+  assert(my_b_inited(&m_io_cache));
+  return my_b_safe_write(&m_io_cache, buffer, length);   // ★ 不是 my_b_write
+}
+
+bool IO_CACHE_ostream::truncate(my_off_t offset) {
+  assert(my_b_inited(&m_io_cache));
+  assert(m_io_cache.file != -1);
+  if (my_chsize(m_io_cache.file, offset, 0, MYF(MY_WME))) return true;
+  reinit_io_cache(&m_io_cache, WRITE_CACHE, offset, false, true);
+  return false;
+}
+
+bool IO_CACHE_ostream::flush() {
+  assert(my_b_inited(&m_io_cache));
+  return flush_io_cache(&m_io_cache);         // ★ 宏 → my_b_flush_io_cache(info, 1)
+}
+
+bool IO_CACHE_ostream::sync() {
+  assert(my_b_inited(&m_io_cache));
+  return mysql_file_sync(m_io_cache.file, MYF(MY_WME)) != 0;
+  //  ★ 直接 fsync 底层 fd，不先 flush —— 注释明确要求调用者先 flush()
+}
+```
+
+> ★ 每个方法开头的 `assert(my_b_inited(&m_io_cache))` 就是"C 结构没有 RAII 构造"的补偿：`IO_CACHE` 是 POD，必须靠 `init_io_cache*` / `open_cached_file` 显式初始化，而 `my_b_inited()`（即 `buffer != nullptr`）是唯一的"是否已初始化"标记。
+
+**`IO_CACHE_istream::open()` 用的是 `init_io_cache_ext`**（`sql/basic_istream.cc:45`）——因为它要传第二个 PSI key：
+
+```cpp
+  file = mysql_file_open(log_file_key, file_name, O_RDONLY, MYF(MY_WME));
+  if (file < 0) return true;
+#ifdef HAVE_PSI_INTERFACE
+  if (init_io_cache_ext(&m_io_cache, file, cache_size, READ_CACHE, 0, false,
+                        flags, log_cache_key))
+#else
+  if (init_io_cache(&m_io_cache, file, cache_size, READ_CACHE, 0, false,
+                    MYF(MY_WME | MY_DONT_CHECK_FILESIZE)))
+#endif
+  { mysql_file_close(file, MYF(0)); return true; }
+  return false;
+```
+
+```cpp
+ssize_t IO_CACHE_istream::read(unsigned char *buffer, size_t length) {
+  if (my_b_read(&m_io_cache, buffer, length) ||
+      DBUG_EVALUATE_IF("simulate_magic_header_io_failure", 1, 0))
+    return m_io_cache.error;              // ★ 返回 IO_CACHE::error（通常 -1），不抛异常
+  return static_cast<longlong>(length);
+}
+my_off_t IO_CACHE_istream::length() { return my_b_filelength(&m_io_cache); }
+bool IO_CACHE_istream::seek(my_off_t offset) { my_b_seek(&m_io_cache, offset); return false; }
+```
+
+**★ 加解密层的"偏移翻译"——只有加密头一项，不是文件长度前缀**：
+
+```cpp
+// sql/binlog_ostream.cc:396 —— 偏移翻译只在 seek/truncate 里，write 完全顺序
+bool Binlog_encryption_ostream::seek(my_off_t offset) {
+  if (m_down_ostream->seek(m_header->get_header_size() + offset)) return true;
+  //                       ★ 物理偏移 = 逻辑偏移 + HEADER_SIZE(512)
+  return m_encryptor->set_stream_offset(offset);
+  //     ★ 让 AES-CTR 计数器对齐到逻辑 offset
+}
+
+bool Binlog_encryption_ostream::truncate(my_off_t offset) {
+  if (m_down_ostream->truncate(m_header->get_header_size() + offset))
+    return true;      // ★ 截断长度也 +512，否则会把加密头截掉
+  return m_encryptor->set_stream_offset(offset);
+}
+
+// write() 不做任何偏移换算，只做 2048 字节分块加密
+bool Binlog_encryption_ostream::write(const unsigned char *buffer, my_off_t length) {
+  const int ENCRYPT_BUFFER_SIZE = 2048;
+  unsigned char encrypt_buffer[ENCRYPT_BUFFER_SIZE];
+  const unsigned char *ptr = buffer;
+  while (length > 0) {
+    int encrypt_len = std::min(length, static_cast<my_off_t>(ENCRYPT_BUFFER_SIZE));
+    if (m_encryptor->encrypt(encrypt_buffer, ptr, encrypt_len)) { ...; return true; }
+    if (m_down_ostream->write(encrypt_buffer, encrypt_len)) return true;
+    //  ★ AES-CTR 流密码：密文等长
+    ptr += encrypt_len; length -= encrypt_len;
+  }
+  return false;
+}
+```
+
+```cpp
+// sql/binlog_istream.cc:118 —— 读侧对称
+ssize_t Binlog_encryption_istream::read(unsigned char *buffer, size_t length) {
+  ssize_t ret = m_down_istream->read(buffer, length);     // ★ 按物理偏移读密文
+  if (ret > 0 && m_decryptor->decrypt(buffer, buffer, ret)) ret = -1;  // ★ 原地解密
+  return ret;
+}
+bool Binlog_encryption_istream::seek(my_off_t offset) {
+  bool res = m_decryptor->set_stream_offset(offset);
+  if (!res) res = m_down_istream->seek(offset + m_decryptor->get_header_size());
+  return res;
+}
+my_off_t Binlog_encryption_istream::length() {
+  return m_down_istream->length() - m_decryptor->get_header_size();  // ★ 反向翻译
+}
+```
+
+> ⚠️ **勘误**：8.0.39 的 `Rpl_encryption_header_v1` **没有 file-size 字段**（`sql/rpl_log_encryption.h:705-763`：Magic(4) + Version(1) + KeyID TLV + EncryptedPassword(32) + IV(16) + Padding，`HEADER_SIZE = 512`）。所以偏移差**只有加密头一项**。
+>
+> ★ 加密头写入点：`m_header->serialize(m_down_ostream.get())`（`binlog_ostream.cc:296`）——从此下游物理偏移 = 逻辑偏移 + 512。打开已有加密文件时走 `open(down, header)` 重载，末尾 `return seek(0)` 把下游定位到 512。
+
+**临时文件加密：密码每事务换**（`sql/binlog_ostream.cc:206`）：
+
+```cpp
+bool IO_CACHE_binlog_cache_storage::enable_encryption() {
+  if (m_io_cache.m_encryptor != nullptr && m_io_cache.m_decryptor != nullptr)
+    return false;
+  if (rpl_encryption.is_enabled()) {
+    std::unique_ptr<Rpl_encryption_header> header =
+        Rpl_encryption_header::get_new_default_header();
+    const Key_string password_str = header->generate_new_file_password();
+    std::unique_ptr<Stream_cipher> encryptor = header->get_encryptor();
+    if (encryptor->open(password_str, 0)) return true;
+    //                                ★ header_size 传 0：临时文件没有加密头
+    std::unique_ptr<Stream_cipher> decryptor = header->get_decryptor();
+    if (decryptor->open(password_str, 0)) return true;
+
+    m_io_cache.m_encryptor = encryptor.release();   // ★★ 交给 C 结构自己管理
+    m_io_cache.m_decryptor = decryptor.release();
+  }
+  return false;
+}
+
+void IO_CACHE_binlog_cache_storage::disable_encryption() {
+  if (m_io_cache.m_encryptor != nullptr) {
+    delete m_io_cache.m_encryptor;      // ★ 手工 delete，配对上面的 release()
+    m_io_cache.m_encryptor = nullptr;
+  }
+  ...
+}
+```
+
+> ★ `reset()`（每次事务提交清理 binlog cache 时调用）里会 `setup_ciphers_password()` **重新生成随机密码**——注释明说"密码不仅每个临时文件不同，**同一连接内每个事务也不同**"。
+>
+> ★ `m_max_cache_size` 是直接改 C 字段实现的：`m_io_cache.end_of_file = max_cache_size;`（`binlog_ostream.cc:56`）。
 
 这是整章最有价值的一节——它解释了"为什么一个 C 结构能被 C++ 类当值成员持有"。
 

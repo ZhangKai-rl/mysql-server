@@ -42,14 +42,14 @@ query/09  RowIterator 框架
 
 | 文件 | 核心内容 |
 |------|----------|
-| [01_filesort.md](01_filesort.md) | **filesort**：**边装边溢而非预判落盘**（核心洞察）、`sort_buffer_size` 是预算非预分配（32KB 起 ×1.5 块式增长）、sort key 的可 memcmp 编码（**DESC 只反转数据本体**、NULL 三值、varlen 前缀含自身、`strnxfrm` 权重膨胀）、**addon vs rowid**（8.0.20 默认 addon，rowid 仅剩三场景；rowid 拼进 key 尾部换取确定序）、packed addon 的 <14 字节判据推导、算法选择决策表（≤100 `std::sort` / >100 `std::stable_sort`）、**LIMIT 两层优化**（`nth_element` 预筛 vs PQ，PQ 慢 3 倍与 k+1 槽不变式）、7 路归并（**内部临时表本身见 07**） |
-| [02_subquery_runtime.md](02_subquery_runtime.md) | 子查询运行期：物化（`subselect_hash_sj_engine`）、IN2EXISTS（`Item_in_optimizer`）、semi-join 五策略的运行期、标量子查询、EXISTS、子查询缓存 |
-| [03_cte.md](03_cte.md) | **CTE（含递归）**：WITH 解析与 `Common_table_expr` 三数组、非递归 CTE = derived table（**merge/materialize 决策链与优先级**）、**物化表自动建索引**（`add_derived_key`，按引用表分组且不超过 `MAX_REF_PARTS`）、递归 CTE 的 seed+收敛循环、`FollowTailIterator` 只读上一轮新增行且不撞 EOF、共享物化 `clone_tmp_table`、**UNION 去重陷阱 / 类型由 anchor 决定 / 无环检测与性能特征** |
-| [04_window_function.md](04_window_function.md) | 窗口函数执行内部：Window 对象、流式 vs 缓冲迭代器、frame 语义与 RANGE 三路比较器、partition/peer 判定、窗口函数 Item |
-| [05_join_buffer.md](05_join_buffer.md) | join buffer：BNL 改写为 hash join、BKA + DS-MRR、hash join 的 build/probe/spill、`setup_join_buffering` 决策链 |
-| [07_temptable.md](07_temptable.md) | **内部临时表（通用载体）**：为什么需要临时表层、`create_tmp_table` 的字段与键设计（隐藏字段、`hash_field` 唯一约束的冲突代价）、**三级降级链**（RAM → mmap → InnoDB，`create_ondisk_from_heap` 逐行拷贝）、TempTable 为何替代 MEMORY、物化与共享、场景全景 |
-| [08_materialization.md](08_materialization.md) | **物化（Materialization）**：`MaterializeIterator` 完整实现（`Init` 一次跑完、`Read` 只转发）、**LIMIT 必须内建的三处论证**、去重两条路径（唯一索引可忽略错误 vs hash 字段）、INTERSECT/EXCEPT 的计数器算法与 `HalfCounter`、递归物化的严格模式与收敛判据、**`FollowTailIterator` 为何不能撞 EOF**（MEMORY deleted-record 漏行实录）、**invalidators 参数化物化**（generation 比较、`pending_invalidators` 的 NULL 补充行陷阱、`SAFE_IF_SCANNED_ONCE`） |
-| [06_rollup.md](06_rollup.md) | ROLLUP：`Item_rollup_sum_switcher` 多层聚合（每 level 一份 Item_sum）、`Item_rollup_group_item` 分组列 NULL 化、`AggregateIterator` 流式聚集状态机、rollup 对优化器的 6 项限制 |
+| [01_filesort.md](01_filesort.md) | filesort：边装边溢、addon vs rowid、LIMIT 优化、多路归并 |
+| [02_subquery_runtime.md](02_subquery_runtime.md) | 子查询运行期：物化、IN2EXISTS、semi-join 五策略运行期 |
+| [03_cte.md](03_cte.md) | CTE（含递归）：merge/materialize 决策、递归收敛循环 |
+| [04_window_function.md](04_window_function.md) | 窗口函数执行内部：流式 vs 缓冲、frame 语义 |
+| [05_join_buffer.md](05_join_buffer.md) | join buffer：BNL 改 hash join、BKA、build/probe/spill |
+| [07_temptable.md](07_temptable.md) | 内部临时表：TempTable 的 Row/Cell 与标准容器索引、RAM→mmap→InnoDB 四级降级链、`create_tmp_table` 的 hash_field 与四类键、共享物化与降级时换 handler |
+| [08_materialization.md](08_materialization.md) | 物化：MaterializeIterator、LIMIT 内建、invalidators |
+| [06_rollup.md](06_rollup.md) | ROLLUP：多层聚合与分组列 NULL 化 |
 
 ---
 

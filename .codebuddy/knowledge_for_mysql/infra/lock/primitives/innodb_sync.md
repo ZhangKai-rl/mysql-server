@@ -71,6 +71,169 @@ L4  实例          dict_operation_lock、index->lock、buf_pool 各 mutex ...  
 
 #### 一、两级等待：自旋多久才值得睡
 
+**自旋本体 `ut_delay()`**（⚠️ 真身在 `ut/ut0ut.cc:99`，**不存在 `ut0delay.h`**）：
+
+```cpp
+ulint ut_delay(ulint delay) {
+  ulint i, j;
+  /* We don't expect overflow here, as ut::spin_wait_pause_multiplier is limited
+  to 100, and values of delay are not larger than @@innodb_spin_wait_delay
+  which is limited by 1 000. ... */
+  const ulint iterations = delay * ut::spin_wait_pause_multiplier;
+  //                       ★★ 实际 PAUSE 条数 = delay × 倍数，不是 delay × 常数
+
+  UT_LOW_PRIORITY_CPU();                       // POWER 上发 "or 1,1,1" 降优先级
+  j = 0;
+  for (i = 0; i < iterations; i++) {
+    j += i;                                    // ★ 无意义算术，唯一目的是阻止编译器消除空循环
+    UT_RELAX_CPU();                            // ★ 每轮发射一条 PAUSE / ISB
+  }
+  UT_RESUME_PRIORITY_CPU();
+  return (j);                                  // ★ 返回值是 dummy（j = Σi），调用方一律丢弃
+}
+```
+
+```cpp
+namespace ut {
+/** The current value of @@innodb_spin_wait_pause_multiplier. Determines
+how many PAUSE instructions to emit for each requested unit of delay
+when calling `ut_delay(delay)`. The default value of 50 causes `delay*50` PAUSES
+which was equivalent to `delay` microseconds on 100 MHz Pentium + Visual C++.
+Useful on processors which have "non-standard" duration of a single PAUSE
+instruction - one can compensate for longer PAUSES by setting the
+spin_wait_pause_multiplier to a smaller value on such machine */
+extern ulong spin_wait_pause_multiplier;       // 默认 50
+}
+```
+
+**`UT_RELAX_CPU` 全平台分支**（`ut0ut.h:81`）——★ **aarch64 是 `isb` 不是 `yield`**：
+
+```cpp
+#if defined(HAVE_PAUSE_INSTRUCTION)
+#define UT_RELAX_CPU() __asm__ __volatile__("pause")        // x86
+#elif defined(HAVE_FAKE_PAUSE_INSTRUCTION)
+#define UT_RELAX_CPU() __asm__ __volatile__("rep; nop")     // 老 x86
+#elif defined _WIN32
+#define UT_RELAX_CPU() YieldProcessor()
+#elif defined(__aarch64__)
+/* A "yield" instruction in aarch64 is essentially a nop, and does not cause
+enough delay to help backoff. "isb" is a barrier that, especially inside a
+loop, creates a small delay without consuming ALU resources.
+Experiments shown that adding the isb instruction improves stability and reduces
+result jitter. Adding more delay to the UT_RELAX_CPU than a single isb reduces
+performance. */
+#define UT_RELAX_CPU() __asm__ __volatile__("isb" ::: "memory")   // ★ ARM64
+#else
+#define UT_RELAX_CPU() __asm__ __volatile__("" ::: "memory")      // 通用兜底
+#endif
+
+#if defined(HAVE_HMT_PRIORITY_INSTRUCTION)
+#define UT_LOW_PRIORITY_CPU() __asm__ __volatile__("or 1,1,1")    // ★ POWER
+#define UT_RESUME_PRIORITY_CPU() __asm__ __volatile__("or 2,2,2")
+#else
+#define UT_LOW_PRIORITY_CPU() ((void)0)
+#define UT_RESUME_PRIORITY_CPU() ((void)0)
+#endif
+```
+
+> ⚠️ **勘误**：**没有 `__builtin_ia32_pause`**；**没有 POWER 的 `UT_RELAX_CPU` 分支**（POWER 走的是另一对宏 `UT_LOW/RESUME_PRIORITY_CPU`）。
+
+**⚠️ `UT_WAIT_FOR` 宏不存在**——真名是三个模板函数：
+
+| 函数 | 位置 | 语义 |
+|---|---|---|
+| `ut::wait_for(cond, max_wait)` | `ut0ut.ic:131` | 纯 sleep，固定 **2ms** 粒度 |
+| `ut::wait_for(spins_limit, sleep, condition)` | `ut0ut.ic:153` | 自旋→sleep，**每 4 次翻倍**，上限 100ms |
+| `os_event_wait_for(event, spins_limit, timeout, condition)` | `os0event.ic:58` | ★ **自旋 → event 的分界** |
+
+```cpp
+template <typename Condition>
+inline static Wait_stats os_event_wait_for(os_event_t &event,
+                                           uint64_t spins_limit,
+                                           std::chrono::microseconds timeout,
+                                           Condition condition = {}) {
+  uint32_t next_level = 4;                       // Windows 上是 64
+  uint32_t waits = 0;
+  constexpr auto MIN_TIMEOUT = std::chrono::microseconds{1};
+  constexpr auto MAX_TIMEOUT = std::chrono::microseconds{100 * 1000};
+
+  while (true) {
+    const bool wait = spins_limit == 0;          // ★ 递减到 0 就转入事件等待
+    const int64_t sig_count = !wait ? 0 : os_event_reset(event);
+    //                               ★★ 先 reset 抓计数，再检查条件 → 防丢唤醒
+
+    if (condition(wait)) return (Wait_stats{waits});
+
+    if (!wait) {
+      --spins_limit;
+      UT_RELAX_CPU();                            // ★ 自旋段只有 PAUSE，不调 ut_delay
+    } else {
+      ++waits;
+      if (timeout < MIN_TIMEOUT) {
+        /* ... we measured how long does it take to wake up on timeout,
+        depending on timeout:
+             1us ->   57us,   10us ->   66us,   20us ->   76us,
+            50us ->  106us,  100us ->  156us, 1000us -> 1100us.
+        (Oracle Linux 4.14.28) */
+        timeout = MIN_TIMEOUT;                   // ★ 实测：1us 超时实际要 57us
+      }
+      if (waits == next_level) {
+        timeout = std::min(timeout * 2, MAX_TIMEOUT);   // ★ 指数退避，上限 100ms
+        next_level += 4;
+      }
+      os_event_wait_time_low(event, timeout, sig_count);   // ★ 传第 77 行抓到的计数
+    }
+  }
+}
+```
+
+**spin 相关的三个系统变量**（⚠️ `srv_spin_wait_delay` 单位是 **PAUSE 轮数基数**，不是微秒）：
+
+```cpp
+// srv/srv0srv.cc:589
+ulong srv_n_spin_wait_rounds = 30;      // ★ 默认 30 轮
+ulong srv_spin_wait_delay = 6;          // ★ 默认 6（不是微秒）
+bool srv_priority_boost = true;
+// ut/ut0ut.cc:64
+namespace ut { ulong spin_wait_pause_multiplier = 50; }   // ★ 默认 50
+```
+
+```cpp
+// ha_innodb.cc:22789
+static MYSQL_SYSVAR_ULONG(sync_spin_loops, srv_n_spin_wait_rounds,
+                          PLUGIN_VAR_RQCMDARG,
+                          "Count of spin-loop rounds in InnoDB mutexes (30 by default)",
+                          nullptr, nullptr, 30L, 0L, UINT32_MAX, 0);
+static MYSQL_SYSVAR_ULONG(spin_wait_delay, srv_spin_wait_delay,
+                          PLUGIN_VAR_OPCMDARG,
+                          "Maximum delay between polling for a spin lock (6 by default)",
+                          nullptr, nullptr, 6L, 0L, 1000, 0);
+static MYSQL_SYSVAR_ULONG(spin_wait_pause_multiplier, ut::spin_wait_pause_multiplier,
+                          PLUGIN_VAR_RQCMDARG,
+                          "Controls how many times in a row to use a PAUSE "
+                          "instruction to achieve one unit of delay in a spin "
+                          "lock (see @@innodb_spin_wait_delay), defaults to 50",
+                          nullptr, nullptr, 50, 0, 100, 0);
+```
+
+**典型调用点**（`sync0rw.cc:286`）——★ **随机化退避**防止同频共振：
+
+```cpp
+  os_rmb;                                                   // 读屏障
+  while (i < srv_n_spin_wait_rounds && lock->lock_word <= 0) {
+    if (srv_spin_wait_delay) {
+      ut_delay(ut::random_from_interval_fast(0, srv_spin_wait_delay));
+      //       ★★ 每轮随机 0..delay，不是固定值
+    }
+    i++;
+  }
+  if (i >= srv_n_spin_wait_rounds) {
+    std::this_thread::yield();                              // ★ 自旋耗尽 → 让出 CPU
+  }
+```
+
+> ★ **两级之间的"第三级"是 `std::this_thread::yield()`**，然后才进 sync array / futex 真睡。所以严格说是**三级**：自旋(PAUSE) → yield → OS 等待。
+
 临界区通常几十纳秒到微秒，而"睡眠 + 唤醒"的往返约 57–110µs（源码注释在 `os_event_wait_for` 处给出了实测表：自旋 1µs 唤醒延迟 57µs、1000µs 唤醒延迟 1100µs）。所以所有 InnoDB 原语的加锁循环都是同一骨架：
 
 ```
@@ -84,6 +247,141 @@ try_lock 快路径（一次 CAS）
 代价：自旋烧 CPU——负载高时"大家都拿不到锁、都在烧 CPU"会造成吞吐崩塌。缓解手段全是可调参数（`innodb_spin_wait_delay`、`innodb_sync_spin_loops`），且睡眠前的"复查一次"是防丢唤醒的关键（见下）。
 
 #### 二、★ 防丢唤醒：为什么处处"先登记、再复查"
+
+**源码里的原始场景注释**（`os0event.h:83` / `os0event.cc:129`）——作者把丢唤醒的时序画出来了：
+
+```cpp
+  /**
+  Waits for an event object until it is in the signaled state.
+
+  Typically, if the event has been signalled after the os_event_reset()
+  we'll return immediately because event->is_set == true.
+  There are, however, situations (e.g.: sync_array code) where we may
+  lose this information. For example:
+
+  thread A calls os_event_reset()
+  thread B calls os_event_set()   [event->is_set == true]
+  thread C calls os_event_reset() [event->is_set == false]
+  thread A calls os_event_wait()  [infinite wait!]
+  thread C calls os_event_wait()  [infinite wait!]
+
+  Where such a scenario is possible, to avoid infinite wait, the
+  value returned by os_event_reset() should be passed in as
+  reset_sig_count. */
+```
+
+**机制本体：`reset()` 返回 signal_count，`wait_low()` 比对它**：
+
+```cpp
+  int64_t reset() UNIV_NOTHROW {
+    mutex.enter();
+    if (m_set) {
+      m_set = false;                    // ★ manual-reset：必须显式清位
+    }
+    int64_t ret = signal_count;         // ★ 在锁内读"此刻"的计数
+    mutex.exit();
+    return (ret);                       // ★ 交给调用者当 reset_sig_count
+  }
+```
+
+```cpp
+void os_event::wait_low(int64_t reset_sig_count) UNIV_NOTHROW {
+  mutex.enter();
+  if (!reset_sig_count) {
+    reset_sig_count = signal_count;     // ★ 传 0 = "我不关心中间是否有人 set 过"
+  }
+  while (!m_set && signal_count == reset_sig_count) {
+    //             ★★ 双条件：既没置位、计数又没变，才真阻塞
+    wait();
+    /* Spurious wakeups may occur: we have to check if the
+    event really has been signaled after we came here to wait. */
+  }
+  mutex.exit();
+}
+```
+
+> ★★ **`signal_count` 从 1 起跳**（构造里 `signal_count = 1`），因为 **0 被保留为"未指定"哨兵值**（`wait_low` 里 `if (!reset_sig_count)` 判据）。
+
+**`set()` 是幂等的 + 广播的**（⚠️ 不是 signal 一个）：
+
+```cpp
+  void set() UNIV_NOTHROW {
+    mutex.enter();
+    if (!m_set) {            // ★ 已 set 过就不再 broadcast，避免无谓唤醒风暴
+      broadcast();
+    }
+    mutex.exit();
+  }
+
+  void broadcast() UNIV_NOTHROW {
+    m_set = true;            // ①先置位（后续 wait 直接返回）
+    ++signal_count;          // ②再递增（让持有旧 count 的 waiter 也退出）
+    pthread_cond_broadcast(&cond_var);   // ③★ 广播，不是 signal
+  }
+```
+
+> ⚠️ **勘误**：`os_event` **有私有 `signal()`**（`pthread_cond_signal`）但**整份 `os0event.cc` 无人调用——死代码**。所以 `os_event_set()` 唤醒的是**全部**等待者。
+> ⚠️ **`m_set` / `signal_count` 不是 `std::atomic`**，是原生 `bool` / `int64_t`，全靠 `EventMutex`（=`OSMutex`，裸 pthread mutex）串行化。
+
+**★ 教科书级用法**（`buf/buf0dblwr.cc:528` / `:643`）——reset/fence/复查/set 四步：
+
+```cpp
+    auto sig_count = os_event_reset(m_event);          // ① 先 reset 拿 signal_count
+    std::atomic_thread_fence(std::memory_order_acquire);  // ② acquire fence
+    if (m_batch_running.load(std::memory_order_acquire)) {  // ③ 复查条件
+      mutex_exit(&m_mutex);                            //    已 true → 不睡
+      ...
+  void batch_completed() noexcept {
+    m_batch_running.store(false, std::memory_order_release);  // ① 先发布状态
+    std::atomic_thread_fence(std::memory_order_release);      // ② release fence
+    os_event_set(m_event);                                    // ③ 再 set
+  }                                                    // ★★ 顺序不可颠倒，否则丢唤醒
+```
+
+**wait array 里也用同一招**（`sync0arr.cc:240` / `:341`）：
+
+```cpp
+  os_event_t event = sync_cell_get_event(cell);
+  cell->signal_count = os_event_reset(event);   // ★ reserve_cell 时就抓好
+  ...
+  os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
+```
+
+**★ `TTASEventMutex::wait()` 顶部有整整 100 行的 C++14 内存模型证明**（`ut0mutex.ic:47`，"Theorem 1"）——它论证"只要每个 `enter()` 的线程最终都 `exit()`，进入 `os_event_wait()` 的线程必然被唤醒"。推论出的**两条操作顺序硬约束**：
+
+```cpp
+  /* The memory order of the array reservation and
+  the change in the waiters field is important: when
+  we suspend a thread, we first reserve the cell and
+  then set waiters field to 1. When threads are released
+  in mutex_exit, the waiters field is first set to zero
+  and then the event is set to the signaled state. */
+  set_waiters();            // 等待侧：① reserve cell → ② set_waiters → ③ try_lock → ④ wait
+
+void TTASEventMutex<Policy>::signal() UNIV_NOTHROW {
+  clear_waiters();          // 释放侧：① clear_waiters → ② os_event_set
+  /* The memory order of resetting the waiters field and
+  signaling the object is important. See Theorem 1 above. */
+  os_event_set(m_event);
+  sync_array_object_signalled();
+}
+```
+
+> ★★ **`rw_lock_t` 的两个 event 各有一套顺序协议**（`sync0rw.cc` 头注释，逐字抄录）：
+> - `event`：**(1) `os_event_reset()` 记录计数 → (2) `waiters=1` → (3) 复查 `lock_word <= 0`**。(1) 必须在 (2) 前以保证不丢信号；(2) 必须在 (3) 前以保证信号会被发出。
+> - `wait_ex_event`：**(1) `lock_word -= X_LOCK_DECR` → (2) `os_event_reset()` → (3) 复查 `lock_word < 0`**。(1) 必须最先，既阻止新读者进入，又通知 unlocker 必须发信号。
+
+**兜底：`sync_arr_wake_threads_if_sema_free()`**（`sync0arr.cc:780`，由 `srv_error_monitor_thread` 约每 1 秒调）——注释承认这是给"漏发信号"打补丁：
+
+> ```cpp
+> /** If the wakeup algorithm does not work perfectly at semaphore releases,
+>  this function will do the waking (see the comment in mutex_exit). This
+>  function should be called about every 1 second in the server.
+>
+>  Note that there's a race condition between this thread and mutex_exit
+>  changing the lock_word and calling signal_object, so sometimes this finds
+>  threads to wake up even when nothing has gone wrong. */
+> ```
 
 InnoDB 的慢路径有一个统一协议，`os_event` 的注释给出了它要防的反例：
 
@@ -129,6 +427,168 @@ SX 阻止其他 SX 与一切 X，但放行 S——"树结构修改串行化、�
 
 ### 算法与数据结构
 
+**★ 唯一的原子状态字：`lock_word`**（`sync0rw.h:106`）——⚠️ `X_LOCK_DECR` 是 **0x20000000** 不是 0x10000000：
+
+```cpp
+/* We decrement lock_word by X_LOCK_DECR for each x_lock. It is also the
+start value for the lock_word, meaning that it limits the maximum number
+of concurrent read locks before the rw_lock breaks. */
+/* We decrement lock_word by X_LOCK_HALF_DECR for sx_lock. */
+constexpr int32_t X_LOCK_DECR = 0x20000000;       // ★ = 536870912
+constexpr int32_t X_LOCK_HALF_DECR = 0x10000000;  // ★ = 268435456
+```
+
+**权威编码表**（`sync0rw.cc:54` 头注释原文，逐字）：
+
+```cpp
+lock_word == X_LOCK_DECR:       Unlocked.
+X_LOCK_HALF_DECR < lock_word < X_LOCK_DECR:
+                                S locked, no waiting writers.
+                                (X_LOCK_DECR - lock_word) is the number of S locks.
+lock_word == X_LOCK_HALF_DECR:  SX locked, no waiting writers.
+0 < lock_word < X_LOCK_HALF_DECR:
+                                SX locked AND S locked, no waiting writers.
+                                (X_LOCK_HALF_DECR - lock_word) is the number of S locks.
+lock_word == 0:                 X locked, no waiting writers.
+-X_LOCK_HALF_DECR < lock_word < 0:
+                                S locked, with a waiting writer.
+                                (-lock_word) is the number of S locks.
+lock_word == -X_LOCK_HALF_DECR: X locked and SX locked, no waiting writers.
+-X_LOCK_DECR < lock_word < -X_LOCK_HALF_DECR:
+                                S locked, with a waiting writer which has SX lock.
+                                -(lock_word + X_LOCK_HALF_DECR) is the number of S locks.
+lock_word == -X_LOCK_DECR:      X locked with recursive X lock (2 X locks).
+-(X_LOCK_DECR + X_LOCK_HALF_DECR) < lock_word < -X_LOCK_DECR:
+                                X locked. The number of the X locks is:
+                                2 - (lock_word + X_LOCK_DECR)
+lock_word == -(X_LOCK_DECR + X_LOCK_HALF_DECR):
+                                X locked with recursive X lock (2 X locks) and SX locked.
+lock_word < -(X_LOCK_DECR + X_LOCK_HALF_DECR):
+                                X locked and SX locked.
+                                The number of the X locks is:
+                                2 - (lock_word + X_LOCK_DECR + X_LOCK_HALF_DECR)
+
+ LOCK COMPATIBILITY MATRIX
+    S SX  X
+ S  +  +  -
+ SX +  -  -
+ X  -  -  -
+```
+
+> ★★ **一个字编码 4 类信息**：S 锁数量、是否有 SX、X 锁重数、是否有等待中的 writer。**没有 `writer_count` / `reader_count` 字段**——全靠 `rw_lock_get_x_lock_count()` / `rw_lock_get_reader_count()` 从 `lock_word` 反推。
+
+```cpp
+static inline ulint rw_lock_get_x_lock_count(const rw_lock_t *lock) {
+  lint lock_copy = lock->lock_word;
+  if (lock_copy == 0 || lock_copy == -X_LOCK_HALF_DECR) {
+    return (1);                                        // "1 x-lock" 或 "1 x-lock + sx"
+  } else if (lock_copy > -X_LOCK_DECR) {
+    return (0);                                        // s-locks / sx / x-waiter
+  } else if (lock_copy > -(X_LOCK_DECR + X_LOCK_HALF_DECR)) {
+    return (2 - (lock_copy + X_LOCK_DECR));
+  } else {
+    return (2 - (lock_copy + X_LOCK_DECR + X_LOCK_HALF_DECR));
+  }
+}
+```
+
+**`struct rw_lock_t` 完整定义**（`sync0rw.h:346`）：
+
+```cpp
+struct rw_lock_t
+#ifdef UNIV_DEBUG
+    : public latch_t          // ★ debug 下继承 latch_t，才有 get_level() / m_id 供 LatchDebug
+#endif
+{
+  std::atomic<int32_t> lock_word;            // ★ 唯一的权威状态
+  std::atomic<bool> waiters;                 // 1: 有等待者
+  std::atomic<bool> recursive;               // ★ 也是"writer_thread 有效"的哨兵
+  volatile ulint sx_recursive;               // ⚠️ 非 atomic，只能由持锁者自己改
+  std::atomic<std::thread::id> writer_thread;
+  Atomic_xor_of_thread_id reader_thread;     // ★ XOR 聚合，只能反推唯一读者
+  os_event_t event;                          // 普通等待者（S/X/SX 竞争）
+  os_event_t wait_ex_event;                  // ★ 已占位的 next-writer 等 S 退出
+  ut::Location clocation;
+  const char *last_s_file_name;
+  const char *last_x_file_name;
+  bool is_block_lock;
+  uint16_t last_s_line;
+  uint16_t last_x_line;
+  uint32_t count_os_wait;                    // ★★ 8.0.39 唯一的 per-lock 等待计数器
+  UT_LIST_NODE_T(rw_lock_t) list;
+#ifdef UNIV_PFS_RWLOCK
+  struct PSI_rwlock *pfs_psi;
+#endif
+  bool is_x_blocked_by_s() {
+    const auto snapshot = lock_word.load();
+    return snapshot < 0 && -X_LOCK_DECR < snapshot && snapshot != -X_LOCK_HALF_DECR;
+  }
+};
+```
+
+**初始化**（`sync0rw.cc:191`）：
+
+```cpp
+  lock->lock_word = X_LOCK_DECR;                            // ★ 初值 = 0x20000000
+  lock->waiters = false;
+  lock->recursive.store(false, std::memory_order_relaxed);  // ★ 默认非递归
+  lock->sx_recursive = 0;
+  lock->writer_thread = std::thread::id{};                  // "不可能的线程 id"
+  lock->event = os_event_create();
+  lock->wait_ex_event = os_event_create();                  // ★ 两个 event
+  UT_LIST_ADD_FIRST(rw_lock_list, lock);                    // 挂进全局链表
+```
+
+**★ recursive-x 的完整处理**（`sync0rw.cc:447`）——这就是"经典坑"的全部：
+
+```cpp
+static inline bool rw_lock_x_lock_low(rw_lock_t *lock, ulint pass,
+                                      const char *file_name, ulint line) {
+  if (rw_lock_lock_word_decr(lock, X_LOCK_DECR, X_LOCK_HALF_DECR)) {
+    ut_a(!lock->recursive.load(std::memory_order_relaxed));
+    rw_lock_set_writer_id_and_recursion_flag(lock, !pass);
+    //  ★ pass==0 → recursive=true（允许本线程递归）；pass!=0（AIO 移交）→ false
+    rw_lock_x_lock_wait(lock, pass, 0, file_name, line);   // 等 S 退到 0
+  } else {
+    if (!pass && lock->recursive.load(std::memory_order_acquire) &&
+        lock->writer_thread.load(std::memory_order_relaxed) ==
+            std::this_thread::get_id()) {
+      if (rw_lock_lock_word_decr(lock, X_LOCK_DECR, 0)) {
+        /* 有 SX 但无 X：SX 持有者升级为 X，等 S 退到 -X_LOCK_HALF_DECR */
+        rw_lock_x_lock_wait(lock, pass, -X_LOCK_HALF_DECR, file_name, line);
+      } else {
+        /* 已有 ≥2 个 X */
+        if (lock->lock_word == 0 || lock->lock_word == -X_LOCK_HALF_DECR) {
+          lock->lock_word -= X_LOCK_DECR;   // ★ 第 1→2 个 X：整块减
+        } else {
+          ut_ad(lock->lock_word <= -X_LOCK_DECR);
+          --lock->lock_word;                // ★ 第 3/4/... 个 X：只减 1（本线程独占，无需 CAS）
+        }
+      }
+    } else {
+      return false;   // ★★ 同线程持 S 再请求 X 会走到这里 → 死锁风险
+    }
+  }
+  ...
+}
+```
+
+> ⚠️ **`rw_lock_x_lock_wait()` 是 IF_DEBUG 包装**（`sync0rw.cc:440`）——release 下 `pass` 参数被 `[[maybe_unused]]` 丢掉，真身是 `rw_lock_x_lock_wait_func()`（`:373`）。
+> ⚠️ **`rw_lock_s_lock()` 禁止递归 S**（`sync0rw.ic:271` 的 `ut_ad(!rw_lock_own(lock, RW_LOCK_S))`）——注释解释：S 锁不记 thread id，若允许递归 S，可能与请求 X 的线程死锁。**X/SX 可递归，S 不可递归**。
+
+**SX 的第一层只减 HALF**（`sync0rw.cc:520`）：
+
+```cpp
+      if (lock->sx_recursive++ == 0) {
+        /* This thread is making first SX-lock request and it must be holding
+        at least one X-lock here because: ... */
+        ut_ad((lock->lock_word == 0) ||
+              ((lock->lock_word <= -X_LOCK_DECR) &&
+               (lock->lock_word > -(X_LOCK_DECR + X_LOCK_HALF_DECR))));
+        lock->lock_word -= X_LOCK_HALF_DECR;
+      }
+```
+
 | 结构 | 核心字段 | 复杂度 |
 |---|---|---|
 | `os_event` | `m_set`（sticky）、`signal_count`、mutex、cond | set/wait O(1)（各一把内部锁） |
@@ -152,6 +612,179 @@ SX 阻止其他 SX 与一切 X，但放行 S——"树结构修改串行化、�
 ## 核心实现
 
 ### L0：地基层（futex / pthread / std::atomic）
+
+**⚠️ `ut0atomic.h` 不存在**——真名 `include/os0atomic.h`，全文 83 行，8.0 里**只剩两个屏障宏**（真正的原子操作已全面改用 `std::atomic`）：
+
+```cpp
+#ifdef HAVE_IB_GCC_ATOMIC_THREAD_FENCE
+#define HAVE_MEMORY_BARRIER
+#define os_rmb __atomic_thread_fence(__ATOMIC_ACQUIRE)   // ★ 读屏障 = acquire fence
+#define os_wmb __atomic_thread_fence(__ATOMIC_RELEASE)   // ★ 写屏障 = release fence
+#elif defined(HAVE_IB_GCC_SYNC_SYNCHRONISE)
+#define os_rmb __sync_synchronize()                      // 退化为全屏障
+#define os_wmb __sync_synchronize()
+#elif defined(HAVE_IB_MACHINE_BARRIER_SOLARIS)
+#define os_rmb __machine_r_barrier()
+#define os_wmb __machine_w_barrier()
+#elif defined(HAVE_WINDOWS_MM_FENCE) && defined(_WIN64)
+#define os_rmb _mm_lfence()
+#define os_wmb _mm_sfence()
+#else
+#define os_rmb                                           // ★ 完全退化为 no-op
+#define os_wmb
+#define IB_MEMORY_BARRIER_STARTUP_MSG "Memory barrier is not used"
+#endif
+```
+
+> ★ 探测逻辑在 `innodb.cmake:173-190`。`os_rmb` 在加锁路径大量出现（如 `sync0rw.cc:288` 的 `os_rmb;`）。
+
+**⚠️ `atomic_signal_fence` 在 InnoDB 里 0 命中**——8.0.39 完全不用它。
+
+**`std::atomic` 的 8 处典型用法**：
+
+| 字段 | 位置 | 类型 | 内存序 |
+|---|---|---|---|
+| `TTASEventMutex::m_owner` | `ib0mutex.h:577` | `std::atomic<std::thread::id>` | **全默认 seq_cst**；`static_assert(is_always_lock_free)` |
+| `TTASEventMutex::m_waiters` | `ib0mutex.h:587` | `std::atomic_bool` | 全默认 seq_cst |
+| `TTASFutexMutex::m_lock_word` | `ib0mutex.h:369` | `alignas(4) std::atomic<mutex_state_t>` | 全默认 seq_cst + `alignas(4)` 满足 futex 对齐 |
+| `os_thread_count` | `os0thread-create.h:51` | `std::atomic_int` | `fetch_add(relaxed)` + 外层 **release fence** |
+| `Link_buf::m_tail` | `ut0link_buf.h:357` | — | `load(acquire)`（必须先看到尾指针推进） |
+| `copyable_atomic_t` | `buf0buf.h:1120` | 继承 `std::atomic<T>` | 为 memcpy 式容器定制，拷贝用 relaxed |
+| `srv_innodb_needs_monitoring` | `srv0srv.h:722` | `std::atomic_uint32_t` | 跨模块原子开关 |
+| `rw_lock_t::lock_word` | `sync0rw.h` | `std::atomic<int32_t>` | 见上文 |
+
+> ★★ **结论：PolicyMutex 一律依赖 `std::atomic` 默认的 `memory_order_seq_cst`**，**不写任何显式内存序参数**。这与 `ut0mutex.ic` 里 Theorem 1 证明依赖的"全部 seq_cst"前提完全一致。
+
+**显式 fence 在 InnoDB 的全部使用点**（12 处）：
+
+| 位置 | 种类 | 用途 |
+|---|---|---|
+| `mach/mach0data.cc:106,122,138,154,173,188,204` | `__atomic_thread_fence(ACQUIRE)` | **GCC bug 77673 workaround**（`DEPLOY_FENCE`，仅 GCC≥5 非 clang） |
+| `log/log0log.cc:809` | release | "Do not reorder writes above, below this line" |
+| `log/log0buf.cc:1097 / 1154` | release | 发布 `sn` / dirty-page 事件前 |
+| `log/log0buf.cc:1328` | acquire | 读到新 lsn 后读数据前 |
+| `buf/buf0dblwr.cc:532 / 645` | acquire / release | ★ os_event 教科书用法（见"防丢唤醒"） |
+| `ut0seq_lock.h:72 / 94` | release / acquire | Seq_lock 两端配对 |
+| `os0thread-create.h:210 / 221` | release | 线程 preamble / epilogue |
+| `ib0mutex.h:250 / 347` | acquire | futex `exit()` 开头 / `ttas()` 开头 |
+
+**futex 三态 lock_word 与系统调用**（`ib0mutex.h:173`）——Linux 默认**不是 futex**：
+
+```cpp
+  enum class mutex_state_t : futex_word_t {
+    UNLOCKED = 0,          // 空闲
+    LOCKED = 1,            // 有人持有，无人等待
+    LOCKED_WITH_WAITERS = 2  // ★ 有人持有且有等待者 → 释放时必须 syscall
+  };
+
+  bool set_waiters() UNIV_NOTHROW {
+    return m_lock_word.exchange(mutex_state_t::LOCKED_WITH_WAITERS) ==
+           mutex_state_t::UNLOCKED;   // ★ 返回 true = "抢到了"，不用睡
+  }
+
+  uint32_t wait() UNIV_NOTHROW {
+    uint32_t n_waits = 0;
+    do {
+      ++n_waits;
+      syscall(SYS_futex, &m_lock_word, FUTEX_WAIT_PRIVATE,
+              mutex_state_t::LOCKED_WITH_WAITERS, 0, 0, 0);
+      //  Since we are retrying the operation the return value doesn't matter.
+    } while (!set_waiters());   // ★ 醒来立刻再抢一次
+    return (n_waits);
+  }
+
+  void signal() UNIV_NOTHROW {
+    syscall(SYS_futex, &m_lock_word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);  // 只唤醒 1 个
+  }
+```
+
+```cpp
+  void exit() UNIV_NOTHROW {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (state() == mutex_state_t::LOCKED_WITH_WAITERS) {
+      m_lock_word = mutex_state_t::UNLOCKED;
+    } else if (unlock() == mutex_state_t::LOCKED) {
+      /* No threads waiting, no need to signal a wakeup. */
+      return;   // ★★ 无等待者 → 省掉一次系统调用
+    }
+    signal();
+  }
+```
+
+> ⚠️ **`FUTEX_WAIT_PRIVATE` / `FUTEX_WAKE_PRIVATE`** —— 带 `_PRIVATE` 表示不跨进程。
+
+**★ 默认实现是 `MUTEX_SYS`，不是 futex**（`innodb.cmake:253`）：
+
+```cmake
+IF(MUTEXTYPE MATCHES "event")
+  ADD_DEFINITIONS(-DMUTEX_EVENT)
+ELSEIF(MUTEXTYPE MATCHES "futex" AND DEFINED HAVE_IB_LINUX_FUTEX)
+  ADD_DEFINITIONS(-DMUTEX_FUTEX)
+ELSE()
+   ADD_DEFINITIONS(-DMUTEX_SYS)     # ★★ 默认走这里
+ENDIF()
+```
+
+```cpp
+// ut0mutex.h:88
+#ifdef MUTEX_FUTEX
+typedef FutexMutex ib_mutex_t;
+typedef BlockFutexMutex ib_bpmutex_t;
+#define MUTEX_TYPE "Uses futexes"
+#elif defined(MUTEX_SYS)
+typedef SysMutex ib_mutex_t;                 // ★ 默认 = OSTrackMutex = 裸 pthread
+typedef BlockSysMutex ib_bpmutex_t;
+#define MUTEX_TYPE "Uses system mutexes"
+#elif defined(MUTEX_EVENT)
+typedef SyncArrayMutex ib_mutex_t;
+typedef BlockSyncArrayMutex ib_bpmutex_t;
+#define MUTEX_TYPE "Uses event mutexes"
+#else
+#error "ib_mutex_t type is unknown"
+#endif
+```
+
+> ⚠️ **勘误**：`EventMutex` **不是 `TTASEventMutex` 的封装**（`ut0mutex.h:74`：`typedef OSMutex EventMutex;`）——它是**裸 pthread mutex**。`TTASEventMutex` 的封装真名是 **`SyncArrayMutex`**。
+> ⚠️ **不存在 `BufPoolMutex` / `LockMutex` / `DictMutex` / `BlockUTMutex`**。真名：`ib_bpmutex_t`、`Lock_mutex`（`lock0latches.h:107`）、`DictSysMutex`（`dict0types.h:319`）、`BlockMutexPolicy`（是策略不是 mutex）。
+> ⚠️ **`ttas_lock` 符号不存在**，只有成员函数 `ttas()`（futex 版）；且**全部用 `compare_exchange_strong`，没有 weak**。
+> ⚠️ **不存在 `mutex_enter()` / `mutex_exit()` 函数**——它们是**宏** → `mutex_enter_inline<Mutex>`（`ut0mutex.h:114`）。`sync0sync.cc` 全文仅 292 行，只有 PSI key + 4 个工具函数。
+> ⚠️ **不存在 `UT_MUTEX_HOOK` / `m_loc_file` / `m_loc_line`**——对接点是 `UT_LOCATION_HERE` → `ut::Location{__FILE__, __LINE__}`（`ut0core.h:48`），**不分 debug/release 永远传**，代价仅是两个立即数（且 `OSTrackMutex` 路径标了 `[[maybe_unused]]` 会被优化掉）。
+
+**PolicyMutex 的三段式 hook**（★ 解锁顺序**反直觉**）：
+
+```cpp
+  void exit() UNIV_NOTHROW {
+    pfs_exit();                 // ①
+    policy().release(m_impl);   // ② 先 release hook
+    m_impl.exit();              // ③ 再真正解锁
+  }
+
+  void enter(uint32_t n_spins, uint32_t n_delay, const char *name, uint32_t line) {
+    PSI_mutex_locker *locker = pfs_begin_lock(&state, name, line);
+    policy().enter(m_impl, name, line);      // ① 加前 hook
+    m_impl.enter(n_spins, n_delay, name, line);  // ② 真正加锁
+    policy().locked(m_impl, name, line);     // ③ 加后 hook
+    pfs_end(locker, 0);
+  }
+```
+
+```cpp
+/* Do nothing —— 零成本策略 */
+template <typename Mutex>
+struct NoPolicy {
+  void init(const Mutex &, latch_id_t, const char *, uint32_t) UNIV_NOTHROW {}
+  void destroy() UNIV_NOTHROW {}
+  void enter(const Mutex &, const char *, ulint line) UNIV_NOTHROW {}
+  void add(uint32_t, uint32_t) UNIV_NOTHROW {}
+  void locked(const Mutex &, const char *, ulint) UNIV_NOTHROW {}
+  void release(const Mutex &) UNIV_NOTHROW {}
+  std::string to_string() const { return (""); }
+  latch_id_t get_id() const;
+};
+```
+
+> ★★ **两条策略的差别**：`GenericPolicy` 用 `Counter::Count m_count`（**每实例独立计数**）；`BlockMutexPolicy` 用 `Counter::Count *m_count`（**聚合计数**，buf page mutex 太多，逐个计开销大）。
+> ★ **`OSTrackMutex` 不记录 owner 线程**——只记 3 个 debug bool（`m_freed` / `m_locked` / `m_destroy_at_exit`），所以 `is_owned()` 返回 `m_locked && m_policy.is_owned()`。系统 mutex 查不到 owner。
 
 这一层常被忽略，但它决定了上面所有原语的性能上限与平台差异。
 
@@ -534,6 +1167,141 @@ btr 层注释佐证："an sx-latch on the tree"（悲观修改树结构时对树
 
 ### latch 校验：三套体系并存（8.0.39 现状）
 
+⚠️ **勘误：`lock_order` 不是 InnoDB 的子系统**——`storage/innobase` 下 grep `lock_order` / `debug_lock_order` **0 命中**。它在 **server 层** `sql/debug_lock_order.{h,cc}`，基于 PSI 的 "authorised arc" 有向图做 **MDL / THD lock** 的死锁检测。InnoDB **只有两套**（`LatchDebug` + 它的薄封装 `sync_check_*`）。
+
+| | `LatchDebug` | `sync_check_*` | `lock_order`（server 层） |
+|---|---|---|---|
+| 位置 | `sync/sync0debug.cc:115` | `sync0debug.cc:1019-1086` | `sql/debug_lock_order.{h,cc}` |
+| 生效 | `UNIV_DEBUG` + `srv_sync_debug` | 同上（内部判 `instance() != nullptr`） | `--debug-lock-order`，PSI 钩子驱动 |
+| 粒度 | 每线程 `std::vector<Latched>` | 纯转发，无规则 | 全局有向图 `LO_graph` |
+| 规则来源 | `check_order()` 的 per-level `switch` | 无 | 运行时注册的 arc 表 |
+| InnoDB 用吗 | 是 | 是 | **否** |
+
+**`sync_check_*` 全是薄封装**（`sync0debug.cc:1019`）：
+
+```cpp
+void sync_check_lock_validate(const latch_t *latch) {
+  if (LatchDebug::instance() != nullptr) {
+    LatchDebug::instance()->lock_validate(latch, latch->get_level());
+  }
+}
+void sync_check_lock_granted(const latch_t *latch) { ... lock_granted(latch, latch->get_level()); }
+void sync_check_unlock(const latch_t *latch)      { ... unlock(latch); }
+void sync_check_relock(const latch_t *latch)      { ... relock(latch); }
+void sync_check_lock(const latch_t *latch, latch_level_t level) {
+  if (LatchDebug::instance() != nullptr) {
+    ut_ad(latch->get_level() == SYNC_LEVEL_VARYING);
+    ut_ad(latch->get_id() == LATCH_ID_BUF_BLOCK_LOCK);   // ★ 只有 buf_block 能用
+    LatchDebug::instance()->lock_validate(latch, level);
+    LatchDebug::instance()->lock_granted(latch, level);
+  }
+}
+```
+
+> ⚠️ **勘误**：`sync_check_lock()` **不是宏**，是 `UNIV_DEBUG` 下的**真实函数**。release 下 `sync0debug.h` **根本不声明它**，调用点被 `ut_d()` / `IF_DEBUG()` 编译掉。只有 `UNIV_LIBRARY`（embedded）分支才有 `#define sync_check_lock(A, B) ((void)0)`（`sync0rw.h:84`）。
+
+**★ 完整链路**：`PolicyMutex::enter()` → `GenericPolicy::enter()` → `MutexDebug::enter()` → `sync_check_lock_validate()` → `LatchDebug::lock_validate()`。
+
+**⚠️ 不是"全局严格递减"，而是 per-level switch**（`sync0debug.cc:704`）——三类规则：
+
+```cpp
+  switch (level) {
+    case SYNC_NO_ORDER_CHECK:
+    case SYNC_EXTERN_STORAGE:
+    case SYNC_TREE_NODE_FROM_HASH:
+      /* Do no order checking */
+      break;                                     // ① 完全跳过
+
+    case SYNC_LOG_SN: case SYNC_DICT: case SYNC_TABLE: /* ... 约 55 个 ... */
+      /* This is the most typical case, in which we expect requested<held. */
+      assert_requested_is_lower_than_held(level, latches);   // ② 严格递减
+      break;
+
+    case SYNC_FIL_SHARD: case SYNC_DBLWR: case SYNC_BUF_BLOCK:
+    case SYNC_FSP: case SYNC_SEARCH_SYS: /* ... 15 个 ... */
+      /* We can have multiple latches of this type therefore we
+      can only check whether the requested<=held condition holds. */
+      assert_requested_is_lower_or_equal_to_held(level, latches);  // ③ 允许同 level 多实例
+      break;
+
+    case SYNC_FSP_PAGE:
+      ut_a(find(latches, SYNC_FSP) != nullptr);  // ④ 必须先持有另一把
+      break;
+
+    case SYNC_TRX:
+      /* Either the thread must own the lock_sys global latch, or
+      it is allowed to own only ONE trx_t::mutex. */
+      if (find_lower_or_equal(latches, level) != nullptr) {
+        assert_requested_is_lower_or_equal_to_held(level, latches);
+        ut_a(find(latches, SYNC_LOCK_SYS_GLOBAL) != nullptr);
+      }
+      break;
+    ...
+    case SYNC_INDEX_TREE:
+      assert_all_held_are_above(latches, level, SYNC_TREE_NODE - 1);  // ⑤ 自定义下界
+      break;
+  }
+```
+
+```cpp
+  void assert_requested_is_lower_than_held(latch_level_t requested_level,
+                                           const Latches *latches) const {
+    assert_all_held_are_above(latches, requested_level, requested_level);
+  }
+  void assert_requested_is_lower_or_equal_to_held(latch_level_t requested_level,
+                                                  const Latches *latches) const {
+    assert_all_held_are_above(latches, requested_level, requested_level - 1);
+    //                                                              ★ 下界 -1 = "允许相等"
+  }
+
+void LatchDebug::assert_all_held_are_above(const Latches *latches,
+                                           latch_level_t requested_level,
+                                           ulint forbidden_level) const {
+  const Latched *latched = find_lower_or_equal(latches, latch_level_t(forbidden_level));
+  if (latched != nullptr) {
+    crash(latches, latched, requested_level);   // ★★ 违规 = 直接 abort
+  }
+}
+```
+
+**兜底检查只看"最后一把"**（`sync0debug.cc:227`）：
+
+```cpp
+  void lock_validate(const latch_t *latch, latch_level_t level) UNIV_NOTHROW {
+    /* Ignore diagnostic latches, starting with '.' */
+    if (*latch->get_name() != '.' && latch->get_level() != SYNC_LEVEL_VARYING) {
+      Latches *latches = check_order(latch, level);
+      if (!(latches->empty() || level == SYNC_LEVEL_VARYING ||
+            level == SYNC_NO_ORDER_CHECK ||
+            latches->back().get_level() == SYNC_NO_ORDER_CHECK ||
+            latches->back().m_latch->get_level() == SYNC_LEVEL_VARYING ||
+            latches->back().get_level() >= level)) {
+        ib::error(ER_IB_LOCK_VALIDATE_LATCH_ORDER_VIOLATION)
+            << "LatchDebug::lock_validate() latch order violation. level="
+            << level << ...;
+        ut_error;                              // ★ 直接崩
+      }
+    }
+  }
+```
+
+> ★ **数据结构**：每线程一个 `std::vector<Latched>`，按**获取顺序** `push_back`；因为检查通过才允许 push，所以"按获取顺序" ≡ "按 level 降序"。`unlock()` 时**从后往前找**（LIFO，应对同 latch 多层递归）。
+> ★ 违规信息用 `print_latches()` 打印整个栈——这是排查 latch order 违规的主要输出。
+
+**level 是静态绑定到 `latch_id_t` 的**（⚠️ **不存在 `rw_lock_set_level()`**）：
+
+```cpp
+  latch_level_t get_level() const UNIV_NOTHROW {
+    ut_a(m_id != LATCH_ID_NONE);
+    return (sync_latch_get_level(m_id));   // ★ 查 LatchMeta 表，运行时不可改
+  }
+```
+
+> ★ **唯一的运行时 level 是 buffer page latch**（`SYNC_LEVEL_VARYING`），通过 `buf_block_dbg_add_level()` → `sync_check_lock(&block->lock, level)` 传入。
+
+**`latch_level_t` 全集**（`sync0types.h:199`，约 100 个值）——顺序即层级，从低到高：`SYNC_UNKNOWN=0, SYNC_MUTEX=1, RW_LOCK_SX, RW_LOCK_X_WAIT, RW_LOCK_S, RW_LOCK_X, RW_LOCK_NOT_LOCKED, SYNC_LOCK_FREE_HASH, SYNC_MONITOR_MUTEX, SYNC_ANY_LATCH, SYNC_FIL_SHARD, ... SYNC_DICT_OPERATION, SYNC_AHI_ENABLED, SYNC_TRX_I_S_LAST_READ, SYNC_TRX_I_S_RWLOCK, SYNC_RECV_WRITER, SYNC_LEVEL_VARYING, SYNC_NO_ORDER_CHECK, SYNC_LEVEL_MAX = SYNC_NO_ORDER_CHECK`。
+> `LatchDebug` 构造里 `ut_ad(m_levels.size() == SYNC_LEVEL_MAX + 1)` 保证枚举与名字表一一对应。
+
 | 体系 | 位置 | 校验什么 | 状态 |
 |---|---|---|---|
 | **`LatchDebug`**（`latch_t` 基类） | `sync0debug.cc` + `sync0types.h` | 按 `latch_level_t` 金字塔（头部有整幅 ASCII 锁序图：Dict mutex → 索引树 → 叶页 → trx sys → buf pool → log）检查加锁顺序，违反打 `"latch order violation"` 后 crash | UNIV_DEBUG |
@@ -545,6 +1313,102 @@ btr 层注释佐证："an sx-latch on the tree"（悲观修改树结构时对树
 - **LatchDebug** = InnoDB 专属（UNIV_DEBUG，只覆盖 InnoDB 自研原语，锁序金字塔是 InnoDB 内部知识）
 - **LOCK ORDER 工具** = **server 层跨层**（`sql/debug_lock_order.cc`，覆盖 server + InnoDB **所有 PFS 锁**——输入是 PFS instrument 名，不关心锁是 mysys 还是 InnoDB 实现）
 - **PFS** = 两者共享的**锁命名层**：LOCK ORDER 以 PFS 名为图节点；LatchDebug 校验的锁在 PFS 也有对应 instrument（`wait/synch/mutex|rwlock|sxlock/innodb/*`），供运行时观测竞争（见「可观测性」章）。锁序校验的演进方向就是"从 InnoDB 内部金字塔走向以 PFS 名为通用坐标"。
+
+### 桥接函数：`buf_block_dbg_add_level`——页级锁怎么进入 LatchDebug
+
+LatchDebug 校验的是 `latch_t`，但 InnoDB 绝大多数加锁对象是**缓冲页的 rw-lock**（`buf_block_t::lock`）。把页锁接入锁序体系的就是这个看着不起眼的函数。第一层只是个空壳（`buf0buf.ic`）：
+
+```cpp
+// UNIV_DEBUG 下：
+static inline void buf_block_dbg_add_level(
+    buf_block_t *block,  /*!< buffer page where we have acquired latch */
+    latch_level_t level) /*!< latching order level */
+{
+  sync_check_lock(&block->lock, level);
+}
+#else                                    /* UNIV_DEBUG */
+#define buf_block_dbg_add_level(block, level) /* nothing */
+#endif
+```
+
+**release 构建下它是空宏**——锁序检查零成本，生产环境连函数调用都没有。这是"策略层零成本注入"（见概述）在页锁上的具体落地。
+
+第二层 `sync_check_lock`（`sync0debug.cc`）才有信息量：
+
+```cpp
+void sync_check_lock(const latch_t *latch, latch_level_t level) {
+  if (LatchDebug::instance() != nullptr) {
+    ut_ad(latch->get_level() == SYNC_LEVEL_VARYING);      // ★ 页锁的 level 是"可变的"
+    ut_ad(latch->get_id() == LATCH_ID_BUF_BLOCK_LOCK);    // ★ 只允许缓冲页锁走这条路
+    LatchDebug::instance()->lock_validate(latch, level);  // 校验顺序
+    LatchDebug::instance()->lock_granted(latch, level);   // 记入本线程持锁栈
+  }
+}
+```
+
+★ 两条断言把设计说清楚了：**"level 可变"这个机制就是专为缓冲页锁准备的**（只有 `LATCH_ID_BUF_BLOCK_LOCK` 能进）。原因同一份文件里写着：
+
+```
+  /* NOTE that there is a problem with _NODE and _LEAF levels: if the
+  B-tree height changes, then a leaf can change to an internal node
+  or the other way around. We do not know at present if this can cause
+  unnecessary assertion failures below. */
+```
+
+即 **B-tree 高度变化会让叶子页变成内节点（或反之）**，同一个页在不同时刻的"角色层级"会变，无法静态指定——这才是 `SYNC_LEVEL_VARYING` 存在的动机。
+
+第三层是真正的判定，也在这里暴露一个反直觉的结果：
+
+```cpp
+  void lock_validate(const latch_t *latch, latch_level_t level) UNIV_NOTHROW {
+    /* Ignore diagnostic latches, starting with '.' */
+    if (*latch->get_name() != '.' && latch->get_level() != SYNC_LEVEL_VARYING) {
+      ut_ad(level != SYNC_LEVEL_VARYING);
+      Latches *latches = check_order(latch, level);
+
+      if (!(latches->empty() || level == SYNC_LEVEL_VARYING ||
+            level == SYNC_NO_ORDER_CHECK ||
+            latches->back().get_level() == SYNC_NO_ORDER_CHECK ||
+            latches->back().m_latch->get_level() == SYNC_LEVEL_VARYING ||
+            latches->back().get_level() >= level)) {
+        ib::error(ER_IB_LOCK_VALIDATE_LATCH_ORDER_VIOLATION)
+            << "LatchDebug::lock_validate() latch order violation. ...";
+        ut_error;                                   // ★ 违规即崩溃
+      }
+    }
+  }
+
+  void lock_granted(const latch_t *latch, latch_level_t level) UNIV_NOTHROW {
+    if (*latch->get_name() != '.' && latch->get_level() != SYNC_LEVEL_VARYING) {
+      latches->push_back(Latched(latch, level));     // 入栈
+    }
+  }
+```
+
+★ **注意进入条件**：`latch->get_level() != SYNC_LEVEL_VARYING`。而 `sync_check_lock` 传入的正是 `SYNC_LEVEL_VARYING` 的页锁 ⇒ **两个函数的主体都被跳过**。也就是说，**"页锁参与金字塔校验"是错的**——它既不校验也不入栈。判断依据是代码条件本身，不是函数名。
+
+真正的顺序校验发生在**固定 level 的锁**（mutex / 非页 rw-lock）上，规则是 `latches->back().get_level() >= level`——**栈顶（最近持有的）层级必须 ≥ 新请求的层级**，即只能"从高层往低层"加锁。五个豁免条件：
+
+| 豁免 | 含义 |
+|---|---|
+| `latches->empty()` | 线程当前没持任何锁 |
+| `level == SYNC_NO_ORDER_CHECK` | 新锁**显式声明**不参与顺序检查 |
+| 栈顶 `== SYNC_NO_ORDER_CHECK` | 上一个锁是豁免的 → 后续不再比对 |
+| 栈顶锁是 `SYNC_LEVEL_VARYING` | 上一个是页锁 → 不比对 |
+| `level == SYNC_LEVEL_VARYING` | 新锁本身可变 → 不比对 |
+
+另外两类被跳过：名字以 **`.` 开头的是"诊断锁"**（不参与）；以及 `check_order` 里单独列出的豁免层级——`SYNC_NO_ORDER_CHECK`、`SYNC_EXTERN_STORAGE`（LOB 外存）、`SYNC_TREE_NODE_FROM_HASH`（AHI 哈希命中取页）都明确 `/* Do no order checking */`。
+
+**level 由调用方按语义指定**，同一个 `buf_block_t` 在不同场景下可以是不同 level——因为"锁序"约束的是**角色**而非对象：
+
+| level | 含义 | 典型调用点 |
+|---|---|---|
+| `SYNC_TREE_NODE` | 索引树节点页（内部/叶子） | `btr_free_root_check`、`btr_page_get_father_block` 等 B-tree 路径 |
+| `SYNC_EXTERN_STORAGE` | 外部存储（LOB/BLOB）页 | `lob0lob.cc`、`lob0ins.cc`、`lob0del.cc` |
+| `SYNC_TRX_UNDO_PAGE` | undo 页 | `trx0undo.ic` |
+| `SYNC_NO_ORDER_CHECK` | **显式豁免**：本锁不参与顺序检查 | `fut0fut.ic`、以及"从 BP 拿页但只做短暂操作"的路径 |
+
+⇒ 所以在 B-tree / DDL 代码里看到 `buf_block_dbg_add_level(block, SYNC_TREE_NODE)`，它表达的是**角色语义**（"这个页此刻按树节点对待"），而不是"请校验它"——release 下整行消失，debug 下也因 VARYING 而跳过。**它是给读代码的人看的角色标注**，这解释了为什么它遍布 B-tree / DDL 路径却几乎从不触发 violation。
 
 ### LatchDebug 的锁序金字塔：机制详解
 
@@ -934,6 +1798,255 @@ case SYNC_FSP_PAGE:
 
 ### 模块闭环：下游靠什么、上游谁在用
 
+**`os_event` 完整结构体**（`os/os0event.cc:63`）——⚠️ 真定义在 **.cc** 里，`os0event.h` 只有前向声明：
+
+```cpp
+struct os_event {
+  void destroy() UNIV_NOTHROW {
+    pthread_cond_destroy(&cond_var);
+    mutex.destroy();
+    ut_ad(n_objects_alive.fetch_sub(1) != 0);
+  }
+
+  void set() UNIV_NOTHROW {
+    mutex.enter();
+    if (!m_set) { broadcast(); }        // ★ 幂等
+    mutex.exit();
+  }
+
+  bool try_set() UNIV_NOTHROW {
+    if (mutex.try_lock()) {             // ★ 拿不到锁直接放弃，不阻塞（signal handler 用）
+      if (!m_set) { broadcast(); }
+      mutex.exit();
+      return (true);
+    }
+    return (false);
+  }
+
+  int64_t reset() UNIV_NOTHROW {
+    mutex.enter();
+    if (m_set) { m_set = false; }
+    int64_t ret = signal_count;
+    mutex.exit();
+    return (ret);                       // ★ 调用者当 reset_sig_count
+  }
+
+  bool is_set() const UNIV_NOTHROW { return (m_set); }   // ★ 无锁读，仅诊断
+
+ private:
+  void init() UNIV_NOTHROW {
+    mutex.init();
+    pthread_cond_init(&cond_var, &cond_attr);   // ★ cond_attr 全局共享，含 CLOCK_MONOTONIC
+    ut_d(n_objects_alive.fetch_add(1));
+  }
+
+  void wait() UNIV_NOTHROW {
+    pthread_cond_wait(&cond_var, mutex);        // ★ 就是 pthread_cond_wait
+  }
+
+  bool timed_wait(const timespec *abstime);     // ★ 非 Windows：绝对时间
+
+ private:
+  bool m_set;                 // ★ 非 atomic，靠 EventMutex 保护
+  int64_t signal_count;       // ★ 非 atomic
+  EventMutex mutex;           // = OSMutex（裸 pthread）
+  os_cond_t cond_var;         // pthread_cond_t / CONDITION_VARIABLE
+
+  static pthread_condattr_t cond_attr;
+  static bool cond_attr_has_monotonic_clock;
+  static bool global_initialized;
+#ifdef UNIV_DEBUG
+  static std::atomic_size_t n_objects_alive;
+#endif
+ protected:
+  os_event(const os_event &);              // 禁拷贝
+  os_event &operator=(const os_event &);
+};
+```
+
+```cpp
+os_event::os_event() UNIV_NOTHROW {
+  ut_a(global_initialized);
+  init();
+  m_set = false;
+  /* We return this value in os_event_reset(), ... The value of zero is
+  reserved in os_event_wait_low() for the case when the caller does not want
+  to pass any signal_count value. To distinguish between the two cases we
+  initialize signal_count to 1 here. */
+  signal_count = 1;                        // ★★ 从 1 起跳，0 是"未指定"哨兵
+}
+
+os_event_t os_event_create() {
+  os_event_t ret = (ut::new_withkey<os_event>(UT_NEW_THIS_FILE_PSI_KEY));
+#if defined(LINUX_SUSE)
+  /* On SuSE Linux we get spurious EBUSY from pthread_mutex_destroy() ... */
+  os_event_reset(ret);                     // ★ SuSE workaround：创建后立刻加解锁一次
+#endif
+  return ret;
+}
+```
+
+> ⚠️ **签名是 `os_event_t os_event_create()`（无参）**——老版本的 `os_event_create(name)` 已不存在。
+> ⚠️ **`os_event` 没有 cond 类 PFS 埋点**。全文件唯一 PSI 是 `UT_NEW_THIS_FILE_PSI_KEY`，只做 **PFS 内存记账**。对比之下 `PolicyMutex` 有完整 PFS（`init_mutex` / `start_mutex_wait` / `end_mutex_wait` / `unlock_mutex` / `destroy_mutex` + `sync0sync.cc` 里约 **97 个 `mysql_pfs_key_t`**）。**所以"mutex 有 PFS、event 没有"是 8.0 的事实**。
+
+**`wait_time_low()`**（`os0event.cc:450`）——超时返回值只有两种：
+
+```cpp
+ulint os_event::wait_time_low(std::chrono::microseconds timeout,
+                              int64_t reset_sig_count) UNIV_NOTHROW {
+  bool timed_out = false;
+#ifndef _WIN32
+  struct timespec abstime;
+  if (timeout != std::chrono::microseconds::max()) {
+    abstime = os_event::get_wait_timelimit(timeout);
+  } else {
+    abstime.tv_nsec = 999999999;
+    abstime.tv_sec = std::numeric_limits<time_t>::max();   // ★ "伪无限"
+  }
+#endif
+  mutex.enter();
+  if (!reset_sig_count) { reset_sig_count = signal_count; }
+
+  do {
+    if (m_set || signal_count != reset_sig_count) {
+      break;                       // ★★ 与 wait_low 相同的双重判据
+    }
+    timed_out = timed_wait(&abstime);
+  } while (!timed_out);
+  mutex.exit();
+
+  return (timed_out ? OS_SYNC_TIME_EXCEEDED : 0);   // ★ 0=成功，1=超时
+}
+```
+
+```cpp
+bool os_event::timed_wait(const timespec *abstime) {
+  int ret = pthread_cond_timedwait(&cond_var, mutex, abstime);
+  switch (ret) {
+    case 0:
+    case ETIMEDOUT:
+    case EINTR:      /* We play it safe by checking for EINTR even though
+                     according to the POSIX documentation it can't return EINTR. */
+      break;
+    default:
+      ib::error(ER_IB_MSG_742) << "pthread_cond_timedwait() returned: " << ret
+                               << ": abstime={" << abstime->tv_sec << ","
+                               << abstime->tv_nsec << "}";
+      ut_error;
+  }
+  return (ret == ETIMEDOUT);       // ★ 只有 ETIMEDOUT 算超时；EINTR 视为"被唤醒"，外层循环重判
+}
+```
+
+**等待数组的完整生命周期**（`sync0arr.cc`）：
+
+```cpp
+sync_cell_t *sync_array_reserve_cell(sync_array_t *arr, void *object,
+                                     ulint type, ut::Location location) {
+  sync_cell_t *cell;
+  sync_array_enter(arr);
+
+  if (arr->first_free_slot != ULINT_UNDEFINED) {
+    cell = sync_array_get_nth_cell(arr, arr->first_free_slot);
+    arr->first_free_slot = cell->line;      // ★ 空闲链表：next 指针复用 cell->line 字段
+  } else if (arr->next_free_slot < arr->n_cells) {
+    cell = sync_array_get_nth_cell(arr, arr->next_free_slot);
+    ++arr->next_free_slot;
+  } else {
+    sync_array_exit(arr);
+    return (nullptr);                       // ★ 本数组满了 → 换一个数组实例
+  }
+  ++arr->res_count;
+  ++arr->n_reserved;
+  cell->request_type = type;
+  ...                                       // 按 type 填 latch.mutex / latch.bpmutex / latch.lock
+  cell->file = location.filename;
+  cell->line = location.line;
+  sync_array_exit(arr);
+  cell->thread_id = std::this_thread::get_id();
+  cell->reservation_time = std::chrono::steady_clock::now();
+
+  os_event_t event = sync_cell_get_event(cell);
+  cell->signal_count = os_event_reset(event);   // ★★ 先 reset 再等待
+  return (cell);
+}
+```
+
+```cpp
+void sync_array_wait_event(sync_array_t *arr, sync_cell_t *&cell) {
+  sync_array_enter(arr);
+  cell->waiting = true;
+#ifdef UNIV_DEBUG
+  rw_lock_debug_mutex_enter();
+  ut_a(arr->last_scan % 2 == 0);
+  ++arr->last_scan;
+  sync_array_detect_deadlock(arr, cell, 0);    // ★ debug 下入队前先做 DFS 环检测
+  ++arr->last_scan;
+  ut_a(arr->last_scan % 2 == 0);
+  rw_lock_debug_mutex_exit();
+#endif
+  sync_array_exit(arr);
+
+  os_event_wait_low(sync_cell_get_event(cell), cell->signal_count);
+
+  sync_array_free_cell(arr, cell);             // ★★ 返回后自动释放
+  cell = nullptr;
+}
+```
+
+```cpp
+void sync_array_free_cell(sync_array_t *arr, sync_cell_t *&cell) {
+  sync_array_enter(arr);
+  cell->waiting = false;
+  cell->signal_count = 0;
+  cell->latch.mutex = nullptr;
+  cell->line = arr->first_free_slot;
+  arr->first_free_slot = cell - arr->cells;    // ★ 头插法回收
+  arr->n_reserved--;
+  if (arr->next_free_slot > arr->n_cells / 2 && arr->n_reserved == 0) {
+    arr->next_free_slot = 0;                  // ★ 全空且水位过半 → 整体收缩
+    arr->first_free_slot = ULINT_UNDEFINED;
+  }
+  sync_array_exit(arr);
+  cell = nullptr;
+}
+```
+
+**多数组时的随机分派**（`sync0arr.ic:44`）：
+
+```cpp
+static inline sync_array_t *sync_array_get() {
+  if (sync_array_size <= 1) {
+    return (sync_wait_array[0]);            // ★ 默认只有 1 个
+  }
+  return (sync_wait_array[default_indexer_t<>::get_rnd_index() % sync_array_size]);
+}
+```
+
+```cpp
+// sync_array_init() —— 总槽位 = 线程数，按数组数均分
+  ulint n_slots = 1 + (n_threads - 1) / sync_array_size;
+  for (ulint i = 0; i < sync_array_size; ++i) {
+    sync_wait_array[i] = ut::new_withkey<sync_array_t>(UT_NEW_THIS_FILE_PSI_KEY, n_slots);
+  }
+```
+
+**★ 依赖方向图**：
+
+```
+        ┌─ PolicyMutex (ib_mutex_t) ─┬─ OSTrackMutex   → pthread_mutex
+        │                            ├─ TTASFutexMutex → syscall(SYS_futex)
+        │                            └─ TTASEventMutex ─┐
+        └─ rw_lock_t ───────────────────────────────────┤
+                                                        ↓
+                              sync0arr (wait array) ← os_event ← pthread_cond
+                                        ↓
+                              srv_error_monitor_thread（每秒兜底唤醒）
+
+        locksys::Latches ── global_latch (Sharded_rw_lock, 64 片 rw_lock_t)
+                        └─ page_shards[512] / table_shards[512]（各一把 ib_mutex_t）
+```
+
 **下游（本篇调谁）**：只有 L0——`futex`（Linux 且 `MUTEX_FUTEX`）、`pthread_cond_t`（os_event）、`pthread_mutex_t`（`OSTrackMutex`）、`std::atomic`（所有锁字）；以及 PFS（`PolicyMutex` 的 `pfs_begin_lock` / `rw_lock` 的 `pfs_rw_lock_*`）与 sync0arr 的诊断接口。
 
 **上游（谁调本篇）**——本篇是纯基础设施，所有 InnoDB 子系统的并发都在它之上：
@@ -993,6 +2106,118 @@ LatchDebug（人工 level 枚举，金字塔）
 
 ### `SHOW ENGINE INNODB STATUS` 的 SEMAPHORES 段
 
+⚠️ **勘误（重要）**：`RW-shared spins / RW-excl spins / RW-sx spins` 三行**在 8.0.39 里恒为 0**——计数器**已被删除**。全仓 grep `spin_wait_count` / `spin_round_count` / `os_wait_count` **0 命中**。
+
+**硬编码打印 0 的现场**（`sync0sync.cc:191`）：
+
+```cpp
+/**
+Prints wait info of the sync system.
+Note: The instrumental counters are deprecated
+      and prints all 0 for compatibility.
+@param file - where to print */
+static void sync_print_wait_info(FILE *file) {
+  fprintf(file,
+          "RW-shared spins 0, rounds 0, OS waits 0\n"
+          "RW-excl spins 0, rounds 0, OS waits 0\n"
+          "RW-sx spins 0, rounds 0, OS waits 0\n");
+
+  fprintf(file,
+          "Spin rounds per wait: 0.00 RW-shared,"
+          " 0.00 RW-excl, 0.00 RW-sx\n");
+}
+```
+
+> ★★ **实战结论**：8.0 里 SEMAPHORES 段**唯一有价值的信息**是 ① "OS WAIT ARRAY INFO: reservation count / signal count"（来自 `sync_array_print_info()`）与 ② 长等待告警（`sync_array_print_long_waits()`）。**spin 统计已死**。
+> ★ 唯一残留的 per-lock 等待计数是 `rw_lock_t::count_os_wait`（`sync0rw.cc` 里 `lock->count_os_wait += count_os_wait;`），`MutexMonitor::reset()` 会清零。
+
+**wait array 的打印**（`sync0arr.cc:976`）：
+
+```cpp
+void sync_array_print(FILE *file) {
+  sync_array_print_info(file, sync_wait_array, sync_array_size);
+}
+```
+> ⚠️ **不存在 `sync_array_output()`**。存在的是 `sync_array_print()`（:976）、`sync_array_print_info()`（:933）、`sync_array_print_info_low()`（:910）、`sync_array_print_long_waits()`（:858）。
+
+**⚠️ `innodb_sync_array_size` 是 READONLY**（`ha_innodb.cc:22083`）——运行期不可改，默认 **1**：
+
+```cpp
+static MYSQL_SYSVAR_ULONG(sync_array_size, srv_sync_array_size,
+                          PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,
+                          "Size of the mutex/lock wait array.", nullptr,
+                          nullptr, 1, 1, 1024, 0);
+```
+
+**★ wait array 职责收缩的官方原文**（`sync0arr_impl.h:57`）——这是 5.0.30 的历史性改动：
+
+```cpp
+  As of 5.0.30 the above mentioned design is changed. Since now OS can handle
+  millions of wait events efficiently, we no longer have this concept of each
+  cell of wait array having one event.  Instead, now the event that a thread
+  wants to wait on is embedded in the wait object (mutex or rw_lock). We still
+  keep the global wait array for the sake of diagnostics and also to avoid
+  infinite wait The error_monitor thread scans the global wait array to signal
+  any waiting threads who have missed the signal.
+```
+
+> ★★ **所以 wait array 现在只剩两个用途**：①**诊断**（`SHOW ENGINE INNODB STATUS` 的等待列表）；②**兜底防丢唤醒**（`sync_arr_wake_threads_if_sema_free()` 每秒扫描）。
+> ⚠️ **cell 不自带 event**——`sync_cell_get_event()` 从被等的 latch 里取（`sync0arr.cc:160`）：mutex → `m_event`；rw_lock → `event` 或 `wait_ex_event`（X_WAIT 用后者）。
+
+```cpp
+struct sync_cell_t {
+  sync_object_t latch;       /* union: rw_lock_t* / WaitMutex* / BlockWaitMutex* */
+  ulint request_type = 0;
+  const char *file = nullptr;
+  ulint line = 0;                      // ★ 空闲链表复用它存 next
+  std::thread::id thread_id{};
+  bool waiting = false;
+  int64_t signal_count = 0;            // ★ os_event_reset() 的返回值
+  std::chrono::steady_clock::time_point reservation_time{};
+  uint64_t last_scan{0};               // ★ DFS 环检测标记（奇数=在栈上）
+};
+```
+
+> ⚠️ **不存在 `sync_array_create()` / `sync_array_cell_get()`**——真名 `sync_array_t` 构造函数（:114）+ `sync_array_get_nth_cell()`（:147）。
+> ★ `sync_array_t::mutex` 是 **`SysMutex`（裸 OSMutex）**——注释明说 "to prevent infinite recursion in implementation, we fall back to an OS mutex"。
+
+**★ locksys 分片：`SHARDS_COUNT = 512`**（`lock0latches.h:166`）——⚠️ 不是 32/64：
+
+```cpp
+  static constexpr size_t SHARDS_COUNT = 512;   // ★ page shard 与 table shard 各 512，共 1024 把 mutex
+
+class Page_shards {
+  Padded_mutex mutexes[SHARDS_COUNT];           // ★ ut::Cacheline_padded<ib_mutex_t>
+ public:
+  static size_t get_shard(const page_id_t &page_id);
+};
+class Table_shards {
+  Padded_mutex mutexes[SHARDS_COUNT];
+ public:
+  static size_t get_shard(const table_id_t table_id);
+};
+```
+
+```cpp
+size_t Latches::Page_shards::get_shard(const page_id_t &page_id) {
+  /* We need a property that if two pages are mapped to the same bucket of the
+  hash table, and thus their lock queues are merged, then these two lock queues
+  are protected by the same shard. This is why to compute the shard we use the
+  cell_id as the input and not the original lock_rec_hash_value's result. */
+  return hash_calc_cell_id(lock_rec_hash_value(page_id), lock_sys->rec_hash) % SHARDS_COUNT;
+  //     ★★ 先算 hash cell 再 %512 —— 保证"同一 cell ⇒ 同一 shard"
+}
+
+size_t Latches::Table_shards::get_shard(const table_id_t table_id) {
+  return table_id % SHARDS_COUNT;      // ★ table 直接按 id 取模，无额外 hash
+}
+```
+
+> ⚠️ **`include/lock0shard.h` 不存在**（全仓 0 命中）。`Shard_latches_guard` / `Global_exclusive_latch_guard` 等 RAII guard 都在 **`include/lock0guards.h`**。
+> ★ **global_latch 本身也是分片的**（`Sharded_rw_lock`，内部 64 个 `rw_lock_t`）——因为 ARM 上 `rw_lock_t` 的 s-latch 计数是 read-update-CAS 循环，多线程抢同一 cache line。`Unique_sharded_rw_lock` 用 `thread_local size_t m_shard_id` 记住本线程 s-latch 了哪一片。
+> ★ 分片 mutex 的 latch level：page = `SYNC_LOCK_SYS_SHARDED`，table = `SYNC_LOCK_SYS_TABLE`。
+> ⚠️ **不存在 `Latches::print()`**——只有 4 个 UNIV_DEBUG 断言辅助：`owns_exclusive_global_latch()` / `owns_shared_global_latch()` / `owns_page_shard()` / `owns_table_shard()`。
+
 仍在：`srv_printf_innodb_monitor` 打 `"----------\nSEMAPHORES\n----------\n"` 后调 `sync_print()` = `rw_lock_list_print_info`（DEBUG：遍历 `rw_lock_list` 打非空闲锁）+ `sync_array_print`（OS WAIT ARRAY INFO：reservation/signal count、每个 cell 的等待者详情）+ `sync_print_wait_info`。
 
 **★ spin 统计已废弃**——后者打印固定 0：
@@ -1004,6 +2229,28 @@ fprintf(file, "RW-shared spins 0, rounds 0, OS waits 0\n"
 ```
 
 （注释自述 "The instrumental counters are deprecated and prints all 0 for compatibility"。）自旋/OS wait 统计让位给 PFS——**别再从 SEMAPHORES 段读 spin 数**。另外 `innodb_status_output_locks` 是事务锁系统的开关，与 SEMAPHORES 段无关。
+
+### core dump 排查锁持有者：gdb + pt-pmp 排除法
+
+latch 没有死锁检测，一旦 hang 住（semaphore wait 超时 crash 或实例无响应），core dump 是唯一现场。四类锁的 gdb 排查法（淘宝内核月报 2020-03 的完整方法论）：
+
+| 锁 | gdb 看什么 | 关键点 |
+|---|---|---|
+| server `pthread_mutex_t` | `p LOCK_status` → `__data.__owner` | `__owner` = 持有者线程的 **LWP 号**，对照 `info threads` 定位持有者 |
+| server `pthread_rwlock_t` | `__nr_readers` / `__nr_writers_queued` / `__writer` | **写锁优先**：`__nr_writers_queued != 0` 时新读请求也阻塞（防写饿死）；读锁持有者可能多个，需排除法 |
+| InnoDB `rw_lock_t` | `lock_word` + `writer_thread` + `last_*_file_name` | ① `lock_word` 对照编码表（见「rw_lock_t」节）判断当前是 S/SX/X/等待态；② `writer_thread` 是持有者线程 id（十六进制，可直接在堆栈里搜）；③ ★ **`last_s_file_name:last_s_line` / `last_x_file_name:last_x_line`**——最近一次加 S/X 锁的**源码位置**（写锁未真正持有时指向上一个持有者），是"谁最后碰过这把锁"的直接线索 |
+| InnoDB `PolicyMutex` | `m_lock_word` | 三态：0 空闲 / 1 持有 / 2 有等待者。**⚠️ `m_waiters=0 不代表无等待线程**——线程都在自旋（未进等待队列）时 waiters 仍为 0；自旋时长由 `innodb_sync_spin_loops` / `innodb_spin_wait_delay` 控制 |
+
+**pt-pmp 排除法**（核心思想：**持有者堆栈只出现 1 次，等锁者大量重复**）：
+
+1. 导出全部线程堆栈 → `pt-pmp` 聚合
+2. 排除频次高于 `__nr_readers` 的高频堆栈（大概率是等锁者）
+3. 排除阻塞在获取该锁的线程
+4. 排除带 `poll()`/`epoll_wait` 的堆栈
+5. 排除带 `pthread_cond_wait`/`__lll_lock_wait` 的堆栈（持有锁期间 sleep 概率极低）
+6. 剩下的"只出现 1 次"的堆栈即持有者
+
+**参数联动**：若所有拿锁线程都在自旋（`waiters=0` 且大量 CPU 空转），减小 `innodb_sync_spin_loops` 或 `innodb_spin_wait_delay` 可让竞争显形——这是"排查不出来时的最后一招"。
 
 ### 观测对象 → 手段 速查
 
@@ -1037,6 +2284,101 @@ fprintf(file, "RW-shared spins 0, rounds 0, OS waits 0\n"
 **社区边界澄清**：`MUTEX_FUTEX` 只在检测到 Linux futex 时启用；Windows 构建走 `MUTEX_SYS`（pthread/critical section 包装）。Percona 曾引入额外的 mutex 统计（如 `innodb_mutex_..`），社区版没有。
 
 ### 易混淆概念
+
+**① `os_event` 是 "manual-reset"，不是 auto-reset**
+
+```cpp
+  /** Creates an event semaphore, i.e., a semaphore which may just have two
+  states: signaled and nonsignaled. The created event is manual reset: it
+  must be reset explicitly by calling os_event_reset(). */
+```
+
+> `set()` 后 `m_set` 一直为 true，**直到显式 `reset()`**。所以"事件"更接近一个"电平"而不是"脉冲"。
+
+**② `os_event_set()` 唤醒全部，不是唤醒一个**
+
+```cpp
+  void broadcast() UNIV_NOTHROW {
+    m_set = true;
+    ++signal_count;
+    pthread_cond_broadcast(&cond_var);   // ★ 广播
+  }
+```
+> ⚠️ 私有 `signal()`（`pthread_cond_signal`）**全文件无调用点——死代码**。对比：futex 版 `signal()` 用 `FUTEX_WAKE_PRIVATE, 1`（**只唤醒 1 个**）。两者语义不同。
+
+**③ `os_event_wait_time_low()` 的超时语义：Linux 是"总时长"，Windows 是"每轮重新计时"**
+
+```cpp
+#ifndef _WIN32
+    abstime = os_event::get_wait_timelimit(timeout);   // ★ 算一次绝对时刻
+#else
+    time_in_ms = ...timeout...;                        // ★ 每次都是相对毫秒
+#endif
+  do {
+    if (m_set || signal_count != reset_sig_count) break;
+    timed_out = timed_wait(&abstime);                  // ★ Linux：abstime 每轮是同一个值
+    //                                                    Windows：每轮重新计时
+  } while (!timed_out);
+```
+
+```cpp
+  struct timespec os_event::get_wait_timelimit(std::chrono::microseconds timeout) {
+    /* We could get rid of this function if we switched to std::condition_variable
+    from the pthread_cond_. The std::condition_variable::wait_for relies on the
+    steady_clock internally and accepts timeout (not time increased by the
+    timeout). */
+    ...
+      if (clock_gettime(CLOCK_MONOTONIC, &tp) == -1) { ... }
+      //  ★★ 单调时钟，避免系统时钟回拨导致永久阻塞
+```
+
+> ★ 时钟源在 `os_event_global_init()` 里设置：`pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC)`（**macOS 无此支持**，会 warn 后退化为 `gettimeofday`）。
+
+**④ `srv_slot_t`（锁等待）与 `sync_cell_t`（latch 等待）是两套完全不同的机制**
+
+| | `srv_slot_t` | `sync_cell_t` |
+|---|---|---|
+| 位置 | `lock/lock0wait.cc` | `sync/sync0arr.cc` |
+| 等的是 | **事务锁**（行锁/表锁） | **latch**（mutex / rw_lock） |
+| 唤醒者 | `lock_wait_release_thread_if_suspended()` | `sync_arr_wake_threads_if_sema_free()`（每秒兜底） |
+| 死锁检测 | `lock_wait_find_and_handle_deadlocks()` | debug 下 `sync_array_detect_deadlock()` |
+| 超时 | `innodb_lock_wait_timeout` | **无超时**（latch 等待不设超时） |
+
+> ★★ **这是最关键的区分**：`Innodb_row_lock_waits` 涨 = 事务锁等待；SEMAPHORES 段有长等待 = latch 争用。二者排查手段完全不同。
+
+**⑤ `EventMutex` ≠ `TTASEventMutex`**
+
+```cpp
+typedef OSMutex EventMutex;                                        // 裸 pthread mutex
+UT_MUTEX_TYPE(TTASEventMutex, GenericPolicy, SyncArrayMutex)        // 这才是 TTASEventMutex
+```
+
+**⑥ `rw_lock_t` 的 S 锁不可递归，X/SX 可递归**
+
+```cpp
+  ut_ad(!rw_lock_own(lock, RW_LOCK_S));   /* see NOTE above */   // sync0rw.ic:271
+  ut_ad(!rw_lock_own(lock, RW_LOCK_X));
+```
+
+**⑦ `lock_word` 初值 `X_LOCK_DECR` 同时是"最大并发 S 锁数"**
+
+> `X_LOCK_DECR = 0x20000000 = 536870912`。`X_LOCK_DECR - lock_word` = S 锁数量，所以理论上限 2^29 个读者。
+
+**⑧ `PolicyMutex::exit()` 的 hook 在解锁之前**
+
+```cpp
+    policy().release(m_impl);   // ① hook
+    m_impl.exit();              // ② 才真正解锁
+```
+> 反直觉但必须如此——`release` 里要 `sync_check_unlock()`，那时锁还没放，读 `m_context` 才安全。
+
+**⑨ `ib_mutex_t` 默认是 `SysMutex`（裸 pthread），不是 futex**
+
+> 需 `cmake -DMUTEXTYPE=futex` 且 `HAVE_IB_LINUX_FUTEX` 探测通过。
+
+**⑩ `innodb_sync_array_size` 是 READONLY，默认 1**
+
+> 不是"越大越好、可在线调"。启动时定死。
 
 - **`os_event` ≠ server 的 `mysql_cond_t`**：前者是 manual-reset 事件（sticky + signal_count），后者是标准条件变量。InnoDB 内部等待统一走 os_event。
 - **wait array 不是等待队列**：5.0.30 起 event 已嵌入被等对象，wait array 只剩诊断、防丢信号兜底、debug 死锁检测三个职责。

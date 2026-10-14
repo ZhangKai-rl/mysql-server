@@ -54,6 +54,56 @@ MDL 是 server 层保护**表结构/元数据**的锁，与引擎的行锁完全
 
 #### 一、锁类型分级 + 意向锁：把"访问意图"编码成强度阶梯
 
+**⚠️ 勘误**：**不存在 `MDL_BACKUP_*` 锁类型**（全仓 0 命中）。备份锁是 **`MDL_key::BACKUP_LOCK` namespace**（值 1）+ 普通类型。也**不存在 `MDL_INTENTION_SHARED`**——IS 与一切兼容，源码注释说 "*Since intention shared scoped locks are compatible with all other type of locks we don't even have any accounting for them*"，**完全不做记账**。
+
+**11 个可用类型**（`mdl.h:196`，索引 0..10，与策略数组 11 元素一一对应）：
+
+| 索引 | 类型 | 官方注释要点 | 谁在用 |
+|---|---|---|---|
+| 0 | `MDL_INTENTION_EXCLUSIVE` (IX) | 仅 scoped；查字典缓存时防止 schema 被删 | DDL（GLOBAL/SCHEMA/…） |
+| 1 | `MDL_SHARED` (S) | 只要元数据；**也复用给 `HANDLER OPEN`** | stored routine / PREPARE |
+| 2 | `MDL_SHARED_HIGH_PRIO` (SH) | **无视 pending X**；I_S / SHOW | I_S 表填充 |
+| 3 | `MDL_SHARED_READ` (SR) | 要读数据 | SELECT、`LOCK TABLES READ` |
+| 4 | `MDL_SHARED_WRITE` (SW) | 要改数据 | INSERT/UPDATE/DELETE、`SELECT..FOR UPDATE` |
+| 5 | `MDL_SHARED_WRITE_LOW_PRIO` (SWLP) | 优先级**低于 SRO**（"piglet"） | `LOW_PRIORITY` DML |
+| 6 | `MDL_SHARED_UPGRADABLE` (SU) | 可升级到 SNW/SNRW/X | ALTER TABLE 第一阶段 |
+| 7 | `MDL_SHARED_READ_ONLY` (SRO) | 阻塞所有写 | `LOCK TABLES READ` |
+| 8 | `MDL_SHARED_NO_WRITE` (SNW) | 允许读不允许写，可升级 X | ALTER 拷数据阶段 |
+| 9 | `MDL_SHARED_NO_READ_WRITE` (SNRW) | 只与 S/SH 共存 | `LOCK TABLES WRITE` |
+| 10 | `MDL_EXCLUSIVE` (X) | 与一切不兼容 | DDL |
+| 11 | `MDL_TYPE_END` | 哨兵（数组维度） | — |
+
+**★ SH 的"高优先级"是有代价的**（源码注释原文）：
+
+```cpp
+  /*
+    A high priority shared metadata lock.
+    ...
+    Since SH lock is compatible with SNRW lock, the connection that
+    holds SH lock lock should not try to acquire any kind of table-level
+    or row-level lock, as this can lead to a deadlock. Moreover, after
+    acquiring SH lock, the connection should not wait for any other
+    resource, as it might cause starvation for X locks and a potential
+    deadlock during upgrade of SNW or SNRW to X lock (e.g. if the
+    upgrading connection holds the resource that is being waited for).
+  */
+```
+
+**★ S 锁给 HANDLER 复用的理由**（注释原文片段）：S 必须与 SNRW（`LOCK TABLES WRITE`）兼容，所以 `HANDLER READ` 不能走"S 再升级 SR"的路子；副作用是需要 `thr_abort_locks_for_thread()` 来打破"S ↔ 升级中的 SNRW"的死锁环。
+
+**duration 只有 3 个**（`mdl.h:333`）：
+
+```cpp
+enum enum_mdl_duration {
+  MDL_STATEMENT = 0,   // 语句/事务结束时自动释放
+  MDL_TRANSACTION,     // 事务结束时自动释放
+  MDL_EXPLICIT,        // 跨事务存活，必须显式 release_lock()
+  MDL_DURATION_END
+};
+```
+
+> ⚠️ `MDL_ticket::m_duration` **只在 `#ifndef NDEBUG` 下存在**（`mdl.h:1080`）——release 下没有这个字段，纯 debug 断言用。
+
 MDL 把意图分成十余级（`enum_mdl_type`），每级对应一类 SQL：
 
 | 类型 | 对应语句 | unobtrusive? |
@@ -92,6 +142,151 @@ struct MDL_lock_strategy {
 
 #### 三、★ fast path：用"计数"换"链表"，用"CAS"换"mutex"
 
+**`m_fast_path_state` 位布局**（`mdl.cc:859`，是 `static const` 成员常量，**不是 `#define`**）：
+
+```cpp
+  static const fast_path_state_t IS_DESTROYED  = 1ULL << 62;
+  static const fast_path_state_t HAS_OBTRUSIVE = 1ULL << 61;
+  static const fast_path_state_t HAS_SLOW_PATH = 1ULL << 60;
+```
+
+| 位 | 含义 |
+|---|---|
+| 62 | `IS_DESTROYED` —— 已标记销毁，等所有 hazard pointer unpin |
+| 61 | `HAS_OBTRUSIVE` —— 有（或正在探测）obtrusive 锁。**置位 ⇒ [INV1]：所有 `m_fast_path_state` 变更必须在 `m_rwlock` 写锁下** |
+| 60 | `HAS_SLOW_PATH` —— `m_granted`/`m_waiting` 非空 |
+| 0..59 | 打包的 unobtrusive 计数器，**按策略分段** |
+
+```cpp
+typedef longlong fast_path_state_t;               // 64 bit 有符号
+typedef unsigned short bitmap_t;                  // 16 bit，装得下 11 种类型
+std::atomic<fast_path_state_t> m_fast_path_state;
+```
+
+**object 策略的计数器分段**（`mdl.cc:2363`）：
+
+```cpp
+      note: fast_path_state bit meaning!
+      - bits 0 .. 19  - S and SH (we don't differentiate them once acquired)
+      - bits 20 .. 39 - SR
+      - bits 40 .. 59 - SW and SWLP (we don't differentiate them once acquired)
+      Overflow is not an issue as we are unlikely to support more than 2^20 - 1
+      concurrent connections in foreseeable future.
+```
+
+```cpp
+  static bitmap_t object_lock_fast_path_granted_bitmap(const MDL_lock &lock) {
+    bitmap_t result = 0;
+    fast_path_state_t fps = lock.m_fast_path_state;
+    if (fps & 0xFFFFFULL) result |= MDL_BIT(MDL_SHARED);
+    if (fps & (0xFFFFFULL << 20)) result |= MDL_BIT(MDL_SHARED_READ);
+    if (fps & (0xFFFFFULL << 40)) result |= MDL_BIT(MDL_SHARED_WRITE);
+    return result;
+  }
+  //  ★ 0xFFFFF = 20 位掩码 = 每段的宽度
+
+  static bitmap_t scoped_lock_fast_path_granted_bitmap(const MDL_lock &lock) {
+    return (lock.m_fast_path_state.load() & 0xFFFFFFFFFFFFFFFULL)
+               ? MDL_BIT(MDL_INTENTION_EXCLUSIVE) : 0;
+  }
+  //  ★ scoped 的 0..59 整体就是一个 IX 计数器
+```
+
+> ⚠️ **勘误：不存在 `HAS_FAST_PATH`，也不存在 `FAST_PATH_COUNT_MASK`**（全仓 0 命中）。"没有 fast path"是用 `HAS_SLOW_PATH == 0` 反推的。
+
+**★ 授予就一次 CAS，全程不碰任何 mutex/rwlock**（`mdl.cc:2964`）：
+
+```cpp
+  if (!force_slow) {
+    MDL_lock::fast_path_state_t old_state = lock->m_fast_path_state;
+    bool first_use;
+    do {
+      if (old_state & MDL_lock::IS_DESTROYED) {
+        if (pinned) lf_hash_search_unpin(m_pins);
+        DEBUG_SYNC(get_thd(), "mdl_acquire_lock_is_destroyed_fast_path");
+        goto retry;                          // ①对象已销毁 → 重新查 hash
+      }
+      if (old_state & MDL_lock::HAS_OBTRUSIVE) goto slow_path;  // ②有人持 obtrusive → 老实排队
+      first_use = (old_state == 0);
+    } while (!lock->fast_path_state_cas(
+        &old_state, old_state + unobtrusive_lock_increment));   // ③CAS 加计数
+
+    if (pinned) lf_hash_search_unpin(m_pins);
+    if (first_use && pinned) mdl_locks.lock_object_used();
+
+    ticket->m_lock = lock;
+    ticket->m_is_fast_path = true;           // ★ 不进 m_granted 链表
+    m_ticket_store.push_front(mdl_request->duration, ticket);
+    mdl_request->ticket = ticket;
+    mysql_mdl_set_status(ticket->m_psi, MDL_ticket::GRANTED);
+    return false;
+  }
+```
+
+> ★★ 源码注释甚至说：*"In theory, this algorithm will work correctly (but not very efficiently) if the read will return random values"* —— 因为正确性完全由后面的 CAS 兜底。
+
+**强制走 slow path 的两个条件**（`mdl.cc:2905`）：
+
+```cpp
+  force_slow = !unobtrusive_lock_increment || m_needs_thr_lock_abort;
+```
+
+| 条件 | 含义 |
+|---|---|
+| `unobtrusive_lock_increment == 0` | 请求类型是 **obtrusive** |
+| `m_needs_thr_lock_abort == true` | 本连接**开了 HANDLER** |
+
+```cpp
+  void set_needs_thr_lock_abort(bool needs_thr_lock_abort) {
+    m_needs_thr_lock_abort = needs_thr_lock_abort;
+    if (m_needs_thr_lock_abort) {
+      /* For MDL_object_lock::notify_conflicting_locks() to work properly
+      all context requiring thr_lock aborts should not have any "fast path"
+      locks. */
+      materialize_fast_path_locks();   // ★ 开了 HANDLER 就永久放弃 fast path
+    }
+  }
+```
+
+> ★ 唯一调用方是 `sql/sql_handler.cc:295`；关掉最后一个 HANDLER 才复位（`:366 / :857 / :974`）。
+
+**slow path 的关键顺序**（`mdl.cc:3089`）——**先置 HAS_OBTRUSIVE，再问 can_grant_lock**：
+
+```cpp
+  bool first_obtrusive_lock =
+      (unobtrusive_lock_increment == 0) &&
+      ((lock->m_obtrusive_locks_granted_waiting_count++) == 0);
+  ...
+  if (!(state & MDL_lock::HAS_SLOW_PATH) || first_obtrusive_lock) {
+    do {
+      first_use = (state == 0);
+    } while (!lock->fast_path_state_cas(
+        &state, state | MDL_lock::HAS_SLOW_PATH |
+                    (first_obtrusive_lock ? MDL_lock::HAS_OBTRUSIVE : 0)));
+  }
+  ticket->m_lock = lock;
+  if (lock->can_grant_lock(mdl_request->type, this)) { ... }
+```
+
+> ★★ 注释明说：*"This is necessary to prevent concurrent fast path acquisitions from invalidating the results of this method."* 顺序反了就会漏判。
+
+**CAS 包装强制不变式**（`mdl.cc:926`）：
+
+```cpp
+  bool fast_path_state_cas(fast_path_state_t *old_state,
+                           fast_path_state_t new_state) {
+#if !defined(NDEBUG)
+    if (((*old_state & (IS_DESTROYED | HAS_OBTRUSIVE | HAS_SLOW_PATH)) !=
+         (new_state & (IS_DESTROYED | HAS_OBTRUSIVE | HAS_SLOW_PATH))) ||
+        *old_state & HAS_OBTRUSIVE) {
+      mysql_prlock_assert_write_owner(&m_rwlock);   // ★ debug 下校验
+    }
+#endif
+    assert(!(*old_state & IS_DESTROYED));
+    return atomic_compare_exchange_strong(&m_fast_path_state, old_state, new_state);
+  }
+```
+
 DML 的 SR/SW 是最高频操作。若每次都加 `m_rwlock` 写锁 + 遍历 granted 链表，所有 DML 会在全局锁上串行化。MDL 的解法（源码注释原文翻译）：
 
 > A) **"unobtrusive" 类型**：① 集合内任意两种类型互相兼容（包括自身）；② 是 DML 常见操作。我们的目标是优化这类锁的获取与释放——避开 `m_waiting`/`m_granted` bitmap 与链表的复杂检查，**用整数计数器的检查 + 增减替代**。我们称之为 "fast path"。
@@ -107,6 +302,117 @@ DML 的 SR/SW 是最高频操作。若每次都加 `m_rwlock` 写锁 + 遍历 gr
 4. **存在 obtrusive 锁时整体退化**，且退化是单向的（已物化的 ticket 不回 fast path）。
 
 #### 四、防饥饿：4 张矩阵动态切换，但默认等于关闭
+
+**精确说法：1 张 granted 不兼容矩阵 + 4 张 waiting 优先级矩阵**（`mdl.cc:475/489`）：
+
+```cpp
+    bitmap_t m_granted_incompatible[MDL_TYPE_END];       // 1 张
+    bitmap_t m_waiting_incompatible[4][MDL_TYPE_END];    // ★ 这才是 4 张
+```
+
+```cpp
+    /**
+      Arrays of bitmaps which elements specify which waiting locks are
+      incompatible with the type of lock being requested. Basically, each
+      array defines priorities between lock types.
+      We need 4 separate arrays since in order to prevent starvation for
+      some of lock request types, we use different priority matrices:
+      0) in "normal" situation.
+      1) in situation when the number of successively granted "piglet" requests
+         exceeds the max_write_lock_count limit.
+      2) in situation when the number of successively granted "hog" requests
+         exceeds the max_write_lock_count limit.
+      3) in situation when both "piglet" and "hog" counters exceed limit.
+    */
+```
+
+**切换索引的拼装与判定**（`mdl.cc:582`）：
+
+```cpp
+  uint get_incompatible_waiting_types_bitmap_idx() const {
+    mysql_prlock_assert_write_owner(&m_rwlock);
+    uint idx = 0;
+    if (m_piglet_lock_count >= max_write_lock_count) idx += 1;   // ★ piglet → +1
+    if (m_hog_lock_count >= max_write_lock_count) idx += 2;      // ★ hog → +2
+    return idx;
+  }
+```
+
+**计数条件**（`mdl.cc:666`）：
+
+```cpp
+  bool count_piglets_and_hogs(enum_mdl_type type) {
+    mysql_prlock_assert_write_owner(&m_rwlock);
+    if ((MDL_BIT(type) & MDL_OBJECT_HOG_LOCK_TYPES) != 0) {
+      if (m_waiting.bitmap() & ~MDL_OBJECT_HOG_LOCK_TYPES) {
+        m_hog_lock_count++;                        // ★ 授予 hog 且队列里还有非 hog
+        if (switch_incompatible_waiting_types_bitmap_if_needed()) return true;
+      }
+    } else if (type == MDL_SHARED_WRITE) {
+      if (m_waiting.bitmap() & MDL_BIT(MDL_SHARED_READ_ONLY)) {
+        m_piglet_lock_count++;                     // ★ 授予 SW 且队列里有 SRO
+        if (switch_incompatible_waiting_types_bitmap_if_needed()) return true;
+      }
+    }
+    return false;
+  }
+
+  static const bitmap_t MDL_OBJECT_HOG_LOCK_TYPES =
+      (MDL_BIT(MDL_SHARED_NO_WRITE) | MDL_BIT(MDL_SHARED_NO_READ_WRITE) |
+       MDL_BIT(MDL_EXCLUSIVE));                    // ★ hog = {SNW, SNRW, X}
+```
+
+**★ 为什么"默认等于关闭"**：
+
+```cpp
+// sql/sys_vars.cc:3145
+static Sys_var_ulong Sys_max_write_lock_count(
+    "max_write_lock_count",
+    "After this many write locks, allow some read locks to run in between",
+    GLOBAL_VAR(max_write_lock_count), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULONG_MAX), DEFAULT(ULONG_MAX), BLOCK_SIZE(1));
+//                                    ★★ 默认 ULONG_MAX = 2^64-1
+```
+
+> ★★ 判定是 `m_hog_lock_count >= max_write_lock_count`，计数器是 `ulong` 且每次只 `++`。要连续授予 **2^64-1 次** hog 锁才会触发——**实际永远不可能**。所以 `idx` 恒为 0，恒用矩阵 #0，**防饥饿机制默认完全不生效**。只有手工把 `max_write_lock_count` 调小（如 100）才激活。
+>
+> ⚠️ **`max_read_lock_count` 不存在**（全仓 0 命中）。
+> ⚠️ **`max_write_lock_count` 不只是 thr_lock 的**——8.0.39 的 MDL 也用它。
+
+**4 张矩阵的差异**（`mdl.cc:2286`）：
+
+| 矩阵 | 触发条件 | 关键差异 |
+|---|---|---|
+| **#0** | 默认 | X 最高；SWLP 让 SRO；SW 让 SNRW/SNW；S 让 X |
+| **#1** | piglet 超阈值 | **SW 降到 SRO 之下**（SW 掩码多出 `MDL_BIT(MDL_SHARED_READ_ONLY)`） |
+| **#2** | hog 超阈值 | S/SH/SR/SW/SU/SRO 全部优先于 hog；X 掩码 = `~MDL_OBJECT_HOG_LOCK_TYPES` |
+| **#3** | 两者都超 | SRO 优先于 SW/SWLP，非 hog 优先于 hog；X 掩码 = `~(HOG \| SW \| SWLP)` |
+
+**★ 只对 object 锁生效**（`mdl.cc:654`）：
+
+```cpp
+  bool is_affected_by_max_write_lock_count() const {
+    /*
+      Disable max_write_lock_count handling for ACL_CACHE namespace to
+      enable optimization that avoids find_deadlock() for it.
+    */
+    return key.mdl_namespace() != MDL_key::ACL_CACHE &&
+           m_strategy->m_is_affected_by_max_write_lock_count;
+  }
+```
+
+> ★ `m_scoped_lock_strategy` 的 `m_is_affected_by_max_write_lock_count = false`（`mdl.cc:2166`），所以 **scoped 锁（GLOBAL/SCHEMA/…）完全不参与防饥饿**——它的 4 张 waiting 矩阵里只有 #0 有内容，1/2/3 全是 0。
+
+**fast path 完全绕过这套逻辑**（`mdl.cc:3030` 注释原文）：
+
+```cpp
+    /*
+      Lock has been acquired. Since this can only be an "unobtrusive" lock and
+      there were no active/pending requests for "obtrusive" locks, we don't need
+      to care about "hog" and "piglet" locks and the max_write_lock_count
+      threshold.
+    */
+```
 
 `m_waiting_incompatible` 有 **4 张**，由两个计数器与阈值 `max_write_lock_count` 选择：
 
@@ -150,6 +456,154 @@ static Sys_var_ulong Sys_max_write_lock_count(
 - **延迟计算 / lazy materialization**（fast path 的思想原型）：与编译器的 lazy codegen、数据库的 lazy evaluation 同源——把精度成本从高频路径转移到低频路径。
 
 ### 算法与数据结构
+
+**★ `can_grant_lock()` 的三重短路**（`mdl.cc:2390`）：
+
+```cpp
+bool MDL_lock::can_grant_lock(enum_mdl_type type_arg,
+                              const MDL_context *requestor_ctx) const {
+  bool can_grant = false;
+  bitmap_t waiting_incompat_map = incompatible_waiting_types_bitmap()[type_arg];
+  //  ① 先问「等待队列里有没有更高优先级的」
+  bitmap_t granted_incompat_map = incompatible_granted_types_bitmap()[type_arg];
+  //  ② 再问「已授予里有没有不兼容的」
+
+  if (!(m_waiting.bitmap() & waiting_incompat_map)) {
+    if (!(fast_path_granted_bitmap() & granted_incompat_map)) {
+      if (!(m_granted.bitmap() & granted_incompat_map))
+        can_grant = true;
+      else {
+        Ticket_iterator it(m_granted);
+        MDL_ticket *ticket;
+        /* 冲突锁可能就是我自己的（升级场景）→ 逐个核对 ctx */
+        while ((ticket = it++)) {
+          if (ticket->get_ctx() != requestor_ctx &&
+              ticket->is_incompatible_when_granted(type_arg))
+            break;
+        }
+        if (ticket == nullptr) can_grant = true;   // ★ 冲突锁全是自己的
+      }
+    }
+    /* else: 与 fast path 计数器里的锁冲突 —— 必然不是自己的，直接失败 */
+  }
+  return can_grant;
+}
+```
+
+> ★ 顺序不可换：**waiting 优先级 → fast path 位图 → slow path 位图 → 逐个核对 owner**。
+
+**`reschedule_waiters()`：公平调度**（`mdl.cc:1912`）：
+
+```cpp
+void MDL_lock::reschedule_waiters() {
+  MDL_lock::Ticket_iterator it(m_waiting);
+  MDL_ticket *ticket;
+
+  while ((ticket = it++)) {
+    if (can_grant_lock(ticket->get_type(), ticket->get_ctx())) {
+      if (!ticket->get_ctx()->m_wait.set_status(MDL_wait::GRANTED)) {
+        m_waiting.remove_ticket(ticket);
+        m_granted.add_ticket(ticket);
+
+        if (is_affected_by_max_write_lock_count()) {
+          if (count_piglets_and_hogs(ticket->get_type())) {
+            /* Switch of priority matrice might have unblocked some lower-prio
+            locks which are still compatible with the lock type we just have
+            granted (for example, when we grant SNW lock and there are pending
+            requests of SR type). Restart iteration to wake them up, otherwise
+            we might get deadlocks. */
+            it.rewind();       // ★★ 换矩阵后可能解锁了别人 → 必须重头再扫
+            continue;
+          }
+        }
+      }
+      /* If we could not update the wait slot of the waiter, it can be due to
+      fact that its connection/statement was killed or it has timed out ... */
+    }
+  }
+  /* 收尾：等待队列空了就把 hog/piglet 计数清零并切回矩阵 #0 */
+  if (is_affected_by_max_write_lock_count()) {
+    if (m_current_waiting_incompatible_idx == 3) {
+      /* 矩阵 #3 直接跳回 #0，不经过 #2（否则 SW+SRO 会永远饿死 hog） */
+      if ((m_waiting.bitmap() & ~(MDL_OBJECT_HOG_LOCK_TYPES |
+                                  MDL_BIT(MDL_SHARED_WRITE) |
+                                  MDL_BIT(MDL_SHARED_WRITE_LOW_PRIO))) == 0) {
+        m_piglet_lock_count = 0;
+        m_hog_lock_count = 0;
+        m_current_waiting_incompatible_idx = 0;
+      }
+    } else {
+      if ((m_waiting.bitmap() & ~MDL_OBJECT_HOG_LOCK_TYPES) == 0) {
+        m_hog_lock_count = 0;
+        m_current_waiting_incompatible_idx &= ~2;   // ★ 清 hog 位
+      }
+      if ((m_waiting.bitmap() & MDL_BIT(MDL_SHARED_READ_ONLY)) == 0) {
+        m_piglet_lock_count = 0;
+        m_current_waiting_incompatible_idx &= ~1;   // ★ 清 piglet 位
+      }
+    }
+  }
+}
+```
+
+> ★★ **不变式 [INV2]**（源码注释原文）：对任一优先级矩阵，「不兼容的等待请求集合 A」必须是「不兼容的已授予请求集合 B」的**子集**——即**把一个锁从 waiting 挪到 granted 不会解锁新的请求**。`reschedule_waiters()` 依赖这条性质才敢不重扫。
+
+**物化（fast → slow，单向）**（`mdl.cc:2762`）：
+
+```cpp
+void MDL_context::materialize_fast_path_locks() {
+  for (int i = 0; i < MDL_DURATION_END; i++) {
+    MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(i);
+    MDL_ticket *matf = m_ticket_store.materialized_front(i);
+    //  ★ m_mat_front 是优化游标：只处理「上次物化之后新增」的 ticket
+    for (MDL_ticket *ticket = it++; ticket != matf; ticket = it++) {
+      if (ticket->m_is_fast_path) {
+        MDL_lock *lock = ticket->m_lock;
+        MDL_lock::fast_path_state_t unobtrusive_lock_increment =
+            lock->get_unobtrusive_lock_increment(ticket->get_type());
+        ticket->m_is_fast_path = false;
+        mysql_prlock_wrlock(&lock->m_rwlock);
+        lock->m_granted.add_ticket(ticket);
+        MDL_lock::fast_path_state_t old_state = lock->m_fast_path_state;
+        while (!lock->fast_path_state_cas(
+            &old_state, ((old_state - unobtrusive_lock_increment) |
+                         MDL_lock::HAS_SLOW_PATH))) {
+        }
+        mysql_prlock_unlock(&lock->m_rwlock);
+      }
+    }
+  }
+  m_ticket_store.set_materialized();
+}
+```
+
+> ★★ **两个强制物化时机**：① 申请 **obtrusive** 锁时（`try_acquire_lock_impl` 里 `if (!unobtrusive_lock_increment) materialize_fast_path_locks();`）；② `will_wait_for()` 挂 wait-for 边之前——否则 fast path 锁不在 `m_granted` 链表里，**死锁检测看不到它，会漏检**。
+
+**`remove_ticket()` 的释放侧**（也要看 obtrusive）：
+
+```cpp
+    if (ticket->m_is_fast_path) {
+      MDL_lock::fast_path_state_t old_state = lock->m_fast_path_state;
+      bool last_use;
+      do {
+        if (old_state & MDL_lock::HAS_OBTRUSIVE) {
+          mysql_prlock_wrlock(&lock->m_rwlock);
+          last_use = (lock->fast_path_state_add(-unobtrusive_lock_increment) ==
+                      unobtrusive_lock_increment);
+          if (lock->m_obtrusive_locks_granted_waiting_count)
+            lock->reschedule_waiters();      // ★ 有 obtrusive 等待者 → 释放后要重排
+          mysql_prlock_unlock(&lock->m_rwlock);
+          goto end_fast_path;
+        }
+        last_use = (old_state == unobtrusive_lock_increment);
+      } while (!lock->fast_path_state_cas(
+          &old_state, old_state - unobtrusive_lock_increment));
+    } else {
+      lock->remove_ticket(this, m_pins, &MDL_lock::m_granted, ticket);
+    }
+```
+
+> ★ 释放 fast path 锁时若发现 `HAS_OBTRUSIVE`，**必须升级到写锁路径**：既要保证计数与链表修改原子（[INV1]），又要兜住"有人正等我这把 unobtrusive 锁"的情况。
 
 | 结构 | 组成 | 复杂度 |
 |---|---|---|
@@ -336,6 +790,56 @@ enum enum_mdl_namespace {
 | 13 | `ACL_CACHE` | ACL 缓存 | object | 实例级（singleton） |
 | 14 | `COLUMN_STATISTICS` | 列统计/直方图 | object | **列级**（key 带第 4 段列名） |
 | 15–17 | `RESOURCE_GROUPS`/`FOREIGN_KEY`/`CHECK_CONSTRAINT` | 资源组、外键名、检查约束名 | **scoped** | 对象级 |
+
+#### ★ `BACKUP_LOCK`：函数名与锁类型完全颠倒
+
+`BACKUP_LOCK` 是上表里最反直觉的一个——只看 `acquire_exclusive_backup_lock` / `acquire_shared_backup_lock` 这两个名字会理解反。源码（`sql/sql_backup_lock.cc`）：
+
+```cpp
+static bool acquire_mdl_for_backup(THD *thd, enum_mdl_type mdl_type,
+                                   enum_mdl_duration mdl_duration,
+                                   ulong lock_wait_timeout) {
+  MDL_request mdl_request;
+  assert(mdl_type == MDL_SHARED || mdl_type == MDL_INTENTION_EXCLUSIVE);
+
+  MDL_REQUEST_INIT(&mdl_request, MDL_key::BACKUP_LOCK, "", "", mdl_type,
+                   mdl_duration);
+  return thd->mdl_context.acquire_lock(&mdl_request, lock_wait_timeout);
+}
+
+/*
+  The following rationale is for justification of choice for specific lock
+  types to support BACKUP LOCK.
+
+  IX and S locks are mutually incompatible. On the other hand both these
+  lock types are compatible with themselves. IX lock has lower priority
+  than S locks. So we can use S lock for rare Backup operation which should
+  not be starved by more frequent DDL operations using IX locks.
+
+  From all listed above follows that S lock should be considered as Exclusive
+  Backup Lock and IX lock should be considered as Shared Backup Lock.
+*/
+
+bool acquire_exclusive_backup_lock(THD *thd, ulong lock_wait_timeout, bool for_trx) {
+  enum_mdl_duration duration = (for_trx ? MDL_TRANSACTION : MDL_EXPLICIT);
+  return acquire_mdl_for_backup(thd, MDL_SHARED, duration, lock_wait_timeout);   // ★ S
+}
+
+bool acquire_shared_backup_lock(THD *thd, ulong lock_wait_timeout, bool for_trx) {
+  enum_mdl_duration duration = (for_trx ? MDL_TRANSACTION : MDL_EXPLICIT);
+  return acquire_mdl_for_backup(thd, MDL_INTENTION_EXCLUSIVE, duration, lock_wait_timeout);  // ★ IX
+}
+```
+
+**"Exclusive" 拿的是 S，"Shared" 拿的是 IX**——与名字恰好相反。源码注释给了完整的选型推理，三条环环相扣：
+
+1. **IX 与 S 互斥**，但两者**各自与自己兼容**（多个 DDL 可同时持 IX，多次备份可同时持 S）。
+2. ★ **IX 的优先级低于 S**（见「优先级与饿死」节）——这是关键：备份是**罕见**操作，DDL 是**频繁**操作，如果给备份用低优先级的 IX，它会被源源不断的 DDL 饿死。
+3. 所以颠倒过来：罕见的备份拿**高优先级的 S**（不会被 DDL 饿死），频繁的 DDL 拿**低优先级的 IX**；而 S 与 IX 互斥正好实现了"备份期间禁止 DDL"。
+
+⇒ 于是命名跟着**语义**走而非跟着 MDL 锁类型走：对备份来说"能挡住所有 DDL"就是 Exclusive，所以 S 被叫作 Exclusive Backup Lock；DDL 之间互不干扰只是"共享"地声明自己在改结构，所以 IX 被叫作 Shared Backup Lock。
+
+另外两点：`MDL_REQUEST_INIT` 的 db/name 都是空串——`BACKUP_LOCK` 是实例级 singleton（上表"粒度"列），不需要名字；`duration` 由 `for_trx` 决定是 `MDL_TRANSACTION`（事务内）还是 `MDL_EXPLICIT`（显式持有，需 `LOCK INSTANCE FOR BACKUP` 后手动释放）。释放侧 `release_backup_lock` 用一个 `MDL_release_locks_visitor` 按 namespace 过滤（`ticket->get_key()->mdl_namespace() == MDL_key::BACKUP_LOCK`）批量释放。
 
 分派代码（`get_strategy()` 完整）：
 
@@ -935,6 +1439,192 @@ thd->mdl_context.set_force_dml_deadlock_weight(false);
 
 #### 与 InnoDB 死锁检测的对比
 
+**★ victim 权重是静态常量，与回滚代价无关**（`mdl.h:958`）：
+
+```cpp
+class MDL_wait_for_subgraph {
+ public:
+  virtual bool accept_visitor(MDL_wait_for_graph_visitor *gvisitor) = 0;
+
+  static const uint DEADLOCK_WEIGHT_CO  = 0;    // commit order wait（复制），最低
+  static const uint DEADLOCK_WEIGHT_DML = 25;
+  static const uint DEADLOCK_WEIGHT_ULL = 50;   // user level lock (GET_LOCK)
+  static const uint DEADLOCK_WEIGHT_DDL = 100;  // 最高，最不容易被牺牲
+
+  virtual uint get_deadlock_weight() const = 0;
+};
+```
+
+```cpp
+uint MDL_ticket::get_deadlock_weight() const {
+  /* Waits for user-level locks have lower weight than waits for locks
+  typically acquired by DDL, so we don't abort DDL in case of deadlock
+  involving user-level locks and DDL. ... */
+  if (m_lock->key.mdl_namespace() == MDL_key::USER_LEVEL_LOCK)
+    return DEADLOCK_WEIGHT_ULL;
+
+  /* Locks higher or equal to MDL_SHARED_UPGRADABLE:
+     *) Are typically acquired for DDL and LOCK TABLES statements.
+     *) Are often acquired in a way which doesn't allow simple release of
+        locks and restart of lock acquisition process in case of deadlock
+        (e.g. through lock_table_names() call).
+     To avoid such statements getting aborted with ER_LOCK_DEADLOCK error
+     we use the higher DEADLOCK_WEIGHT_DDL weight for them. ... */
+  if (m_lock->key.mdl_namespace() == MDL_key::GLOBAL ||
+      m_type >= MDL_SHARED_UPGRADABLE)
+    return DEADLOCK_WEIGHT_DDL;
+
+  return DEADLOCK_WEIGHT_DML;
+}
+```
+
+> ⚠️ **勘误：不存在 `MDL_CONTEXT_VICTIM_WEIGHT_*`**（全仓 0 命中）。真名 `MDL_wait_for_subgraph::DEADLOCK_WEIGHT_*`。
+> ⚠️ **`DEADLOCK_WEIGHT_CO` 的唯一使用者**是 `rpl_replica_commit_order_manager.cc:551`（"Return the lowest weight so that workers are [chosen as victims]"）。
+
+**★ 深度上限的真名与语义**（`mdl.cc:342`）：
+
+```cpp
+  static const uint MAX_SEARCH_DEPTH = 32;      // ★ 不是 MAX_DEPTH_TO_SEARCH
+```
+
+```cpp
+bool Deadlock_detection_visitor::enter_node(MDL_context *node) {
+  m_found_deadlock = ++m_current_search_depth >= MAX_SEARCH_DEPTH;
+  //  ★★ 超深度 =「无条件宣告死锁」，不是放弃搜索
+  if (m_found_deadlock) {
+    assert(!m_victim);
+    opt_change_victim_to(node);                 // 把当前最深节点当 victim
+  }
+  return m_found_deadlock;
+}
+```
+
+**victim 竞选**（回溯路径上每节点都参与）：
+
+```cpp
+void Deadlock_detection_visitor::leave_node(MDL_context *node) {
+  --m_current_search_depth;
+  if (m_found_deadlock) opt_change_victim_to(node);
+}
+
+void Deadlock_detection_visitor::opt_change_victim_to(MDL_context *new_victim) {
+  if (m_victim == nullptr ||
+      m_victim->get_deadlock_weight() >= new_victim->get_deadlock_weight()) {
+    MDL_context *tmp = m_victim;
+    m_victim = new_victim;
+    m_victim->lock_deadlock_victim();     // ★ 上读锁，防止 victim 在选中期间消失
+    if (tmp) tmp->unlock_deadlock_victim();
+  }
+}
+```
+
+**★ 边遍历是「先 BFS 扫边，再 DFS 递归」四轮**（`mdl.cc:3978`）：
+
+```cpp
+  /* We do a breadth-first search first -- that is, inspect all
+  edges of the current node, and only then follow up to the next
+  node. In workloads that involve wait-for graph loops this
+  has proven to be a more efficient strategy. */
+  while ((ticket = granted_it++)) {                      // ① BFS: granted
+    if (ticket->get_ctx() != src_ctx &&
+        ticket->is_incompatible_when_granted(waiting_ticket->get_type()) &&
+        gvisitor->inspect_edge(ticket->get_ctx()))
+      goto end_leave_node;
+  }
+  while ((ticket = waiting_it++)) {                      // ② BFS: waiting
+    if (ticket->get_ctx() != src_ctx &&
+        ticket->is_incompatible_when_waiting(waiting_ticket->get_type()) &&
+        gvisitor->inspect_edge(ticket->get_ctx()))
+      goto end_leave_node;
+  }
+  granted_it.rewind();
+  while ((ticket = granted_it++)) {                      // ③ DFS: granted
+    if (... && ticket->get_ctx()->visit_subgraph(gvisitor))
+      goto end_leave_node;
+  }
+  waiting_it.rewind();
+  while ((ticket = waiting_it++)) {                      // ④ DFS: waiting
+    if (... && ticket->get_ctx()->visit_subgraph(gvisitor))
+      goto end_leave_node;
+  }
+```
+
+**★ 防"假死锁"**（`mdl.cc:3957` 注释里画的时序）：
+
+> 边已入 waiting 队列、但目标其实**已被授予**（授予方改了队列，等待方还没清 `m_waiting_for`）→ 会误判成环。**解法：先查源节点 wait slot 是否还空着**：
+
+```cpp
+  if (src_ctx->m_wait.get_status() != MDL_wait::WS_EMPTY) {
+    result = false;
+    goto end;
+  }
+```
+
+**`find_deadlock()` 是个 while(true) 循环**（`mdl.cc:4077`）：
+
+```cpp
+void MDL_context::find_deadlock() {
+  while (true) {
+    /* The fact that we use fresh instance of gvisitor for each
+    search performed by find_deadlock() below is important,
+    the code responsible for victim selection relies on this. */
+    Deadlock_detection_visitor dvisitor(this);
+    MDL_context *victim;
+    if (!visit_subgraph(&dvisitor)) break;             // 没环 → 结束
+
+    victim = dvisitor.get_victim();
+    (void)victim->m_wait.set_status(MDL_wait::VICTIM);
+    victim->unlock_deadlock_victim();
+
+    if (victim == this) break;
+    /* After adding a new edge to the waiting graph we found that it
+    creates a loop (i.e. there is a deadlock). We decided to destroy
+    this loop by removing an edge, but not the one that we added.
+    Since this doesn't guarantee that all loops created by addition
+    of the new edge are destroyed, we have to repeat the search. */
+  }
+}
+```
+
+> ★★ **干掉的可能是环上另一条边，新加的边可能还在别的环里 → 必须重搜**。
+
+**对比表**：
+
+| | MDL | InnoDB 行锁 |
+|---|---|---|
+| 图节点 | `MDL_context`（每连接一个） | `trx_t` |
+| 边 | `MDL_context::m_waiting_for` → 一张 `MDL_ticket`（**只有一条出边**） | lock → trx（可多条） |
+| victim 权重 | **静态常量**（CO 0 / DML 25 / ULL 50 / DDL 100） | **事务权重 = 已修改行数 + 已加锁数**（`trx_weight_ge()`） |
+| 深度上限 | `MAX_SEARCH_DEPTH = 32`，超限**判死锁** | 无硬上限，靠 `UT_LIST` 遍历 |
+| 遍历 | BFS 扫边 + DFS 递归（四轮） | 纯 DFS 递归 |
+| 报错 | `ER_LOCK_DEADLOCK` | `ER_LOCK_DEADLOCK`（"Deadlock found when trying to get lock"） |
+| 能否关闭 | 不能（`lock_wait_timeout=0` 或 ACL_CACHE 特殊路径会跳过） | `innodb_deadlock_detect=OFF` |
+
+**★ 什么时候根本不跑死锁检测**：
+
+```cpp
+  if (lock_wait_timeout == 0) {
+    /* Resort to try_acquire_lock() in case of zero timeout.
+    This allows to avoid unnecessary deadlock detection attempt and "fake"
+    deadlocks which might result from it. */
+    if (try_acquire_lock(mdl_request)) return true;
+    ...
+  }
+```
+
+```cpp
+  /* ACL_CACHE 的 S 锁 + 已有等待者 → 把死锁检测推迟 1 秒，赌它先拿到 */
+  bool delayed_find_deadlock = false;
+  if (lock->key.mdl_namespace() != MDL_key::ACL_CACHE ||
+      ticket->m_type != MDL_SHARED ||
+      get_owner()->might_have_commit_order_waiters()) {
+    find_deadlock();
+  } else if (has_locks()) {
+    assert(lock->needs_connection_check());
+    delayed_find_deadlock = true;
+  }
+```
+
 | 维度 | MDL（server 层） | InnoDB（引擎层） |
 |---|---|---|
 | 触发时机 | **主动：每次开始等待前**（加边时） | 后台线程周期性 + 事件触发 |
@@ -951,6 +1641,168 @@ thd->mdl_context.set_force_dml_deadlock_weight(false);
 ### 扩展用法
 
 #### 用户级锁 GET_LOCK（5.7 起基于 MDL）
+
+⚠️ **勘误**：GET_LOCK 的代码**不在 `sql/lock.cc`**（那是 thr_lock 表锁，`grep User_level_lock` 0 命中），真身在 **`sql/item_func.cc:5203`**。
+
+**★ 它拿的是什么锁**（`item_func.cc:5411`）：
+
+```cpp
+  MDL_request ull_request;
+  MDL_REQUEST_INIT(&ull_request, MDL_key::USER_LEVEL_LOCK, "", name,
+                   MDL_EXCLUSIVE, MDL_EXPLICIT);
+  //                ★ namespace=USER_LEVEL_LOCK，类型=X，duration=EXPLICIT（跨事务存活）
+```
+
+> ⚠️ **不是 `MDL_SHARED`**——是 **X 锁**！所以 `GET_LOCK('a')` 与 `GET_LOCK('a')` 互相排斥，语义上等价互斥锁。
+
+**为什么还要额外一个 `User_level_lock` 结构**（注释原文）：
+
+```cpp
+/**
+  For locks with EXPLICIT duration, MDL returns a new ticket
+  every time a lock is granted. This allows to implement recursive
+  locks without extra allocation or additional data structures, such
+  as below. However, if there are too many tickets in the same
+  MDL_context, MDL_context::find_ticket() is getting too slow,
+  since it's using a linear search.
+  This is why a separate structure is allocated for a user
+  level lock held by connection, and before requesting a new lock from MDL,
+  GET_LOCK() checks thd->ull_hash if such lock is already granted,
+  and if so, simply increments a reference counter.
+*/
+
+struct User_level_lock {
+  MDL_ticket *ticket;   // 指向真实 MDL ticket
+  uint refs;            // 递归计数
+};
+```
+
+**★ 名字强制小写**（`item_func.cc:5305`）：
+
+```cpp
+  buff[bytes_copied] = '\0';
+  my_casedn_str(system_charset_info, buff);
+  //  ★★ GET_LOCK('a') 与 GET_LOCK('A') 是同一把锁（MDL 内部是二进制比较）
+```
+
+**★ 超时被吞掉，换成返回值 0 而不是报错**（`item_func.cc:5265`）：
+
+```cpp
+class User_level_lock_wait_error_handler : public Internal_error_handler {
+ public:
+  bool handle_condition(THD *, uint sql_errno, const char *,
+                        Sql_condition::enum_severity_level *,
+                        const char *) override {
+    if (sql_errno == ER_LOCK_WAIT_TIMEOUT) {
+      m_lock_wait_timeout = true;
+      return true;                    // ★ 吞掉超时
+    } else if (sql_errno == ER_LOCK_DEADLOCK) {
+      my_error(ER_USER_LOCK_DEADLOCK, MYF(0));   // ★ 换成 USER_LOCK_DEADLOCK
+      return true;                    //   （不回滚事务！）
+    }
+    return false;
+  }
+```
+
+> ★★ 注释明说：*"The former means that implicit rollback of transaction has occurred which doesn't (and should not) happen when we get deadlock while waiting for user-level lock."* —— **GET_LOCK 死锁不会回滚事务**，这是它跟普通 MDL 死锁的关键差别。
+
+**★ 负 timeout 会被当成无限等待**：
+
+```cpp
+  /* Convert too big and negative timeout values to INT_MAX32.
+  This gives robust, "infinite" wait on all platforms. */
+  if (timeout > INT_MAX32) timeout = INT_MAX32;
+  //  ★ ulonglong timeout 是 (ulonglong) 读的，负数实参变成巨大正数 → INT_MAX32
+```
+
+**递归只加引用计数，不再问 MDL**：
+
+```cpp
+  const auto it = thd->ull_hash.find(ull_key);
+  if (it != thd->ull_hash.end()) {
+    /* Recursive lock. */
+    it->second->refs++;
+    null_value = false;
+    return 1;
+  }
+```
+
+**释放时引用计数归零才真正放锁**：
+
+```cpp
+  if (--ull->refs == 0) {
+    thd->ull_hash.erase(it);
+    thd->mdl_context.release_lock(ull->ticket);
+    my_free(ull);
+  }
+```
+
+**★ `IS_USED_LOCK` / `IS_FREE_LOCK` 走 `find_lock_owner()` + visitor**：
+
+```cpp
+class MDL_lock_get_owner_thread_id_visitor : public MDL_context_visitor {
+ public:
+  void visit_context(const MDL_context *ctx) override {
+    m_owner_id = ctx->get_owner()->get_thd()->thread_id();   // PROCESSLIST_ID
+  }
+  my_thread_id get_owner_id() const { return m_owner_id; }
+ private:
+  my_thread_id m_owner_id;
+};
+```
+
+```cpp
+bool MDL_context::find_lock_owner(const MDL_key *mdl_key,
+                                  MDL_context_visitor *visitor) {
+  ...
+  if ((owner = lock->get_lock_owner())) visitor->visit_context(owner);
+  ...
+}
+
+inline MDL_context *MDL_lock::get_lock_owner() const {
+  Ticket_iterator it(m_granted);
+  MDL_ticket *ticket;
+  if ((ticket = it++)) return ticket->get_ctx();   // ★ 只返回链表第一个
+  return nullptr;
+}
+```
+
+> ⚠️ **关键限制**（`mdl.cc:4458` 注释原文）：*"This method only works properly for locks which were acquired using 'slow' path."* —— fast path 锁**不在 `m_granted` 链表里**，所以 `IS_USED_LOCK()` 对 fast path 的锁可能返回 NULL（误判为"空闲"）。不过 GET_LOCK 用的是 X 锁（必然 slow path），所以这条对 GET_LOCK 不适用。
+
+**连接断开时的清理**（`item_func.cc:5224`）：
+
+```cpp
+void mysql_ull_cleanup(THD *thd) {
+  for (const auto &key_and_value : thd->ull_hash) {
+    User_level_lock *ull = key_and_value.second;
+    thd->mdl_context.release_lock(ull->ticket);
+    my_free(ull);
+  }
+  thd->ull_hash.clear();
+}
+```
+
+**★ `needs_connection_check()`——断连即中止等待**：
+
+```cpp
+  static bool object_lock_needs_connection_check(const MDL_lock *lock) {
+    return (lock->key.mdl_namespace() == MDL_key::USER_LEVEL_LOCK ||
+            lock->key.mdl_namespace() == MDL_key::LOCKING_SERVICE ||
+            lock->key.mdl_namespace() == MDL_key::ACL_CACHE);
+  }
+```
+
+```cpp
+      if (lock->needs_connection_check() && !m_owner->is_connected()) {
+        /* If this is user-level lock and the client is disconnected don't wait
+        forever: assume it's the same as statement being killed (this differs
+        from pre-5.7 where we treat it as timeout, but is more logical). */
+        if (!m_wait.set_status(MDL_wait::KILLED)) wait_status = MDL_wait::KILLED;
+        break;
+      }
+```
+
+> ★ 这三个 namespace 的等待会被切成 **1 秒小段轮询**（`set_timespec(&abs_shortwait, 1)`），而不是一次睡到超时——就是为了让断连检查有机会执行。
 
 实现在 `sql/item_func.cc`，**直接复用 `MDL_context::acquire_lock()`**：
 
@@ -1106,6 +1958,32 @@ void rollback_to_savepoint(const MDL_savepoint &mdl_savepoint) {
 
 （因为"语句/事务锁总是 prepend 到链头"，所以从队头一路 pop 到哨兵即可。**显式锁不参与**——ROLLBACK TO SAVEPOINT 后 HANDLER/LOCK TABLES/GET_LOCK 仍保留。）
 
+释放侧的本体就是那个"哨兵遍历"，值得单独看一眼：
+
+```cpp
+void MDL_context::release_locks_stored_before(enum_mdl_duration duration,
+                                              MDL_ticket *sentinel) {
+  MDL_ticket *ticket;
+  MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+  if (m_ticket_store.is_empty(duration)) {
+    return;
+  }
+
+  while ((ticket = it++) && ticket != sentinel) {
+    DBUG_PRINT("info", ("found lock to release ticket=%p", ticket));
+    release_lock(duration, ticket);
+  }
+}
+```
+
+★ 三个细节决定了它为什么是对的：
+
+1. **哨兵是"指针相等"比较，不是计数**——`ticket != sentinel` 直接比指针。所以 savepoint 不需要记录"当时有几个锁"，只需记住**当时队头那个 ticket 对象**；回滚就是一路走到它为止。这就是上文"savepoint 就是两个队头指针"能成立的原因。
+2. ★ **`sentinel == nullptr` 时是"全部释放"**——条件 `ticket != sentinel` 在哨兵为空时永远为真，循环会走到链表末尾。所以同一个函数既服务 `rollback_to_savepoint`（传哨兵，部分释放），也服务"释放该 duration 的所有锁"（传 nullptr）。
+3. **空链表快速返回**：`is_empty(duration)` 直接 return，避免为"压根没锁"的 duration 走一遍迭代器。
+
+（对比：`acquire_locks` 批量获取失败时用的也是同一套——见 `MDL_context::acquire_locks` 里先记 `explicit_front = m_ticket_store.front(MDL_EXPLICIT)`，失败后用 `release_locks_stored_before(MDL_EXPLICIT, explicit_front)` 只回滚这次新加的显式锁，语义与 savepoint 完全一致。）
+
 `release_lock()` 的两个顺序细节：① **先从 `m_ticket_store` 摘 ticket 再释放锁**（哈希索引要读 `MDL_lock::key`，而 lock 可能随后被销毁）；② X 锁的 key 要**拷贝到栈上**，因为 `MDL_lock` 对象可能在释放过程中被回收。
 
 ---
@@ -1182,6 +2060,114 @@ void rollback_to_savepoint(const MDL_savepoint &mdl_savepoint) {
 数据由 MDL 侧在 ticket 创建时通过 `mysql_mdl_create()` 写入，状态变化用 `mysql_mdl_set_status()`，销毁用 `mysql_mdl_destroy()`。**fast path 锁同样会登记**。需 `setup_instruments` 里打开 `wait/lock/metadata/sql/mdl`。
 
 ### 18 个等待状态字符串（`SHOW PROCESSLIST`）
+
+**完整数组**（`mdl.cc:110`）——下标即 `enum_mdl_namespace` 的值：
+
+```cpp
+PSI_stage_info MDL_key::m_namespace_to_wait_state_name[NAMESPACE_END] = {
+    {0, "Waiting for global read lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for backup lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for tablespace metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for schema metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for table metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for stored function metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for stored procedure metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for trigger metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for event metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for commit lock", 0, PSI_DOCUMENT_ME},
+    {0, "User lock", 0, PSI_DOCUMENT_ME}, /* Be compatible with old status. */
+    {0, "Waiting for locking service lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for spatial reference system lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for acl cache lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for column statistics lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for resource groups metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for foreign key metadata lock", 0, PSI_DOCUMENT_ME},
+    {0, "Waiting for check constraint metadata lock", 0, PSI_DOCUMENT_ME}};
+```
+
+> ⚠️ **第 11 项（USER_LEVEL_LOCK）是 `"User lock"`，没有 "Waiting for" 前缀**——注释明写 "Be compatible with old status"。所以 `GET_LOCK()` 卡住时 PROCESSLIST 显示 **`User lock`**，不是 "Waiting for user lock"。这是最常见的误判点。
+
+**取用是 O(1) 数组下标，无锁**（`mdl.h:762`）：
+
+```cpp
+  const PSI_stage_info *get_wait_state_name() const {
+    return &m_namespace_to_wait_state_name[(int)mdl_namespace()];
+  }
+```
+
+**PSI stage 注册**（`mdl.cc:135`）——逐个注册为 `sql/*` 下的 stage event：
+
+```cpp
+void MDL_key::init_psi_keys() {
+  int count = static_cast<int>(
+      array_elements(MDL_key::m_namespace_to_wait_state_name));
+  for (int i = 0; i < count; i++) {
+    /* mysql_stage_register wants an array of pointers, registering 1 by 1. */
+    PSI_stage_info *info = &MDL_key::m_namespace_to_wait_state_name[i];
+    mysql_stage_register("sql", &info, 1);
+  }
+}
+```
+
+**`mdl.h:373` 的强制约定**：
+
+```cpp
+    Object namespaces.
+    Sic: when adding a new member to this enum make sure to
+    update m_namespace_to_wait_state_name array in mdl.cc!
+```
+
+```cpp
+// storage/perfschema/table_helper.cc:736 —— PFS 侧有 static_assert 兜底
+  static_assert(MDL_key::NAMESPACE_END == 18,
+                "Adjust performance schema when changing enum_mdl_namespace");
+```
+
+> ★ **实战**：这些字符串同时也是 **PFS stage 事件名**，`performance_schema.events_stages_history_long` 里能看到。比 `SHOW PROCESSLIST` 更能定位"卡在哪个 namespace"。
+
+**★ 一次普通 DDL 会拿哪些 scoped MDL**（`sql_base.cc:5390 lock_table_names()`）：
+
+```
+GLOBAL  IX  (MDL_STATEMENT)     ← 防 FTWRL
+BACKUP  IX  (MDL_TRANSACTION)   ← DDL 自动带（LOCK TABLES 除外）
+SCHEMA  IX  (MDL_TRANSACTION)   ← 每个涉及的 schema 一个
+TABLE   X                       ← 目标表
+```
+
+```cpp
+      MDL_REQUEST_INIT(&global_request, MDL_key::GLOBAL, "", "",
+                       MDL_INTENTION_EXCLUSIVE, MDL_STATEMENT);
+  ...
+  if (acquire_backup_lock) {
+    MDL_REQUEST_INIT(&backup_lock_request, MDL_key::BACKUP_LOCK, "", "",
+                     MDL_INTENTION_EXCLUSIVE, MDL_TRANSACTION);
+    mdl_requests.push_front(&backup_lock_request);
+  }
+  // Phase 3: Acquire the locks which have been requested so far.
+  if (thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout))
+    return true;
+```
+
+> ★★ **这解释了为什么 FTWRL 会卡住后续所有 DDL**：FTWRL 持 `GLOBAL S`，而每个 DDL 都要 `GLOBAL IX`，两者在 scoped 矩阵里不兼容。
+
+**DEBUG_SYNC 全集**（★ 复现并发 MDL 问题的手段）：
+
+| 同步点 | 位置 | 用途 |
+|---|---|---|
+| `mdl_acquire_lock_wait` | `mdl.cc:3472` | ★ 即将进入锁等待——**最常用注入点** |
+| `mdl_acquire_lock_wait` | `mdl.cc:3406` | 零超时未拿到 |
+| `mdl_upgrade_lock` | `mdl.cc:3785` | ★ `upgrade_shared_lock()` 入口（抓 ALTER 的 SU→X） |
+| `alter_table_inplace_after_lock_downgrade` | `sql_table.cc:13567` | inplace ALTER 把 X 降级为 SNW/SU 之后 |
+| `mdl_acquire_lock_is_destroyed_fast_path` | `mdl.cc:2997` | fast path 撞上已销毁对象 |
+| `mdl_acquire_lock_is_destroyed_slow_path` | `mdl.cc:3090` | slow path 撞上已销毁对象 |
+| `mdl_find_lock_owner_is_destroyed` | `mdl.cc:4482` | `find_lock_owner()` 重试 |
+| `mdl_remove_random_unused_*`（3 个） | `mdl.cc:1321/1344/1383` | MDL_lock 对象回收 |
+| `before/after_lock_tables_takes_lock` | `sql_base.cc:6910/6916` | thr_lock 加锁前后 |
+
+```
+SET DEBUG_SYNC = 'mdl_acquire_lock_wait SIGNAL mdl_wait WAIT_FOR go';
+-- 另开连接制造 MDL 冲突，然后 SET DEBUG_SYNC = 'now SIGNAL go';
+```
 
 来自 `MDL_key::m_namespace_to_wait_state_name[]`，**下标即 namespace 枚举序**——这是按 `PROCESSLIST_STATE` 反查"卡在哪类对象上"的最快方式：
 
@@ -1264,6 +2250,97 @@ FTWRL 的备份线程持有 `COMMIT` 锁（MDL），SQL 线程等 `COMMIT` 锁�
 **教训**：rename/DDL 卡住时先看 pstack 停在哪个函数——停在 MDL 等待点才是 MDL 问题，停在 `fil_rename_tablespace` 是文件层问题。**持有 MDL 不代表死锁环里有 MDL**。
 
 ### 易混淆概念
+
+**① `MDL_context::downgrade_lock()` 不存在**——降级只有 **`MDL_ticket::downgrade_lock()`**（`mdl.cc:4329`）。INPLACE DDL 里那句 `table->mdl_ticket->downgrade_lock(MDL_SHARED_NO_WRITE)` 是 ticket 的方法。
+
+**② 升级不是"原地改类型"，而是"重新申请一把"**（`mdl.cc:3776`）：
+
+```cpp
+  MDL_REQUEST_INIT_BY_KEY(&mdl_new_lock_request, &mdl_ticket->m_lock->key,
+                          new_type, MDL_TRANSACTION);
+  if (acquire_lock(&mdl_new_lock_request, lock_wait_timeout)) return true;
+  ...
+  mdl_ticket->m_type = new_type;        // ★ 真正的"升级"就这一行
+  lock->m_granted.add_ticket(mdl_ticket);
+```
+
+> ★ 升级**可能等待、可能死锁**（注释：*"There can be only one upgrader for a lock or we will have deadlock"*）。而且只能**升到 obtrusive**（`assert(lock->is_obtrusive_lock(new_type))`）。
+
+**③ `acquire_shared_backup_lock()` 拿的是 IX，`acquire_exclusive_backup_lock()` 拿的是 S**——**函数名与锁类型完全颠倒**（`sql_backup_lock.cc:177`）：
+
+```cpp
+/*
+  IX and S locks are mutually incompatible. On the other hand both these
+  lock types are compatible with themselves. IX lock has lower priority
+  than S locks. So we can use S lock for rare Backup operation which should
+  not be starved by more frequent DDL operations using IX locks.
+
+  From all listed above follows that S lock should be considered as Exclusive
+  Backup Lock and IX lock should be considered as Shared Backup Lock.
+*/
+
+bool acquire_exclusive_backup_lock(THD *thd, ulong lock_wait_timeout,
+                                   bool for_trx) {
+  return acquire_mdl_for_backup(thd, MDL_SHARED, duration, lock_wait_timeout);
+  //                                 ★ MDL_SHARED
+}
+
+bool acquire_shared_backup_lock(THD *thd, ulong lock_wait_timeout,
+                                bool for_trx) {
+  return acquire_mdl_for_backup(thd, MDL_INTENTION_EXCLUSIVE, duration,
+                                lock_wait_timeout);
+  //                                 ★ MDL_INTENTION_EXCLUSIVE
+}
+```
+
+**④ `MDL_context_backup_manager` 与备份锁无关**——它是 **XA PREPARED 后客户端断开时保存 MDL 上下文**的单例（`sql/mdl_context_backup.h:45`）。
+
+**⑤ `lock_tables()` 不拿 MDL**——它只做 thr_lock（`mysql_lock_tables`）。MDL 在**之前的 `open_tables()` → `lock_table_names()`**（`sql_base.cc:5390`）里拿。
+
+**⑥ `MDL_context` 里没有 `m_tickets` 数组**——真实成员是 `MDL_ticket_store m_ticket_store;`，内部 `Duration m_durations[MDL_DURATION_END]`。且 **ticket 数 ≥ 256 时自动建 `std::unordered_multimap` 哈希索引**：
+
+```cpp
+  const size_t THRESHOLD = 256;              // "has worked well in benchmarks"
+  const size_t INITIAL_BUCKET_COUNT = THRESHOLD * 2;
+  ...
+  return (m_map == nullptr || m_count < THRESHOLD) ? find_in_lists(req)
+                                                   : find_in_hash(req);
+```
+
+**⑦ `m_tickets` 链表是"时间逆序"的**（`push_front`）——所以 `release_locks_stored_before(duration, sentinel)` 从 front 一路 pop 到 sentinel 就等价"释放 savepoint 之后的所有锁"。
+
+**⑧ `MDL_wait` 不是全局条件变量**——**每个 `MDL_context` 各持一个**（含自己的 `mysql_mutex_t` + `mysql_cond_t`）。
+
+**⑨ 超时是"等待者自己给自己定状态"**（`mdl.cc:1830`）：
+
+```cpp
+  if (m_wait_status == WS_EMPTY) {
+    if (owner->is_killed())
+      m_wait_status = KILLED;
+    else if (set_status_on_timeout)
+      m_wait_status = TIMEOUT;
+  }
+```
+
+> ★ 必须在锁内完成，防止"grant 方刚写 GRANTED、这边却判成超时"的竞态。**谁先抢到 `WS_EMPTY` 谁说了算**。`set_status_on_timeout == false` 时保持 `WS_EMPTY`，供 1 秒轮询复用。
+
+**⑩ 五个等待结局**：`WS_EMPTY` / `GRANTED` / `VICTIM` / `TIMEOUT` / `KILLED`。`set_status()` 是"一次写入"语义（非空则写不进去，返回 true 表示已被占）。
+
+**⑪ `metadata_locks_hash_instances` / `metadata_locks_cache_size` 都不存在**（全仓 0 命中）——5.6/5.7 的变量已删，8.0 用**单例 `MDL_map mdl_locks` + LF_HASH** 取代，分区由 LF_HASH 内部完成。
+
+**⑫ PFS 表真名是 `table_md_locks.cc`**，不是 `table_mdl.cc`；类型是 **`PFS_metadata_lock`**，不是 `PFS_MDL`。
+
+**⑬ `m_psi` 不在 `MDL_ticket::create()` 里赋值**（那里 `m_psi(nullptr)`）——真正赋值点是 `try_acquire_lock_impl()`（`mdl.cc:2915`）与 `clone_ticket()`（`mdl.cc:3221`）。
+
+**⑭ `sys.schema_table_lock_waits` 只覆盖 `object_type='TABLE'`**：
+
+```sql
+ WHERE g.object_type = 'TABLE';   -- ★ FTWRL / BACKUP LOCK / SCHEMA 阻塞都看不到
+```
+
+> ★★ 排查 FTWRL 或 `LOCK INSTANCE FOR BACKUP` 造成的阻塞，**必须直接查 `performance_schema.metadata_locks`**，这个视图帮不上忙。
+
+**⑮ `performance_schema_max_metadata_locks = 0` 会完全关闭 MDL 插桩**——表为空时先查这个变量。
 
 - **MDL 的 X vs InnoDB 的 X**：同名不同物（元数据排他锁 vs 行级排他锁）。一个 DML 同时持 MDL 的 SW + InnoDB 行锁。
 - **"写锁"不是 MDL 术语**：DML 用 `MDL_SHARED_WRITE`（"共享写"），DDL 用 `MDL_EXCLUSIVE`。

@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。涵盖 **InnoDB 完整 I/O 栈**（内存层 → fil 表空间层 → `IORequest` 抽象 → `os_file` 原语 → AIO 子系统 → 系统调用）、**server 层文件 I/O**（binlog / slow / general / error log）、**I/O 线程模型**、**压缩与加密对 I/O 的影响**，以及 **MySQL 跑在云盘上的特殊行为**。
 >
-> **边界**：本篇讲 **MySQL 与文件系统/块设备之间**的 I/O。Buffer Pool 的替换算法与 LRU 见 [`buffer_pool.md`](buffer_pool.md)；redo 的**格式、写/刷路径、后台线程与 checkpoint 语义**见 [`redo_log.md`](redo_log.md)（本篇只保留 redo 在 I/O 全景中的**横切对比**）；崩溃恢复见 [`recovery.md`](recovery.md)；DDL 的临时文件与 row log 见 [`ddl.md`](ddl.md)；**表空间元数据与 I/O 分发（fil 层）**见 [`fil.md`](fil.md)；**刷脏批次的组织、读路径与预读**见 [`buffer_pool.md`](buffer_pool.md)；**doublewrite 的完整实现**见 [`dblwr.md`](dblwr.md)；**InnoDB 并行扫描**见 [`parallel_scan.md`](parallel_scan.md)；**云存储（EBS/云盘）本身**见 [`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)。
+> **边界**：本篇讲 **MySQL 与文件系统/块设备之间**的 I/O。Buffer Pool 的替换算法与 LRU 见 [`buffer_pool.md`](buffer_pool.md)；redo 的**格式、写/刷路径、后台线程与 checkpoint 语义**见 [`redo_log.md`](redo_log.md)（本篇只保留 redo 在 I/O 全景中的**横切对比**）；崩溃恢复见 [`recovery.md`](recovery.md)；DDL 的临时文件与 row log 见 [`ddl.md`](../feat/ddl/ddl.md)；**表空间元数据与 I/O 分发（fil 层）**见 [`fil.md`](fil.md)；**刷脏批次的组织、读路径与预读**见 [`buffer_pool.md`](buffer_pool.md)；**doublewrite 的完整实现**见 [`dblwr.md`](dblwr.md)；**InnoDB 并行扫描**见 [`parallel_scan.md`](parallel_scan.md)；**云存储（EBS/云盘）本身**见 [`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)。
 
 - [概述](#概述)
 - [理论基础](#理论基础)
@@ -173,6 +173,36 @@ OS 的 page cache 已经很完善（LRU、readahead、write-back 合并），数
 
 > **被否决的方案**：完全交给 OS（即 PG 的做法）。PG 的 shared_buffers 官方建议只给内存的 25%，剩下靠 OS cache；MySQL 默认给 50~75% 并强烈建议 `O_DIRECT`。**MySQL 选了"自己控制"这条路**，换来可预测性，代价是复杂度（这套代码有几万行）。
 
+#### ★ 学术参照，以及一个必须澄清的混淆：mmap 有两种用法
+
+> Crotty, Leis, Pavlo，*"Are You Sure You Want to Use MMAP in Your Database Management System?"*，**CIDR 2022**（<https://db.cs.cmu.edu/mmap-cidr2022>）——系统论证了 mmap **不能**作为 buffer pool 的替代，可视为上表的学术版论证。
+
+论文列举的 mmap 四宗罪（针对**文件映射 I/O**）：
+
+| 问题 | 机制 | 论文的观察 |
+|------|------|-----------|
+| **事务安全** | OS 可在任意时刻静默回写脏页；`msync` 能强制刷但**无法阻止刷**（等价于强制 steal 策略），且无通知 | 应对只有三种 COW：内核 COW（MongoDB MMAPv1）、用户态 COW（SQLite、RavenDB）、影子分页（LMDB，仅单写者） |
+| **I/O 停顿** | mmap 无异步接口；OS 驱逐时机不可控，`mlock`/`madvise(MADV_WILLNEED)` 只是建议 | 补救手段（额外预取线程）恰恰抵消了 mmap 的"简单"收益 |
+| **错误处理** | 无内存/磁盘的明确边界 → checksum 每次访问都得重算；I/O 错误（SIGBUS）可能在**任意内存访问处**触发 | 与 Buffer Pool"刷盘时集中校验 + 集中处理 I/O 错误"对比鲜明 |
+| **性能** | 内核**页表竞争**、**单线程页面驱逐**、**TLB shootdown**（核间中断数千周期） | 随机读实验：page cache 打满后 I/O 跌 0 近 5 秒；10 块 SSD 与 1 块 SSD 吞吐几乎相同——**不随硬件扩展** |
+
+**★ 必须澄清的混淆：mmap 有两种完全不同的用法**
+
+1. **文件映射 I/O**（`mmap(MAP_SHARED, fd)`）——把文件内容映射进地址空间，让 OS 管页面加载/回写。**这才是论文批判的对象**。
+2. **匿名内存分配**（`mmap(MAP_PRIVATE|MAP_ANON)`）——只是向内核要一块内存，与文件无关。**InnoDB 的 BP chunk 属于这一类**：`ut::malloc_large_page_withkey` → `detail/ut/large_page_alloc-linux.h` 的 `MAP_PRIVATE|MAP_ANON|MAP_HUGETLB`，语义等价于"malloc 大块"（BP 体积远超 glibc 的 `MMAP_THRESHOLD` 128KB，底层本来就是匿名 mmap）。
+
+**结论：InnoDB 恰好站在论文推荐的一侧**——自己管 buffer pool + `O_DIRECT` + 显式 AIO，**数据文件 I/O 完全不走 mmap**（见[server 层 vs InnoDB 层对照表](#server-层-vs-innodb-层一张对照表)）。论文所述"最初用 MMAP、后来付出巨大工程代价改为自己管文件 I/O"的系统（MongoDB MMAPv1、InfluxDB、QuestDB 等）**不含 InnoDB**。
+
+MySQL 里真正属于文件映射 I/O、适用论文批判的是 **server 层的 3 处**：
+
+| 用法 | 位置 | 是否受论文批判影响 |
+|------|------|-------------------|
+| `tc_log`（XA 2PC） | `sql/tc_log.cc`，mmap + `my_msync`（= `msync` + `fsync`，`my_mmap.cc` 注释明写"msync 只刷到 fs cache，必须再 fsync"） | 已用双重保证，**是唯一严谨的 mmap 持久化用法**；XA 提交量小，不在性能关键路径 |
+| MyISAM `myisam_use_mmap` | `mi_mmap_pread/pwrite` | 真·文件映射 I/O，且 key cache 与 OS page cache 形成**双缓存**；MyISAM 非事务引擎，事务安全一条不适用 |
+| TempTable MMAP | `temptable` 的 MMAP_FILE（tmpdir 里的匿名文件） | 临时数据不要求持久性，**事务安全与 I/O 停顿问题均不适用** |
+
+> **反向视角**：RavenDB CEO Oren Eini 撰文反驳该论文，认为 Buffer Pool 同样要处理驱逐、页表竞争是已修复的内核 bug、单线程驱逐在脏页少时不构成瓶颈，且批评论文的基准只对比 fio 而没有 Buffer Pool 对照。两个视角合起来看：mmap 是**"开发成本 vs 可控性"的 trade-off**，不是单纯的对错——但对需要严格 WAL 与可预测延迟的事务型 DBMS，论文的结论依然成立。
+
 #### 二、为什么 redo 用同步写、数据页用异步 AIO
 
 | | redo | 数据页 |
@@ -213,6 +243,7 @@ binlog 是**顺序追加、量小**，且组提交已经把 fsync 摊薄成"一�
 | **五分钟法则（Gray & Putzolu, 1987）** | 页的访问频率 × 页大小 vs 内存/磁盘价格，决定哪些页该常驻内存 | Buffer Pool 存在的经济学依据（不是"越大越好"，而是"边际收益低于内存成本时停止"） |
 | **Volcano / 迭代器模型（Graefe 1990）** | 一次一行（`ha_rnd_next`） | 决定了 MySQL 的读 I/O 是**逐行触发的随机读**，而不是批量列式扫描（也是为什么预读机制必须存在） |
 | **libaio vs io_uring** | io_uring 用环形队列消除系统调用开销 | MySQL 8.0.39 **仍用 libaio**（`LINUX_NATIVE_AIO`），全仓库 `io_uring` **0 匹配** |
+| **"别用 mmap 做 DBMS 的文件 I/O"（Crotty/Leis/Pavlo, CIDR 2022）** | mmap 替代 buffer pool 在事务安全、I/O 停顿、错误处理、性能（TLB shootdown / 单线程驱逐）四方面均有结构性问题 | InnoDB 数据文件 **0 处 mmap**——正是该论文推荐的形态；server 层仍有 3 处（`tc_log` / MyISAM / TempTable），见本章「★ 学术参照」 |
 | **Chain/Quorum replication** | 分布式副本模型 | 不在 MySQL 侧，见 `../cloud/cloud_storage.md` |
 
 ### 算法与数据结构
@@ -323,6 +354,97 @@ fil_system（全局单例）
 **为什么要 68 个分片**：把 `fil_system` 的全局 mutex 拆成 68 把。高并发建表 / 删表 / 刷表空间时，不同 `space_id` 落在不同 shard，锁争用大幅下降。**undo 单独分片**是因为 undo 表空间的 extend 会持锁较久，不能让它卡住普通表空间。
 
 #### 主链路：`fil_io` → `Fil_shard::do_io`
+
+⚠️ **勘误**：`class Fil_shard` **定义在 `fil0fil.cc:658`**，不在 `fil0fil.h`（头文件里只有 friend 声明 `:1826`）——这是本版本一个显著的反直觉点。
+
+```cpp
+// fil0fil.cc:658 —— 分片内部的三张表
+class Fil_shard {
+  using File_list = UT_LIST_BASE_NODE_T(fil_node_t, LRU);
+  using Space_list = UT_LIST_BASE_NODE_T(fil_space_t, unflushed_spaces);
+  using Spaces = std::unordered_map<space_id_t, fil_space_t *>;   // ★ space_id → fil_space_t*
+  using Names = std::unordered_map<const char *, fil_space_t *, Char_Ptr_Hash,
+                                   Char_Ptr_Compare>;             // ★ 按名字的哈希
+ private:
+  const size_t m_id;
+  Spaces m_spaces;
+  Names m_names;
+  Deleted_spaces m_deleted_spaces;   // ★ 已删除、等引用计数归零才真正释放
+
+  /** Base node for the LRU list of the most recently used open files with no
+  pending I/O's; if we start an I/O on the file, we first remove it from this
+  list, and return it to the start of the list when the I/O ends; the system
+  tablespace file is not put to this list */
+  File_list m_LRU;                   // ★★ 打开文件的 LRU，用来限制 fd 数量
+
+  /** Base node for the list of those tablespaces whose files contain
+  unflushed writes */
+  Space_list m_unflushed_spaces;     // ★★ fil_flush_file_spaces() 遍历的就是它
+
+  int64_t m_modification_counter;
+  mutable ib_mutex_t m_mutex;        // ★ 每个 shard 一把独立 mutex —— 拆 shard 的核心收益
+};
+```
+
+**`fil_node_t`（一个文件）**（`fil0fil.h:155`）：
+
+```cpp
+struct fil_node_t {
+  fil_space_t *space;          // 一个表空间可对应多个文件
+  char *name;
+  bool is_open;
+  pfs_os_file_t handle;
+  os_event_t sync_event;       // ★★ 同一文件的 fsync 被这个 event 串行化/合并
+  bool is_raw_disk;
+  page_no_t size;              // 文件页数
+  page_no_t flush_size;        // ★ 上次 flush 时的大小（O_DIRECT_NO_FSYNC 下判元数据同步）
+  page_no_t init_size;
+  page_no_t max_size;
+  size_t n_pending_ios;        // ★★ 非 0 时文件不能从 m_LRU 摘掉关闭
+  size_t n_pending_flushes;
+  bool is_being_extended;      // ★ 扩展中
+  int64_t modification_counter;
+  int64_t flush_counter;
+  List_node LRU;
+  bool punch_hole;             // ★ 文件系统是否支持打洞
+  size_t block_size;           // ★ 打洞用的 block size
+  bool atomic_write;
+};
+```
+
+> ★ `sync_event` 是"fsync 合并"的落点：同一文件上并发的 fsync 请求会被这个 event 排队合并，避免 N 个线程各 fsync 一次。
+>
+> ★ `n_pending_ios` 与 `fil_node_t::can_be_closed()` 配合：I/O 在途的文件不会被 fd LRU 淘汰关闭。
+
+**`fil_space_t` 与 I/O 相关的关键成员**（`fil0fil.h:236`）：
+
+```cpp
+ private:
+  std::atomic<uint32_t> m_version{};      // ★ truncate/drop 时 bump → BP 中所有旧引用变 stale
+  std::atomic_size_t m_n_ref_count{};
+ public:
+  std::atomic_bool m_deleted{};
+  bool stop_new_ops{};                    // ★★ do_io() 里异步读被这个挡掉
+  fil_type_t purpose;                     // TEMPORARY / IMPORT / TABLESPACE
+  Files files{};
+  page_no_t size{};
+  uint32_t flags{};
+  uint32_t n_pending_flushes{};           // ★ 非 0 时禁止 DROP
+  uint32_t n_pending_ops{};               // ★ 非 0 时禁止 DROP
+  rw_lock_t latch;
+  List_node unflushed_spaces;
+  Compression::Type compression_type;
+  Encryption_metadata m_encryption_metadata;
+  static fil_space_t *s_sys_space;
+ public:
+  /** 把"表空间内页号"换算成"文件内页号"并找出对应 fil_node_t */
+  [[nodiscard]] fil_node_t *get_file_node(page_no_t *page_no) noexcept;
+};
+```
+
+> ⚠️ `m_version` / `m_n_ref_count` 都是 **private**，靠 `get_current_version()` / `get_recent_version()` / `inc_ref()` / `dec_ref()` 访问（见 buffer_pool 篇的 stale 页机制）。
+>
+> ⚠️ **不存在 `fil_open_log_file()` / `fil_create_new_single_table_tablespace()`**——8.0.39 的等价入口是 `fil_space_create()` / `fil_ibd_open()` / `fil_write_initial_pages()`。
 
 `storage/innobase/fil/fil0fil.cc`：
 
@@ -654,6 +776,168 @@ static int os_file_fsync_posix(os_file_t file) {
 ### AIO 子系统
 
 #### 同步 I/O 与异步 I/O 的分工
+
+⚠️ **勘误**：`fil_io()` 全文**只有 27 行**（`fil0fil.cc:7991`），不校验、不找文件、不发 AIO——只做 `shard_by_id()` 路由；全部实质逻辑在 `Fil_shard::do_io()`（`:7610`）。
+
+```cpp
+dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
+               const page_size_t &page_size, ulint byte_offset, ulint len,
+               void *buf, void *message) {
+  auto shard = fil_system->shard_by_id(page_id.space());   // ★ 唯一实质动作
+#ifdef UNIV_DEBUG
+  if (!sync) {
+    /* In case of async io we transfer the io responsibility to the thread
+    which will perform the io completion routine. */
+    static_cast<buf_page_t *>(message)->release_io_responsibility();
+  }
+#endif
+  auto const err = shard->do_io(type, sync, page_id, page_size, byte_offset,
+                                len, buf, message);
+#ifdef UNIV_DEBUG
+  auto bpage = static_cast<buf_page_t *>(message);
+  if (err != DB_SUCCESS && !sync && bpage->was_io_fixed()) {
+    bpage->take_io_responsibility();
+  }
+#endif
+  return err;
+}
+```
+
+```cpp
+// fil0fil.cc:1653 —— shard 路由：undo 单独一段，其余纯取模
+  [[nodiscard]] Fil_shard *shard_by_id(space_id_t space_id) const {
+    if (fsp_is_undo_tablespace(space_id)) {
+      const size_t limit = space_id % UNDO_SHARDS;
+      return m_shards[UNDO_SHARDS_START + limit];
+    }
+    return m_shards[space_id % UNDO_SHARDS_START];
+  }
+```
+
+**同步/异步的第一次分流**（`Fil_shard::get_AIO_mode()`，`fil0fil.cc:7590`）：
+
+```cpp
+AIO_mode Fil_shard::get_AIO_mode(const IORequest &, bool sync) {
+  if (sync) { return AIO_mode::SYNC; }
+  else      { return AIO_mode::NORMAL; }
+}
+```
+
+```cpp
+// include/os0file.h:637 —— 三种 mode，不是两种
+enum class AIO_mode : size_t {
+  /** Normal asynchronous i/o not for ibuf pages or ibuf bitmap pages */
+  NORMAL = 21,
+  /** Asynchronous i/o for ibuf pages or ibuf bitmap pages */
+  IBUF = 22,
+  /** Asynchronous i/o where the calling thread will itself wait for
+  the i/o to complete, doing also the job of the i/o-handler thread;
+  can be used for any pages, ibuf or non-ibuf. This is used to save
+  CPU time, as we can do with fewer thread switches. Plain synchronous
+  I/O is not as good, because it must serialize the file seek and read
+  or write, causing a bottleneck for parallelism. */
+  SYNC = 24
+};
+```
+
+> ★★ `AIO_mode::SYNC` 不是"同步 I/O"——它仍然**提交到 AIO 数组**，只是**当前线程自己等待并收割**（省一次线程切换）。这就是"同步 I/O 比普通异步更省 CPU"的原因。
+>
+> ★ ibuf 页读会被升级成 `IBUF` mode：`if (ibuf_page(...)) { req_type.clear_do_not_wake(); aio_mode = AIO_mode::IBUF; }`（`:7649`）——因为 ibuf handler 不能睡眠。
+
+**`Fil_shard::do_io()` 的后半：偏移换算 + 挂 AIO**（`fil0fil.cc:7805`）：
+
+```cpp
+  mutex_release();     // ★★ 发 I/O 之前就释放 shard mutex —— AIO 请求不入锁临界区
+  DEBUG_SYNC_C("innodb_fil_do_io_prepared_io_with_no_mutex");
+
+  auto offset = (os_offset_t)page_no * page_size.physical();   // ★ 文件内页号 → 字节偏移
+  offset += byte_offset;
+
+  /* Don't compress the log, page 0 of all tablespaces, tables compressed with
+   the old compression scheme and all pages from the system tablespace. */
+  if (req_type.is_write() && !page_size.is_compressed() &&
+      page_id.page_no() > 0 && IORequest::is_punch_hole_supported() &&
+      file->punch_hole) {
+    req_type.set_punch_hole();
+    req_type.compression_algorithm(space->compression_type);
+  } else {
+    req_type.clear_compressed();
+  }
+
+  fil_io_set_encryption(req_type, page_id, space);   // ★ 在这里"补全" IORequest
+  req_type.block_size(file->block_size);
+
+  err = os_aio(req_type, aio_mode, file->name, file->handle, buf, offset, len,
+               fsp_is_system_temporary(page_id.space()) ? false
+                                                        : srv_read_only_mode,
+               file, message);
+  //  ★★ m1=file(fil_node_t*)，m2=message(buf_page_t*) —— fil_aio_wait() 靠它俩回调
+
+  if (err == DB_IO_NO_PUNCH_HOLE) { err = DB_SUCCESS; ... fil_no_punch_hole(file); }
+
+  ut_a(req_type.is_dblwr() || err == DB_SUCCESS);
+
+  if (sync) {
+    mutex_acquire();
+    complete_io(file, req_type);      // ★ 同步路径：返回时 I/O 已完成，本线程直接收尾
+    mutex_release();
+  }
+  //  ★ 异步路径什么都不做 —— 交给 io 线程
+  return err;
+}
+```
+
+**异步完成路径 `fil_aio_wait()`（`:7931`）**：
+
+```cpp
+void fil_aio_wait(ulint segment) {
+  void *m2; fil_node_t *m1; IORequest type;
+
+  auto err = os_aio_handler(segment, &m1, &m2, &type);   // ★ 取回 do_io 塞进去的 (file, message)
+  ut_a(err == DB_SUCCESS);
+
+  auto file = reinterpret_cast<fil_node_t *>(m1);
+  if (file == nullptr) {
+    ut_ad(srv_shutdown_state.load() == SRV_SHUTDOWN_EXIT_THREADS);
+    return;
+  }
+  ut_a(!type.is_dblwr());
+
+  auto shard = fil_system->shard_by_id(file->space->id);
+  shard->mutex_acquire();
+  shard->complete_io(file, type);
+  shard->mutex_release();
+
+  switch (file->space->purpose) {
+    case FIL_TYPE_IMPORT:
+    case FIL_TYPE_TEMPORARY:
+    case FIL_TYPE_TABLESPACE:
+      if (m2 != nullptr) {
+        auto bpage = static_cast<buf_page_t *>(m2);
+        ut_d(bpage->take_io_responsibility());
+        buf_page_io_complete(bpage, false);   // ★★ 异步 I/O 真正的"完成"在这里
+      }
+      return;
+  }
+}
+```
+
+**`do_io()` 前半的两个"拒绝"出口**（`:7687`）——与 stale 页机制联动：
+
+```cpp
+  if (space == nullptr ||
+      (req_type.is_read() && !sync && space->stop_new_ops)) {
+    //  ★ 删除中的表空间不允许异步读（但允许写与同步读）
+    ...
+    if (req_type.is_write() && bpage->is_stale()) return DB_PAGE_IS_STALE;
+    ...
+    return DB_TABLESPACE_DELETED;
+  }
+  if (bpage != nullptr && req_type.is_write() && bpage->is_stale()) {
+    mutex_release();
+    return DB_PAGE_IS_STALE;    // ★★ stale 页拒绝落盘（见 buffer_pool 篇）
+  }
+```
 
 MySQL 有两条**完全不同**的 I/O 下发路径，分岔点在 `os_aio_func`（`os0file.cc`）：
 
@@ -1011,7 +1295,232 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 - OFF：sort file 走 page cache（反复读命中快），但大排序会污染 OS cache 挤热页；
 - ON：O_DIRECT 绕过（避免污染，但排序变慢）。
 
-详见 [`ddl.md`](ddl.md)。
+详见 [`ddl.md`](../feat/ddl/ddl.md)。
+
+#### page cache 参与决策：为什么有的可绕、有的不可绕、有的要清理
+
+**"能不能绕"在源码里是两个独立的 `if`，都在 `os_file_create_func()` 里**（`os0file.cc:3101`）：
+
+```cpp
+#ifdef O_SYNC
+  /* We let O_SYNC only affect log files; note that we map O_DSYNC to
+  O_SYNC because the datasync options seemed to corrupt files in 2001
+  in both Linux and Solaris */
+  if (!read_only && type == OS_LOG_FILE &&                    // ★ ① 只有 redo log
+      srv_unix_file_flush_method == SRV_UNIX_O_DSYNC) {
+    create_flag |= O_SYNC;      // ★★ 注意用的是 O_SYNC 而非 O_DSYNC（2001 年的历史 bug）
+  }
+#endif /* O_SYNC */
+
+  do {
+    file.m_file = ::open(name, create_flag, os_innodb_umask);   // ★ open 时不带 O_DIRECT
+  } while (retry);
+
+  /* We disable OS caching (O_DIRECT) only on data files. For clone we
+  need to set O_DIRECT even for read_only mode. */
+  if ((!read_only || type == OS_CLONE_DATA_FILE) && *success &&   // ★ ② 只有数据文件 / dblwr / clone
+      (type == OS_DATA_FILE || type == OS_CLONE_DATA_FILE ||
+       type == OS_DBLWR_FILE) &&
+      (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT ||
+       srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC)) {
+    os_file_set_nocache(file.m_file, name, mode_str);            // ★★ 这里才 fcntl 追加 O_DIRECT
+  }
+```
+
+> ★★ **O_DIRECT 是在 `open()` 之后用 `fcntl(fd, F_SETFL, O_DIRECT)` 追加的**，不在 `open()` 的 flags 里。这是最容易搞错的一点。
+>
+> ⚠️ **不存在 `os_file_set_odirect()`**（真名 `os_file_set_nocache()`）。
+
+```cpp
+// os0file.cc:5271
+void os_file_set_nocache(int fd, const char *file_name, const char *operation_name) {
+#if defined(UNIV_SOLARIS) && defined(DIRECTIO_ON)
+  if (directio(fd, DIRECTIO_ON) == -1) { ... }      // ★ Solaris 走 directio(3C)
+#elif defined(O_DIRECT)
+  if (fcntl(fd, F_SETFL, O_DIRECT) == -1) {         // ★★ 追加式
+    if (errno_save == EINVAL) {
+      if (!warning_message_printed) {
+        warning_message_printed = true;             // ★ 只打印一次
+#ifdef UNIV_LINUX
+        ib::warn(ER_IB_MSG_824) << "Failed to set O_DIRECT on file" << file_name
+            << "; " << operation_name << ": " << strerror(errno_save)
+            << ", continuing anyway. O_DIRECT is known to result in "
+               "'Invalid argument' on Linux on tmpfs, see MySQL Bug#26662.";
+        //  ★★★ tmpfs 上 O_DIRECT 必然 EINVAL —— 这是经典坑
+#endif
+      }
+    } else { ib::warn(...) << "..., continuing anyway."; }
+  }
+#endif
+}
+```
+
+**Windows 的等价物在 `CreateFile()` 的 attributes 里一次给全**（`os0file.cc:4038`）：
+
+```cpp
+  if (purpose == OS_FILE_AIO) {
+    if (srv_use_native_aio) attributes |= FILE_FLAG_OVERLAPPED;   // ★ Windows native AIO
+  }
+#ifdef UNIV_NON_BUFFERED_IO
+  if (type == OS_BUFFERED_FILE || type == OS_CLONE_LOG_FILE || type == OS_LOG_FILE) {
+    /* Do not use unbuffered i/o for the log files because
+    we write really a lot and we have log flusher for fsyncs. */
+    //  ★ 日志类文件绝不 NO_BUFFERING
+  } else if (srv_win_file_flush_method == SRV_WIN_IO_UNBUFFERED) {
+    attributes |= FILE_FLAG_NO_BUFFERING;   // ★★ Windows 版的 "O_DIRECT"
+  }
+#endif
+  file.m_file = CreateFile((LPCTSTR)name, access, share_mode, NULL,
+                           create_flag, attributes, NULL);
+  if (file.m_file != INVALID_HANDLE_VALUE) {
+    /* This is a best effort use case, if it fails then we will find out
+    when we try and punch the hole. */
+    DeviceIoControl(file.m_file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &temp, NULL);
+    //  ★ 顺手设成 sparse，为 page compression 铺路
+  }
+```
+
+**"要不要清理（fsync）"：哪些文件不刷**（`fil_disable_space_flushing()`，`fil0fil.cc:643`）：
+
+```cpp
+static inline bool fil_disable_space_flushing(const fil_space_t *space) {
+#ifndef _WIN32
+  if (space->purpose == FIL_TYPE_TABLESPACE &&
+      srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC) {
+    return true;      // ★ O_DIRECT_NO_FSYNC：数据文件不 fsync
+  }
+#endif
+  if (space->purpose == FIL_TYPE_TEMPORARY) {
+    return true;      // ★★ 临时表空间永不 fsync
+  }
+  return false;
+}
+```
+
+```cpp
+// fil0fil.cc:8032 —— 临时表空间的硬 skip（第二道）
+void Fil_shard::space_flush(space_id_t space_id) {
+  fil_space_t *space = get_space_by_id(space_id);
+  if (space == nullptr || space->purpose == FIL_TYPE_TEMPORARY ||
+      space->stop_new_ops) {
+    return;           // ★★ 临时表空间在这里被直接跳过
+  }
+  const bool disable_flush = fil_disable_space_flushing(space);
+  if (disable_flush) {
+    /* No need to flush. User has explicitly disabled buffering. However,
+    flush should be called if the file size changes to keep OS metadata
+    in sync. */
+    bool no_flush = true;
+    for (const auto &file : space->files) {
+      if (file.flush_size != file.size) { no_flush = false; break; }
+      //  ★★ 例外：文件"长大"了还是要 fsync 一次，保证文件系统元数据同步
+    }
+    if (no_flush) return;
+  }
+  ...
+}
+```
+
+```cpp
+// fil0fil.cc:8185 —— 批量刷：只遍历"脏"链表 + 掩码过滤
+void Fil_shard::flush_file_spaces() {
+  Space_ids space_ids;
+  mutex_acquire();
+  for (auto space : m_unflushed_spaces) {                        // ★ 只遍历脏链表，不是全量
+    if ((to_int(space->purpose) & FIL_TYPE_TABLESPACE) &&        // ★★ 掩码过滤掉 TEMPORARY / IMPORT
+        !space->stop_new_ops) {
+      space_ids.push_back(space->id);
+    }
+  }
+  mutex_release();
+  for (auto space_id : space_ids) {     // ★ 先拷出 id 列表再逐个刷 —— 避免在持锁时做 fsync
+    mutex_acquire();
+    space_flush(space_id);
+    mutex_release();
+  }
+}
+void fil_flush_file_spaces() { fil_system->flush_file_spaces(); }   // → 遍历所有 shard
+```
+
+> ⚠️ **`fil_flush()` 只刷单个 `space_id`**；批量刷是 `fil_flush_file_spaces()`。
+> ⚠️ **不存在 `FIL_TYPE_LOG`**（全仓 0 匹配）——8.0.30 起 redo log 已从 fil 层剥离。`fil_type_t` 只有 3 个值：
+> ```cpp
+> enum fil_type_t : uint8_t {
+>   FIL_TYPE_TEMPORARY = 1,   /** temporary tablespace */
+>   FIL_TYPE_IMPORT = 2,      /** a tablespace that is being imported */
+>   FIL_TYPE_TABLESPACE = 4,  /** persistent tablespace */
+> };
+> ```
+> 而且它**被当位掩码用**：`to_int(space->purpose) & FIL_TYPE_TABLESPACE`（`:8191`）。
+
+**O_DIRECT 对齐：靠分配器保证，不是运行时校验**：
+
+```cpp
+// os0file.cc:6222 —— 探测真实扇区大小（唯一一处 open() 直接带 O_DIRECT）
+static const ulint MAX_SECTOR_SIZE = 4096;
+void os_fusionio_get_sector_size() {
+  if (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT ||
+      srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC) {
+    ulint sector_size = UNIV_SECTOR_SIZE;          // 默认 512
+    check_file = ::open(check_file_name,
+                        O_CREAT | O_TRUNC | O_WRONLY | O_DIRECT, S_IRWXU);
+    alignas(MAX_SECTOR_SIZE) byte data[MAX_SECTOR_SIZE];
+    while (sector_size <= MAX_SECTOR_SIZE) {
+      block_ptr = static_cast<byte *>(ut_align(&data, sector_size));
+      ret = pwrite(check_file, block_ptr, sector_size, 0);
+      if (ret > 0 && (ulint)ret == sector_size) break;   // ★ 用 pwrite 能否成功判定真实粒度
+      sector_size *= 2;                                  // 512 → 1024 → 2048 → 4096
+    }
+    close(check_file); unlink(check_file_name);
+    os_io_ptr_align = sector_size;                       // ★ 写回全局变量
+  }
+}
+```
+
+```cpp
+// os0file.cc:965 —— 对齐不是分配时保证的，是"取用时向上对齐"出来的
+byte *os_block_get_frame(const file::Block *block) noexcept {
+  return (static_cast<byte *>(ut_align(block->m_ptr, os_io_ptr_align)));
+}
+```
+
+> ⚠️ **不存在 `os_file_get_alignment()`**——是全局变量 `os_io_ptr_align`（`os0file.cc:128`）+ 探测函数。
+>
+> ★ 三重对齐分别由三处保证：① **内存地址** `os_alloc_block()` + `ut_align()`（压缩/加密临时缓冲）、`ut::aligned_alloc(n, os_io_ptr_align)`（大 redo）；② **传输长度** `ut_ad((len % block_size) == 0)`（`os0file.cc:1695`）；③ **文件偏移** `ut_ad((offset % block_size) == 0)`（`:1696`）。
+
+> 上面总览表是**事实层**（谁走了什么）；本节是**决策层**——每个子系统"为什么"这么选。三个子问题：是否值得绕过（O_DIRECT）？是否需要写穿透（O_DSYNC）？是否值得主动清理（`fadvise DONTNEED`）？
+
+**决策变量一共三个**，每个子系统按自己的访问模式对号入座：
+
+| 决策变量 | 判断问题 | 指向 |
+|---|---|---|
+| ① 双重缓存 | 这份数据是否**已经有 MySQL 自己管理的缓存**？ | 是 → page cache 是第二份拷贝，O_DIRECT 有收益；否 → 没有双重缓存问题 |
+| ② 写模式 | 是 write-through（写完立即 fsync）还是 write-back（攒批后台刷）？ | write-through → page cache 里的脏页存活毫秒级，缓存写无意义；write-back → 走 page cache 会"双份脏页 + 二次落盘" |
+| ③ 读模式 | 随机读大文件，还是顺序读一次？ | 随机 → OS readahead 帮倒忙；顺序 → readahead 有益 |
+
+**逐个子系统对号**：
+
+- **数据文件**：①是（buffer pool）②write-back ③随机——**三个变量全部指向"绕过"** ⇒ 提供 `innodb_flush_method=O_DIRECT`。这就是它拥有开关的根本原因
+- **redo**：①否（redo 不进任何 MySQL 内存缓存）②write-through（写完即 fsync，见 `redo_log.md`「落盘时机」）③顺序写、几乎不读——**三个变量全指向"缓存无收益"** ⇒ 不给 O_DIRECT 开关；同时 write-through 的强持久场景用 **O_DSYNC（O_SYNC 写穿透）** 覆盖——每次 `pwrite` 直接到盘，省掉 fsync 调用。O_DIRECT 只解决"缓存"，解决不了"落盘时机"；redo 要的是后者，所以它的开关形态是 O_DSYNC 而非 O_DIRECT
+- **sort 临时文件**：①否（不进 buffer pool，page cache 是它**唯一**缓存）②write-back（大文件反复读，cache 有真实收益）③顺序但有反复读——**收益与风险并存** ⇒ 给独立开关 `innodb_disable_sort_file_cache`。这是全库唯一一个"page cache 本身有价值、但污染风险也可观"的场景，所以才单独设开关
+- **binlog/relay log**：①否 ②write-through（`sync_binlog` 控制 fsync；relay log 连强持久都不要）③读侧是顺序 readahead 有益——**缓存无收益、读有收益** ⇒ 不绕、不提供开关。server 层 `IO_CACHE` 整个体系（含所有日志）都没有 O_DIRECT 概念
+
+**"要清理吗"的决策规则**（`fadvise DONTNEED`）：
+
+> ★ **只有能证明"这段内容永不再访问"时才清理**——否则 DONTNEED 会制造缺页，得不偿失。
+
+| 调用点（全部 4 处，已 grep 核实） | 能证明不再访问吗 | 清理原因 |
+|---|---|---|
+| DDL 排序/merge 文件（`ddl0ddl.cc`/`ddl0merge.cc`） | ✓ 单向游标，读过的段永不回读 | 大文件读完即弃，不清会挤掉热页 |
+| DDL row log（`row0rowlog.cc`） | ✓ 同样单向 | 同上 |
+| 启动探测读（`find_space_id_from_first_pages`） | ✓ 一次性 `fread` 前 64 页找 space id | 探测完永远不再读 |
+| 数据文件 / redo / binlog | ✗ 不能证明（随时可能被再次访问） | **不清理**；其中数据文件 O_DIRECT 模式干脆不进 cache，天然解决 |
+
+**推论**：
+
+- redo/binlog 不清理的另一个原因：容量有上界（redo 环形固定大小、binlog 可 purge），page cache 占用自然封顶，且 write-through 模式下脏页存活极短，占的主要是随时可回收的干净页
+- "绕不绕"和"清不清"是两个独立决策：`innodb_disable_sort_file_cache` 只解决"绕"（O_DIRECT），DDL 文件在 page cache 模式下仍靠 fadvise 解决"清"——两者叠加才覆盖"大排序既不慢也不污染"
+- O_DIRECT 与 fadvise 的取舍：O_DIRECT 是**一劳永逸**（全程不进 cache），fadvise 是**精确点射**（只丢明确无用的区间）——所以"访问模式可预测"的文件用 fadvise，"缓存全程无价值"的文件用 O_DIRECT
 
 ---
 
@@ -1117,6 +1626,224 @@ DDL 排序的临时文件（`ibXXXXXX`）**不是数据页，不进 Buffer Pool*
 入口 `log_builtins_init`（`sql/server_component/log_builtins.cc`），刷栈 `log_builtins_error_stack_flush`。
 
 #### ★ 内部临时表与排序文件（最容易产生"意外 I/O"的地方）
+
+⚠️ **勘误**：
+- 内部临时表满转的是 **InnoDB**，不是 MyISAM（`sql_tmp_table.cc:2621` `share.db_plugin = ha_lock_engine(thd, innodb_hton)`）
+- 排序临时文件**不是 filesort 自己 `open()`** 的，统一走 `open_cached_file()` → `IO_CACHE`
+- **`max_sort_length` 不决定缓冲区大小**——只截断单个排序键长度
+
+**"创建即删除"的三条路**（`mysys/mf_tempfile.cc:219` `create_temp_file()`）：
+
+```cpp
+#ifdef HAVE_O_TMPFILE
+  if (unlink_or_keep == UNLINK_FILE) {                  // ★ 路径 A：Linux 优先 O_TMPFILE
+    file = mysys_priv::RetryOnEintr(
+        [&]() {
+          return open(dirname_buf, O_RDWR | O_TMPFILE | O_CLOEXEC,
+                      S_IRUSR | S_IWUSR);
+        }, -1);
+    //  ★★ O_TMPFILE：文件自始至终没有目录项，close() 即彻底消失
+    if (file >= 0) {
+      sprintf(to, "%s%.20sfd=%d", dirname_buf, prefix ? prefix : "tmp.", file);
+      file_info::RegisterFilename(file, to, file_info::OpenType::FILE_BY_O_TMPFILE);
+    }
+  }
+  // Fall through, in case open() failed above (or we have KEEP_FILE).
+#endif
+  if (file == -1) {                                     // ★ 路径 B：回退 mkstemp + unlink
+    my_stpcpy(convert_dirname(to, dir, NullS), prefix_buff);
+    file = mkstemp(to);                                 // 原子建文件（O_EXCL 语义）
+    if (file < 0) { ... return file; }
+    file_info::RegisterFilename(file, to, file_info::OpenType::FILE_BY_MKSTEMP);
+    if (unlink_or_keep == UNLINK_FILE) {
+      unlink(to);   // ★★ "创建即 unlink"：目录项立刻消失，只留 fd
+    }
+  }
+#endif /* _WIN32 */
+  //  ★ 路径 C（Windows）：create_temp_file_uuid() 建真文件 → my_open → my_delete(to)
+```
+
+> ★★ 三条路的共同点：返回的是**仍可 read/write 的 fd**，但文件系统里已经（或从未）有可见路径。这就是"进程崩溃不留垃圾"的实现基础。
+>
+> ⚠️ **不存在 `create_tmp_file()`**（真名 `create_temp_file()`）。
+>
+> ★ InnoDB 侧入口链：`os_file_create_tmpfile()`（`os0file.cc:1612`，只是 `fdopen` 壳）→ `innobase_mysql_tmpfile()`（`ha_innodb.cc:2484`）→ `mysql_tmpfile_path()`（`sql_thd_internal_api.cc:341`）→ `mysql_file_create_temp(..., UNLINK_FILE, ...)`。
+
+**排序：缓冲区大小来自 `sort_buffer_size`，不是 `max_sort_length`**（`sql/filesort.cc:372`）：
+
+```cpp
+  ulong memory_available = thd->variables.sortbuff_size;   // ★★ sort_buffer_size 就在这里
+  IO_CACHE tempfile;    // Temporary file for storing intermediate results.
+  IO_CACHE chunk_file;  // For saving Merge_chunk structs.
+  IO_CACHE *outfile;    // Contains the final, sorted result.
+  ...
+```
+
+```cpp
+// :490 —— 按可用内存算每批行数
+    if (num_rows_estimate < MERGEBUFF2) num_rows_estimate = MERGEBUFF2;
+    ha_rows keys = memory_available / (param->max_record_length() + sizeof(char *));
+    param->max_rows_per_buffer =
+        min(num_rows_estimate > 0 ? num_rows_estimate : 1, keys);
+    fs_info->set_max_size(memory_available, param->max_record_length());
+```
+
+**`max_sort_length` 的真实作用**（`sortlength()`，`filesort.cc:2097`）：
+
+```cpp
+  const uint max_sort_length_even = (thd->variables.max_sort_length + 1) & ~1;
+  //  ★ 补齐偶数，因为 strnxfrm() 要求偶数长度
+  ...
+    if (!sortorder->is_varlen && is_string_type) {
+      /*
+        We would love to never have to care about max_sort_length anymore,
+        but that would make it impossible for us to sort blobs (TEXT) with
+        PAD SPACE collations, since those are not variable-length (the padding
+        is serialized as part of the sort key) and thus require infinite space.
+        ...
+      */
+      sortorder->length = std::min(sortorder->length, max_sort_length_even);
+      //  ★★ 只截断"非变长字符串"键的长度
+    }
+```
+
+**排序缓冲满 → 写临时文件**（`write_keys()`，`filesort.cc:1089`）：
+
+```cpp
+static int write_keys(Sort_param *param, Filesort_info *fs_info, uint count,
+                      IO_CACHE *chunk_file, IO_CACHE *tempfile) {
+  count = fs_info->sort_buffer(param, count, param->max_rows);
+
+  if (!my_b_inited(chunk_file) &&
+      open_cached_file(chunk_file, mysql_tmpdir, TEMP_PREFIX, DISK_BUFFER_SIZE,
+                       MYF(MY_WME)))                       // ★ chunk_file：存 Merge_chunk 元数据
+    return 1;
+
+  if (!my_b_inited(tempfile) &&
+      open_cached_file(tempfile, mysql_tmpdir, TEMP_PREFIX, DISK_BUFFER_SIZE,
+                       MYF(MY_WME)))                       // ★★ tempfile：存已排序 run（tmpdir + "MY" 前缀）
+    return 1;
+
+  merge_chunk.set_file_position(my_b_tell(tempfile));      // 该 run 在 tempfile 里的起始偏移
+  merge_chunk.set_rowcount(static_cast<ha_rows>(count));
+
+  for (uint ix = 0; ix < count; ++ix) {
+    uchar *record = fs_info->get_sorted_record(ix);
+    size_t rec_length = param->get_record_length(record);
+    if (my_b_write(tempfile, record, rec_length)) return 1;  // ★ 写排序文件就是 my_b_write
+  }
+  if (my_b_write(chunk_file, pointer_cast<uchar *>(&merge_chunk),
+                 sizeof(merge_chunk)))
+    return 1;
+  return 0;
+}
+```
+
+**多路归并：两个临时文件乒乓**（`merge_many_buff()`，`sql/merge_many_buff.h:50`）：
+
+```cpp
+  if (num_chunks <= MERGEBUFF2) return false;
+  if (flush_io_cache(t_file) ||
+      open_cached_file(&t_file2, mysql_tmpdir, TEMP_PREFIX, DISK_BUFFER_SIZE,
+                       MYF(MY_WME))) return true;
+
+  IO_CACHE *from_file = t_file;
+  IO_CACHE *to_file = &t_file2;
+
+  while (num_chunks > MERGEBUFF2) {
+    if (reinit_io_cache(from_file, READ_CACHE, 0L, false, false)) goto cleanup;
+    if (reinit_io_cache(to_file, WRITE_CACHE, 0L, false, false)) goto cleanup;
+    for (i = 0; i < num_chunks - MERGEBUFF * 3U / 2U; i += MERGEBUFF) {
+      if (merge_buffers(thd, param, from_file, to_file, sort_buffer,
+                        last_chunk++,
+                        Merge_chunk_array(&chunk_array[i], MERGEBUFF), true))
+        goto cleanup;                                  // ★ 每趟把 MERGEBUFF(=15) 个 run 合成 1 个
+    }
+    ...
+    std::swap(from_file, to_file);                     // ★★ 读写角色互换
+    setup_io_cache(from_file);
+    setup_io_cache(to_file);
+    num_chunks = last_chunk - chunk_array.begin();
+  }
+```
+
+> ★ `merge_buffers()` 里 `thd->inc_status_sort_merge_passes()`（`filesort.cc:1910`）——这就是 **`Sort_merge_passes`** 状态变量的来源。它用**优先队列**（`Priority_queue<Merge_chunk*>`）做 k 路归并。
+
+**内部临时表：MEMORY/TempTable → InnoDB 转换**（`create_ondisk_from_heap()`，`sql/sql_tmp_table.cc:2577`）：
+
+```cpp
+  if (error != HA_ERR_RECORD_FILE_FULL) {
+    wtable->file->print_error(error, MYF(ME_FATALERROR));
+    return true;                                  // ★ 只有"表满"才转换，其他错误直接报
+  }
+  if (wtable->s->db_type() != heap_hton) {
+    if (wtable->s->db_type() != temptable_hton) {
+      /* Do not convert in-memory temporary tables to on-disk temporary
+      tables if the storage engine is anything other than the temptable
+      engine. */
+      wtable->file->print_error(error, MYF(ME_FATALERROR));
+      return true;                                // ★ 只有 heap / temptable 才允许转换
+    }
+  }
+  THD_STAGE_INFO(thd, stage_converting_heap_to_ondisk);   // ★ SHOW PROCESSLIST 里的状态名
+  ...
+  share.db_plugin = ha_lock_engine(thd, innodb_hton);     // ★★ 8.0 目标引擎是 InnoDB
+  ...
+  new_table.file = get_new_handler(&share, false, ...);   // 换成 InnoDB handler
+  ...
+  while (!table->file->ha_rnd_next(new_table.record[1])) {  // ★★ 全表扫描内存表
+    write_err = new_table.file->ha_write_row(new_table.record[1]);  // ★★ 逐行写 InnoDB 临时表
+    if (write_err) goto err_after_open;
+  }
+```
+
+**触发阈值**：`tmp_table_size / reclength = share->max_rows`（`sql_tmp_table.cc:2206`）：
+
+```cpp
+  if (thd->variables.tmp_table_size == ~(ulonglong)0)  // No limit
+    share->max_rows = ~(ha_rows)0;
+  else
+    share->max_rows = (ha_rows)(((share->db_type() == heap_hton)
+                                     ? min(thd->variables.tmp_table_size,
+                                           thd->variables.max_heap_table_size)
+                                     : thd->variables.tmp_table_size) /
+                                share->reclength);
+  share->max_rows = std::max(share->max_rows, ha_rows(1));
+```
+
+> ★ heap 场景取 **`min(tmp_table_size, max_heap_table_size)`**——两个变量都要调。
+>
+> ★ optimizer trace 里能看到 `converting_tmp_table_to_ondisk` / `cause: memory_table_size_exceeded`（`:2722`）。
+
+**LOAD DATA 用两层缓冲**（`READ_INFO`，`sql/sql_load.cc:118`）：
+
+```cpp
+#define GET (stack_pos != stack ? *--stack_pos : my_b_get(&cache))   // ★ 优先从"回退栈"取字节
+#define PUSH(A) *(stack_pos++) = (A)                                  // ★ 压回已读字符（支持多字节分隔符回溯）
+
+class READ_INFO {
+  File file;
+  uchar *buffer;      /* Buffer for read text */         // ★ 行/字段级缓冲
+  uchar *end_of_buff;
+  size_t buff_length;
+  int *stack, *stack_pos;                                // ★ 单字节回退栈
+  IO_CACHE cache;                                        // ★★ 块级缓冲
+  ...
+};
+```
+
+```cpp
+// :1332 —— 三种来源统一成 IO_CACHE
+    if (init_io_cache(&cache, (get_it_from_net) ? -1 : file, 0,
+            (get_it_from_net) ? READ_NET : (is_fifo ? READ_FIFO : READ_CACHE),
+            0L, true, MYF(MY_WME))) { ... }
+    if (get_it_from_net) cache.read_function = _my_b_net_read;
+    //  ★ LOCAL INFILE → READ_NET（从 client 协议读）；FIFO → READ_FIFO；普通文件 → READ_CACHE
+```
+
+> ⚠️ **LOAD DATA 不用 `fread`/stdio**——是 `IO_CACHE` + 字符级 `GET`/`PUSH` 宏。
+>
+> ★ **`SELECT ... INTO OUTFILE` 也是 `IO_CACHE`**（`Query_result_to_file::cache`，`query_result.h:206`）：`init_io_cache(cache, file, thd->variables.select_into_buffer_size, WRITE_CACHE, ...)`，且**不允许覆盖已存在文件**（`query_result.cc:205` 里 `if (!access(path, F_OK)) my_error(ER_FILE_EXISTS_ERROR, ...)`）。
 
 SQL 层的内部临时表是**三级降级**：
 
@@ -1248,6 +1975,638 @@ SQL 层的内部临时表是**三级降级**：
 | 并行扫描 | `row0pread.cc` | `innodb_parallel_read_threads` |
 
 > **ibuf merge 没有自己的线程**是个容易记错的点——它寄生在 master 线程里。
+
+#### ★ `io_handler_thread` 主循环：收割循环，不是"等待队列"
+
+```cpp
+// os0file.cc:6167
+static void io_handler_thread(ulint segment) {
+  while (srv_shutdown_state.load() != SRV_SHUTDOWN_EXIT_THREADS ||
+         buf_flush_page_cleaner_is_active() || !os_aio_all_slots_free()) {
+    fil_aio_wait(segment);    // ★ 每个线程死循环处理自己那一个 segment
+  }
+}
+```
+
+**一个 segment 一个线程**（`AIO::start_threads()`，`os0file.cc:6176`）：
+
+```cpp
+void AIO::start_threads() {
+  ulint segment = 0;
+  const auto start = [&](mysql_pfs_key_t key, PSI_thread_seqnum seqnum) {
+    os_thread_create(key, seqnum, io_handler_thread, segment++).start();
+  };
+  /* For read only mode, we don't need ibuf I/O thread. */
+  if (number_of_extra_threads()) {
+    ut_ad(s_ibuf != nullptr);
+    ut_ad(s_ibuf->get_n_segments() == 1);
+    start(io_ibuf_thread_key, 0);                    // ib_io_ibuf-0
+  } else {
+    ib::info(ER_IB_MSG_1128);
+  }
+  /* Numbering for ib_io_rd-NN starts with N=1. */
+  for (PSI_thread_seqnum i = 1; i <= s_reads->get_n_segments(); ++i) {
+    start(io_read_thread_key, i);                    // ib_io_rd-1..N
+  }
+  /* Numbering for ib_io_wr-NN starts with N=1. */
+  for (PSI_thread_seqnum i = 1; i <= s_writes->get_n_segments(); ++i) {
+    start(io_write_thread_key, i);                   // ib_io_wr-1..N
+  }
+}
+```
+
+> ★ 线程名里的编号与 `segment` **完全一致**，所以 `SHOW ENGINE INNODB STATUS` / PFS 里的 `ib_io_rd-3` 就直接对应全局 segment 3。
+
+**三选一的静态分派点**（`os_aio_handler()`，`os0file.cc:5875`）：
+
+```cpp
+dberr_t os_aio_handler(ulint segment, fil_node_t **m1, void **m2,
+                       IORequest *request) {
+  dberr_t err;
+  if (srv_use_native_aio) {                    // ★ 唯一开关：innodb_use_native_aio
+    srv_set_io_thread_op_info(segment, "native aio handle");
+#ifdef WIN_ASYNC_IO
+    err = os_aio_windows_handler(segment, m1, m2, request);
+#elif defined(LINUX_NATIVE_AIO)
+    err = os_aio_linux_handler(segment, m1, m2, request);
+#else
+    ut_error;
+    err = DB_ERROR;
+#endif
+  } else {
+    srv_set_io_thread_op_info(segment, "simulated aio handle");
+    err = os_aio_simulated_handler(segment, m1, m2, request);
+  }
+  return (err);
+}
+```
+
+```cpp
+// os0file.cc:2505
+static dberr_t os_aio_linux_handler(ulint global_segment, fil_node_t **m1,
+                                    void **m2, IORequest *request) {
+  LinuxAIOHandler handler(global_segment);
+  dberr_t err = handler.poll(m1, m2, request);
+  if (err == DB_IO_NO_PUNCH_HOLE) {
+    if (!request->is_dblwr()) { fil_no_punch_hole(*m1); err = DB_SUCCESS; }
+  }
+  return (err);
+}
+```
+
+**`LinuxAIOHandler::collect()`（收割，`os0file.cc:2294`）**：
+
+```cpp
+void LinuxAIOHandler::collect() {
+  io_context *io_ctx = m_array->io_ctx(m_segment);      // ★ 每 segment 一个 io_context
+  ulint start_pos = m_segment * m_n_slots;
+  ulint end_pos = start_pos + m_n_slots;
+
+  for (;;) {
+    struct io_event *events = m_array->io_events(m_segment * m_n_slots);
+    memset(events, 0, sizeof(*events) * m_n_slots);
+
+    struct timespec timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = OS_AIO_REAP_TIMEOUT;              // ★ 500ms（os0file.cc:787）
+
+    auto ret = io_getevents(io_ctx, 1, m_n_slots, events, &timeout);
+
+    for (int i = 0; i < ret; ++i) {
+      auto iocb = reinterpret_cast<struct iocb *>(events[i].obj);
+      auto slot = reinterpret_cast<Slot *>(iocb->data);  // ★★ 反查槽位：提交时 iocb->data = slot
+      ut_a(slot->is_reserved);
+      ut_a(slot->pos >= start_pos);
+      ut_a(slot->pos < end_pos);
+
+      if (slot->offset > 0 && !slot->skip_punch_hole &&
+          slot->type.is_compression_enabled() && !slot->type.is_log() &&
+          slot->type.is_write() && slot->type.is_compressed() &&
+          slot->type.punch_hole() && !slot->type.is_dblwr()) {
+        slot->err = AIOHandler::io_complete(slot);      // 压缩页写后 punch hole
+      } else {
+        slot->err = DB_SUCCESS;
+      }
+
+      m_array->acquire();
+      slot->io_already_done = true;                     // ★ 打"完成"标记
+      if (events[i].res > slot->len) {
+        slot->n_bytes = 0;
+        slot->ret = events[i].res;                      // res 放的是 -errno
+      } else {
+        slot->n_bytes = events[i].res;
+        slot->ret = 0;
+      }
+      m_array->release();
+    }
+
+    if (srv_shutdown_state.load() == SRV_SHUTDOWN_EXIT_THREADS ||
+        !buf_flush_page_cleaner_is_active() || ret > 0) {
+      break;                                            // ★ 退出条件
+    }
+
+    switch (ret) {
+      case -EAGAIN:   /* Not enough resources! Try again. */
+      case -EINTR:    /* Interrupted! */
+      case 0:         /* No pending request! */
+        continue;
+    }
+    ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_755)
+        << "Unexpected ret_code[" << ret << "] from io_getevents()!";
+    break;
+  }
+}
+```
+
+**`LinuxAIOHandler::poll()`（收割主循环，`:2424`）**：
+
+```cpp
+dberr_t LinuxAIOHandler::poll(fil_node_t **m1, void **m2, IORequest *request) {
+  dberr_t err;
+  Slot *slot;
+
+  for (;;) {
+    ulint n_pending;
+    slot = find_completed_slot(&n_pending);
+
+    if (slot != nullptr) {
+      err = check_state(slot);
+      if (err != DB_FAIL) break;                 // DB_FAIL 不是硬错误，需 resubmit
+      err = resubmit(slot);                      // 部分 IO：重投剩余字节
+      if (err != DB_SUCCESS) break;
+      m_array->release();
+    } else if (is_shutdown() && n_pending == 0) {
+      *m1 = nullptr; *m2 = nullptr;
+      return (DB_SUCCESS);                       // ★ IO 线程正常退出的出口
+    } else {
+      srv_set_io_thread_op_info(m_global_segment,
+                                "waiting for completed aio requests");
+      collect();                                 // ★ 阻塞在 io_getevents()，带 500ms 超时
+    }
+  }
+
+  if (err == DB_IO_PARTIAL_FAILED) {
+    ib::fatal(...) << "io_submit() call failed when resubmitting a partial I/O "
+                      "request on the file " << slot->name << ".";
+  }
+  *m1 = slot->m1; *m2 = slot->m2; *request = slot->type;
+  m_array->release(slot);
+  m_array->release();
+  return (err);
+}
+```
+
+**提交不是 `LinuxAIOHandler` 做的**（`AIO::linux_dispatch()`，`os0file.cc:2539`）：
+
+```cpp
+bool AIO::linux_dispatch(Slot *slot) {
+  ulint io_ctx_index;
+  struct iocb *iocb = &slot->control;
+  io_ctx_index = (slot->pos * m_n_segments) / m_slots.size();   // ★ 槽位 → segment 的交织映射
+  int ret = io_submit(m_aio_ctx[io_ctx_index], 1, &iocb);       // ★ 一次只提交 1 个 iocb
+  if (ret != 1) errno = -ret;
+  return (ret == 1);
+}
+```
+
+> ★★ **提交在请求者线程里**（`os_aio_func()` 直接调 `linux_dispatch`），**收割在 IO 线程里**。所以 `ib_io_rd-N` 线程名的"read"指的是**收割读完成**，不是"执行读"。
+>
+> ⚠️ **不存在 `LinuxAIOHandler::submit()`**、**不存在 `class WindowsAIOHandler`**（Windows 是自由函数 `os_aio_windows_handler()`）、**不存在 `AIO::select_handler()`**（真名 `select_slot_array()`）。
+
+**`SimulatedAIOHandler` 主循环**（`os_aio_simulated_handler()`，`os0file.cc:7362`）——★ 关键：做 I/O 时**放锁**：
+
+```cpp
+  for (;;) {
+    ulint n_slots = handler.check_pending(global_segment, event);
+    if (n_slots == 0) continue;                       // 刚睡醒（攒批模式）
+    handler.init(n_slots);
+    array->acquire();
+    ulint n_reserved;
+    slot = handler.check_completed(&n_reserved);      // 上一轮 done() 标记的槽位
+    if (slot != nullptr) break;
+    else if (n_reserved == 0 && !buf_flush_page_cleaner_is_active() &&
+             srv_shutdown_state.load() == SRV_SHUTDOWN_EXIT_THREADS) {
+      array->release(); *m1 = nullptr; *m2 = nullptr;
+      return (DB_SUCCESS);                            // 退出出口
+    }
+    else if (handler.select()) break;                 // ★ 选中待发起的槽位
+    os_event_reset(event);
+    array->release();
+    os_event_wait(event);                             // ★ 无事可做 → 睡在 segment 事件上
+  }
+
+  if (slot == nullptr) {
+    handler.merge();            // ★ 相邻 slot 合并（最多 OS_AIO_MERGE_N_CONSECUTIVE = 64）
+    /* We release the array mutex for the time of the I/O: NOTE that
+    this assumes that there is just one i/o-handler thread serving
+    a single segment of slots! */
+    array->release();           // ★★ 做 IO 期间放锁（一个 segment 只一个 IO 线程，安全）
+    handler.io();               // ★★ 真正的系统调用在此：pread()/pwrite()
+    handler.io_complete();
+    array->acquire();
+    handler.done();             // ★ 标记 io_already_done
+    slot = handler.first_slot();
+  }
+  *m1 = slot->m1; *m2 = slot->m2; *type = slot->type;
+  array->release(slot); array->release();
+  return (DB_SUCCESS);
+```
+
+**槽位选择：防饥饿 + 电梯**（`SimulatedAIOHandler::select()`）：
+
+```cpp
+  bool select() {
+    if (!select_oldest()) {          // ★ 先防饥饿：>2s 的老请求优先
+      return (select_lowest_offset());  // ★ 否则选 offset 最小者（电梯式，利于顺序 IO）
+    }
+    return (true);
+  }
+
+  void select_if_older(Slot *slot) {
+    const auto time_diff = std::max(
+        std::chrono::steady_clock::now() - slot->reservation_time,
+        std::chrono::steady_clock::duration{0});
+    if (time_diff >= std::chrono::seconds{2}) {        // ★★ 2 秒阈值
+      if ((time_diff > m_oldest) ||
+          (time_diff == m_oldest && slot->offset < m_lowest_offset)) {
+        m_slots[0] = slot; m_n_elems = 1;
+        m_oldest = time_diff; m_lowest_offset = slot->offset;
+      }
+    }
+  }
+```
+
+> ⚠️ **模拟 AIO 已禁用读合并**：`allocate_buffer()` / `copy_to_buffer()` 两处调用被注释掉（`os0file.cc:7458-7459`），注释明说 "We don't support write combining for simulated AIO"。`merge()` 只做 slot 选择，每个 slot 各自 `pread/pwrite`。
+>
+> ⚠️ **不存在 `SimulatedAIOHandler::gather()`**——拆成了 `check_completed()` / `select()` / `merge()` 三个方法。
+
+```cpp
+static void io_handler_thread(ulint segment) {
+  while (srv_shutdown_state.load() != SRV_SHUTDOWN_EXIT_THREADS ||
+         buf_flush_page_cleaner_is_active() || !os_aio_all_slots_free()) {
+    fil_aio_wait(segment);          // ← 一个线程负责一个 segment
+  }
+}
+```
+
+`fil_aio_wait()` → `os_aio_handler()` 里按平台分派**三种完全不同的等待机制**（这是本节的要点）：
+
+| 模式 | 等待机制 | 超时 |
+|---|---|---|
+| **Linux native AIO**（`innodb_use_native_aio=ON` 默认） | `io_getevents(io_ctx, 1, n_slots, events, &timeout)` | ★ **`OS_AIO_REAP_TIMEOUT = 500000000UL`（500 ms）** |
+| **Windows native AIO** | `WaitForMultipleObjects(..., INFINITE)` | 无限 |
+| **模拟 AIO**（native 不可用时） | `os_event_wait(os_aio_segment_wait_events[global_segment])` | 事件驱动（每 segment 一个 `os_event`） |
+
+Linux 分支的收割代码：
+
+```cpp
+void LinuxAIOHandler::collect() {
+  for (;;) {
+    timeout.tv_nsec = OS_AIO_REAP_TIMEOUT;                            // ★ 500ms
+    auto ret = io_getevents(io_ctx, 1, m_n_slots, events, &timeout);
+    for (int i = 0; i < ret; ++i) { ... slot->err = AIOHandler::io_complete(slot); ... }
+```
+
+★ 所以 **Linux 上 io 线程是"500ms 一次超时轮询 + 有事件就收割"**，不是死等；这也决定了 shutdown 时**不需要**显式唤醒它们（见下）。
+
+**模拟 AIO 还有个特殊开关**：读线程在 `os_aio_recommend_sleep_for_read_threads` 为真时会先 `os_event_wait(event)` 等一下，让别的线程把多个 I/O 请求一起塞进数组再做——即**批量合并**（`SimulatedAIOHandler::check_pending()`）。
+
+#### ★ 三个事件成员：槽位背压的正确打开方式
+
+`class AIO` 里有 **3 个 `os_event_t`**（`m_not_full` / `m_is_empty` + 每 segment 的 `os_aio_segment_wait_events[]`）。背压的正确理解方式：
+
+```cpp
+// os0file.cc:6456 —— 背压的产生侧
+Slot *AIO::reserve_slot(IORequest &type, fil_node_t *m1, void *m2,
+                        pfs_os_file_t file, const char *name, void *buf,
+                        os_offset_t offset, ulint len,
+                        const file::Block *e_block) {
+  const auto slots_per_seg = slots_per_segment();
+
+  for (;;) {
+    acquire();
+    if (m_n_reserved != m_slots.size()) break;      // 有空槽 → 跳出（仍持锁）
+    release();
+    if (!srv_use_native_aio) {
+      /* If the handler threads are suspended, wake them so that we get
+      more slots */
+      os_aio_simulated_wake_handler_threads();      // ★ 背压自救：模拟 AIO 下先催 IO 线程腾槽
+    }
+    os_event_wait(m_not_full);                      // ★★ 背压核心：槽位满 → 阻塞
+  }
+
+  size_t free_index;
+  if (srv_use_native_aio) {
+    /* We iterate through slots starting with the last used and then trying
+    next ones from consecutive segments to balance the incoming requests
+    evenly between the AIO threads. */
+    free_index = find_slot(m_last_slot_used, [&](size_t i) {
+      i += slots_per_seg;                           // ★ 跨 segment 跳着找（配合交织划分）
+      if (i >= m_slots.size()) i = (i + 1) % slots_per_seg;
+      return i;
+    });
+    m_last_slot_used = free_index;
+  } else {
+    /* We attempt to keep adjacent blocks in the same local segment. This can
+    help in merging IO requests when we are doing simulated AIO */
+    const size_t local_seg =
+        (offset >> (UNIV_PAGE_SIZE_SHIFT + 6)) % m_n_segments;   // ★ 按 offset/64页 哈希到段
+    free_index = find_slot(local_seg * slots_per_seg,
+                           [&](size_t i) { return (i + 1) % m_slots.size(); });
+  }
+  ...
+  ++m_n_reserved;
+  if (m_n_reserved == 1)         os_event_reset(m_is_empty);
+  if (m_n_reserved == m_slots.size()) os_event_reset(m_not_full);  // ★ 满了 → 关掉 not_full
+  slot->is_reserved = true;
+  slot->reservation_time = std::chrono::steady_clock::now();       // ★ 模拟 AIO 防饥饿时间戳
+  ...
+  release();
+  return (slot);
+}
+```
+
+```cpp
+// os0file.cc:1563 —— 背压的解除侧
+void AIO::release(Slot *slot) {
+  ut_ad(is_mutex_owned());
+  ut_ad(slot->is_reserved);
+  slot->is_reserved = false;
+  --m_n_reserved;
+
+  if (m_n_reserved == m_slots.size() - 1) {
+    os_event_set(m_not_full);      // ★ 从"满"变为"非满" → 唤醒所有等在 reserve_slot 的线程
+  }
+  if (m_n_reserved == 0) {
+    os_event_set(m_is_empty);      // ★ 归零 → 唤醒 os_aio_wait_until_no_pending_writes()
+  }
+  ...
+}
+```
+
+**三个事件的语义总表**：
+
+| 事件 | 置位/复位 | 谁等它 | 语义 |
+|---|---|---|---|
+| `m_not_full` | 满时 `reset`（`reserve_slot`）；从满变非满时 `set`（`release`） | **发起 I/O 的用户线程** | 槽位背压：满了就别再发 |
+| `m_is_empty` | 从空变非空时 `reset`；归零时 `set`；初始 `set` | `os_aio_wait_until_no_pending_writes()` | 排空：等该数组彻底清空 |
+| `os_aio_segment_wait_events[i]` | 每 segment 一个；`wake_simulated_handler_thread()` 时 `set` | **模拟 AIO 的 IO 线程** | "你负责的 segment 有活了" |
+
+```cpp
+// os0file.cc:6702 —— 第三个事件的置位条件很严格：只有真有 reserved slot 才唤醒
+void AIO::wake_simulated_handler_thread(ulint global_segment, ulint segment) {
+  ut_ad(!srv_use_native_aio);
+  ulint n = slots_per_segment();
+  ulint offset = segment * n;
+  acquire();
+  const Slot *slot = at(offset);
+  for (ulint i = 0; i < n; ++i, ++slot) {
+    if (slot->is_reserved) {
+      release();
+      os_event_set(os_aio_segment_wait_events[global_segment]);   // ★ 只在该 segment 真有活时才 set
+      return;
+    }
+  }
+  release();
+}
+```
+
+**`os_aio_wait_until_no_pending_writes()`**（`os0file.cc:6428`）——刷脏路径的背压出口：
+
+```cpp
+void os_aio_wait_until_no_pending_writes() {
+  AIO::wait_until_no_pending_writes();    // → os_event_wait(AIO::s_writes->m_is_empty)
+}
+```
+
+> ⚠️ 它**只等 `s_writes`** 一个数组，且**只等异步写**；同步写（`os_file_write_func` 直写）不在统计内。
+
+**停机唤醒三种模式各不同**（`os_aio_wake_all_threads_at_shutdown()`，`os0file.cc:6398`）：
+
+```cpp
+void os_aio_wake_all_threads_at_shutdown() {
+#ifdef WIN_ASYNC_IO
+  AIO::wake_at_shutdown();            // 对每个 slot 的 Event SetEvent
+#elif defined(LINUX_NATIVE_AIO)
+  /* When using native AIO interface the io helper threads
+  wait on io_getevents with a timeout value of 500ms. At
+  each wake up these threads check the server status.
+  No need to do anything to wake them up. */
+  if (srv_use_native_aio) { return; }  // ★ Linux native：靠 500ms 超时自己醒来
+#endif
+  /* Fall through to simulated AIO handler wakeup */
+  for (ulint i = 0; i < os_aio_n_segments; ++i) {
+    os_event_set(os_aio_segment_wait_events[i]);   // ★ 模拟 AIO：逐个 set
+  }
+}
+```
+
+★ **AIO 类定义在 `os0file.cc`（不在 `os0file.h`）**，三个事件成员逐个核实：
+
+| 成员 | 语义（源码注释） | 谁等它 |
+|---|---|---|
+| `m_not_full` | *"set to the signaled state when there is space in the aio"* | ★ **发起 IO 的线程**（用户线程 / page cleaner），槽位满时阻塞在 `os_event_wait(m_not_full)` |
+| `m_is_empty` | *"set to the signaled state when there are no pending i/o"* | `os_aio_wait_until_no_pending_writes()` = `os_event_wait(AIO::s_writes->m_is_empty)` |
+| `m_n_reserved` | 已占用槽位数 | — |
+| ~~`m_completed`~~ | ❌ **不存在** | 收割完成靠 slot 自身状态 + `m_is_empty` |
+
+★ 关键点：**`AIO::reserve_slot()` 是在"发起 I/O 的线程"里执行的**，不是 io 线程。所以"槽位打满"卡住的是**刷脏的 page cleaner 和前台查询**，而不是后台收割线程——这正是"投递速度 > 收割速度 → 前台一起抖"的传导路径：
+
+```cpp
+Slot *AIO::reserve_slot(IORequest &type, ...) {
+  for (;;) {
+    acquire();
+    if (m_n_reserved != m_slots.size()) break;
+    release();
+    if (!srv_use_native_aio) os_aio_simulated_wake_handler_threads();
+    os_event_wait(m_not_full);                     // ★ 阻塞点
+  }
+  ++m_n_reserved;
+  if (m_n_reserved == 1)              os_event_reset(m_is_empty);
+  if (m_n_reserved == m_slots.size()) os_event_reset(m_not_full);
+```
+
+#### ★ segment 编号与在途上限（两处流传的错误值）
+
+**① 每线程 pending AIO 上限默认不是 32，是 256**（`os_aio_init()`，`os0file.cc:6354`）：
+
+```cpp
+bool os_aio_init(ulint n_readers, ulint n_writers) {
+  /* Maximum number of pending aio operations allowed per segment */
+  ulint limit = 8 * OS_AIO_N_PENDING_IOS_PER_THREAD;   // ★★ 8 * 32 = 256
+#ifdef _WIN32
+  if (srv_use_native_aio) {
+    limit = SRV_N_PENDING_IOS_PER_THREAD;              // ★ Windows native 才退回 32
+  }
+#endif
+#if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
+  os_fusionio_get_sector_size();                       // ★ 探测 O_DIRECT 扇区大小 → os_io_ptr_align
+#endif
+  return (AIO::start(limit, n_readers, n_writers));
+}
+```
+
+**完整推导链**（全部在源码里）：
+
+| 量 | 位置 | 值 |
+|---|---|---|
+| `OS_AIO_N_PENDING_IOS_PER_THREAD` | `include/os0file.h:634` | `32`（注释："Win NT does not allow more than 64"） |
+| `limit`（每 segment 槽位） | `os0file.cc:6356` | `8 * 32 = 256`；Windows native 时 `32` |
+| `OS_AIO_MERGE_N_CONSECUTIVE` | `os0file.cc:209` | `64`（模拟 AIO 一次最多合并的相邻请求数） |
+| `IO_IBUF_SEGMENT` | `os0file.cc:109` | `0`（ibuf 恒为全局 segment 0） |
+| `SRV_MAX_N_IO_THREADS` | `include/srv0srv.h:754` | `130` |
+| 总 segment 数 | `os0file.cc:6146` | `(read_only ? 0 : 1) + n_readers + n_writers` |
+| 读数组总槽数 | `os0file.cc:6122` | `n_readers * limit` |
+| 写数组总槽数 | `os0file.cc:6133` | `n_writers * limit` |
+| ibuf 数组总槽数 | `os0file.cc:6108` | `limit`（1 个 segment） |
+| `slots_per_segment()` | `os0file.cc:493` | `m_slots.size() / m_n_segments` = `limit` |
+
+**② `AIO_SEGMENTS` 常量不存在**——等价物是静态变量 `os_aio_n_segments`（`os0file.cc:800`），由 `AIO::start()` 在 `:6146` 赋值：
+
+```cpp
+  os_aio_n_segments = n_segments;                    // ★ 全局 segment 总数在此落定
+  os_aio_validate();
+  os_aio_segment_wait_events = static_cast<os_event_t *>(
+      ut::zalloc_withkey(UT_NEW_THIS_FILE_PSI_KEY,
+                         n_segments * sizeof *os_aio_segment_wait_events));
+  for (size_t i = 0; i < n_segments; ++i) {
+    os_aio_segment_wait_events[i] = os_event_create();
+  }
+```
+
+**segment 编号换算**（`AIO::get_segment_no_from_slot()`，`os0file.cc:6434`）：
+
+```cpp
+ulint AIO::get_segment_no_from_slot(const AIO *array, const Slot *slot) {
+  if (array == s_ibuf) {
+    ut_ad(s_ibuf->get_n_segments() == 1);
+    return IO_IBUF_SEGMENT;                          // ★ ibuf 恒为全局 segment 0
+  }
+  auto earlier_segments = number_of_extra_threads(); // 0（只读）或 1（有 ibuf）
+  if (array == s_reads) {
+    return earlier_segments + slot->pos / s_reads->slots_per_segment();
+  }
+  earlier_segments += s_reads->m_n_segments;
+  ut_a(array == s_writes);
+  return earlier_segments + slot->pos / s_writes->slots_per_segment();
+}
+```
+
+**逆运算**（`get_array_and_local_segment()`，`os0file.cc:1526`）：
+
+```cpp
+ulint AIO::get_array_and_local_segment(AIO *&array, ulint segment) {
+  const auto extra = number_of_extra_threads();
+  ut_a(segment < os_aio_n_segments);
+  if (segment < extra) { array = s_ibuf; return 0; }
+  segment -= extra;
+  if (segment < s_reads->m_n_segments) { array = s_reads; return segment; }
+  segment -= s_reads->m_n_segments;
+  ut_a(segment < s_writes->m_n_segments);
+  array = s_writes;
+  return segment;
+}
+```
+
+> ★★ **槽位与 segment 是"交织式"映射，不是连续块式**（`os0file.cc:2553` 与 `:7569` 同一公式）：
+> ```cpp
+>   io_ctx_index = (slot->pos * m_n_segments) / m_slots.size();
+> ```
+> 即 slot 0, n_seg, 2·n_seg … 属 segment 0；slot 1, n_seg+1 … 属 segment 1。这是为了配合 `reserve_slot()` 里"从 `m_last_slot_used` 起按 `slots_per_seg` 跨度找空槽"的分配策略，把请求**均匀撒到各 IO 线程**。
+>
+> ⚠️ **不存在 `os_aio_get_segment_no_from_slot()`**（5.7 的 C 风格函数，已改为上面的静态方法）。
+>
+> ⚠️ **`AIO` 不是单例**——三个静态实例 `s_ibuf` / `s_reads` / `s_writes`（`os0file.cc:771-777`），源码注释里就写着 `// note: 不是单例类`。
+
+**能力探测：tmpdir 决定用哪套**（`AIO::is_linux_native_aio_supported()`，`os0file.cc:2638`）：
+
+```cpp
+bool AIO::is_linux_native_aio_supported() {
+  if (!linux_create_io_ctx(1, &io_ctx)) {
+    return (false);                                   // 平台不支持
+  } else if (!srv_read_only_mode) {
+    fd = innobase_mysql_tmpfile(nullptr);              // ★★ 在 MySQL tmpdir 上建临时文件试
+    if (fd < 0) { ib::warn(...) << "Unable to create temp file to check native AIO support.";
+                  return (false); }
+    name = "tmpdir";
+  } else {
+    const auto file_path = srv_sys_space.first_datafile()->filepath();
+    fd = ::open(file_path, O_RDONLY);                 // ★ 只读模式改为探测第一个 datafile
+    ...
+    name = file_path;
+  }
+  byte *buf = static_cast<byte *>(ut::aligned_zalloc(UNIV_PAGE_SIZE, UNIV_PAGE_SIZE));
+  if (!srv_read_only_mode) io_prep_pwrite(p_iocb, fd, buf, UNIV_PAGE_SIZE, 0);
+  else                     io_prep_pread(p_iocb, fd, buf, 512, 0);
+  int err = io_submit(io_ctx, 1, &p_iocb);
+  if (err >= 1) err = io_getevents(io_ctx, 1, 1, &io_event, nullptr);
+  ...
+  switch (err) {
+    case 1: return (true);
+    case -EINVAL:
+    case -ENOSYS:
+      ib::error(ER_IB_MSG_765)
+          << "Linux Native AIO not supported. You can either move "
+          << (srv_read_only_mode ? name : "tmpdir")     // ★★ 报错里点名 "tmpdir"
+          << " to a file system that supports native AIO or you can set "
+             "innodb_use_native_aio to false to avoid this message.";
+      [[fallthrough]];
+    default: ...
+  }
+  return (false);
+}
+```
+
+```cpp
+// AIO::start():6092 —— 探测失败即运行时降级
+  if (srv_use_native_aio && !is_linux_native_aio_supported()) {
+    ib::warn(ER_IB_MSG_829) << "Linux Native AIO disabled.";
+    srv_use_native_aio = false;                       // ★ 降级为 simulated AIO
+  }
+```
+
+> ★★ **这就是为什么把 `tmpdir` 挂到 tmpfs 会让 InnoDB 悄悄退回模拟 AIO**——tmpfs 不支持 libaio。错误信息里的 "move tmpdir to a file system that supports native AIO" 是源码原话。
+>
+> ⚠️ **8.0.39 仍无 io_uring**——`io_uring` / `io_uring_setup` / `liburing` / `IB_IO_URING` 全仓 **0 命中**。只有 libaio（`LINUX_NATIVE_AIO`）+ Windows `WIN_ASYNC_IO` + simulated 三条路。
+
+**① 编号是连续的，不是 0/100/200**：
+
+```cpp
+static const ulint IO_IBUF_SEGMENT = 0;
+ulint AIO::get_array_and_local_segment(AIO *&array, ulint segment) {
+  const auto extra = number_of_extra_threads();     // 非只读 = 1，只读 = 0
+  if (segment < extra) { array = s_ibuf; return 0; }
+  segment -= extra;
+  if (segment < s_reads->m_n_segments) { array = s_reads; return segment; }   // read: 1..n_read
+  segment -= s_reads->m_n_segments;
+  array = s_writes; return segment;                                           // write: 接续
+}
+```
+
+即：`0` = ibuf，`1..n_readers` = 读，`n_readers+1 ..` = 写。创建顺序同理（`AIO::start_threads()` 里 `segment++`）。
+
+**② 在途上限是 `8 × 32 = 256` 每 segment**（★ 不是常见的"4×8×256"那种连乘写法）：
+
+```cpp
+static const ulint OS_AIO_N_PENDING_IOS_PER_THREAD = 32;   // include/os0file.h
+bool os_aio_init(ulint n_readers, ulint n_writers) {
+  ulint limit = 8 * OS_AIO_N_PENDING_IOS_PER_THREAD;       // ★ 每 segment 256
+#ifdef _WIN32
+  if (srv_use_native_aio) limit = SRV_N_PENDING_IOS_PER_THREAD;   // Windows native 仅 32
+#endif
+  ...
+  s_reads = create(..., n_readers * n_per_seg, n_readers);
+```
+
+⇒ 默认 `n_readers=4`：**s_reads 数组共 4 × 256 = 1024 个槽**（s_writes 同）。Windows + native AIO 时每 segment 只有 32，总量骤降一个数量级——这是 Windows 上 InnoDB 写性能差异的一个结构性原因。
+
+#### 退出：三种模式各不同
+
+`io_handler_thread` 的 while 条件 = `shutdown==EXIT_THREADS && !page_cleaner_active && os_aio_all_slots_free()`；而"该退出了"的哨兵是 `os_aio_handler` 返回 `m1 == nullptr`。唤醒方式因模式而异（`os_aio_wake_all_threads_at_shutdown()`）：
+
+- **Linux native AIO**：什么都不做——注释原文 *"the io helper threads wait on io_getevents with a timeout value of 500ms... No need to do anything to wake them up."*
+- Windows：`AIO::wake_at_shutdown()`
+- 模拟 AIO：逐个 `os_event_set(os_aio_segment_wait_events[i])`
 
 ---
 
@@ -1661,6 +3020,6 @@ server 层 `close_cached_tables`（`sql/sql_base.cc`）的语义是**关闭表�
 - Buffer Pool 的替换算法与脏页调度（本篇的上游）见 [`buffer_pool.md`](buffer_pool.md)
 - redo 的**格式**、LSN 与 checkpoint 语义见 [`redo_log.md`](redo_log.md)
 - 崩溃恢复中 I/O 的角色见 [`recovery.md`](recovery.md)
-- DDL 的临时文件、row log 与并行扫描见 [`ddl.md`](ddl.md)
+- DDL 的临时文件、row log 与并行扫描见 [`ddl.md`](../feat/ddl/ddl.md)
 - **云存储（EBS / 云盘 / CBS / ESSD）本身**见 [`../cloud/cloud_storage.md`](../cloud/cloud_storage.md)
 - C++ ABI 相关的常量定义约定（`static const ulint` 而非 enum）见 [`../server/plugin/abi.md`](../server/plugin/abi.md)

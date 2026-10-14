@@ -189,26 +189,26 @@ sql/sql_parse.cc:2522  thd->mem_root->ClearForReuse()   ← Parse Tree 在此"�
 
 | 文件 | 阶段 | 核心内容 |
 |------|------|----------|
-| [01_protocol_to_dispatch.md](01_protocol_to_dispatch.md) | 收包 → 命令分发 | **协议层**（VIO/NET/Protocol：4 字节包头、16MB 分片、length-coded integer、OK/ERR/EOF、回包）+ 握手认证、THD、线程模型、`do_command`、`dispatch_command`、LEX 生命周期、mem_root 一次性回收、Prepared Statement 差异 |
-| [02_lexer.md](02_lexer.md) | ① 词法 | `MYSQLlex`、`lex_one_token` 状态机（逐状态）、`Lex_input_stream` 输入缓冲与回退、`find_keyword` 关键字识别、`YYSTYPE` 语义值回传、字符集驱动状态表、LALR(2) 特判 |
-| [03_grammar_notation.md](03_grammar_notation.md) | ①' 语法记法 | **官方文档 EBNF 怎么读**：BNF/EBNF 记法、`[]`/`{}`/`\|`/`...` 每个符号的含义、EBNF ↔ sql_yacc.yy 互转（`[x]`↔`opt_x`、`x,...`↔`x_list`）、SELECT 语法逐行对照、与词法/语法解析的对应 |
-| [04_parser.md](04_parser.md) | ② 语法 → Parse Tree | `sql_yacc.yy` 结构、`NEW_PTN` + mem_root、LEX 结构、PT/PTI 节点体系 |
-| [05_contextualize.md](05_contextualize.md) | ①→② | `contextualize()` 全景、各类节点做什么、Query_term 树（8.0.31 重构）、Item 与 `itemize`、完整分步示例 |
-| [06_resolver_prepare.md](06_resolver_prepare.md) | ②→③ | `Query_block::prepare()` 46 步、`setup_*` 函数族、`fix_fields`、name resolution、semi-join/derived 改写 |
-| **[07_optimize/](07_optimize/README.md)** | ③→④ | **优化器（23 篇，子目录）**：代价模型与统计、`logical/` 逻辑优化（子查询/semi-join/连接简化/谓词）、`physical/` 物理优化（join order/访问方法/range/hypergraph + CSE 等高阶模块）、计划改进；专项篇：GROUP BY/DISTINCT 决策、对象模型、set operation、VIEW；横切篇：决策全景、collation 与索引可用性、worklog 时间线 |
-| [08_access_path.md](08_access_path.md) | ④ | AccessPath 44 种类型、新旧优化器两条创建路径、与 Iterator 1:1 |
-| **[09_executor_iterator.md](09_executor_iterator.md)** | ⑤ | **RowIterator 火山模型（算法级）**：火山契约、`unlock_row` 三种例外、NLJ 的 NULL 补全状态机、HashJoin 三形态与 chunk 估算、BKA 的 MRR cookie、**index merge 三个迭代器**（多路归并取交集/堆归并去重/两阶段 Unique）、排序/物化在 `Init()`、显式栈翻译、`ExecuteIteratorQuery` |
-| [10_dml.md](10_dml.md) | ⑤ DML 分支 | **DML 与 SELECT 的差异篇**（SELECT 是主链 02~09，不重复）：`Sql_cmd_dml` 类体系（SELECT 也继承它）、INSERT 的 `write_record` 链（不走迭代器）、UPDATE/DELETE 单表快路径 vs 多表迭代器、Halloween 问题与两阶段读、与 SELECT 在 read_set/write_set/ICP/覆盖索引的差异 |
-| [12_prepared_statement.md](12_prepared_statement.md) | ⑤' PS 路径（与主链并行） | **预编译语句**：`COM_STMT_*` 五命令与二进制协议（报文逐字段）、`Prepared_statement` 生命周期、**社区版无 plan cache 的证据链**（PS 只缓存语法树、每次 execute 重做 optimize）、`Item_param` 三套类型与 `const_for_execution`（为什么 prepare 期不能折叠 `?`）、reprepare 自动修复、执行链路到 InnoDB |
-| [13_item_expression.md](13_item_expression.md) | 横切（表达式层） | **Item 表达式体系**：为何 Item 既是 AST 又是执行节点（零转换 vs 状态分散的权衡）、**`type()`/`result_type()`/`data_type()` 三套类型**的分工、类型聚合与 unsigned 陷阱、**三阶段生命周期**（构造/`itemize`/`fix_fields`）、`walk`/`transform`/`compile` 改写机制、**`Item_sum` 聚合状态机**（simple vs distinct、`endup` 泵回、`COUNT(DISTINCT)` 的 O(1) 特例）、`Item_cache` 惰性求值、`Item_equal` 等价类、**为何无表达式 JIT** |
-| [14_sql_digest.md](14_sql_digest.md) | 横切（SQL 指纹） | **语句 digest（归一化 + 指纹）**：词法器边解析边收集 token 流（不是重写文本）→ SHA-256 得 32 字节 DIGEST → 重放出 DIGEST_TEXT；归一化精确规则（字面量→`?`、一元负号吸收二元保留、IN 折叠、NULL 二义性靠 yacc 补刀）；两条独立通道（token 流 vs `QT_NORMALIZED_FORMAT`）；PFS 以 `(schema, digest)` 聚合；与 SPM signature 是"同思想不同体系"（digest 不参与计划选择） |
+| [01_protocol_to_dispatch.md](01_protocol_to_dispatch.md) | 收包 → 命令分发 | 协议层（VIO/NET/包格式）、命令分发、握手认证 |
+| [02_lexer.md](02_lexer.md) | ① 词法 | `MYSQLlex` 状态机、关键字识别 |
+| [03_grammar_notation.md](03_grammar_notation.md) | ①' 语法记法 | 官方文档 EBNF 怎么读、与 sql_yacc.yy 互转 |
+| [04_parser.md](04_parser.md) | ② 语法 → Parse Tree | sql_yacc.yy 结构与 PT/PTI 节点体系 |
+| [05_contextualize.md](05_contextualize.md) | ③ 语义 | contextualize 全景、Query_term 树、itemize |
+| [06_resolver_prepare.md](06_resolver_prepare.md) | ④ prepare | `Query_block::prepare()` 46 步、fix_fields、改写 |
+| **[07_optimize/](07_optimize/README.md)** | ⑤ optimize | 优化器（子目录）：代价模型、逻辑优化、物理优化 |
+| [08_access_path.md](08_access_path.md) | ⑤' 物理计划 | AccessPath 44 种类型、与 Iterator 1:1 |
+| **[09_executor_iterator.md](09_executor_iterator.md)** | ⑥ 迭代器化 | RowIterator 火山模型（算法级） |
+| [10_dml.md](10_dml.md) | ⑦ DML 分支 | DML 与 SELECT 的差异篇（write_record 链、Halloween 问题） |
+| [12_prepared_statement.md](12_prepared_statement.md) | PS 路径 | 预编译语句：六命令、二进制协议、无 plan cache |
+| [13_item_expression.md](13_item_expression.md) | 横切（表达式层） | Item 表达式体系：类型、生命周期、改写机制 |
+| [14_sql_digest.md](14_sql_digest.md) | 横切（SQL 指纹） | 语句 digest：归一化 + 指纹 |
+| [15_like.md](15_like.md) | 横切（字符串算子） | `LIKE` 全链路：`Item_func_like`、通配符回溯算法、`LIKE → range` 转换、索引可用性边界、ICP、与全文检索的边界 |
 
 ### 横切内容（不占主链步骤）
 
 | 文件 / 目录 | 说明 |
 |------|------|
-| **[runtime/](runtime/README.md)** | **执行期专题（8 篇）**：filesort 与临时表、子查询运行期、CTE、窗口函数、join buffer、ROLLUP。是 09 篇执行器能力的横向展开 |
-| [11_explain_and_trace.md](11_explain_and_trace.md) | **调试与可观测性**（非主链步骤）：EXPLAIN（TRADITIONAL/TREE/JSON/ANALYZE）、optimizer trace。它横跨优化器与执行器，是"观察主链的工具" |
+| **[runtime/](runtime/README.md)** | 执行期专题：filesort、临时表、子查询运行期、CTE、窗口函数、join buffer、ROLLUP |
 
 ---
 

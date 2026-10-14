@@ -931,6 +931,214 @@ SELECT * FROM t1, LATERAL (SELECT * FROM t2 WHERE t2.a = t1.a) d;
 
 ---
 
+## UNION 的执行期：`Query_result_union`
+
+前面讲的是"物化"这个机制本身。本节讲它在 **set operation（UNION / INTERSECT / EXCEPT）**上怎么用——以及一个反直觉的事实：**UNION ALL 根本不物化**。
+
+### ★ 反直觉：UNION 的物化写入不走 `Query_result_union::send_data()`
+
+`Query_result_union` 确实有 `send_data()`（写临时表 + 唯一性检查），但在**迭代器执行器**下它已不是 UNION 的主路径。全库对 `Query_result::send_data()` 的调用只剩两处，且都不是往 union 临时表写：
+
+- `ExecuteIteratorQuery()` 里向**最外层结果**（客户端 / `Query_result_create`）发送
+- `sql_cursor.cc` 里游标取数时转发
+
+真正往 union 临时表写行的是 `MaterializeQueryBlock()`（直接 `ha_write_row`）。
+
+旁证是同文件里对兄弟类的定性：
+
+```cpp
+/**
+  This class is effectively dead. It was used for non-DISTINCT UNIONs
+  in the pre-iterator executor. Now it exists only as a shell for certain
+  setup tasks, and should be removed.
+*/
+class Query_result_union_direct final : public Query_result_union {
+```
+
+所以 `Query_result_union` 在 8.0 的**主业**变成了：**持有并创建那张 set-op 临时表**（`table` 成员 + `create_result_table()`），并作为 INTERSECT/EXCEPT、派生表、游标物化的公共基类。
+
+### UNION DISTINCT：靠临时表上的唯一索引
+
+```cpp
+  if (!(table = create_tmp_table(thd_arg, &tmp_table_param, visible_fields,
+                                 nullptr, is_union_distinct, true, options,
+                                 HA_POS_ERROR, table_alias)))
+    return true;
+  if (create_table) {
+    table->file->ha_extra(HA_EXTRA_IGNORE_DUP_KEY);
+    if (table->hash_field) table->file->ha_index_init(0, false);
+  }
+```
+
+`create_tmp_table()` 的形参名就是 `distinct`。`HA_EXTRA_IGNORE_DUP_KEY` = "插入遇到唯一键冲突就静默丢弃"——**这就是去重**。写入侧 `MaterializeQueryBlock()` 的注释也确认：
+
+```cpp
+      // An ignorable error means duplicate key, ie. we deduplicated
+      // away the row. ...
+```
+
+两个专门的陷阱：
+
+**① 递归 CTE 时不能把唯一键提升成 InnoDB 主键：**
+
+```cpp
+    if (unit->is_recursive()) {
+      /*
+        If the UNIQUE key specified for UNION DISTINCT were a primary key in
+        InnoDB, rows would be returned by the scan in an order depending on
+        their columns' values, not in insertion order.
+      */
+      tmp_table_param.can_use_pk_for_unique = false;
+    }
+```
+
+**② 混合 UNION DISTINCT / UNION ALL 时不能用唯一索引**，改走 hash field 手工去重：
+
+```cpp
+  } else if (op->has_mixed_distinct_operators()) {
+    // If we have mixed UNION DISTINCT / UNION ALL, we can't use an unique
+    // index to deduplicate, as we need to be able to turn off deduplication
+    // checking when we get to the UNION ALL part. ... Thus, we do it
+    // manually instead.
+    tmp_table_param.force_hash_field_for_unique = true;
+  }
+```
+
+对应运行期的开关字段就是 `MaterializePathParameters::QueryBlock::disable_deduplication_by_hash_field`。
+
+### UNION ALL：完全不物化，直接流式 Append
+
+```cpp
+  /**
+    true if the result of this set operation is materialized. A priori true
+    unless we have a pure UNION ALL.
+  */
+  bool m_is_materialized{true};
+```
+
+UNION ALL 走 `AppendIterator`：
+
+```cpp
+/**
+  Takes in two or more iterators and output rows from them sequentially
+  (first all rows from the first one, the all from the second one, etc.).
+  Used for implementing UNION ALL, typically together with StreamingIterator.
+ */
+```
+
+能否流式由 `streaming_allowed` 决定（`Query_expression::create_access_paths()`）：
+
+```cpp
+  bool streaming_allowed = true;
+  if (global_parameters()->order_list.size() != 0 ||
+      (!is_simple() && set_operation()->m_is_materialized)) {
+    // If we're sorting, we currently put it in a real table no matter what.
+    // This is a legacy decision, because we used to not know whether filesort
+    // would want to refer to rows in the table after the sort (sort by row ID).
+    streaming_allowed = false;
+  } else if ((thd->lex->sql_command == SQLCOM_INSERT_SELECT ||
+              thd->lex->sql_command == SQLCOM_REPLACE_SELECT) && ...) {
+    // ... we would risk incorrect results and/or infinite loops, as we'd be
+    // seeing our own records as they get inserted.
+    streaming_allowed = false;
+  }
+```
+
+> ★ 注意注释里那句"**sort by row ID**"——这正是 [`01_filesort.md`](01_filesort.md) 讲的 `SortBufferIndirectIterator` / `SortFileIndirectIterator`（按 rowid 排序）会导致必须落真表的原因。这是两个模块之间一个容易忽略的耦合点。
+
+混合 DISTINCT/ALL 的切分点：`m_last_distinct` 之前的块物化去重，之后（UNION ALL）的块由 `AppendIterator` 追加。
+
+### UNION 与非 UNION 走同一个执行循环
+
+`ExecuteIteratorQuery()` 里 UNION 与非 UNION **共用** `Init()` + `Read()` 循环 + `send_data` + `send_eof`。UNION 的"多块"语义在 `m_root_iterator` 这棵树里已经表达完了。UNION 唯一的特判是 `send_records_ptr` 的三分支（简单查询 / 物化 set op / 流式 set op）。
+
+## JSON_TABLE：表函数的执行范式
+
+JSON_TABLE 是 MySQL **唯一的表函数**——把"函数"变成 FROM 子句里的数据源。
+
+### 执行范式：物化成临时表 → 再走表扫描
+
+```cpp
+/**
+  An iterator that wraps a Table_function (e.g. JSON_TABLE) and allows you to
+  iterate over the materialized temporary table. The table is materialized anew
+  for every Init().
+  ...
+*/
+class MaterializedTableFunctionIterator final : public TableRowIterator {
+```
+
+`Init()` 是全部流程（三步）：
+
+```cpp
+bool MaterializedTableFunctionIterator::Init() {
+  if (!table()->materialized) {
+    // Create the table if it's the very first time.
+    if (table()->pos_in_table_list->create_materialized_table(thd())) return true;
+  }
+  if (m_table_function->fill_result_table()) return true;   // ② 填充
+  return m_table_iterator->Init();                            // ③ 扫表
+}
+```
+
+`Read()` **完全代理**给子迭代器（表扫描）——这就是"物化 → 再走表扫描"在代码上的体现：本迭代器只负责填充。
+
+**★ 每次 `Init()` 都重新填充**（`Init()` 里没有任何"已填充则跳过"的判断）。这正是 LATERAL 语义的要求：外层每换一行，JSON_TABLE 就得重算一次。
+
+填充算法 `fill_json_table()` 是一次性穷举完所有行的 **eager** 算法（NESTED PATH 用"栈 + 回溯"穷举笛卡尔积）。
+
+### 与 LATERAL 的关系
+
+JSON_TABLE 天然能"依赖同一 FROM 子句中前面的表"（如 `JSON_TABLE(t1.js, ...)`），这就是它事实上的 LATERAL 行为。硬证据：
+
+**依赖通过 `used_tables()` 注入 `dep_tables`：**
+
+```cpp
+bool Table_function::init_args() {
+  ...
+  table->pos_in_table_list->dep_tables |= used_tables();
+```
+
+**hypergraph 把它当成"带参数的表"处理，并禁止哈希化：**
+
+```cpp
+      materialize_path->parameter_tables = GetNodeMapFromTableMap(
+          tl->table_function->used_tables() & ~PSEUDO_TABLE_BITS, ...);
+      if (Overlaps(tl->table_function->used_tables(),
+                   OUTER_REF_TABLE_BIT | RAND_TABLE_BIT)) {
+        // Make sure the table function is never hashed, ever.
+        materialize_path->parameter_tables |= RAND_TABLE_BIT;
+      }
+```
+
+对比可见：**LATERAL 派生表**用 `m_lateral_deps`，**表函数**用 `table_function->used_tables()`——两者是同一机制（`parameter_tables`）的两种取值来源。
+
+另外 `Query_block::end_lateral_table` 的注释直接点名表函数：
+
+```cpp
+  /// Last table for LATERAL join, used by table functions
+  Table_ref *end_lateral_table{nullptr};
+```
+
+### 为什么必须物化？——其实没有语义必需
+
+⚠️ **源码明确认为这是实现形态的限制，而非语义必需。** 直接证据就是那条 TODO：
+
+```
+  TODO: Just wrapping it is probably not the optimal thing to do;
+  Table_function is highly oriented around materialization, but never caches.
+  Thus, perhaps we should rewrite Table_function to return a RowIterator
+  instead of going through a temporary table.
+```
+
+拆开讲：
+
+1. **语义上没有阻塞**：要流式，就得把 `fill_json_table()` 从 push 改写成 pull 模型（正是 TODO 说的"return a RowIterator"）
+2. **算法形态不好直接流式化**：`fill_json_table()` 用"NESTED PATH 栈 + 回溯 + `set_subtree_to_null` + `skip_row`"状态机，一次迭代内要前后跳 `col_idx`、要回溯兄弟路径——这是**需要随机改写当前行各字段**的过程，天然适合"构造一行 → write_row"
+3. **对比：普通派生表是可以流式的**（`rematerialize && IsTableScan(table_path) && !need_rowid`），且注释明说 *"Currently, rematerialize is true only for JSON_TABLE"*——即 JSON_TABLE 走的是 `MATERIALIZE_TABLE_FUNCTION` 分支，压根不进 `GetAccessPathForDerivedTable()` 的流式分支
+
+**物化的两个代价**：① 每次 `Init()` 整体重填（LATERAL 逐行重算 → O(外层行数 × JSON 行数)）② 结果全量落临时表，可能 MEMORY→磁盘溢出。**一个好处**：结果表可被多次扫描/排序/做索引查找，语义上就是一张普通临时表。
+
 ## 优化器侧：为什么会走到物化
 
 决策链（`sql_resolver.cc`）的关键一句是——**"合不了就物化"是默认回退**，不是等价的二选一：

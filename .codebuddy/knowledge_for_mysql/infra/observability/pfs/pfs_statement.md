@@ -2,7 +2,7 @@
 
 > 本篇讲 Performance Schema 的**语句（statement）统计**：`events_statements_*` 四张表各自是什么、统计字段怎么累加、延迟直方图怎么分桶、`QUERY_SAMPLE_TEXT` 保留哪条 SQL、以及 sys schema 视图与 PFS 原生分位数的语义差异。
 >
-> **与 [`../query/14_sql_digest.md`](../query/14_sql_digest.md) 的分工**：那篇讲**指纹怎么算**（归一化 / 哈希 / 反解析 / digest 槽管理），本篇讲**统计怎么聚合**（表族 / 统计字段 / 直方图 / 采样 / 汇总维度）。交界处只有 `events_statements_summary_by_digest` 一张表。
+> **与 [`../query/14_sql_digest.md`](../../../server/query/14_sql_digest.md) 的分工**：那篇讲**指纹怎么算**（归一化 / 哈希 / 反解析 / digest 槽管理），本篇讲**统计怎么聚合**（表族 / 统计字段 / 直方图 / 采样 / 汇总维度）。交界处只有 `events_statements_summary_by_digest` 一张表。
 
 ## 目录
 
@@ -285,7 +285,7 @@ if (thread->m_flag_events_statements_history_long) {
 
 ### 2.3 `events_statements_summary_by_digest` —— 按指纹聚合
 
-聚合 key 与槽管理见 [`../query/14_sql_digest.md`](../query/14_sql_digest.md) 第五章。这里是**唯一一张带 `QUERY_SAMPLE_*` 和 `QUANTILE_*` 的表**。
+聚合 key 与槽管理见 [`../query/14_sql_digest.md`](../../../server/query/14_sql_digest.md) 第五章。这里是**唯一一张带 `QUERY_SAMPLE_*` 和 `QUANTILE_*` 的表**。
 
 ---
 
@@ -1072,6 +1072,6 @@ thd->m_statement_psi = MYSQL_START_STATEMENT(
 - `scripts/sys_schema/views/p_s/` —— sys 视图定义
 
 **相关文档**
-- 指纹计算、归一化、digest 槽管理：[`../query/14_sql_digest.md`](../query/14_sql_digest.md)
+- 指纹计算、归一化、digest 槽管理：[`../query/14_sql_digest.md`](../../../server/query/14_sql_digest.md)
 - PFS 框架总论（instrumentation / AOP / 零开销探针）：[`pfs.md`](pfs.md)
-- 变量体系：[`variables.md`](variables.md)
+- 变量体系：[`variables.md`](../../../server/infra/variables.md)

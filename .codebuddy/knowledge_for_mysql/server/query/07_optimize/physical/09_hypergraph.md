@@ -201,6 +201,216 @@ if (thd->lex->using_hypergraph_optimizer()) {
 
 ### 3.1 Node / Hyperedge 结构（`hypergraph.h`）
 
+> ⚠️ **勘误**：`JoinHypergraph`（带 `TABLE*` payload 的那个）**不在** `hypergraph.h`，而在 **`make_join_hypergraph.h:67`**。`hypergraph.h` 里只有**无 payload 的纯拓扑**三件套。
+
+**`hypergraph.h` 文件头 doxygen**（`:27-38`）——注意它明说"这个定义与维基百科不同"：
+
+```cpp
+/**
+  @file
+  Definition of an undirected (join) hypergraph. A hypergraph in this context
+  is an undirected graph consisting of nodes and hyperedges, where hyperedges
+  are edges that can have more than one node in each side of the edge.
+  For instance, in a graph with nodes {A, B, C, D}, a regular undirected edge
+  could be e.g. (A,B), while in a hypergraph, an edge such as ({A,C},B) would
+  also be allowed. Note that this definition of hypergraphs differs from that
+  on Wikipedia.
+
+  The main user of Hypergraph is subgraph_enumeration.h.
+ */
+```
+
+```cpp
+// sql/join_optimizer/hypergraph.h:51
+struct Node {
+  // List of edges (indexes into the hypergraph's “edges” array) that touch this
+  // node. We split these into simple edges (only one node on each side) and
+  // complex edges (all others), because we can often quickly discard all simple
+  // edges by testing the set of interesting nodes against the
+  // “simple_neighborhood” bitmap.
+  //
+  // For optimization purposes, the edges are stored as if they were directed,
+  // even though the hypergraph is fundamentally undirected. That is, a (u,v)
+  // edge will be duplicated internally to (v,u), and the version that is posted
+  // in a node's edge list is the one where the node itself is on the left side.
+  // This saves a lot of duplicate code, and also reduces the amount of branch
+  // mispredictions significantly (it helps something like 30% on the overall
+  // speed).
+  std::vector<unsigned> complex_edges, simple_edges;
+
+  // All nodes on the “right” side of an edge in simple_edges.
+  NodeMap simple_neighborhood = 0;
+
+ private:
+  // Speeds up BM_HyperStar17_ManyHyperedges by 5–10%.
+  static constexpr int Size =
+      sizeof(std::vector<unsigned>) * 2 + sizeof(NodeMap);
+  char padding[std::max<int>(1, 64 - Size)];
+};
+static_assert(sizeof(Node) >= 64);
+
+// :80
+struct Hyperedge {
+  // The endpoints (hypernodes) of this hyperedge. See the comment about
+  // duplicated edges in Node.
+  //
+  // left and right may not overlap, and both must have at least one bit set.
+  NodeMap left;
+  NodeMap right;
+};
+
+// :89
+struct Hypergraph {
+ public:
+  explicit Hypergraph(MEM_ROOT *mem_root) : nodes(mem_root), edges(mem_root) {}
+  Mem_root_array<Node> nodes;      // Maximum 8*sizeof(NodeMap) elements.
+  Mem_root_array<Hyperedge> edges;
+
+  void AddNode();
+  void AddEdge(NodeMap left, NodeMap right);
+
+  // NOTE: Since every edge is stored twice (see AddEdge), also updates the
+  // corresponding opposite-direction edge automatically. ...
+  void ModifyEdge(unsigned edge_idx, NodeMap new_left, NodeMap new_right);
+
+ private:
+  void AttachEdgeToNodes(size_t left_first_idx, size_t right_first_idx,
+                         NodeMap left, NodeMap right);
+};
+```
+
+> ★ `static_assert(sizeof(Node) >= 64)` + 私有 `padding` —— 强制每个 Node 占满一个缓存行，这是 `complex_edges`/`simple_edges` 二分和 `simple_neighborhood` 位图能带来 30% 提速的物理前提。
+
+**节点数上限的真实来源**（`node_map.h:31`）——⚠️ **不存在 `kMaxSupportedNodes`**：
+
+```cpp
+/**
+  Since our graphs can never have more than 61 tables, node sets and edge lists
+  are implemented using 64-bit bit sets. ...
+ */
+using NodeMap = uint64_t;
+```
+
+```cpp
+// sql/sql_const.h:104
+constexpr const size_t MAX_TABLES_FOR_SIZE{sizeof(table_map) * 8};   // 64
+constexpr const size_t MAX_TABLES{MAX_TABLES_FOR_SIZE - 3};          // = 61
+constexpr const table_map INNER_TABLE_BIT{1ULL << (MAX_TABLES + 0)};
+constexpr const table_map OUTER_REF_TABLE_BIT{1ULL << (MAX_TABLES + 1)};
+constexpr const table_map RAND_TABLE_BIT{1ULL << (MAX_TABLES + 2)};
+constexpr const table_map PSEUDO_TABLE_BITS{INNER_TABLE_BIT | OUTER_REF_TABLE_BIT |
+                                            RAND_TABLE_BIT};
+```
+
+**`JoinHypergraph`：拓扑与 payload 分离**（`make_join_hypergraph.h:67`）：
+
+```cpp
+struct JoinHypergraph {
+  JoinHypergraph(MEM_ROOT *mem_root, const Query_block *query_block)
+      : graph(mem_root), nodes(mem_root), edges(mem_root),
+        predicates(mem_root), sargable_join_predicates(mem_root),
+        m_query_block(query_block) {}
+
+  hypergraph::Hypergraph graph;      // ★ 纯拓扑，无 payload
+
+  std::array<int, MAX_TABLES> table_num_to_node_num;  // tableno → node index
+
+  struct Node {
+    TABLE *table;
+    Mem_root_array<Item *> join_conditions_pushable_to_this;
+    Mem_root_array<SargablePredicate> sargable_predicates;
+  };
+  Mem_root_array<Node> nodes;        // ★ payload 侧，与 graph.nodes 同下标
+
+  // Note that graph.edges contain each edge twice (see Hypergraph
+  // for more information), so edges[i] corresponds to graph.edges[i*2].
+  Mem_root_array<JoinPredicate> edges;   // ★★ 2:1 对应！
+
+  Mem_root_array<Predicate> predicates;  // 前 num_where_predicates 个是 WHERE
+  unsigned num_where_predicates = 0;
+  ...
+  bool has_reordered_left_joins = false;
+  table_map tables_inner_to_outer_or_anti = 0;
+};
+```
+
+> ⚠️ **勘误**：`JoinHypergraph::Node` **没有 `relations` 位图**；`JoinHypergraph` **没有 `num_nodes`**（用 `graph.nodes.size()`）。`selectivity` **不在** `Hyperedge` 里，而在 `JoinPredicate`（`access_path.h:70`）：
+> ```cpp
+> struct JoinPredicate {
+>   RelationalExpression *expr;
+>   double selectivity;              // ★ 真正的 selectivity 在这里
+>   size_t estimated_bytes_per_row;
+>   FunctionalDependencySet functional_dependencies;
+>   int ordering_idx_needed_for_semijoin_rewrite = -1;
+>   Item **semijoin_group = nullptr;
+>   int semijoin_group_size = 0;
+> };
+> ```
+
+**`ConflictRule` 只有两个字段**（`relational_expression.h:56`）——⚠️ 不存在 `companion_node` / `companion_rule`：
+
+```cpp
+// Describes a rule disallowing specific joins; if any tables from
+// needed_to_activate_rule is part of the join, then _all_ tables from
+// required_nodes must also be present.
+struct ConflictRule {
+  hypergraph::NodeMap needed_to_activate_rule;   // A
+  hypergraph::NodeMap required_nodes;            // B
+};
+```
+
+运行时检查（`relational_expression.h:177`）：
+
+```cpp
+inline bool PassesConflictRules(hypergraph::NodeMap joined_tables,
+                                const RelationalExpression *expr) {
+  for (const ConflictRule &rule : expr->conflict_rules) {
+    if (Overlaps(joined_tables, rule.needed_to_activate_rule) &&
+        !IsSubset(rule.required_nodes, joined_tables)) {
+      return false;
+    }
+  }
+  return true;
+}
+```
+
+**`RelationalExpression::Type`**（`relational_expression.h:66`）——注意 `MULTI_INNER_JOIN` 只在下推阶段存在：
+
+```cpp
+  enum Type {
+    INNER_JOIN = static_cast<int>(JoinType::INNER),
+    LEFT_JOIN = static_cast<int>(JoinType::OUTER),
+    SEMIJOIN = static_cast<int>(JoinType::SEMI),
+    ANTIJOIN = static_cast<int>(JoinType::ANTI),
+    STRAIGHT_INNER_JOIN = 101,
+    FULL_OUTER_JOIN = static_cast<int>(JoinType::FULL_OUTER),
+    MULTI_INNER_JOIN = 102,   // 内连接栈压平后的 n 元形式，仅 pushdown 期存在
+    TABLE = 100
+  } type;
+  table_map tables_in_subtree;
+  hypergraph::NodeMap nodes_in_subtree;  // 与 tables_in_subtree 并行维护
+  int companion_set{-1};                 // 内连接连通分量，决定哪里允许成环
+  Mem_root_array<ConflictRule> conflict_rules;
+```
+
+**bitmap 工具**（`bit_utils.h`）——⚠️ **不存在** `IsSingleton()` / `NodesBetween()` / `BitsSetInBetween()`：
+
+```cpp
+constexpr uint64_t TableBitmap(unsigned x) { return uint64_t{1} << x; }
+inline uint64_t BitsBetween(unsigned start, unsigned end);      // :199
+inline uint64_t TablesBetween(unsigned start, unsigned end);    // :215
+inline uint64_t IsolateLowestBit(uint64_t x) { return x & (-x); }  // :225
+inline bool IsSubset(uint64_t x, uint64_t y) { return (x & y) == x; }  // :229
+inline bool IsProperSubset(uint64_t x, uint64_t y);             // :232
+inline bool Overlaps(uint64_t x, uint64_t y) { return (x & y) != 0; }  // :237
+inline bool AreMultipleBitsSet(uint64_t x) { return (x & (x - 1)) != 0; }  // :240
+inline bool IsSingleBitSet(uint64_t x);                         // :243
+inline bool IsBitSet(int bit_num, uint64_t x);                  // :248
+inline int PopulationCount(uint64_t x);                         // :253
+inline BitIteratorAdaptor<CountBitsAscending> BitsSetIn(uint64_t state);
+inline BitIteratorAdaptor<CountBitsDescending> BitsSetInDescending(uint64_t state);
+```
+
 ```cpp
 struct Node {                                    // :51
   std::vector<unsigned> complex_edges, simple_edges;
@@ -223,6 +433,112 @@ struct Hyperedge {                               // :80
 - `NodeMap` 是 **`uint64_t` 位集**（`node_map.h:40`），最多 61 张表
 
 ### 3.2 建图流程（`make_join_hypergraph.cc:3474`）
+
+**真正递归建节点 + 建超边的函数**（`:3138`）——`MakeJoinHypergraph()` 只是它的编排者：
+
+```cpp
+void MakeJoinGraphFromRelationalExpression(THD *thd, RelationalExpression *expr,
+                                           string *trace,
+                                           JoinHypergraph *graph) {
+  if (expr->type == RelationalExpression::TABLE) {
+    graph->graph.AddNode();                    // ★ 纯拓扑侧加节点
+    graph->nodes.push_back(JoinHypergraph::Node{   // ★ payload 侧加节点
+        expr->table->table,
+        Mem_root_array<Item *>{thd->mem_root,
+                               expr->join_conditions_pushable_to_this},
+        Mem_root_array<SargablePredicate>{thd->mem_root}});
+    graph->table_num_to_node_num[expr->table->tableno()] =
+        graph->graph.nodes.size() - 1;
+    expr->nodes_in_subtree = NodeMap{1} << (graph->graph.nodes.size() - 1);
+    return;
+  }
+
+  MakeJoinGraphFromRelationalExpression(thd, expr->left, trace, graph);
+  MakeJoinGraphFromRelationalExpression(thd, expr->right, trace, graph);
+  expr->nodes_in_subtree =
+      expr->left->nodes_in_subtree | expr->right->nodes_in_subtree;
+
+  table_map used_tables = 0;
+  for (Item *condition : expr->join_conditions) used_tables |= condition->used_tables();
+  for (Item *condition : expr->equijoin_conditions) used_tables |= condition->used_tables();
+  const NodeMap used_nodes = GetNodeMapFromTableMap(   // ★ SES
+      used_tables & ~PSEUDO_TABLE_BITS, graph->table_num_to_node_num);
+
+  const Hyperedge edge =
+      FindHyperedgeAndJoinConflicts(thd, used_nodes, expr, graph);  // ★ CD-C
+  graph->graph.AddEdge(edge.left, edge.right);   // ★ 加超边（内部存两份）
+  ...
+  double selectivity = 1.0;
+  for (Item *item : expr->equijoin_conditions)
+    selectivity *= EstimateSelectivity(current_thd, item, trace);
+  for (Item *item : expr->join_conditions)
+    selectivity *= EstimateSelectivity(current_thd, item, trace);
+
+  const size_t estimated_bytes_per_row = EstimateRowWidthForJoin(*graph, expr);
+  graph->edges.push_back(JoinPredicate{       // ★ 边的 payload
+      expr, selectivity, estimated_bytes_per_row,
+      /*functional_dependencies=*/0, /*functional_dependencies_idx=*/{}});
+}
+```
+
+**`MakeJoinHypergraph()` 的编排骨架**（`:3474`，省略 trace 与断言）：
+
+```cpp
+bool MakeJoinHypergraph(THD *thd, string *trace, JoinHypergraph *graph,
+                        bool *where_is_always_false) {
+  const size_t num_tables = query_block->leaf_table_count;
+  if (num_tables == 1) {                       // ★ 单表快路径，完全跳过 join 逻辑
+    return MakeSingleTableHypergraph(thd, query_block, trace, graph,
+                                     where_is_always_false);
+  }
+
+  RelationalExpression *root =
+      MakeRelationalExpressionFromJoinList(thd, query_block->m_table_nest);
+  int num_companion_sets = 0;
+  int table_num_to_companion_set[MAX_TABLES];
+  ComputeCompanionSets(root, -1, &num_companion_sets, table_num_to_companion_set);
+  FlattenInnerJoins(root);                     // ★ 内连接栈压成 MULTI_INNER_JOIN
+
+  PushDownJoinConditions(thd, root, table_num_to_companion_set, &table_filters,
+                         &cycle_inducing_edges, trace);
+  /* WHERE 条件下推 */
+  where_conditions = PushDownAsMuchAsPossible(...);
+  UnflattenInnerJoins(root);                   // ★ 下推完就压回去
+  LateConcretizeMultipleEqualities(thd, root);
+  PushDownJoinConditionsForSargable(thd, root);
+  FindConditionsUsedTables(thd, root);
+  MakeHashJoinConditions(thd, root);           // ★ equijoin 从此与 join_conditions 分离
+
+  MakeJoinGraphFromRelationalExpression(thd, root, trace, graph);   // ★★ 建图
+  ClearImpossibleJoinConditions(root);
+
+  if (!cycle_inducing_edges.empty()) AddCycleEdges(thd, cycle_inducing_edges, graph, trace);
+
+  CompleteFullMeshForMultipleEqualities(thd, multiple_equalities, graph, trace);
+  // ★ 多表等值 → 全网格建边（t1.a=t2.a AND t2.a=t3.a ⇒ 补 t1-t3 边）
+
+  for (Item *condition : where_conditions)
+    AddPredicate(thd, condition, /*was_join_condition=*/false, -1, root, graph, trace);
+  SortPredicates(graph->predicates.begin() + num_cycle_predicates,
+                 graph->predicates.end());     // ★ 选择性高、代价低的排前面
+  graph->num_where_predicates = graph->predicates.size();
+  return false;
+}
+```
+
+`ComputeCompanionSets()`（`:355`）决定**哪里允许成环**——外连接/半连接的右子树另起一个 set：
+
+```cpp
+    case RelationalExpression::LEFT_JOIN:
+    case RelationalExpression::SEMIJOIN:
+    case RelationalExpression::ANTIJOIN:
+      if (current_set == -1) current_set = (*num_companion_sets)++;
+      ComputeCompanionSets(expr->left, current_set, ...);
+      ComputeCompanionSets(expr->right, /*current_set=*/-1, ...);
+      break;
+```
+
+> ★ 注意 `MakeJoinHypergraph()` 返回 `false` 表示**成功**（MySQL 惯例：true = 错误）。
 
 | 行 | 步骤 | 作用 |
 |---|---|---|
@@ -274,6 +590,257 @@ graph->edges.push_back(JoinPredicate{expr, selectivity, estimated_bytes_per_row,
 每条边带一个 `JoinPredicate`（`expr` 指针 + 综合 selectivity + 估计行宽 + 函数依赖 FD）。
 
 ### 3.3 CD-C 算法：TES 与 conflict rules（核心）
+
+⚠️ **勘误**：真实函数名是 **`FindHyperedgeAndJoinConflicts()`**（全仓无 `FindHyperedgeConflicts`）。先看它的**长注释**（`make_join_hypergraph.cc:2643-2714`，节选最关键的两段）：
+
+```cpp
+/**
+  For the join operator in “expr”, build a hyperedge that encapsulates its
+  reordering conditions as completely as possible. The conditions given by
+  the hyperedge are necessary and usually sufficient; for the cases where
+  they are not sufficient, we leave conflict rules on “expr” (see below).
+
+  This function is almost verbatim the CD-C algorithm from “On the correct and
+  complete enumeration of the core search space” by Moerkotte et al [Moe13].
+  It works by the concept of conflict rules (CRs); if a CR A → B, for relation
+  sets A and B, is attached on a given join, then if _any_ table from A is
+  present in the join, then _all_ tables from B are required. ...
+
+  Conflict rules are both expressive enough to precisely limit invalid rewrites,
+  and in the majority of cases, can be folded into hyperedges, relegating
+  the task of producing only valid plans to the subgraph enumeration (DPhyp),
+  which is highly efficient at it. In the few cases that remain, they will need
+  to be checked manually in CostingReceiver, but this is fast (only a few bitmap
+  operations per remaining CR).
+  ...
+  Note that in the presence of degenerate predicates or Cartesian products,
+  we may make overly broad hyperedges, ie., we will disallow otherwise
+  valid plans (but never allow invalid plans). This is the only case where
+  the algorithm misses a valid join ordering, and also the only place where
+  we diverge somewhat from the paper, which doesn't discuss hyperedges in
+  the presence of such cases.
+ */
+```
+
+```cpp
+// sql/join_optimizer/make_join_hypergraph.cc:2715
+Hyperedge FindHyperedgeAndJoinConflicts(THD *thd, NodeMap used_nodes,
+                                        RelationalExpression *expr,
+                                        const JoinHypergraph *graph) {
+  assert(expr->type != RelationalExpression::TABLE);
+
+  Mem_root_array<ConflictRule> conflict_rules(thd->mem_root);
+  ForEachJoinOperator(
+      expr->left, [expr, graph, &conflict_rules](RelationalExpression *child) {
+        if (!OperatorsAreAssociative(*child, *expr)) {
+          // Prevent associative rewriting; we cannot apply this operator
+          // (rule kicks in as soon as _any_ table from the right side
+          // is seen) until we have all nodes mentioned on the left side of
+          // the join condition.
+          const table_map left = IntersectIfNotDegenerate(
+              child->conditions_used_tables, child->left->tables_in_subtree);
+          conflict_rules.emplace_back(ConflictRule{
+              child->right->nodes_in_subtree,        // ★ A = 子算子右子树
+              GetNodeMapFromTableMap(left & ~PSEUDO_TABLE_BITS,
+                                     graph->table_num_to_node_num)});  // ★ B
+        }
+        if (!OperatorsAreLeftAsscom(*child, *expr)) {
+          const table_map right = IntersectIfNotDegenerate(
+              child->conditions_used_tables, child->right->tables_in_subtree);
+          conflict_rules.emplace_back(ConflictRule{
+              child->left->nodes_in_subtree,
+              GetNodeMapFromTableMap(right & ~PSEUDO_TABLE_BITS,
+                                     graph->table_num_to_node_num)});
+        }
+      });
+
+  // Exactly the same as the previous, just mirrored left/right.
+  ForEachJoinOperator(expr->right, [...](RelationalExpression *child) { ... });
+
+  // Now go through all of the conflict rules and use them to grow the
+  // hypernode, making it more restrictive if possible/needed.
+  NodeMap total_eligibility_set =
+      AbsorbConflictRulesIntoTES(used_nodes, &conflict_rules);
+  //                             ^^^^^^^^^^ 初始 TES = SES（条件直接引用的节点）
+
+  // Check for degenerate predicates and Cartesian products;
+  // we cannot have hyperedges with empty end points.
+  if (!Overlaps(total_eligibility_set, expr->left->nodes_in_subtree)) {
+    total_eligibility_set |= expr->left->nodes_in_subtree;   // ★ 整棵左子树进 TES
+    total_eligibility_set =
+        AbsorbConflictRulesIntoTES(total_eligibility_set, &conflict_rules);
+  }
+  if (!Overlaps(total_eligibility_set, expr->right->nodes_in_subtree)) {
+    total_eligibility_set |= expr->right->nodes_in_subtree;
+    total_eligibility_set =
+        AbsorbConflictRulesIntoTES(total_eligibility_set, &conflict_rules);
+  }
+  expr->conflict_rules = std::move(conflict_rules);
+  // ★ 吸不进超边的 CR 留在这里，交给 CostingReceiver::FoundSubgraphPair 手工检查
+
+  const NodeMap left = total_eligibility_set & expr->left->nodes_in_subtree;
+  const NodeMap right = total_eligibility_set & expr->right->nodes_in_subtree;
+  return {left, right};      // ★★ TES 按左右子树一分为二 = 超边的两个（可能多节点的）端点
+}
+```
+
+**`AbsorbConflictRulesIntoTES()`（`:2597`）——不动点迭代**：
+
+```cpp
+/**
+  When we have the conflict rules, we want to fold them into the hyperedge
+  we are about to create. This works by growing the TES (Total Eligibility
+  Set), the set of tables that needs to be present before we can do the
+  join; the TES will eventually be split into two and made into a hyperedge.
+
+  The TES must obviously include the SES (Syntactic Eligibility Set),
+  every table mentioned in the join condition. And if anything on the left
+  side of a conflict rule overlaps with the TES, that conflict rule would
+  always be active, and we can safely include the right side into the TES.
+  Similarly, if the TES is a superset of what's on the right side of a conflict
+  rule, that rule will never prevent anything ... so it can be removed. We
+  iterate over all the conflict rules until they are all gone or the TES has
+  stopped growing; then we create our hyperedge by splitting the TES.
+ */
+NodeMap AbsorbConflictRulesIntoTES(
+    NodeMap total_eligibility_set,
+    Mem_root_array<ConflictRule> *conflict_rules) {
+  NodeMap prev_total_eligibility_set;
+  do {
+    prev_total_eligibility_set = total_eligibility_set;
+    for (const ConflictRule &rule : *conflict_rules) {
+      if (Overlaps(rule.needed_to_activate_rule, total_eligibility_set)) {
+        total_eligibility_set |= rule.required_nodes;   // ★ A∩TES≠∅ ⇒ TES ∪= B
+      }
+    }
+    auto new_end = std::remove_if(
+        conflict_rules->begin(), conflict_rules->end(),
+        [total_eligibility_set](const ConflictRule &rule) {
+          return IsSubset(rule.required_nodes, total_eligibility_set);
+        });
+    conflict_rules->erase(new_end, conflict_rules->end());
+  } while (total_eligibility_set != prev_total_eligibility_set &&
+           !conflict_rules->empty());
+  return total_eligibility_set;
+}
+```
+
+**`FindTESForCondition()`（`:2384`）——外连接补 NULL 如何长成多节点端点**：
+
+```cpp
+/**
+  For a condition with the SES (Syntactic Eligibility Set) “used_tables”,
+  find all relations in or under “expr” that are part of the condition's TES
+  (Total Eligibility Set). ...
+
+  The TES always contains at least SES, but may be bigger. For instance,
+  given the join tree (a LEFT JOIN b), a condition such as b.x IS NULL
+  would have a SES of {b}, but a TES of {a,b}, since joining in a could
+  synthesize NULLs from b. However, given (a JOIN b) (ie., an inner join
+  instead of an outer join), the TES would be {b}, identical to the SES.
+ */
+table_map FindTESForCondition(table_map used_tables,
+                              const RelationalExpression *expr) {
+  if (expr->type == RelationalExpression::TABLE) {
+    return used_tables;
+  } else if (expr->type == RelationalExpression::LEFT_JOIN ||
+             expr->type == RelationalExpression::ANTIJOIN) {
+    table_map tes = used_tables;
+    if (Overlaps(used_tables, expr->left->tables_in_subtree)) {
+      tes |= FindTESForCondition(used_tables, expr->left);
+    }
+    if (Overlaps(used_tables, expr->right->tables_in_subtree)) {
+      // The predicate needs a table from the right-hand side, but this join can
+      // cause that table to become NULL, so we need to delay until the join has
+      // happened. We do this by demanding that all tables on the left side have
+      // been joined in, ...
+      tes |= expr->left->tables_in_subtree;   // ★★ 整个左子树进 TES
+      for (Item *condition : expr->equijoin_conditions) {
+        tes |= condition->used_tables();
+      }
+      for (Item *condition : expr->join_conditions) {
+        tes |= condition->used_tables();
+      }
+    }
+    return tes;
+  } else { /* 内连接：左右各自递归，TES 不额外膨胀 */ }
+}
+```
+
+> ★ 注释里那句 *"if we limited it to {t2,t3}, we would push it below \<opA\> in the case of the rewrite, which is wrong. So the entire left side needs to be included"* —— 这就是**外连接为什么必须保守**。
+
+**CD-C 的三张算子表**（`:734-836`）——每个函数上方的注释都点明"Table 2 / Table 3 from [Moe13]"：
+
+```cpp
+bool OperatorsAreAssociative(const RelationalExpression &a,
+                             const RelationalExpression &b) {
+  // Table 2 from [Moe13]; which operator pairs are associative.
+  if ((a.type == RelationalExpression::LEFT_JOIN ||
+       a.type == RelationalExpression::FULL_OUTER_JOIN) &&
+      b.type == RelationalExpression::LEFT_JOIN) {
+    // True if and only if the second join predicate rejects NULLs on all e2.
+    return IsNullRejecting(b, b.left->tables_in_subtree);
+  }
+  if (a.type == RelationalExpression::FULL_OUTER_JOIN &&
+      b.type == RelationalExpression::FULL_OUTER_JOIN) {
+    return IsNullRejecting(a, a.right->tables_in_subtree) &&
+           IsNullRejecting(b, b.left->tables_in_subtree);
+  }
+  // Secondary engine does not want us to treat STRAIGHT_JOINs as associative.
+  if ((current_thd->secondary_engine_optimization() ==
+       Secondary_engine_optimization::SECONDARY) &&
+      (a.type == RelationalExpression::STRAIGHT_INNER_JOIN ||
+       b.type == RelationalExpression::STRAIGHT_INNER_JOIN)) {
+    return false;
+  }
+  // For the operations we support, it can be collapsed into this simple
+  // condition. (Cartesian products and inner joins are treated the same.)
+  return IsInnerJoin(a.type) && b.type != RelationalExpression::FULL_OUTER_JOIN;
+}
+
+bool OperatorsAreLeftAsscom(const RelationalExpression &a,
+                            const RelationalExpression &b) {
+  // Table 3 from [Moe13]; which operator pairs are l-asscom.
+  if (a.type == RelationalExpression::STRAIGHT_INNER_JOIN ||
+      b.type == RelationalExpression::STRAIGHT_INNER_JOIN) {
+    return false;   // ★ STRAIGHT_JOIN 用户就是要"更少自由度"，一律禁止
+  }
+  if (a.type == RelationalExpression::LEFT_JOIN) {
+    if (b.type == RelationalExpression::FULL_OUTER_JOIN) {
+      return IsNullRejecting(a, a.left->tables_in_subtree);
+    } else {
+      return true;
+    }
+  }
+  ...
+  return b.type != RelationalExpression::FULL_OUTER_JOIN;
+}
+
+bool OperatorsAreRightAsscom(const RelationalExpression &a,
+                             const RelationalExpression &b) {
+  if (a.type == RelationalExpression::FULL_OUTER_JOIN &&
+      b.type == RelationalExpression::FULL_OUTER_JOIN) {
+    return IsNullRejecting(a, a.right->tables_in_subtree) &&
+           IsNullRejecting(b, b.right->tables_in_subtree);
+  }
+  return a.type == RelationalExpression::INNER_JOIN &&
+         b.type == RelationalExpression::INNER_JOIN;
+}
+```
+
+退化条件的处理（`:2587`）：
+
+```cpp
+table_map IntersectIfNotDegenerate(table_map used_tables,
+                                   table_map available_tables) {
+  if (!Overlaps(used_tables, available_tables)) {
+    // Degenerate case.
+    return available_tables;   // ★ 条件没引用这一侧 ⇒ 整侧都算进去（保守）
+  } else {
+    return used_tables & available_tables;
+  }
+}
+```
 
 `FindHyperedgeAndJoinConflicts`（`make_join_hypergraph.cc:2715`）注释明说：
 
@@ -341,6 +908,94 @@ for (Item_field &left_field : item_equal->get_fields())
 
 ### 4.2 主循环（667-691）
 
+⚠️ **勘误**：入口函数名是 **`EnumerateAllConnectedPartitions()`**（论文里的 `Solve()`）；**不存在** `EnumerateConnectedSubgraphs()`。且 **`subgraph_enumeration.h` 是 header-only**（没有 `.cc`），全部函数都是 `template <class Receiver>` + `inline`。
+
+```cpp
+// sql/join_optimizer/subgraph_enumeration.h:649
+// Consider increasing subsets of the graph, backwards; first only the
+// last node (say, R6), then {R5,R6} with R5 as the seed, then
+// {R4,R5,R6} with R4 as the seed, and so on. ...
+//
+// Called Solve() in the DPhyp paper.
+//
+// If at any point receiver->FoundSingleNode() or receiver->FoundSubgraphPair()
+// returns true, the algorithm will abort, and this function also return true.
+template <class Receiver>
+bool EnumerateAllConnectedPartitions(const Hypergraph &g, Receiver *receiver) {
+  for (int seed_idx = g.nodes.size() - 1; seed_idx >= 0; --seed_idx) {
+    if (receiver->FoundSingleNode(seed_idx)) {   // ★ 先为单表建 access path
+      return true;
+    }
+
+    NodeMap seed = TableBitmap(seed_idx);
+    NodeMap forbidden = TablesBetween(0, seed_idx);
+    // ★★ X = 所有编号 < seed_idx 的节点：保证每个集合只被枚举一次
+    NodeMap full_neighborhood = 0;
+    NeighborhoodCache cache(0);
+    NodeMap neighborhood =
+        FindNeighborhood(g, seed, forbidden, seed, &cache, &full_neighborhood);
+    if (EnumerateComplementsTo(g, seed_idx, seed, full_neighborhood,
+                               neighborhood, receiver)) {
+      return true;
+    }
+    if (ExpandSubgraph(g, seed_idx, seed, full_neighborhood, neighborhood,
+                       forbidden | seed, receiver)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+> ★★ **"backwards"（从 N-1 递减到 0）是 DPhyp 的命脉**：先枚举编号大的种子，于是任何集合 S 的**最小编号节点最后才当种子**，保证 S 的所有真子集都先于 S 被枚举完毕 —— 这就是 DP 的拓扑序。
+
+**Receiver 是模板参数，不是虚基类**（文件头注释 `:65-72` 的解释）：
+
+```
+For complex joins, we may have to run DPhyp multiple times in a mode
+where we just count the number of partitions over various constrained
+graphs, and this will be a critical part of query planning time.
+Thus, it is coded as a template over a receiver type that gets callbacks
+for each partition. If the receiver just interested in counting,
+this saves a significant amount of call overhead.
+```
+
+> ⚠️ **不存在** `class Receivers`。两个实例：**`TrivialReceiver`**（`trivial_receiver.h:30`，纯计数，图简化用）与 **`CostingReceiver`**（`join_optimizer.cc:165`）。duck typing 要求实现三个方法：`HasSeen()` / `FoundSingleNode()` / `FoundSubgraphPair()`。
+
+```cpp
+// sql/join_optimizer/trivial_receiver.h:30
+class TrivialReceiver {
+ public:
+  bool HasSeen(hypergraph::NodeMap subgraph) const {
+    return m_seen_subgraphs.count(subgraph) != 0;   // ★ 连通性判定的真实数据结构
+  }
+  bool FoundSingleNode(int node_idx) {
+    ++seen_nodes;
+    m_seen_subgraphs.insert(TableBitmap(node_idx));
+    return false;
+  }
+  // Called EmitCsgCmp() in the paper.
+  bool FoundSubgraphPair(hypergraph::NodeMap left, hypergraph::NodeMap right,
+                         int edge_idx [[maybe_unused]]) {
+    const JoinPredicate *edge = &m_graph->edges[edge_idx];
+    if (!PassesConflictRules(left | right, edge->expr)) return false;
+    ++seen_subgraph_pairs;
+    if (m_subgraph_pair_limit >= 0 &&
+        seen_subgraph_pairs > m_subgraph_pair_limit) {
+      return true;      // ★ 超限 ⇒ 让 DPhyp 立刻中止
+    }
+    m_seen_subgraphs.insert(left | right);   // ★ 记住并集 ⇒ 之后 HasSeen 知道它连通
+    return false;
+  }
+  int seen_nodes = 0;
+  int seen_subgraph_pairs = 0;
+ private:
+  mem_root_unordered_set<hypergraph::NodeMap> m_seen_subgraphs;
+  const JoinHypergraph *m_graph;
+  const int m_subgraph_pair_limit;
+};
+```
+
 ```cpp
 template <class Receiver>
 bool EnumerateAllConnectedPartitions(const Hypergraph &g, Receiver *receiver) {
@@ -366,6 +1021,84 @@ bool EnumerateAllConnectedPartitions(const Hypergraph &g, Receiver *receiver) {
 - **③④** 对每个 csg 做两件事：找 complement 配对、继续长大
 
 ### 4.3 FindNeighborhood（285-341）—— N(S, X)
+
+函数体（`subgraph_enumeration.h:285`）——注意它只检查 `IsSubset(e.left, subgraph)`，因为每条边存了两份：
+
+```cpp
+inline NodeMap FindNeighborhood(const Hypergraph &g, NodeMap subgraph,
+                                NodeMap forbidden, NodeMap just_grown_by,
+                                NeighborhoodCache *cache,
+                                NodeMap *full_neighborhood_arg) {
+  assert(IsSubset(just_grown_by, subgraph));
+
+  NodeMap full_neighborhood = *full_neighborhood_arg;
+  NodeMap neighborhood = 0;
+
+  NodeMap to_search =
+      cache->InitSearch(just_grown_by, &neighborhood, &full_neighborhood);
+
+  for (size_t node_idx : BitsSetIn(to_search)) {
+    // Simple edges.
+    neighborhood |= g.nodes[node_idx].simple_neighborhood;
+    // ★ 一次 OR 就把全部简单边邻居收进来 —— 这是 simple_neighborhood 位图的价值
+
+    for (size_t edge_idx : g.nodes[node_idx].complex_edges) {
+      const Hyperedge e = g.edges[edge_idx];
+
+      if (IsSubset(e.left, subgraph) &&
+          !Overlaps(e.right, subgraph | forbidden)) {
+        // e.right is an interesting hypernode (part of E↓'(S,X)).
+        full_neighborhood |= e.right;
+        if (!Overlaps(e.right, neighborhood)) {
+          // e.right is also not subsumed by another edge (ie., it is part of
+          // E↓(S,X)), so add a “representative node” for it to the
+          // neighborhood.
+          neighborhood |= IsolateLowestBit(e.right);
+          // ★ 第 3 步：取最低位节点作为该 hypernode 的「代表元」
+        }
+      }
+    }
+  }
+
+  neighborhood &= ~(subgraph | forbidden);   // ★ S 和 X 里的节点都不算邻居
+  full_neighborhood |= neighborhood;
+  cache->Store(just_grown_by, neighborhood, full_neighborhood);
+  *full_neighborhood_arg = full_neighborhood;
+  return neighborhood;
+}
+```
+
+> ★★ 那段 60 行注释（`:207-284`）里有四条"paper 没写清"的关键说明，其中第三条解释了为什么只搜 `just_grown_by`：
+> *"Third, due to the way we grow our subgraph, only the nodes that we have just grown by can contribute to the E↓'(S,X). The reason is simple; every node from the previous neighborhood will have been added either to S or to X, and both exclude them from the new neighborhood."*
+>
+> ★ 第四条承认**完全极小化做不到**（minimum set problem，最优 O(n²/log n)），所以只做"低垂果实"：用 `simple_neighborhood` 位图一次性淘汰所有被简单边覆盖的复杂超边。
+>
+> ★ 性能：*“This function accounts for roughly 20–70% of the total DPhyp running time … ~40% average”*。
+
+**`NeighborhoodCache` 的 taboo bit**（`:112`，单元素缓存）：
+
+```cpp
+  // Tell the cache we intend to start a neighborhood search.
+  inline NodeMap InitSearch(NodeMap just_grown_by, NodeMap *neighborhood,
+                            NodeMap *full_neighborhood) {
+    if (IsSubset(m_last_just_grown_by, just_grown_by)) {
+      * full_neighborhood |= m_last_full_neighborhood;
+      *neighborhood = m_last_neighborhood;
+      return just_grown_by & ~m_last_just_grown_by;   // ★ 只需补算新长出来的部分
+    }
+    return just_grown_by;   // 缓存不中，全量算
+  }
+
+  inline void Store(NodeMap just_grown_by, NodeMap neighborhood,
+                    NodeMap full_neighborhood) {
+    if (Overlaps(just_grown_by, m_taboo_bit)) return;   // ★ 命中 taboo bit 不写缓存
+    m_last_just_grown_by = just_grown_by;
+    m_last_full_neighborhood = full_neighborhood;
+    m_last_neighborhood = neighborhood;
+  }
+```
+
+> ★ 注释量化了收益：*"The overhead of managing the cache is a ~15-20% loss for simple graphs with low degrees … but a huge speedup (60% or more) for graphs with high degrees, such as stars."*
 
 ```cpp
 for (size_t node_idx : BitsSetIn(to_search)) {
@@ -395,6 +1128,66 @@ neighborhood &= ~(subgraph | forbidden);
 ### 4.4 EnumerateComplementsTo（351-416）—— EmitCsg
 
 ```cpp
+// sql/join_optimizer/subgraph_enumeration.h:343
+// Called EmitCsg() in the DPhyp paper.
+template <class Receiver>
+[[nodiscard]] bool EnumerateComplementsTo(
+    const Hypergraph &g, size_t lowest_node_idx, NodeMap subgraph,
+    NodeMap full_neighborhood, NodeMap neighborhood, Receiver *receiver) {
+  NodeMap forbidden = TablesBetween(0, lowest_node_idx);
+  // ★ X 被重置为 [0, lowest_node_idx)：补图可以包含先前被禁的低编号节点
+
+  neighborhood &= ~subgraph;
+
+  NeighborhoodCache cache(neighborhood);
+  for (size_t seed_idx : BitsSetInDescending(neighborhood)) {  // ★ 同样倒序
+    NodeMap seed = TableBitmap(seed_idx);
+    if (Overlaps(g.nodes[seed_idx].simple_neighborhood, subgraph)) {
+      for (size_t edge_idx : g.nodes[seed_idx].simple_edges) {
+        const Hyperedge e = g.edges[edge_idx];
+        assert(e.left == seed);
+        if (Overlaps(e.right, subgraph)) {
+          if (receiver->FoundSubgraphPair(subgraph, seed, edge_idx / 2)) {
+            return true;      // ★★ EmitCsgCmp：回调 receiver
+          }
+        }
+      }
+    }
+    for (size_t edge_idx : g.nodes[seed_idx].complex_edges) {
+      const Hyperedge e = g.edges[edge_idx];
+      if (e.left == seed && IsSubset(e.right, subgraph)) {
+        if (receiver->FoundSubgraphPair(subgraph, seed, edge_idx / 2)) {
+          return true;
+        }
+      }
+    }
+
+    // Grow the complement candidate along the neighborhoods ...
+    // Note that the extension of the forbidden set is required to avoid
+    // enumerating the same set twice; ...
+    // This is analogous to what we do in EnumerateAllConnectedPartitions(),
+    // and the whole reason for iterating backwards, but the DPhyp paper
+    // misses this. The “Building Query Compilers” document, however, seems
+    // to have corrected it.
+    NodeMap new_forbidden =
+        forbidden | subgraph | (neighborhood & TablesBetween(0, seed_idx));
+    //                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                          ★ MySQL 对原论文的修正
+    NodeMap new_full_neighborhood = 0;
+    NodeMap new_neighborhood = FindNeighborhood(g, seed, new_forbidden, seed,
+                                                &cache, &new_full_neighborhood);
+    if (ExpandComplement(g, lowest_node_idx, subgraph, full_neighborhood, seed,
+                         new_neighborhood, new_forbidden, receiver)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+> ★ `edge_idx / 2` 处处出现——因为 `g.edges` 里每条逻辑边存两份（正反），除以 2 还原成 `JoinPredicate` 下标。
+
+```cpp
 NodeMap forbidden = TablesBetween(0, lowest_node_idx);   // ★ 重置，不含上层 forbidden
 NeighborhoodCache cache(neighborhood);
 for (size_t seed_idx : BitsSetInDescending(neighborhood)) {    // 倒序选 complement 种子
@@ -417,6 +1210,97 @@ for (size_t seed_idx : BitsSetInDescending(neighborhood)) {    // 倒序选 comp
 - **`edge_idx / 2`**：因为边存了两份，除以 2 还原成 `JoinHypergraph::edges` 下标
 
 ### 4.5 ExpandSubgraph（425-514）—— 两趟循环保证 DP 拓扑序
+
+```cpp
+// sql/join_optimizer/subgraph_enumeration.h:418
+// Given a subgraph of g, grow it recursively along the neighborhood.
+// If the subgraph is connected, use it as base for enumerating a complement
+// graph before growing it.
+//
+// Called EnumerateCsgRec() in the paper.
+template <class Receiver>
+[[nodiscard]] bool ExpandSubgraph(const Hypergraph &g, size_t lowest_node_idx,
+                                  NodeMap subgraph, NodeMap full_neighborhood,
+                                  NodeMap neighborhood, NodeMap forbidden,
+                                  Receiver *receiver) {
+  NeighborhoodCache cache(neighborhood);
+
+  // ★★★ 第一趟：产出趟 ★★★
+  for (NodeMap grow_by : NonzeroSubsetsOf(neighborhood)) {
+    NodeMap grown_subgraph = subgraph | grow_by;
+    if (receiver->HasSeen(grown_subgraph)) {
+      // ★★ 连通性判定的全部秘密：问 receiver「你之前见过这个集合吗？」
+      NodeMap new_full_neighborhood = full_neighborhood;
+      NodeMap new_neighborhood =
+          FindNeighborhood(g, subgraph | grow_by, forbidden, grow_by, &cache,
+                           &new_full_neighborhood);
+
+      // EnumerateComplementsTo() resets the forbidden set, ... so we know
+      // exactly which nodes they are!
+      new_neighborhood |= forbidden & ~TablesBetween(0, lowest_node_idx);
+      new_neighborhood |= neighborhood;
+
+      if (EnumerateComplementsTo(g, lowest_node_idx, grown_subgraph,
+                                 new_full_neighborhood, new_neighborhood,
+                                 receiver)) {
+        return true;
+      }
+    }
+  }
+
+  // ★★★ 第二趟：生长趟 ★★★
+  // Now try to grow all the grown subgraphs into larger, connected subgraphs.
+  // Note that we do this even if the grown subgraph isn't connected, since it
+  // might be connected as we add more nodes.
+  //
+  // We need to do this after EnumerateComplementsTo() has run on all of them
+  // (in turn, generating csg-cmp-pairs and calling FoundSubgraphPair()),
+  // to guarantee that we will see any smaller subgraphs before larger ones.
+  for (NodeMap grow_by : NonzeroSubsetsOf(neighborhood)) {
+    NodeMap grown_subgraph = subgraph | grow_by;
+
+    // Recursive calls are not allowed to add any of the nodes from
+    // our current neighborhood, since we're already trying all
+    // combinations of those ourselves.
+    NodeMap new_forbidden = (forbidden | neighborhood) & ~grown_subgraph;
+    assert(!IsSubset(grown_subgraph, new_forbidden));
+
+    NodeMap new_full_neighborhood = full_neighborhood;
+    NodeMap new_neighborhood =
+        FindNeighborhood(g, subgraph | grow_by, new_forbidden, grow_by, &cache,
+                         &new_full_neighborhood);
+
+    if (ExpandSubgraph(g, lowest_node_idx, grown_subgraph,
+                       new_full_neighborhood, new_neighborhood, new_forbidden,
+                       receiver)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+> ★★ **为什么必须分两趟**（源码注释 `:486-488` 是官方答案）：合并成一趟的话，递归会先钻进 `grow_by` 的大子树并在那里产出**更大**的 csg-cmp-pair，回头才产出小的 —— **破坏"小集合先于大集合"的 DP 拓扑序**，导致 `HasSeen()` 查不到父级 access path（DP 表还没填）。
+>
+> ★ 两趟共用 `:438` 构造的**同一个** `NeighborhoodCache`，这是缓存命中率的关键。
+
+`ExpandComplement()`（`:567`，论文 `EnumerateCmpRec()`）结构相同，唯一差异是第一趟改成"尝试连边"而非"枚举补图"：
+
+```cpp
+  for (NodeMap grow_by : NonzeroSubsetsOf(neighborhood)) {   // 第一趟：产出
+    NodeMap grown_complement = complement | grow_by;
+    if (receiver->HasSeen(grown_complement)) {
+      if (TryConnecting(g, subgraph, subgraph_full_neighborhood,
+                        grown_complement, receiver)) {
+        return true;
+      }
+    }
+  }
+  NeighborhoodCache cache(neighborhood);   // ★ 只在第二趟前构造
+  for (NodeMap grow_by : NonzeroSubsetsOf(neighborhood)) {   // 第二趟：递归长大
+    ...
+  }
+```
 
 ```cpp
 // 第一趟：对所有已连通的增长子图，枚举 complement

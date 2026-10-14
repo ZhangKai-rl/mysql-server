@@ -2,7 +2,8 @@
 
 > 基于 MySQL 8.0.39 源码，覆盖关闭的全链路：三条入口（`SHUTDOWN` SQL / 信号 / `mysqladmin`）→ 汇聚到信号线程 → `close_connections()`（温和两轮 kill + 强制断开 + 无限等待）→ 主线程 `clean_up()`（逆序卸载）→ InnoDB 九态关闭状态机 → `mysqld_exit()`。
 >
-> **边界**：本篇讲**运行期关闭与退出**；
+> **本篇横跨 server 层与 InnoDB 层**，讲完「从关闭触发到进程 exit」这一段纵向闭环：三入口汇聚 → 信号线程 `close_connections()` → **下探到 InnoDB 两段式关闭（`srv_pre_dd_shutdown` 屏障 + `srv_shutdown` 九态机 + 后台线程退出 + 资源释放）** → 主线程 `clean_up()` → `mysqld_exit()`。
+> 本篇讲**运行期关闭与退出**；
 > 启动失败走的 `unireg_abort()` 属于启动链路，见 [`02_startup.md`](02_startup.md)；
 > `--initialize` 用 abort 路径走成功退出码，见 [`01_initialize.md`](01_initialize.md)；
 > 崩溃恢复（关闭不干净的后果）见 [`../../innodb/recovery.md`](../../innodb/recovery.md)；
@@ -298,6 +299,91 @@ static bool srv_purge_should_exit(ulint n_purged) {
 
 ### 主链路
 
+#### 并发时序：三个线程怎么协作（关闭的核心难点）
+
+关闭不是单线程的：触发者、执行者、收尾者是三个不同的线程。这张图是理解整篇的关键：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端连接线程<br/>(执行 SHUTDOWN)
+    participant S as 信号线程<br/>signal_hand()
+    participant M as 主线程<br/>mysqld_main()
+    participant I as InnoDB
+
+    alt 路径 A：SHUTDOWN SQL
+        C->>C: check_global_access(SHUTDOWN_ACL)
+        C->>C: my_ok(thd) 先回 OK 包
+        C->>S: kill_mysql() → pthread_kill(SIGTERM)
+        C->>C: dispatch_command 置 error=true → 连接关闭
+    else 路径 B：kill -TERM / systemd stop
+        Note over S: 内核直接投递信号
+    end
+
+    Note over S: server_components_init_wait() 早已返回<br/>（信号线程在 ready 时已被唤醒）
+
+    S->>S: LogErr(ER_SERVER_SHUTDOWN_INFO)
+    S->>S: if (!connection_events_loop_aborted())  ← 幂等闸门
+    S->>S: set_connection_events_loop_aborted(true)
+
+    rect rgb(255, 238, 238)
+        Note over S,M: ★ 打断主线程的 poll()
+        loop while socket_listener_active
+            S->>M: pthread_kill(main_thread_id, SIGALRM)
+            S->>S: cond_wait(COND_socket_listener_active)
+            M->>M: poll() 因 EINTR 返回 → 看到 aborted → 退出循环
+            M->>S: socket_listener_active=false + broadcast
+        end
+    end
+
+    rect rgb(238, 245, 255)
+        Note over S: ★ 阶段 1：close_connections()
+        S->>S: close_listener()（不再 accept）
+        S->>C: Set_kill_conn 第 1 轮（温和：只置 KILL_CONNECTION）
+        S->>S: end_slave() 停复制线程
+        S->>S: 等 8 秒 → set_dump_thread_flag → 杀 dump 线程
+        S->>S: Events::stop() + sleep(2)
+        S->>C: Call_close_conn 第 2 轮（强制：断 vio）
+        S->>S: Events::deinit()
+        S->>S: wait_till_no_thd() → wait_till_no_connection()
+        Note right of S: ★ 两个等待都【无超时】<br/>shutdown hang 的主要来源
+    end
+
+    S->>S: my_thread_exit()
+
+    Note over M: connection_event_loop() 已返回
+    M->>M: SERVER_SHUTTING_DOWN + sysd::notify("STOPPING=1")
+    M->>M: mysql_audit_notify(REASON_SHUTDOWN)
+    M->>M: terminate_compress_gtid_table_thread()
+    M->>I: gtid_state->save_gtids_of_last_binlog_into_table()
+    Note right of M: ★ 必须在 InnoDB 还活着时做
+
+    M->>S: my_thread_join(signal_thread_id)
+
+    rect rgb(240, 255, 240)
+        Note over M,I: ★ 阶段 2：clean_up() —— 两模块交替推进
+        M->>I: ha_pre_dd_shutdown() → srv_pre_dd_shutdown()
+        I->>I: 推进到 SRV_SHUTDOWN_DD（停掉访问 DD 的线程）
+        M->>M: dd::shutdown()   ← server 关 DD
+        M->>M: binlog/acl/tz/grant 卸载
+        M->>I: plugin_shutdown() → hton->panic → srv_shutdown()
+        I->>I: 九态机推进到 EXIT_THREADS（刷脏 + checkpoint + 释放）
+        M->>M: delete_pid_file() + ER_SERVER_SHUTDOWN_COMPLETE
+        Note right of M: mysqladmin 就是等 pid 文件消失
+    end
+
+    M->>M: mysqld_exit(signal_hand_thr_exit_code)
+    Note over M: my_end() → destroy_error_log() → shutdown_performance_schema() → exit()
+```
+
+三条读图要点：
+
+1. **发信号的人不知道结果**。`SHUTDOWN` 线程发完 `pthread_kill` 就关连接了，它不知道关闭是否完成——所以 `mysqladmin` 只能靠"等 pid 文件消失"判断。
+2. **打断 `poll()` 是唯一的同步点**。主线程阻塞在 `poll()` 上根本不会查标志，只能靠 SIGALRM 把它叫醒；信号线程用 `while` 循环重试对抗"唤醒丢失"。
+3. **阶段 2 是 server 与 InnoDB 交替推进的**，`SRV_SHUTDOWN_DD` 就是那个交接棒。
+
+#### 调用栈全景
+
 ```
 [路径 A] SHUTDOWN SQL
   do_command → dispatch_command → mysql_execute_command
@@ -481,6 +567,57 @@ error:
 已废弃的 `COM_SHUTDOWN` 协议命令在 8.0 只剩一个占位：`COM_DEPRECATED_1, /**< Deprecated, used to be COM_SHUTDOWN */`。老的 C API `mysql_shutdown()` 也改为发 SQL。
 
 ### 二、阶段 1：`close_connections()`
+
+#### 两轮 kill 的流程与分支
+
+```mermaid
+flowchart TD
+    A["close_connections() 开始"] --> B["RUN_HOOK(before_server_shutdown)"]
+    B --> C["kill_blocked_pthreads()<br/>thread_cache 缩到 0"]
+    C --> D["close_listener()<br/>不再 accept 新连接"]
+
+    D --> E["第 1 轮 Set_kill_conn<br/>（温和：只置 KILL_CONNECTION）"]
+
+    E --> E1{"是 replica 线程?"}
+    E1 -->|是| E2["return（跳过，由 end_slave() 处理）"]
+    E1 -->|否| E3{"是 COM_BINLOG_DUMP?"}
+    E3 -->|是| E4["++dump_thread_count; return<br/>★ 留到最后才杀"]
+    E3 -->|否| E5{"kill_immunizer<br/>（正在操作 DD 表）?"}
+    E5 -->|是| E6["save_killed_state()<br/>★ 存起来，退出临界区后生效"]
+    E5 -->|否| E7["killed = KILL_CONNECTION"]
+    E7 --> E8["broadcast(current_cond)<br/>唤醒正在等锁/等磁盘的线程"]
+
+    E2 --> F["end_slave()<br/>terminate_slave_threads(SLAVE_FORCE_ALL)"]
+    E4 --> F
+    E6 --> F
+    E8 --> F
+
+    F --> G{"dump_thread_count > 0?"}
+    G -->|是| G1["最多等 8 秒（每次 sleep 1s）<br/>等其余会话结束"]
+    G1 --> G2["set_dump_thread_flag()<br/>再跑一次 do_for_all_thd 杀 dump"]
+    G -->|否| H
+    G2 --> H["Events::stop()"]
+
+    H --> I{"thd_count > 0?"}
+    I -->|是| I1["sleep(2) 宽限"]
+    I -->|否| J
+    I1 --> J["第 2 轮 Call_close_conn<br/>（强制：close vio）"]
+
+    J --> J1["打 ER_FORCE_CLOSE_THREAD<br/>\"Forcing close of thread N\"  "]
+    J1 --> J2["close_connection()<br/>★ 让阻塞在 net_read() 的线程收到 EOF"]
+
+    J2 --> K["Events::deinit()<br/>★ 必须在所有连接中止之后"]
+    K --> L["wait_till_no_thd()<br/>★ 无超时"]
+    L --> M["wait_till_no_connection()<br/>★ 无超时"]
+    M --> N["delete_slave_info_objects()"]
+
+    style E fill:#e8f5e9
+    style J fill:#ffebee
+    style L fill:#fff3e0
+    style M fill:#fff3e0
+```
+
+三个颜色标记对应三种语义：绿色=温和、红色=强制、黄色=**无超时等待**（shutdown hang 的两大来源）。
 
 完整原文（注释保留，它们是设计说明的一部分）：
 
@@ -796,7 +933,17 @@ void MYSQL_BIN_LOG::cleanup() {
 
 `close()` 的 `exiting` 位掩码定义：`LOG_CLOSE_INDEX`（关 index 文件）/ `LOG_CLOSE_TO_BE_OPENED`（关完马上要开）/ `LOG_CLOSE_STOP_EVENT`（写 stop 事件）。
 
-### 四、InnoDB 关闭（本篇最核心）
+### 四、InnoDB 关闭（横跨两层的这一段）
+
+前面 §二 / §三 是 server 层的两阶段；从本节开始下探到引擎。InnoDB 的关闭被**从中间劈成两半**，分别挂在 `clean_up()` 的两个不同位置：
+
+```
+clean_up()
+├─ ha_pre_dd_shutdown()   → srv_pre_dd_shutdown()   ★ 阶段一：停掉所有会访问 DD 的线程
+├─ dd::shutdown()                                   ← server 在这里关 DD
+└─ ...
+   └─ plugin_shutdown() → hton->panic → srv_shutdown()   ★ 阶段二：真正刷盘 + 关文件
+```
 
 #### 4.1 函数名核实（这批名字错得最多）
 
@@ -890,7 +1037,98 @@ enum srv_shutdown_t {
 };
 ```
 
+**推进器强制单调 +1**，状态迁移如下（`--->` 为 InnoDB 自己推进，`==>` 为由 server 侧触发）：
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> NONE : 服务器运行中
+
+    NONE --> RECOVERY_ROLLBACK : srv_pre_dd_shutdown() 开始<br/>① for(10 次) { if(活动线程==0) break; sleep(1s) }<br/>② ut_a(活动线程==0) ★ 否则崩溃<br/>③ ut_a(!m_recv_writer 活着)<br/>④ redo 禁用 且 fast=2 → 强制降级 fast=1<br/>⑤ clone gtid_persistor.stop()<br/>⑥ 等 trx_recovery_rollback 【仅 fast=0】
+
+    RECOVERY_ROLLBACK --> PRE_DD : ★ 停所有【会访问 DD】的线程<br/>fts_optimize_shutdown()<br/>dict_stats_shutdown() + _thread_deinit()<br/>等 ts_alter_encrypt 退出<br/>srv_wake_master_thread()<br/>+ os_event_wait(m_master_ready_for_dd_shutdown)<br/>ut_d(trx_sys_before_pre_dd_shutdown_validate())
+
+    PRE_DD --> PURGE : while (purge 活着) { srv_purge_wakeup(); sleep(100us) }<br/>★ fast=0 时要求 n_purged==0（清完）<br/>fast!=0 时 n_purged!=0 也可退<br/>purge state → INIT / EXIT / DISABLED<br/>ut_d(trx_sys_after_pre_dd_shutdown_validate())
+
+    PURGE --> DD : srv_shutdown_set_state(DD)<br/>（InnoDB 到此停下）
+
+    DD ==> CLEANUP : ★★ 外部屏障<br/>【server 侧】dd::shutdown()<br/>然后 plugin_shutdown() → hton->panic<br/>→ innodb_shutdown() → srv_shutdown()
+
+    CLEANUP --> MASTER_STOP : srv_shutdown_cleanup_and_master_stop()<br/>（同一个函数推进两态，用 max_wait_on_state）<br/>停：lock_wait_timeout / error_monitor<br/>/ monitor / buf_dump / buf_resize<br/>【每 60s 打 "Waiting for %s to exit."】
+
+    MASTER_STOP --> FLUSH_PHASE : srv_shutdown_page_cleaners()<br/>buf_pool_wait_for_no_pending_io()<br/>while (page cleaner 活着) { os_event_set(buf_flush_event); sleep }<br/>【page cleaner 循环刷到 success && n_flushed==0】<br/>★ fast=2 时 page cleaner 直接 thread_exit
+
+    FLUSH_PHASE --> LAST_PHASE : srv_shutdown_log()<br/>fast!=2：不动点迭代 log_make_latest_checkpoint()<br/>  → log_stop_background_threads()<br/>  → fil_flush_file_spaces()<br/>  → ★ fil_write_flushed_lsn(lsn)<br/>fast==2：只 log_stop_background_threads()<br/>  ★【不写】flushed_lsn → 下次崩溃恢复
+
+    LAST_PHASE --> EXIT_THREADS : srv_shutdown_arch()（等 archiver）<br/>+ srv_shutdown_exit_threads()<br/>★ 唯一允许绕过 +1 约束的态<br/>【保留 redo 线程到总等待的 75%】<br/>【最多 60s，超时 release 只 warn / debug 崩】
+
+    EXIT_THREADS --> [*] : 资源释放 step 5（22 个调用）<br/>ib::info(ER_IB_MSG_1155)<br/>"Shutdown completed; log sequence number %llu"
+
+    note right of NONE
+      用户事务在【此阶段】就已停
+      （close_connections() 杀连接时顺带结束）
+      所以 InnoDB 状态机从"处理 recovery 回滚"开始
+    end note
+
+    note right of DD
+      ★★ 唯一由【外部】推进的态
+      srv_shutdown_set_state 强制 +1，
+      但这里 InnoDB 主动停下等 server
+    end note
+
+    note right of PRE_DD
+      给插件作者的契约：
+      "你的线程若会访问 DD，
+      必须在此阶段停掉"
+    end note
+```
+
+配合这张图看 `innodb_fast_shutdown` 三档——**它只改变 4 个态的行为**：
+
+```mermaid
+flowchart LR
+    subgraph F0["innodb_fast_shutdown = 0（slow）"]
+        A1["RECOVERY_ROLLBACK<br/>✅ 等回滚完"]
+        A2["MASTER_STOP<br/>✅ ibuf 全 merge"]
+        A3["PURGE<br/>✅ 清完所有 undo"]
+        A4["FLUSH_PHASE<br/>✅ 刷脏"]
+        A5["LAST_PHASE<br/>✅ checkpoint<br/>✅ 写 flushed_lsn"]
+        A1 --> A2 --> A3 --> A4 --> A5
+    end
+
+    subgraph F1["= 1（默认）"]
+        B1["RECOVERY_ROLLBACK<br/>❌ 不等"]
+        B2["MASTER_STOP<br/>❌ 不 merge<br/>（但做 background drop tables）"]
+        B3["PURGE<br/>❌ 只做 batch=20 一轮"]
+        B4["FLUSH_PHASE<br/>✅ 刷脏"]
+        B5["LAST_PHASE<br/>✅ checkpoint<br/>✅ 写 flushed_lsn"]
+        B1 --> B2 --> B3 --> B4 --> B5
+    end
+
+    subgraph F2["= 2（crash-like）"]
+        C1["RECOVERY_ROLLBACK<br/>❌"]
+        C2["MASTER_STOP<br/>❌ 连 drop tables 都不做"]
+        C3["PURGE<br/>❌"]
+        C4["FLUSH_PHASE<br/>❌ 不刷脏"]
+        C5["LAST_PHASE<br/>❌ 不 checkpoint<br/>❌★ 不写 flushed_lsn"]
+        C1 --> C2 --> C3 --> C4 --> C5
+    end
+
+    A5 --> OK["下次启动：<br/>checkpoint_lsn == flush_lsn<br/>→ 判定【干净关闭】，不恢复"]
+    B5 --> OK
+    C5 --> RECOV["下次启动：<br/>checkpoint_lsn != flush_lsn<br/>→ ★ 崩溃恢复<br/>（已提交事务不丢：redo 已落盘）"]
+
+    style A5 fill:#e8f5e9
+    style B5 fill:#e8f5e9
+    style C5 fill:#ffebee
+    style OK fill:#e8f5e9
+    style RECOV fill:#fff3e0
+```
+
 注意第一条注释里的关键信息：**用户事务在 `SRV_SHUTDOWN_NONE` 阶段就已经停了**（`close_connections()` 杀连接时顺带结束），InnoDB 的状态机从"处理 recovery 回滚"开始。
+
+而 `SRV_SHUTDOWN_DD` 是唯一一个**由外部推进**的态：InnoDB 走到这里就停下，等 server 关完 DD，再由 `plugin_shutdown()` 接着往后推。这就是"把跨模块顺序编码进状态机"。
 
 #### 4.4 `srv_pre_dd_shutdown()`（clean_up 第 1 步到达）
 
@@ -1422,6 +1660,269 @@ sync_check_close();
 
 注意 **`fil_close_all_files()`（step 3）在 `dblwr::close()`（step 5）之前**——先关文件句柄再释放内存。
 
+#### 4.14 资源释放逐个解释（step 5 的完整语义）
+
+| 调用 | 释放了什么 | 为什么在这个位置 |
+|---|---|---|
+| `btr_search_disable()` | AHI（自适应哈希索引） | **必须最先**：AHI 持有对 buffer pool 页与 dict 索引的引用，晚关会悬空。源码注释："This must be disabled before closing the buffer pool and closing the data dictionary." |
+| `ibuf_close()` | change buffer | 同属"引用 buffer pool"的结构 |
+| `ddl_log_close()` | DDL log（原子 DDL 的日志表） | |
+| `log_sys_close()` | redo 系统（就是 `log_sys_free()`） | 文件已在 step 3 关掉，这里释放内存 |
+| `recv_sys_close()` | 恢复结构（哈希表等） | |
+| `trx_sys_close()` / `lock_sys_close()` / `trx_pool_close()` | 事务系统 / 锁系统 / trx 池 | |
+| `dict_close()` / `dict_persist_close()` / `btr_search_sys_free()` | 引擎字典 / 动态元数据模块 / AHI 系统结构 | |
+| `undo_spaces_deinit()` | undo 表空间内存对象 | |
+| `os_aio_free()` | AIO 子系统 | **必须在 `buf_pool_free_all()` 之前**——buffer pool 释放时可能还有 pending I/O |
+| `que_close()` / `row_mysql_close()` / `pars_close()` / `pars_lexer_close()` | 查询图、row 层、解析器 | |
+| `srv_free()` / `fil_close()` | srv 全局对象 / 文件层 | |
+| `buf_pool_free_all()` | 所有 buffer pool 实例 | 逐个实例释放 |
+| `clone_free()` / `arch_free()` | clone / archiver | |
+| `dblwr::close()` | doublewrite | 打印 `ER_IB_DBLWR_BYTES_INFO` 统计 |
+| `os_thread_close()` / `sync_check_close()` | 线程管理资源 / **latch order 校验框架** | `sync_check` 最后关——它要监控到所有 latch 都销毁 |
+
+三条顺序硬约束：
+
+- `btr_search_disable()` 最先（AHI 引用）；
+- **`fil_close_all_files()`（step 3，关文件句柄）必须在 `dblwr::close()`（step 5，释放内存）之前**；
+- `sync_check_close()` 最后（要监控到所有 latch 销毁）。
+
+#### 4.15 不动点迭代：为什么写 checkpoint 要循环
+
+```cpp
+void log_make_empty_and_stop_background_threads(log_t &log) {
+  log_files_dummy_records_disable(log);
+  while (log_make_latest_checkpoint(log)) {
+    /* It could happen, that when writing a new checkpoint,
+    DD dynamic metadata was persisted, making some pages
+    dirty (with the persisted data) and writing new redo
+    records to protect those modifications. In such case,
+    current lsn would be higher than lsn and we would need
+    another iteration to ensure, that checkpoint lsn points
+    to the newest lsn. */
+  }
+  log_stop_background_threads(log);
+}
+```
+
+**写 checkpoint 这个动作本身会产生新的 redo**（持久化 DD 动态元数据会把页弄脏并写 redo 保护）。所以必须迭代到"checkpoint lsn == 当前 lsn"这个**不动点**。`srv_shutdown_log()` 里的断言就是不动点的验证：
+
+```cpp
+  ut_a(lsn == log_sys->last_checkpoint_lsn.load() ||
+       srv_force_recovery >= SRV_FORCE_NO_LOG_REDO);
+  ut_a(lsn == log_get_lsn(*log_sys));
+```
+
+#### 4.16 一个真实的死锁场景：`log_stop_background_threads()` 的"不得持 X 锁"
+
+```cpp
+void log_stop_background_threads(log_t &log) {
+  /* We cannot stop threads when x-lock is acquired, because of scenario:
+          * log_checkpointer starts log_checkpoint()
+          * log_checkpoint() asks to persist dd dynamic metadata
+          * dict_persist_to_dd_table_buffer() tries to write to redo
+          * but cannot lock on log.sn
+          * so log_checkpointer thread waits for this thread
+            until the x-lock is released
+          * but this thread waits until log background threads
+            have been stopped - log_checkpointer is not stopped. */
+  ut_ad(!rw_lock_own(log.sn_lock_inst, RW_LOCK_X));
+  ...
+  log.should_stop_threads.store(true);
+  while (log_writer_is_active())         { os_event_set(log.writer_event); sleep(10us); }
+  while (log_write_notifier_is_active()) { os_event_set(log.write_notifier_event); ... }
+  while (log_flusher_is_active())        { os_event_set(log.flusher_event); ... }
+  while (log_flush_notifier_is_active()) { os_event_set(log.flush_notifier_event); ... }
+  while (log_checkpointer_is_active())   { os_event_set(log.checkpointer_event); ... }
+  while (log_files_governor_is_active()) { os_event_set(log.m_files_governor_event); ... }
+```
+
+这段注释描述了一个**真实的死锁**：持有 `log.sn` 的 X 锁去停 redo 线程，而 redo 线程里的 checkpoint 又要写 redo（需要 `log.sn`）⇒ 互相等待。
+
+解法是**用断言把前置条件固定下来**（"调用者不得持 X 锁"），而不是在锁上做文章——这是并发设计里典型的"**用契约代替防御**"。注意这里用的是 `ut_ad`（debug 断言）而非运行时检查。
+
+#### 4.17 `flushed_lsn` 到底写在哪：干净关闭的判定公式
+
+```cpp
+/** Write the flushed LSN to the page header of the first page in the
+system tablespace. */
+dberr_t fil_write_flushed_lsn(lsn_t lsn) {
+  auto buf = static_cast<byte *>(ut::aligned_alloc(UNIV_PAGE_SIZE, UNIV_PAGE_SIZE));
+  const page_id_t page_id(TRX_SYS_SPACE, 0);          // ★ 只有系统表空间 page 0
+  err = fil_read(page_id, univ_page_size, 0, univ_page_size.physical(), buf);
+  if (err == DB_SUCCESS) {
+    mach_write_to_8(buf + FIL_PAGE_FILE_FLUSH_LSN, lsn);
+    err = fil_write(page_id, univ_page_size, 0, univ_page_size.physical(), buf);
+    fil_system->flush_file_spaces();                   // 只是 fsync 所有表空间，不写 LSN
+  }
+  ut::aligned_free(buf);
+  return err;
+}
+```
+
+三个精确事实：
+
+1. **只写系统表空间的第 0 页**，其它表空间不写；
+2. 偏移是 **`FIL_PAGE_FILE_FLUSH_LSN = 26`**——属于 **FIL 页头**，**不是** FSP header（FSP header 起点是 `FIL_PAGE_DATA = 38`）。这 8 字节还被 `FIL_PAGE_VERSION` / `FIL_RTREE_SPLIT_SEQ_NUM` 复用；
+3. `fil_flush_file_spaces()` 只是把未刷新的表空间做一次 fsync，与写 LSN 无关。
+
+**"干净关闭"的判定公式**（在 [`02_startup.md`](02_startup.md) 的恢复入口）：
+
+```cpp
+  if (checkpoint_lsn != flush_lsn) {
+    ...
+    recv_init_crash_recovery();      // 需要恢复
+  }
+```
+
+即 **`checkpoint_lsn == flush_lsn` ⟺ 干净关闭**。而关闭侧保证这个等式成立的前提就是 `srv_shutdown_log()` 里那句断言：
+
+```cpp
+  ut_a(lsn == log_sys->last_checkpoint_lsn.load() || srv_force_recovery >= SRV_FORCE_NO_LOG_REDO);
+```
+
+**同一个 8 字节字段承载两个语义**：既是"上次干净关闭的 LSN"，也（在 `< LOG_START_LSN` 时）表达"数据目录没初始化过"。
+
+读取侧是 `SysTablespace::read_lsn_and_check_flags()` → `Datafile::validate_first_page()`：
+
+```cpp
+    if (flush_lsn != nullptr) {
+      *flush_lsn = mach_read_from_8(m_first_page + FIL_PAGE_FILE_FLUSH_LSN);
+    }
+```
+
+它还会在首 page 校验失败时**尝试从 doublewrite 恢复 page 0**（`restore_from_doublewrite(0)`）——首 page 被撕裂时这是唯一的自救手段。
+
+#### 4.18 buffer pool 是怎么被释放的
+
+```cpp
+void buf_pool_free_all() {
+  for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
+    buf_pool_free_instance(&buf_pool_ptr[i]);
+  }
+  buf_pool_free();
+}
+```
+
+`buf_pool_free_instance()` 里的关键断言：
+
+```cpp
+  for (bpage = UT_LIST_GET_LAST(buf_pool->LRU); bpage != nullptr; bpage = prev_bpage) {
+    buf_page_state state = buf_page_get_state(bpage);
+    ut_ad(buf_page_in_file(bpage));
+    ut_ad(bpage->in_LRU_list);
+    if (state != BUF_BLOCK_FILE_PAGE) {
+      /* We must not have any dirty block except when doing a fast shutdown. */
+      ut_ad(state == BUF_BLOCK_ZIP_PAGE || srv_fast_shutdown == 2);
+      buf_page_free_descriptor(bpage);
+    }
+  }
+```
+
+即：**不允许残留脏块，除非 `innodb_fast_shutdown = 2`**。这条断言把"fast=2 允许脏页留在内存里等崩溃恢复"这个约定固化下来。
+
+真正的"全部已释放"校验不在这里，而在它之前的两处：
+
+```cpp
+void buf_must_be_all_freed(void) {          // srv_shutdown_log() 里调用两次
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    buf_must_be_all_freed_instance(buf_pool_from_array(i));
+  }
+}
+// → ib::fatal(ER_IB_MSG_83) << "Page ... still fixed or dirty";
+```
+
+以及 page cleaner 收尾时的硬断言：
+
+```cpp
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    ut_a(UT_LIST_GET_LEN(buf_pool_from_array(i)->flush_list) == 0);
+  }
+```
+
+#### 4.19 archiver 与 `dblwr::close()`
+
+**archiver 有两类被统一管理，一类单独管理**：
+
+| 线程 | 退出条件 | 谁停它 |
+|---|---|---|
+| `m_log_archiver` | `srv_shutdown_state ∈ {LAST_PHASE, EXIT_THREADS}` 且状态为 IDLE/INIT → 置 `ARCH_STATE_ABORT` → `archive()` 返回 true → 退出，打 `"Exiting Log Archiver"` | `arch_wake_threads()` |
+| `m_page_archiver` | 同上，打 `"Exiting Page Archiver"` | `arch_wake_threads()` |
+| `m_backup_log_archiver` | MEB（`innodb_redo_log_archive_dirs`）按需启停，**显式 `join()`**；`log_stop_background_threads()` 第一步就 `meb::redo_log_archive_deinit()` | 独立 |
+
+```cpp
+bool arch_wake_threads() {
+  bool found_alive = false;
+  if (srv_thread_is_active(srv_threads.m_log_archiver)) {
+    os_event_set(log_archiver_thread_event); found_alive = true;
+  }
+  if (srv_thread_is_active(srv_threads.m_page_archiver)) {
+    os_event_set(page_archiver_thread_event); found_alive = true;
+  }
+  return (found_alive);     // ★ true ⟺ 还有线程活着
+}
+```
+
+`srv_shutdown_arch()` 就靠这个返回值循环，`SHUTDOWN_SLEEP_ROUNDS` 用尽前每 60 秒打一次 `ER_IB_MSG_1246`。
+
+**`dblwr::close()` 只关 v2**：
+
+```cpp
+void Double_write::shutdown() noexcept {
+  if (s_instances == nullptr) return;                    // 幂等
+  unsigned long long n_bytes = 0;
+  for (auto dblwr : *s_instances) { n_bytes += dblwr->m_bytes_written; ut::delete_(dblwr); }
+  ib::info(ER_IB_DBLWR_BYTES_INFO) << "Bytes written to disk by DBLWR (ON): " << n_bytes;
+  ...  // reduced( DETECT_ONLY) 实例同理，打印 "Bytes written to disk by DBLWR (REDUCED): "
+  for (auto &file : s_files)  if (file.m_pfs.m_file != OS_FILE_CLOSED) os_file_close(file.m_pfs);
+  for (auto &file : s_r_files) if (file.m_pfs.m_file != OS_FILE_CLOSED) os_file_close(file.m_pfs);
+  ...
+}
+```
+
+v1（legacy）在系统表空间的页里，**没有文件句柄，因此没有对应的 close 动作**——它随系统表空间一起释放。
+
+#### 4.20 后台线程退出条件总表
+
+> **名字纠正**：8.0.39 **不存在** `buf_flush_page_cleaner_coordinator`。真实名是 **`buf_flush_page_coordinator_thread()`**（coordinator）与 `buf_flush_page_cleaner_thread()`（worker）——方向与直觉相反：带 "cleaner" 的是 worker，带 "coordinator" 的没有 cleaner。
+
+| 线程 | 主循环检查什么 | 被 `os_event_set` 唤醒后怎么走完最后一轮 |
+|---|---|---|
+| `log_writer` | `should_stop_threads` + `log_writer_is_allowed_to_stop()` | 先把 log buffer 里所有 ready 数据写完（`write_lsn == ready_for_write_lsn`）才 break |
+| `log_flusher` | `should_stop_threads` + `!log_writer_is_active()` | **必须等 writer 先死**；退出循环前再 `log_flush_low()` 一次，末了 `ut_a(write_lsn == flushed_to_disk_lsn)` |
+| `log_write_notifier` | `should_stop_threads` + `!log_writer_is_active()` + `lsn > write_lsn` | 通知完最后一个 block（`ut_a(lsn == write_lsn + 1)`）才 break |
+| `log_flush_notifier` | `should_stop_threads` + `!log_flusher_is_active()` | 同上，但依赖 flusher 先死 |
+| `log_checkpointer` | `should_stop_threads` + writer/flusher 都死 + `dirty_pages_added_up_to_lsn == end_lsn` | 还要校验 `recent_written` / `recent_closed` 区间无残留 link |
+| **`log_files_governor`** | **不检查 `should_stop_threads`**，只看 `!log_writer_is_active()` | 退出后仍要做 `log_files_update_capacity_limits()` + `mark_consumed_files()` + `process_consumed_files()` |
+| `io_handler_thread`（AIO） | `srv_shutdown_state != EXIT_THREADS \|\| page_cleaner 活着 \|\| AIO slot 未空` | 三条件同时满足才退出；靠 `os_aio_wake_all_threads_at_shutdown()` 唤醒处理残留完成事件 |
+| `srv_monitor_thread` | **`os_event_wait_time()` 返回 0**（被唤醒而非超时） | 退出后 `ut_ad(SRV_SHUTDOWN_CLEANUP <= state)` |
+| `srv_error_monitor_thread` | `srv_shutdown_state < SRV_SHUTDOWN_CLEANUP` 则 `goto loop` | 被唤醒后**完整跑完一轮**（LRU 统计 + 死锁检测 + 长等待打印）再判退出 |
+| `lock_wait_timeout_thread` | do-while：`state < SRV_SHUTDOWN_CLEANUP` | 被唤醒后先做完超时检查与死锁检查，再判断 |
+| `buf_flush_page_coordinator_thread` | `state < SRV_SHUTDOWN_CLEANUP` | 刷到 `success && n_flushed == 0 && 无未完成读 IO`；断言 flush list 全空；然后 `is_running = false` + set `is_requested` 让 worker 退出 |
+| `buf_flush_page_cleaner_thread`（worker） | `!page_cleaner->is_running` | 醒来看到 false 即 break |
+| `dict_stats_thread` | `SHUTTING_DOWN()` = `state >= PRE_DD_AND_SYSTEM_TRANSACTIONS` | 唤醒后**再查一次** `SHUTTING_DOWN()`，真则 break，否则处理一条 recalc 条目 |
+| `fts_optimize_thread` | **不看 shutdown state**，靠消息队列的 `FTS_MSG_STOP` | `fts_optimize_shutdown()` 投递 STOP 消息并 join |
+| `srv_worker_thread`（purge worker） | `purge_sys->state == PURGE_STATE_EXIT` | 被唤醒后先 `srv_task_execute()` 做完队列任务，再看 state；**保证 worker 比 coordinator 晚退** |
+| `buf_dump_thread` | `SHUTTING_DOWN()`（与 dict_stats 同一个宏） | 退出循环后**还有一次"最后一 dump"**：`innodb_buffer_pool_dump_at_shutdown=ON` 且 `fast_shutdown != 2` 时，无视 shutdown 标志再 dump 一次 |
+| `buf_resize_thread` | `state < SRV_SHUTDOWN_CLEANUP` | 被唤醒后**二次检查** state 再 break——避免 shutdown 期间又触发一次 resize |
+
+**两条从这张表能读出的设计规律**：
+
+1. **依赖顺序被编码成"检查别人的死活"**：flusher 等 writer、notifier 等 writer/flusher、checkpointer 等两者、governor 只看 writer。redo 六线程的退出顺序是被显式排出来的，不是并发竞争出来的。
+2. **几乎所有线程都是"被唤醒后先跑完当前一轮，再判断退出"**——这就是 `srv_shutdown_exit_threads()` 里"反复 `os_event_set()`"存在的原因：单次唤醒可能被线程睡回去吃掉。
+
+#### 4.21 各 close / free 函数逐个说明
+
+| 函数 | 释放什么 |
+|---|---|
+| `ibuf_close()` | change buffer：`mutex_free(ibuf_pessimistic_insert_mutex / ibuf_mutex / ibuf_bitmap_mutex)`，释放 `ibuf->index` 的锁与内存对象，`ut::free(ibuf)` 并置 `ibuf = nullptr`（重复调用直接返回） |
+| `trx_sys_close()` | 事务系统：断言 `state == SRV_SHUTDOWN_EXIT_THREADS`；若还有未关闭 read view 报 `ER_IB_MSG_1201`；`trx_purge_sys_close()`；清空 `rw_trx_list`；析构 rsegs / mvcc / Trx_shard / rw_trx_ids；退出前 `ut_a` 断言 `rw_trx_list` / `mysql_trx_list` / `serialisation_list` 三个链表**长度均为 0** |
+| `lock_sys_close()` | 锁系统：关闭 `lock_latest_err_file`，`delete` 三张哈希（`rec_hash` / `prdt_hash` / `prdt_page_hash`），销毁 `timeout_event` 与 `srv_max_n_threads` 个等待 slot 的 event，最后 `lock_sys->~lock_sys_t(); ut::free(lock_sys)` |
+| `dict_close()` | 引擎字典：先关掉 `table_stats` / `index_stats` / `dynamic_metadata` / `ddl_log` 四张内部表，再遍历 `table_hash` 逐个移除，`delete` 两个哈希，`ut_ad(dict_sys->size == 0)` 后 `ut::free(dict_sys)` |
+| `os_aio_free()` | AIO：`AIO::shutdown()`（delete `s_ibuf` / `s_writes` / `s_reads`），销毁各 segment 的等待事件，遍历 block cache 断言 `!m_in_use` 后释放 |
+| `sync_check_close()` | 同步基础设施（**最后一个动作**）：`LatchDebug::shutdown()`（debug 下检查 latch 泄漏）、`sync_array_close()`、释放 `mutex_monitor` / `create_tracker`、`sync_latch_meta_destroy()`。它要活到所有 latch 都销毁之后 |
+| `os_thread_close()` | **本身不释放资源**，唯一作用是当 `os_thread_count > 0` 时打 `ib::warn(ER_IB_MSG_1274, os_thread_count)` 警告仍有线程未退出 |
+| `os_thread_any_active()` | 就是 `os_thread_count.load(relaxed) > 0`；`os_thread_count` 是全局 `std::atomic_int`，由 `IB_thread` 的构造/析构增减，是 `srv_shutdown_exit_threads()` 轮询与 `ut_ad(!os_thread_any_active())` 的判据 |
+
 ### 五、插件 / 组件 deinit
 
 #### 5.1 `plugin_shutdown()`
@@ -1699,7 +2200,12 @@ void destroy_error_log() {
 | 关闭是否完成 | error log | `ER_SERVER_SHUTDOWN_COMPLETE`；`SHOW ENGINE INNODB STATUS` 里的 "Shutdown completed; log sequence number N" |
 | 谁发的关闭 | error log | `ER_SERVER_SHUTDOWN_INFO`："<via user signal>" vs 用户名 |
 | systemd 视角 | journal | `STOPPING=1` / `STATUS=Server shutdown complete` |
-| doublewrite 统计 | error log | `ER_IB_DBLWR_BYTES_INFO`（`dblwr::close()` 打印） |
+| doublewrite 统计 | error log | "Bytes written to disk by DBLWR (ON): N" 与 "(REDUCED): N"（`dblwr::close()` 打印） |
+| 退出线程超 60 秒 | error log | `ER_IB_MSG_1103`（release 打 warning；debug 直接 `ut_error`） |
+| archiver 没退完 | error log | `ER_IB_MSG_1246`（每 60 秒一条）；archiver 自己打印 "Exiting Log Archiver" / "Exiting Page Archiver" |
+| buffer pool 还有页没释放 | error log + fatal | `ER_IB_MSG_83`："Page ... still fixed or dirty"（`buf_must_be_all_freed()`，fatal 级） |
+| 还有 InnoDB 线程没退出 | error log | `ER_IB_MSG_1274`（`os_thread_close()` 打的 warning，带 `os_thread_count`） |
+| 这次关闭到底算不算"干净" | 文件系统 / 日志 | `fil_write_flushed_lsn()` 写的是**系统表空间 page 0 偏移 26**；下次启动 `checkpoint_lsn == flush_lsn` 才算干净 |
 
 ---
 
@@ -1754,12 +2260,13 @@ void destroy_error_log() {
 - bugs.mysql.com：搜索 "shutdown hang" / "waiting for threads to die" 可查关闭 hang 的报告（多数根因落在 `wait_till_no_thd` 与 InnoDB 后台线程停止阶段）
 
 **内核月报 / 技术文章**
-- 腾讯云数据库内核月报：InnoDB shutdown 与 `innodb_fast_shutdown` 专题（注意：月报函数名多基于 5.7，`logs_empty_and_mark_files_at_shutdown` 等在 8.0.39 已不存在，需回源码核实）
+- [《MySQL · 引擎特性 · InnoDB 崩溃恢复》](http://mysql.taobao.org/monthly/2017/07/01/)，数据库内核月报 2017/07/01 —— **基于 5.6 分支**。其中 `innodb_fast_shutdown` 三档与 `innodb_force_recovery` 七档的语义描述仍与 8.0.39 一致（已核实）；但函数名（`logs_empty_and_mark_files_at_shutdown` 等）已全部失效，逐条纠正见 [`02_startup.md`](02_startup.md) 的「外部材料核实记录」
 
 **相关文档**
 - 启动流程与 `unireg_abort`：见 [`02_startup.md`](02_startup.md)
 - 初始化与退出码：见 [`01_initialize.md`](01_initialize.md)
 - 崩溃恢复（关闭不干净的后果）：见 [`../../innodb/recovery.md`](../../innodb/recovery.md)
+- InnoDB 启动与崩溃恢复（本篇 §四 的上游）：见 [`02_startup.md`](02_startup.md) 的「ARIES 三阶段在 InnoDB 的落地」
 - redo / checkpoint 机制：见 [`../../innodb/redo_log.md`](../../innodb/redo_log.md)
 - doublewrite 收尾统计：见 [`../../innodb/dblwr.md`](../../innodb/dblwr.md)
 - 插件框架：见 [`../plugin/plugin.md`](../plugin/plugin.md)

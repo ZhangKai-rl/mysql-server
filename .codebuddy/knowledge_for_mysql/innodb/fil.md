@@ -261,6 +261,10 @@ dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id,
 
 ---
 
+### 透明页压缩（TPC）：压缩本体在 compression.md，fil 层只做注入与打洞
+
+> `COMPRESSION='zlib'|'lz4'` 的完整实现链（压缩页头 6 字段、`os_file_compress_page`/`Compression::deserialize` 完整贴码、dblwr 先压后加密、恢复期算法反推）→ [`../feat/compression.md`](../feat/compression.md) 透明页压缩节。本节只交代 fil 层的职责边界：**`do_io` 的四条件注入**（见上方主链路节：写 + 非 zip 页 + `page_no>0` + 打洞可用）与**打洞失败降级**——`os_file_punch_hole` 返回 `DB_IO_NO_PUNCH_HOLE`（文件系统 `ENOTSUP`）时 `fil_no_punch_hole`（fil0fil.cc:8861）把 `file->punch_hole` 永久置 false，之后该文件所有页整页原样写、不再压缩。
+
 ### ★ AIO 模式的三选一（含缺页读为何是同步）
 
 #### `Fil_shard::get_AIO_mode`（`fil0fil.cc`）

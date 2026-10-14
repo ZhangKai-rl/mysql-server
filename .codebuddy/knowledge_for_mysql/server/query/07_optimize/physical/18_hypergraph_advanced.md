@@ -194,6 +194,145 @@ Item *CommonSubexpressionElimination(Item *cond) {
 
 #### 1.2 AlwaysPresent
 
+> ⚠️ **勘误**：CSE **不在** `join_optimizer.cc`，而是独立文件 **`sql/join_optimizer/common_subexpression_elimination.cc`**；且它工作在 **Item 树上、在超图构建之前**（`EarlyNormalizeConditions()` → `CSEConditions()`，`make_join_hypergraph.cc:2265`），**不接触 `Predicate` 与位图**。
+
+**doxygen（`common_subexpression_elimination.h:29`）**——它明说只做一种改写：
+
+```cpp
+/**
+  Do simple CSE (common subexpression elimination) on “item”, and return
+  the answer. The CSE done is exclusively moving common expressions out
+  of conjunctions-of-disjunctions, ie. it rewrites
+
+    (a AND b) OR (a AND c)
+
+  into
+
+    a AND (b OR c)
+
+  The primary motivation is that such split-out items are more versatile;
+  they can be pushed independently, be made into hash join conditions etc.
+  However, an added bonus is that the expressions will simply execute faster.
+
+  This function does not descend into subexpressions that are not AND/OR
+  conjunctions, so e.g. an expression like
+
+    1 + ((a AND b) OR (a AND c))
+
+  will be left as-is.
+ */
+```
+
+**`AlwaysPresent()` 完整源码**（`common_subexpression_elimination.cc:44`）——三条判据：
+
+```cpp
+/**
+  Check if “item” is necessary to make the expression true.
+  This is case if “expr” is either:
+
+   - The same as “item”, or
+   - (something necessary) OR (something necessary)
+   - (something necessary) AND anything
+
+  A typical case would be of the latter would be
+
+    (item AND x) OR (item AND y) OR (z AND w AND item)
+ */
+bool AlwaysPresent(Item *expr, const Item *item) {
+  if (expr->eq(item, /*binary_cmp=*/true)) {
+    return true;                       // ★ 判据①：纯语法结构等价
+  }
+
+  // (something necessary) AND (anything), e.g. item AND x AND y.
+  if (IsAnd(expr)) {
+    for (Item &sub_item : *down_cast<Item_cond_and *>(expr)->argument_list()) {
+      if (AlwaysPresent(&sub_item, item)) {
+        return true;                   // ★ 判据②：AND 下「任一」子项成立即可
+      }
+    }
+    return false;
+  }
+
+  // (something necessary) OR (something necessary),
+  // e.g. item AND (item OR x).
+  if (IsOr(expr)) {
+    for (Item &sub_item : *down_cast<Item_cond_or *>(expr)->argument_list()) {
+      if (!AlwaysPresent(&sub_item, item)) {
+        return false;                  // ★ 判据③：OR 下必须「所有」子项都成立
+      }
+    }
+    return true;
+  }
+
+  // Something else.
+  return false;                        // ★ 非 AND/OR（比较、函数…）一律 false，不下钻
+}
+```
+
+```cpp
+// :38
+bool IsOr(const Item *item) {
+  return item->type() == Item::COND_ITEM &&
+         down_cast<const Item_cond *>(item)->functype() ==
+             Item_func::COND_OR_FUNC;
+}
+// sql/item_cmpfunc.h:2812
+inline bool IsAnd(const Item *item) {
+  return item->type() == Item::COND_ITEM &&
+         down_cast<const Item_cond *>(item)->functype() ==
+             Item_func::COND_AND_FUNC;
+}
+```
+
+**主函数**（`:178`）——注意候选集只来自**第一支**，不是两两比较：
+
+```cpp
+Item *CommonSubexpressionElimination(Item *cond) {
+  if (!IsOr(cond)) return cond;
+
+  Item_cond_or *or_item = down_cast<Item_cond_or *>(cond);
+  if (or_item->argument_list()->is_empty()) {
+    return new Item_func_false;        // ★ 空 OR ⇒ 恒假
+  }
+
+  List<Item> common_items;
+  Item *first_group = or_item->argument_list()->head();
+  if (IsAnd(first_group)) {
+    Item_cond_and *and_group = down_cast<Item_cond_and *>(first_group);
+    for (Item &and_arg : *and_group->argument_list()) {   // ★ 只遍历第一支
+      if (AlwaysPresent(or_item, &and_arg)) {
+        common_items.push_back(&and_arg);
+      }
+    }
+  } else {
+    if (AlwaysPresent(or_item, first_group)) common_items.push_back(first_group);
+  }
+
+  if (common_items.is_empty()) return cond;
+
+  Item *remainder = OrGroupWithSomeRemoved(or_item, common_items);
+  if (remainder != nullptr) {          // ★ nullptr = 恒真 ⇒ 整支丢弃
+    common_items.push_back(remainder);
+  }
+  return CreateConjunction(&common_items);
+}
+```
+
+> ★ 还有一个 `MatchesAny()`（`:86`）也是 `eq(binary_cmp=true)` 的调用点，用于"待移除列表"的命中判断。
+
+**调用点**（`make_join_hypergraph.cc:2241`）——改写后必须重新拆分：
+
+```cpp
+void CSEConditions(THD *thd, Mem_root_array<Item *> *conditions) {
+  bool need_resplit = false;
+  for (Item *&item : *conditions) {
+    Item *new_item = CommonSubexpressionElimination(item);
+    if (new_item != item) { need_resplit = true; item = new_item; }
+  }
+  if (need_resplit) *conditions = ResplitConditions(thd, *conditions);
+}
+```
+
 ```cpp
 bool AlwaysPresent(Item *expr, const Item *item) {
   if (expr->eq(item, /*binary_cmp=*/true)) return true;
@@ -313,6 +452,157 @@ hypergraph 枚举时，为了**避免反复复制 Item 树**，只记录"哪些�
 
 #### 2.2 三个函数
 
+> ⚠️ **勘误**：常见的 `CreateFilterPath()` / `AddFilter()` **都不存在**。真实链条是
+> `ConditionFromFilterPredicates()` → `ExpandSingleFilterAccessPath()` → `ExpandFilterAccessPaths()`，全在 **`sql/join_optimizer/access_path.cc`**。
+
+**① 位图 → Item 树的那一跳**（`access_path.cc:1342`）：
+
+```cpp
+Item *ConditionFromFilterPredicates(const Mem_root_array<Predicate> &predicates,
+                                    OverflowBitset mask,
+                                    int num_where_predicates) {
+  List<Item> items;
+  for (int pred_idx : BitsSetIn(mask)) {         // ★ 遍历位图中每个置位下标
+    if (pred_idx >= num_where_predicates) break; // ★ 越过 num_where_predicates 的是 sargable join 谓词，不作 FILTER
+    items.push_back(predicates[pred_idx].condition);
+  }
+  return CreateConjunction(&items);              // ★ 0 项→nullptr，1 项→原样，多项→AND
+}
+```
+
+```cpp
+// sql/sql_executor.cc:736
+Item *CreateConjunction(List<Item> *items) {
+  if (items->size() == 0) return nullptr;
+  if (items->size() == 1) return items->head();
+  Item_cond_and *condition = new Item_cond_and(*items);
+  condition->quick_fix_field();
+  condition->update_used_tables();
+  condition->apply_is_true();
+  return condition;
+}
+```
+
+**② 单节点展开**（`access_path.cc:1353`，节选两个关键分支）：
+
+```cpp
+void ExpandSingleFilterAccessPath(THD *thd, AccessPath *path, const JOIN *join,
+                                  const Mem_root_array<Predicate> &predicates,
+                                  unsigned num_where_predicates) {
+  // Expand join filters for nested loop joins.
+  if (path->type == AccessPath::NESTED_LOOP_JOIN && ...) {
+    List<Item> items;
+    for (size_t filter_idx :
+         BitsSetIn(path->nested_loop_join().equijoin_predicates)) {  // ★ join 条件也存成位图
+      items.push_back(expr->equijoin_conditions[filter_idx]);
+      ...
+    }
+    for (Item *condition : expr->join_conditions) items.push_back(condition);
+
+    AccessPath *filter_path = new (thd->mem_root) AccessPath;
+    filter_path->type = AccessPath::FILTER;
+    filter_path->filter().child = right_path;
+    filter_path->filter().condition = CreateConjunction(&items);
+    path->nested_loop_join().inner = filter_path;
+    path->nested_loop_join().already_expanded_predicates = true;
+    // ★ 幂等保护：同一子路径可能被多个 root candidate 共享
+  }
+
+  // 哈希 join 走成环边时，把残留的 join 条件「并回」哈希 join 条件
+  if (path->type == AccessPath::HASH_JOIN && ...) {
+    MoveFilterPredicatesIntoHashJoinCondition(thd, path, predicates,
+                                              num_where_predicates);
+  }
+
+  // Expand filters _after_ the access path (these are much more common).
+  Item *condition = ConditionFromFilterPredicates(
+      predicates, path->filter_predicates, num_where_predicates);
+  if (condition == nullptr) return;
+
+  AccessPath *new_path = new (thd->mem_root) AccessPath(*path);
+  path->type = AccessPath::FILTER;              // ★ 当前节点就地变成 FILTER
+  path->filter().condition = condition;
+  path->filter().child = new_path;
+
+  // Clear filter_predicates, but keep applied_sargable_join_predicates.
+  MutableOverflowBitset applied_sargable_join_predicates =
+      path->applied_sargable_join_predicates().Clone(thd->mem_root);
+  applied_sargable_join_predicates.ClearBits(0, num_where_predicates);
+  path->filter_predicates = std::move(applied_sargable_join_predicates);
+}
+```
+
+**③ 整树递归**（`access_path.cc:1463`）：
+
+```cpp
+void ExpandFilterAccessPaths(THD *thd, AccessPath *path_arg, const JOIN *join,
+                             const Mem_root_array<Predicate> &predicates,
+                             unsigned num_where_predicates) {
+  WalkAccessPaths(path_arg, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [thd, &predicates, num_where_predicates](
+                      AccessPath *path, const JOIN *sub_join) {
+                    ExpandSingleFilterAccessPath(
+                        thd, path, sub_join, predicates, num_where_predicates);
+                    return false;
+                  });
+}
+```
+
+**`was_join_condition` 的消费点**（`access_path.cc:1286`）：
+
+```cpp
+  for (int filter_idx : BitsSetIn(path->filter_predicates)) {
+    if (filter_idx >= num_where_predicates) break;
+    const Predicate &predicate = predicates[filter_idx];
+    if (!predicate.was_join_condition) continue;   // ★ 只搬「本该是 join 条件」的那些
+    ...
+  }
+  path->filter_predicates = OverflowBitset::Xor(
+      thd->mem_root, path->filter_predicates, std::move(moved_predicates));
+```
+
+#### 2.4 最终归位判据的唯一出处（`join_optimizer.cc:6642`）
+
+```cpp
+  for (size_t i = 0; i < graph.num_where_predicates; ++i) {
+    // Apply any predicates that don't belong to any
+    // specific table, or which are nondeterministic.
+    if (!Overlaps(graph.predicates[i].total_eligibility_set,
+                  TablesBetween(0, graph.nodes.size())) ||
+        Overlaps(graph.predicates[i].total_eligibility_set, RAND_TABLE_BIT)) {
+      fd_set |= graph.predicates[i].functional_dependencies;
+      has_final_predicates = true;
+    }
+  }
+  ...
+        for (size_t i = 0; i < graph.num_where_predicates; ++i) {
+          if (!Overlaps(...) || Overlaps(..., RAND_TABLE_BIT)) {
+            filter_predicates.SetBit(i);           // ★ 先只在位图里记一笔
+            ...
+          }
+        }
+        ExpandFilterAccessPaths(thd, &path, join, graph.predicates,
+                                graph.num_where_predicates);
+        //                       ★ 紧跟其后才把位图展开成真 FILTER 节点
+```
+
+> ★ 两个条件：① `TES` 与任何表都不相交（跨表/无表，无法下推）；② 命中 `RAND_TABLE_BIT`（非确定性，必须最后算）。
+
+```cpp
+// sql/join_optimizer/access_path.h:112 —— Predicate 的完整字段
+struct Predicate {
+  Item *condition;
+  hypergraph::NodeMap used_nodes;
+  hypergraph::NodeMap total_eligibility_set;   // ★ TES
+  double selectivity;
+  bool was_join_condition = false;             // ★ 因成环被降级为 WHERE 的 join 条件
+  int source_multiple_equality_idx = -1;       // ★ 多路等值去重用的不透明下标
+  FunctionalDependencySet functional_dependencies;
+  Mem_root_array<int> functional_dependencies_idx;
+  Mem_root_array<ContainedSubquery> contained_subqueries;
+};
+```
+
 | 函数 | 职责 |
 |---|---|
 | `ApplyPredicatesForBaseTable` | 对单张基表，把"应用于它的谓词"收集起来，包成 `FILTER` 节点挂在表访问之上；同时计算函数依赖（FD）、决定子查询物化的二选一 |
@@ -338,6 +628,148 @@ hypergraph 枚举时，为了**避免反复复制 Item 树**，只记录"哪些�
 这一点很关键：它是"破坏性操作"，改写 Item 树指向临时表、真正创建临时表对象。所以 `sql_union.cc` 里对它的调用有严格的条件守卫。
 
 #### 3.2 主要工作
+
+**真实源码**（`finalize_plan.cc:656`）——⚠️ 只做 5 件事，**不建 iterator**：
+
+```cpp
+bool FinalizePlanForQueryBlock(THD *thd, Query_block *query_block) {
+  assert(query_block->join->needs_finalize);   // ★ 「只能调一次」的保证
+  query_block->join->needs_finalize = false;   // ★ 立刻翻 false，第二次调用会 assert 失败
+
+  AccessPath *const root_path = query_block->join->root_access_path();
+  assert(root_path != nullptr);
+  if (root_path->type == AccessPath::EQ_REF) {
+    return false;                              // ★ point select 快路径，全部跳过
+  }
+
+  // If the query is offloaded to an external executor, we don't need to create
+  // the internal temporary tables or filesort objects, or rewrite the Item tree
+  // to point into them.
+  if (!IteratorsAreNeeded(thd, root_path)) return false;
+
+  /* ① 合并堆叠的 FILTER */
+  WalkAccessPaths(root_path, query_block->join,
+                  WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [](AccessPath *path, JOIN *) {
+                    if (path->type == AccessPath::FILTER &&
+                        child->type == AccessPath::FILTER &&
+                        child->filter().materialize_subqueries ==
+                            path->filter().materialize_subqueries) {
+                      Item *condition = new Item_cond_and(
+                          child->filter().condition, path->filter().condition);
+                      condition->quick_fix_field();
+                      condition->update_used_tables();
+                      condition->apply_is_true();
+                      path->filter().condition = condition;
+                      path->filter().child = child->filter().child;
+                    }
+                    return false;
+                  }, /*post_order_traversal=*/true);
+
+  /* ② 自底向上第二趟：真正干活 */
+  WalkAccessPaths(root_path, query_block->join,
+                  WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [&](AccessPath *path, JOIN *join) {
+                    DelayedCreateTemporaryTable(thd, query_block, path,
+                                                after_aggregation,
+                                                &last_window_temp_table,
+                                                &num_windows_seen);
+                    // ★ 真正 create_tmp_table() 的地方
+
+                    UpdateReferencesToMaterializedItems(
+                        thd, query_block, path, after_aggregation,
+                        &applied_replacements);
+                    // ★ 把 SELECT list / IODKU / ORDER BY / HAVING 的 Item
+                    //   改指向临时表字段
+
+                    if (path->type == AccessPath::WINDOW) { ... }
+                    else if (path->type == AccessPath::AGGREGATE) {
+                      thd->change_item_tree(
+                          ci.get_item_ptr(),
+                          FindReplacementOrReplaceMaterializedItems(
+                              thd, ci.get_item(), *earlier_replacement,
+                              /*need_exact_match=*/true));   // ★ 调 replace_item
+                      ...
+                      after_aggregation = true;
+                    }
+                    if (AddCachesAroundConstantConditionsInPath(path)) { ... }
+                    return false;
+                  }, /*post_order_traversal=*/true);
+
+  if (query_block->join->push_to_engines()) return true;   // ★③ HG 路径的 push_to_engines 在这里
+  thd->lex->set_current_query_block(old_query_block);
+  return error;
+}
+```
+
+> ⚠️ **勘误**：`finalize_plan.h:38` 那个**三参数**声明 `(thd, query_block, root_path)` 是**僵尸声明**——全仓无定义、无调用；`finalize_plan.cc` 根本不 include `finalize_plan.h`（它 include `join_optimizer.h`）。真实签名是**两参数**。
+
+**`DelayedCreateTemporaryTable()`（`:480`）**——临时表为什么必须"延迟"到这一步：
+
+```cpp
+static void DelayedCreateTemporaryTable(THD *thd, Query_block *query_block,
+                                        AccessPath *path,
+                                        bool after_aggregation,
+                                        TABLE **last_window_temp_table,
+                                        unsigned *num_windows_seen) {
+  if (path->type == AccessPath::WINDOW) {
+    ++*num_windows_seen;
+    window->set_is_last(*num_windows_seen == query_block->join->m_windows.size());
+    path->window().temp_table = CreateTemporaryTableFromSelectList(...);
+    *last_window_temp_table = path->window().temp_table;   // ★ 传给紧随其后的 MATERIALIZE
+  } else if (path->type == AccessPath::MATERIALIZE) {
+    if (path->materialize().param->table == nullptr) {
+      if (*last_window_temp_table != nullptr) {
+        // A materialization that comes directly after a window;
+        // it's intended to materialize the output of that window.
+        path->materialize().param->table = *last_window_temp_table;
+      } else {
+        TABLE *table = CreateTemporaryTableFromSelectList(thd, query_block, nullptr, ...);
+        path->materialize().param->table = table;
+      }
+      EstimateMaterializeCost(thd, path);   // ★ 表建好后才估代价（此时才有真实 handler）
+    }
+  } else if (path->type == AccessPath::STREAM) { ... }
+}
+```
+
+**`UpdateReferencesToMaterializedItems()`（`:381`）**——"物化参数自身也要改"的落点：
+
+```cpp
+  if (temp_table_param != nullptr) {
+    // Update source references in this materialization.
+    for (const Func_ptr_array *earlier_replacement : *applied_replacements) {
+      for (Func_ptr &func : *temp_table_param->items_to_copy) {
+        func.set_func(FindReplacementOrReplaceMaterializedItems(
+            thd, func.func(), *earlier_replacement, /*need_exact_match=*/true));
+      }
+      // ★★ 这就是注释里 "t1.x -> <temp2>.x" 被改写成 "<temp1>.x -> <temp2>.x" 的地方
+    }
+    applied_replacements->push_back(temp_table_param->items_to_copy);
+
+    ReplaceSelectListWithTempTableFields(thd, join, *temp_table_param->items_to_copy);
+    if (thd->lex->sql_command == SQLCOM_INSERT_SELECT) {
+      ReplaceUpdateValuesWithTempTableFields(...);   // ★ IODKU
+    }
+  } else if (path->type == AccessPath::SORT) {
+    for (const Func_ptr_array *earlier_replacement : *applied_replacements) {
+      ReplaceOrderItemsWithTempTableFields(thd, path->sort().order,
+                                           *earlier_replacement);   // ★ ORDER BY
+    }
+    // Set up a Filesort object for this sort.
+    path->sort().filesort = new (thd->mem_root)
+        Filesort(thd, CollectTables(thd, path), /*keep_buffers=*/false,
+                 path->sort().order, path->sort().limit,
+                 path->sort().remove_duplicates, path->sort().force_sort_rowids,
+                 path->sort().unwrap_rollup);        // ★④ 建 Filesort 对象（不是 iterator）
+    join->filesorts_to_cleanup.push_back(path->sort().filesort);
+  } else if (path->type == AccessPath::FILTER) {
+    const bool need_exact_match = !after_aggregation;   // ★ HAVING 包在 Item_aggregate_ref 里
+    path->filter().condition = FindReplacementOrReplaceMaterializedItems(...);
+  }
+```
+
+> ★ 那段 44 行块注释（`:611-655`）解释了为什么"物化参数的源也要改"：*"Say that we first have a materialization that copies t1.x -> \<temp1\>.x. After that, we have a materialization that copies t1.x -> \<temp2\>.x. For this to work properly, we obviously need to go in and modify the second one so that it instead says \<temp1\>.x -> \<temp2\>.x"*
 
 ```
 FinalizePlanForQueryBlock()
@@ -382,14 +814,208 @@ constexpr double kAggregateOneRowCost  = 0.1;
 constexpr double kSortOneRowCost       = 0.1;
 constexpr double kHashBuildOneRowCost  = 0.1;
 constexpr double kHashProbeOneRowCost  = 0.1;
+constexpr double kHashReturnOneRowCost = 0.07;    // ★ 唯一的例外
+constexpr double kMaterializeOneRowCost = 0.1;
 constexpr double kWindowOneRowCost     = 0.1;
 ```
 
-全都是 `0.1` —— 即"每处理一行 0.1 个代价单位"。这是**刻意的粗粒度**：枚举过程中要为海量候选算代价，代价函数必须极快，不能去查可配置的代价表。
+**除 `kHashReturnOneRowCost = 0.07` 外全是 `0.1`** —— 即"每处理一行 0.1 个代价单位"。这是**刻意的粗粒度**：枚举过程中要为海量候选算代价，代价函数必须极快，不能去查可配置的代价表。
+
+★ 那个 `0.07` 值得单独说：它是"从建好的哈希表里取出一行"的代价，比 build（0.1）和 probe（0.1）都便宜——因为哈希查找已完成，这里只是读一次结果行。在一组几乎全是 0.1 的常量里它是唯一被单独调过的，说明作者确实区分过"probe 一次"与"probe 命中后返回一行"的开销。（旧版本文档曾漏掉这个常量与 `kMaterializeOneRowCost`，并误称"全都是 0.1"。）
 
 ★ 这是一个重要的架构信号：**hypergraph 的代价模型是"够用就行"的**，它的精度目标不是"选对索引"，而是"在 DPhyp 的候选空间里做相对排序"。精度敏感的部分（表扫描、ref 访问）仍然复用旧的 `Cost_model_server`。
 
 #### 4.2 估算函数族
+
+**8 个常量（`cost_model.h:47`）——含那段著名的自嘲注释**：
+
+```cpp
+// These are extremely arbitrary cost model constants. We should revise them
+// based on actual query times (possibly using linear regression?), and then
+// put them into the cost model to make them user-tunable.
+constexpr double kApplyOneFilterCost = 0.1;
+constexpr double kAggregateOneRowCost = 0.1;
+constexpr double kSortOneRowCost = 0.1;
+constexpr double kHashBuildOneRowCost = 0.1;
+constexpr double kHashProbeOneRowCost = 0.1;
+constexpr double kHashReturnOneRowCost = 0.07;   // ★ 唯一非 0.1
+constexpr double kMaterializeOneRowCost = 0.1;
+constexpr double kWindowOneRowCost = 0.1;
+
+// :39
+constexpr size_t kMaxItemLengthEstimate = 4096;  // ★ blob 宽度的启发式上限
+// :59
+constexpr ha_rows kRowEstimateFallback = 1000;
+```
+
+**`FindOutputRowsForJoin()`（`cost_model.h:143`，inline 在头文件）**——4 个分支：
+
+```cpp
+inline double FindOutputRowsForJoin(double left_rows, double right_rows,
+                                    const JoinPredicate *edge) {
+  double fanout = right_rows * edge->selectivity;
+  if (edge->expr->type == RelationalExpression::LEFT_JOIN) {
+    // For outer joins, every outer row produces at least one row (if none
+    // are matching, we get a NULL-complemented row).
+    // Note that this can cause inconsistent row counts; see bug #33550360
+    // and/or JoinHypergraph::has_reordered_left_joins.
+    fanout = std::max(fanout, 1.0);                 // ① 外连接：至少 1 行（NULL 补全）
+  } else if (edge->expr->type == RelationalExpression::SEMIJOIN) {
+    // ... we want the probability that at least one row is matching, which is
+    // something else entirely. However, given that we only have selectivity to
+    // work with, we don't really have anything better than to estimate it as a
+    // normal join and cap the result at selectivity 1.0 ...
+    fanout = std::min(fanout, 1.0);                 // ② 半连接：每外表行最多 1 行
+  } else if (edge->expr->type == RelationalExpression::ANTIJOIN) {
+    // Antijoin are estimated as simply the opposite of semijoin (see above),
+    // but wrongly estimating 0 rows (or, of course, a negative amount) could be
+    // really bad, so we assume at least 10% coming out as a fudge factor.
+    // It's better to estimate too high than too low here.
+    fanout = std::max(1.0 - fanout, 0.1);           // ③ 反连接：1-fanout，下限 10%
+  }
+  return left_rows * fanout;                        // ④ 默认（inner）：直接乘
+}
+```
+
+**`EstimateFilterCost()` 与 `FilterCost` 四元组**（`cost_model.h:64` / `:105`）：
+
+```cpp
+struct FilterCost {
+  double cost_if_not_materialized{0.0};
+  double init_cost_if_not_materialized{0.0};
+  double cost_if_materialized{0.0};
+  double cost_to_materialize{0.0};   // ★ 四种情形：不物化/不物化启动/已物化/物化开销
+};
+
+// 廉价重载（子查询结果已缓存时跳过遍历）
+inline FilterCost EstimateFilterCost(
+    THD *thd, double num_rows,
+    const Mem_root_array<ContainedSubquery> &contained_subqueries) {
+  FilterCost cost;
+  cost.cost_if_not_materialized = num_rows * kApplyOneFilterCost;
+  cost.cost_if_materialized = num_rows * kApplyOneFilterCost;
+  for (const ContainedSubquery &subquery : contained_subqueries) {
+    AddCost(thd, subquery, num_rows, &cost);
+  }
+  return cost;
+}
+```
+
+**`AddCost()` 的三种子查询策略**（`cost_model.cc:123`）：
+
+```cpp
+    case ContainedSubquery::Strategy::kMaterializable: {
+      Cost_model_server::enum_tmptable_type tmp_table_type;
+      if (subquery.row_width * num_rows < thd->variables.max_heap_table_size) {
+        tmp_table_type = Cost_model_server::MEMORY_TMPTABLE;   // ★ 按 max_heap_table_size 选内存/磁盘
+      } else {
+        tmp_table_type = Cost_model_server::DISK_TMPTABLE;
+      }
+      cost->cost_if_materialized += thd->cost_model()->tmptable_readwrite_cost(
+          tmp_table_type, /*write_rows=*/0, /*read_rows=*/num_rows);
+      cost->cost_to_materialize +=
+          subquery.path->cost + kMaterializeOneRowCost * subquery.path->num_output_rows();
+      cost->cost_if_not_materialized += num_rows * subquery.path->cost;  // ★ 不物化 = 每行重跑
+    } break;
+    case ContainedSubquery::Strategy::kNonMaterializable: ...
+    case ContainedSubquery::Strategy::kIndependentSingleRow:
+      cost->init_cost_if_not_materialized += subquery.path->cost;   // ★ 标量子查询只算一次
+      break;
+```
+
+**`EstimateSortCost()`（`cost_model.cc:92`）**——`n + k·log₂k`：
+
+```cpp
+    // Filesort's complexity is O(n + k log k) with a limit, or O(n log n)
+    // without. ... So we always calculate it as n + k log k:
+    sort_cost = kSortOneRowCost *
+                (num_input_rows +
+                 num_output_rows * std::max(log2(num_output_rows), 1.0));
+  }
+  path->cost = path->init_cost = child->cost + sort_cost;   // ★ 排序是全量操作：init_cost == cost
+  path->init_once_cost = 0.0;                               // ★ 重扫要重排，无可复用部分
+```
+
+**`EstimateAggregateCost()`（`cost_model.cc:818`）**——按**输入**行数计费：
+
+```cpp
+  path->cost = child->cost +
+               kAggregateOneRowCost * std::max(0.0, child->num_output_rows());
+  path->ordering_state = child->ordering_state;   // ★ AGGREGATE 不改变 ordering state
+```
+
+**`EstimateHashJoinKeyWidth()` / `EstimateRowWidthForJoin()`（`make_join_hypergraph.cc:2567` / `:2796`）**——⚠️ 不在 `cost_model`：
+
+```cpp
+size_t EstimateHashJoinKeyWidth(const RelationalExpression *expr) {
+  size_t ret = 0;
+  for (Item_eq_base *join_condition : expr->equijoin_conditions) {
+    // We heuristically limit our estimate of blobs to 4 kB.
+    // Otherwise, the mere presence of a LONGBLOB field would mean
+    // we'd estimate essentially infinite row width for a join.
+    const Item *left = join_condition->get_arg(0);
+    const Item *right = join_condition->get_arg(1);
+    ret += min<size_t>(
+        max<size_t>(left->max_char_length(), right->max_char_length()),
+        kMaxItemLengthEstimate);          // ★ 取左右较大者，再被 4096 截断
+  }
+  return ret;
+}
+
+size_t EstimateRowWidthForJoin(const JoinHypergraph &graph,
+                               const RelationalExpression *expr) {
+  size_t ret = EstimateHashJoinKeyWidth(expr);
+  for (int node_idx : BitsSetIn(expr->nodes_in_subtree)) {
+    const TABLE *table = graph.nodes[node_idx].table;
+    for (uint i = 0; i < table->s->fields; ++i) {
+      if (bitmap_is_set(table->read_set, i)) {    // ★ 只算真正被读的列
+        ret += min<size_t>(table->field[i]->max_data_length(),
+                           kMaxItemLengthEstimate);
+      }
+    }
+  }
+  // Heuristically add 20 bytes for LinkedImmutableString and hash table
+  // overhead. ...
+  ret += 20;                                       // ★ 固定 +20，纯拍脑袋
+  return ret;
+}
+```
+
+**`rescan_cost()` 与三个造价字段**（`access_path.h:363`）：
+
+```cpp
+  /// Expected cost to read all of this access path once; -1.0 for unknown.
+  double cost{-1.0};
+  /// Expected cost to initialize ... cost to read k out of N rows would be
+  /// init_cost + (k/N) * (cost - init_cost) ...
+  double init_cost{-1.0};
+  /// Of init_cost, how much of the initialization needs only to be done
+  /// once per query block. ... A typical example is a materialized table
+  /// with rematerialize=false ...
+  double init_once_cost{0.0};
+
+  double rescan_cost() const { return cost - init_once_cost; }
+  // ★ 重扫代价 = 总代价 − 可复用的一次性初始化代价
+```
+
+> ★ 存 `init_once_cost` 而不存 `rescan_cost` 的原因（源码注释）：*"since nearly all paths have zero init_once_cost, storing that instead allows us to skip a lot of repeated `path->init_once_cost = path->init_cost` calls"*。
+
+**hypergraph 与老代价模型的接缝**（`cost_model.cc:59`）——两处刻意的 hack：
+
+```cpp
+double EstimateCostForRefAccess(THD *thd, TABLE *table, unsigned key_idx,
+                                double num_output_rows) {
+  // ... if we expect an index lookup to give e.g. 0.9 rows on average, the cost
+  // model will assume we get back 0 -- and even worse, InnoDB's cost model gives
+  // a cost of exactly zero for this case ...
+  const double hacked_num_output_rows = ceil(num_output_rows);   // ★ 向上取整，避免 0.9→0→代价 0
+
+  // We call find_cost_for_ref(), which is the same cost model used
+  // in the old join optimizer, but without the “worst_seek” cap, ...
+  return find_cost_for_ref(thd, table, key_idx, hacked_num_output_rows,
+                           /*worst_seeks=*/DBL_MAX);             // ★ 去掉 worst_seek 上限
+}
+```
 
 | 函数 | 用途 |
 |---|---|
@@ -439,9 +1065,136 @@ cost.cost_if_materialized     = num_rows * kApplyOneFilterCost;
 | **拒计划** | 引擎可以对某些 AccessPath 返回"我不支持"，该候选被丢弃 |
 | **接管执行** | 若代价低于 `secondary_engine_cost_threshold`，把查询卸载到二级引擎 |
 
-#### 6.2 SecondaryEngineFlag：不遍历树就知道上下文
+#### 6.2 二级引擎标志：不遍历树就知道上下文
 
-`secondary_engine_costing_flags.h` 定义了一组标志，让引擎**不必遍历 AccessPath 树**就能知道当前规划上下文：
+**能力位只有 4 个**（`sql/handler.h:2460`）——⚠️ **不存在** `sql/join_optimizer/secondary_engine_flags.h`：
+
+```cpp
+using SecondaryEngineFlags = uint64_t;
+enum class SecondaryEngineFlag : SecondaryEngineFlags {
+  SUPPORTS_HASH_JOIN = 0,
+  SUPPORTS_NESTED_LOOP_JOIN = 1,
+
+  // If this flag is set, aggregation (GROUP BY and DISTINCT) do not require
+  // ordered inputs and create unordered outputs. This is typically the case
+  // if they are implemented using hash-based techniques.
+  AGGREGATION_IS_UNORDERED = 2,
+
+  /// This flag can be set to signal that a secondary storage engine will not
+  /// use MySQL's executor (see JOIN::override_executor_func). In this case, it
+  /// doesn't need MySQL's execution data structures, like internal temporary
+  /// tables, filesort objects or iterators. If the flag is set,
+  /// FinalizePlanForQueryBlock() will not make any changes to the plan, and
+  /// CreateIteratorFromAccessPath() will not be called.
+  USE_EXTERNAL_EXECUTOR = 3,
+};
+
+inline constexpr SecondaryEngineFlags MakeSecondaryEngineFlags() { return 0; }
+template <typename... Args>
+constexpr SecondaryEngineFlags MakeSecondaryEngineFlags(
+    SecondaryEngineFlag flag1, Args... rest) {
+  return (uint64_t{1} << static_cast<int>(flag1)) |
+         MakeSecondaryEngineFlags(rest...);
+}
+```
+
+**"不遍历树就知道上下文"的另一半**（`secondary_engine_costing_flags.h:29`）——4 个零注释的代价期标志：
+
+```cpp
+using SecondaryEngineCostingFlags = uint64_t;
+enum class SecondaryEngineCostingFlag : SecondaryEngineCostingFlags {
+  HAS_MULTIPLE_BASE_TABLES,                 // =0 已在枚举 join（≥2 张基表）
+  CONTAINS_AGGREGATION_ACCESSPATH,          // =1 计划中含聚合
+  CONTAINS_WINDOW_ACCESSPATH,               // =2 计划中含窗口函数
+  HANDLING_DISTINCT_ORDERBY_LIMITOFFSET     // =3 正在处理 DISTINCT/ORDER BY/LIMIT
+};
+```
+
+声明在 `JoinHypergraph` 上（`make_join_hypergraph.h:88`）——源码自己承认这是权宜之计：
+
+```cpp
+  /// Flags set when AccessPaths are proposed to secondary engines for costing.
+  /// The intention of these flags is to avoid traversing the AccessPath tree to
+  /// check for certain criteria.
+  /// TODO (tikoldit) Move to JOIN or Secondary_engine_execution_context, so
+  /// that JoinHypergraph can be immutable during planning
+  SecondaryEngineCostingFlags secondary_engine_costing_flags{};
+```
+
+**全部 6 个赋值点**：
+
+| 位置 | 动作 | 含义 |
+|---|---|---|
+| `join_optimizer.cc:667` | `&= ~HAS_MULTIPLE_BASE_TABLES` | `FoundSingleNode` 里**清位**（单表） |
+| `:3020` | `\|= HAS_MULTIPLE_BASE_TABLES` | `FoundSubgraphPair` 里**置位**（已进 join） |
+| `:6559` | `= {}` | 图简化后重建 receiver 时**整体复位** |
+| `:6727` | `\|= CONTAINS_AGGREGATION_ACCESSPATH` | 进 GROUP BY 前 |
+| `:6851` | `\|= CONTAINS_WINDOW_ACCESSPATH` | 有窗口函数 |
+| `:6867` | `\|= HANDLING_DISTINCT_ORDERBY_LIMITOFFSET` | 进 DISTINCT/ORDER BY/LIMIT 阶段 |
+
+**hook 的函数类型与契约**（`handler.h:2380`）——注释里明列可改的 7 个字段与必须满足的不变量：
+
+```cpp
+using secondary_engine_modify_access_path_cost_t = bool (*)(
+    THD *thd, const JoinHypergraph &hypergraph, AccessPath *access_path);
+```
+
+```
+可改：init_once_cost / init_cost / cost / cost_before_filter
+      num_output_rows / num_output_rows_before_filter / secondary_engine_data
+不变式：init_cost <= cost_before_filter <= cost
+        num_output_rows <= num_output_rows_before_filter
+返回 true = 拒绝该 path（可先 my_error()）
+```
+
+**介入点①改代价**（`join_optimizer.cc:4550`，`ProposeAccessPath()` 开头）：
+
+```cpp
+  if (m_secondary_engine_cost_hook != nullptr) {
+    // If an error was raised by a previous invocation of the hook, reject all
+    // paths.
+    if (m_thd->is_error()) return nullptr;
+
+    if (m_secondary_engine_cost_hook(m_thd, *m_graph, path)) {
+      return nullptr;                     // ★ 介入点②的原子操作：这条 path 消失
+    }
+    assert(!m_thd->is_error());
+    assert(path->init_cost <= path->cost);
+    if (!IsEmpty(path->filter_predicates)) {
+      assert(path->num_output_rows() <= path->num_output_rows_before_filter);
+      assert(path->cost_before_filter <= path->cost);
+    }
+  }
+```
+
+**"All plans were rejected" 的两处报出点**：
+
+```cpp
+// :6593 —— join 枚举后拿不到 root candidate
+  if (secondary_engine_cost_hook != nullptr &&
+      (!receiver.HasSeen(TablesBetween(0, graph.nodes.size())) ||
+       receiver.root_candidates().empty())) {
+    my_error(ER_SECONDARY_ENGINE, MYF(0),
+             "All plans were rejected by the secondary storage engine");
+    return nullptr;
+  }
+
+// :6943 —— 后处理阶段（sort/limit/grouping）被拒空
+  if (root_candidates.empty()) {
+    assert(secondary_engine_cost_hook != nullptr);
+    my_error(ER_SECONDARY_ENGINE, MYF(0),
+             "All plans were rejected by the secondary storage engine");
+    return nullptr;
+  }
+```
+
+> ★ `HasSecondaryEngineCostHook()`（`:257`）是把"候选为空"从**内部 bug** 转为**合法状态**的判据——`ApplyDistinctAndOrder()` 等处都有 `assert(receiver.HasSecondaryEngineCostHook())`（`:5505`、`:5656`）。
+
+⚠️ **勘误**：`EngineFlags()` / `SecondaryEngineCostHook()` 都收 **`const THD *`**；前者**不做任何翻译**，直接返回 `hton->secondary_engine_flags`，无引擎时返回宽松默认 `{HASH_JOIN, NESTED_LOOP_JOIN}`。另有一条更早的拒绝路径 `CheckSupportedQuery()`（`:4846`）：若二级引擎两种 join 都不支持，直接报 `ER_HYPERGRAPH_NOT_SUPPORTED_YET`。
+
+⚠️ **这里其实是两组不同的枚举**，源码分属两个文件，用途也不同——混在一张表里容易误读。
+
+**`SecondaryEngineCostingFlag`**（`secondary_engine_costing_flags.h`）——随**代价回调**传递的"树结构特征"：
 
 | 标志 | 含义 |
 |---|---|
@@ -449,9 +1202,16 @@ cost.cost_if_materialized     = num_rows * kApplyOneFilterCost;
 | `CONTAINS_AGGREGATION_ACCESSPATH` | 含聚合节点 |
 | `CONTAINS_WINDOW_ACCESSPATH` | 含窗口节点 |
 | `HANDLING_DISTINCT_ORDERBY_LIMITOFFSET` | 正在处理 DISTINCT / ORDER BY / LIMIT-OFFSET |
-| `USE_EXTERNAL_EXECUTOR` | 引擎自带外部执行器（决定还要不要建迭代器） |
 
-这是一个**性能设计**：代价回调在枚举热路径上被调用，遍历整棵树太贵，于是把"树的结构特征"压缩成一个 bitmask 随代价一起传递。
+**`SecondaryEngineFlag`**（`sql/handler.h`）——**引擎能力声明**，与代价回调无关：
+
+| 标志 | 值 | 含义 |
+|---|---|---|
+| `SUPPORTS_HASH_JOIN` | 0 | 引擎支持 hash join |
+| `SUPPORTS_NESTED_LOOP_JOIN` | — | 引擎支持嵌套循环 |
+| `USE_EXTERNAL_EXECUTOR` | 3 | 引擎自带外部执行器（决定还要不要建迭代器） |
+
+前者是**性能设计**：代价回调在枚举热路径上被调用，遍历整棵树太贵，于是把"树的结构特征"压缩成一个 bitmask 随代价一起传递。后者是**能力查询**，引擎启动时声明一次。
 
 #### 6.3 IteratorsAreNeeded
 
@@ -537,9 +1297,11 @@ item_or->quick_fix_field();
 
 `update_used_tables()` 重算 `used_tables()` 位图（优化器到处依赖它做下推判定），`quick_fix_field()` 修正字段缓存。**忘了第一步会导致谓词下推错误**——这是 Item 树改写类代码的通用陷阱。
 
-### 4. 用 bitmask 代替树遍历（SecondaryEngineFlag）
+### 4. 用 bitmask 代替树遍历（SecondaryEngineCostingFlag）
 
 把"树的结构特征"压缩成一个 bitmask，让代价回调不必遍历 AccessPath。这是热路径上的典型优化：**用一次性计算的元数据，替代每次重复遍历**。
+
+> ⚠️ 这里是 **`SecondaryEngineCostingFlag`**（`join_optimizer/secondary_engine_costing_flags.h`，随代价回调传递的树结构特征），**不是** `SecondaryEngineFlag`（`sql/handler.h`，引擎能力声明）。两者名字极像但归属不同，见 6.2。
 
 ### 5. `constexpr` 代价常量 vs 可配置代价表
 
@@ -596,14 +1358,14 @@ SELECT * FROM t1 WHERE (t1.a=1 AND t1.b>3) OR (t1.a=1 AND t1.b<0);
 | 让 CSE 处理更多形态（如 OR 里的 OR 公共因子） | `CommonSubexpressionElimination` 的候选收集部分（目前只取第一分支） |
 | 让 CSE 下沉到非 AND/OR | 需在主函数加递归下降，但要注意布尔上下文判定 |
 | 新增一种代价估算 | `cost_model.h/cc` 加 `Estimate*()`，并在对应 AccessPath 类型创建处调用 |
-| 新增一个 `SecondaryEngineFlag` | `secondary_engine_costing_flags.h` 的枚举 + 设置它的位置 |
+| 新增一个 `SecondaryEngineFlag`（引擎能力）或 `SecondaryEngineCostingFlag`（树特征） | 前者在 `sql/handler.h`、后者在 `join_optimizer/secondary_engine_costing_flags.h`——**别搞混**，两者的枚举 + 设置它的位置 |
 | 新增一种最终化动作 | `FinalizePlanForQueryBlock`（注意它只能调一次，动作要幂等或放在正确顺序） |
 
 ### 已知缺陷
 
 - **CSE 只在 hypergraph 路径生效**，经典优化器完全没有这个改写。这意味着同一条 SQL 在两条路径下语义等价但性能可能差很多。
 - **CSE 无 trace、无开关**，出问题只能靠 `EXPLAIN FORMAT=TREE` 反推。
-- **hypergraph 代价常量全是 0.1**，精度目标是"候选间相对排序"而非绝对准确；这导致 hypergraph 与经典优化器选出的计划难以直接比较代价。
+- **hypergraph 代价常量几乎全是 0.1**（唯一例外 `kHashReturnOneRowCost = 0.07`），精度目标是"候选间相对排序"而非绝对准确；这导致 hypergraph 与经典优化器选出的计划难以直接比较代价。
 - `common_subexpression_elimination.cc` 抽成独立文件后修过 crash bug（见文件头的版权年份与相关 Bug 记录），说明这类树改写容易出错。
 
 ### 社区边界澄清（★）

@@ -28,7 +28,7 @@
     - [★ 刷脏批次的组织](#-刷脏批次的组织single-flight--best-effort)
     - [★ hazard pointer：无锁并发遍历的基石](#-hazard-pointer无锁并发遍历的基石)
     - [★ `flush_rbt`：只在崩溃恢复期存在的红黑树](#-flush_rbt只在崩溃恢复期存在的红黑树)
-    - [刷脏前的 WAL：redo 先落盘](#刷脏前的-walredo-先落盘)
+    - [★ 逐行解析：`buf_flush_write_block_low`（刷脏汇聚点）](#-逐行解析buf_flush_write_block_low刷脏汇聚点)
     - [自适应刷脏（Adaptive Flushing）](#自适应刷脏adaptive-flushing)
     - [doublewrite](#doublewrite)
     - [邻接刷盘 `buf_flush_try_neighbors`](#邻接刷盘buf_flush_try_neighbors)
@@ -146,6 +146,82 @@ slot-based buffer manager 的通用概念到 InnoDB 实现的对应（骨架源�
 ```
 
 下面逐环节展开。
+
+### 内存骨架：chunk 与实例化
+
+> 全流程的**物理起点**：buffer pool 内存怎么组织。逻辑上"实例（instance）→ chunk → block（描述符+frame）"三层。
+
+#### 三层结构：instance → chunk → block
+
+```
+buf_pool_t（实例，数量 = innodb_buffer_pool_instances）
+└─ buf_chunk_t（连续内存块，默认 128MB）
+   ├─ block 描述符区  buf_block_t[]  每页一个，紧贴内存块开头
+   └─ frame 区        byte[16KB][]   页帧，紧跟描述符区，页对齐
+```
+
+- **instance**：`buf_pool_t`，LRU/flush_list/page_hash/free 各一套，多实例降低链表竞争（5.6 引入）。
+- **chunk**：`buf_chunk_t`（独立结构体），**一次 mmap 的连续内存块**，resize 以 chunk 为最小单位增减（5.7 引入，online resize 的基础）。
+- **block**：`buf_block_t` = 描述符（控制块）+ `frame`（页帧）。★ **描述符与 frame 在同一块连续内存里**：描述符排前、frame 排后——这是 `buf_chunk_init` 的核心布局。
+
+#### `buf_chunk_init`：一次分配 + 描述符/帧布局
+
+```c
+static buf_chunk_t *buf_chunk_init(buf_pool_t *buf_pool, buf_chunk_t *chunk,
+                                   ulonglong mem_size, std::mutex *mutex) {
+  /* ① 页大小向下取整 */
+  mem_size = ut_2pow_round(mem_size, UNIV_PAGE_SIZE);
+  /* ② 预留 block 描述符空间：每页一个 buf_block_t，向上取整到页倍数 */
+  mem_size += ut_2pow_round(
+      (mem_size / UNIV_PAGE_SIZE) * (sizeof *block) + (UNIV_PAGE_SIZE - 1),
+      UNIV_PAGE_SIZE);
+
+  /* ③ 一次分配连续内存（mmap / 大页） */
+  if (!buf_pool->allocate_chunk(mem_size, chunk)) return (nullptr);
+
+  /* ④ 描述符在内存块开头 */
+  chunk->blocks = (buf_block_t *)chunk->mem;
+
+  /* ⑤ 第一个 frame 页对齐 */
+  frame = (byte *)ut_align(chunk->mem, UNIV_PAGE_SIZE);
+  chunk->size = ut::large_page_allocation_size(chunk->mem, ...) / UNIV_PAGE_SIZE
+                - (frame != chunk->mem);
+
+  /* ⑥ 减去描述符占用的空间，算出真正的页帧数 */
+  { ulint size = chunk->size;
+    while (frame < (byte *)(chunk->blocks + size)) { frame += UNIV_PAGE_SIZE; size--; }
+    chunk->size = size; }
+
+  /* ⑦ 逐个初始化 block，挂 free list */
+  block = chunk->blocks;
+  for (i = chunk->size; i--;) {
+    buf_block_init(buf_pool, block, frame);
+    UT_LIST_ADD_LAST(buf_pool->free, &block->page);   // 初始全在 free list
+    block++;
+    frame += UNIV_PAGE_SIZE;
+  }
+  buf_pool_register_chunk(chunk);
+  return (chunk);
+}
+```
+
+- **② 预留描述符**：每页一个 `buf_block_t`（含 `buf_page_t page` + `BPageLock lock` + `frame` 指针等）。分配时**一次性**把"描述符 + 页帧"算进 `mem_size`，一块 mmap 出来——避免两次分配带来的碎片与指针管理。
+- **⑤ 大页对齐的副作用**：`os_large_page_size` < `UNIV_PAGE_SIZE` 时可能少一块、> 时可能多一块（源码注释原文）。`large_page_allocation_size` 返回实际分配到大页字节数。
+- **⑥ 减描述符空间**：frame 指针从对齐起始位置往后走，逐个跳过被描述符占用的页，剩下的才是可用页帧数 `chunk->size`。
+- **⑦ 初始状态**：所有 block 初始化后**全挂进 free list**（`NOT_USED` 态），等读页时逐个取用——这就是 free list 的初始填充。
+
+#### 多实例 + 多 chunk 的演进
+
+| 版本 | 变化 | 动机 |
+|---|---|---|
+| 5.5 及前 | 单实例、单 `buf_pool mutex` | — |
+| 5.6 | **多实例**（`innodb_buffer_pool_instances`） | 打破单 mutex 争用（多核扩展） |
+| 5.7 | **多 chunk**（`innodb_buffer_pool_chunk_size`，默认 128MB） | online resize 以 chunk 为粒度增减 |
+| 8.0 | chunk 结构稳定；resize 走 withdraw 两阶段（见 resize 节） |
+
+★ **对齐坑**（内核月报原文提醒，8.0 仍成立）：总大小按 `instances × chunk_size` 向上对齐（`buf_pool_size_align`），例如 64 实例 × 128MB = 8GB 对齐，配 9GB 实际可能用 16GB。**不要配过多实例**，否则内存被对齐放大。约束：`innodb_buffer_pool_instances` 在 size < 1GB 时被强制为 1（ha_innodb.cc 会打 "Adjusting ... to 1 since innodb_buffer_pool_size is less than ..."）。
+
+> **chunk 与并发粒度解耦**：page_hash 用 `srv_n_page_hash_locks`（默认 16，向上取整到 2 的幂）个分片 rw-lock，与实例数/chunk 数无关——`ib_create(2 * curr_size, ..., srv_n_page_hash_locks, ...)`。
 
 ### 读路径：页怎么进入 Buffer Pool
 
@@ -331,6 +407,183 @@ buf_block_t *Buf_fetch<T>::lookup() {
 4. **`Buf_fetch_other::get` 的差异**：比 normal 多两段——临时表空间走 `temp_space_page_handler`（不 fix，走专属路径）；`IF_IN_POOL_OR_WATCH` 模式调 `is_on_watch()`（哨兵也算"找到"）；乐观/IF_IN_POOL 模式**不发起读**直接返回未命中（3726-3727：optimistic 请求只在页已在池中时才返回）。
 
 ##### ★ stale 页机制：space 版本号（链路上一处隐藏的守卫）
+
+⚠️ **勘误**：**不存在 `buf_page_is_stale()` 自由函数**。8.0.39 是 `buf_page_t::is_stale()` 与 `buf_page_t::was_stale()` **两个语义不同**的成员函数。且 stale 判定**不是"space 被删了"**，而是**版本号比较**。
+
+**`is_stale()`（需持 fil_shard mutex，`buf0buf.h:1193`）**：
+
+```cpp
+  /** Checks if this space reference saved during last page ID initialization
+  was deleted or truncated since.
+  @return true when space reference stored leads was deleted or truncated and
+  this page should be discarded. Result is up to date until the fil_shard mutex
+  is released. */
+  inline bool is_stale() const {
+    ut_a(m_space != nullptr);
+    ut_a(id.space() == m_space->id);
+    ut_a(m_version <= m_space->get_current_version());   // ★ 页快照版本不可能超前于 space 当前版本
+    if (m_version == m_space->get_current_version()) {
+      ut_a(!m_space->is_deleted());                      // ★ 版本一致 ⇒ space 必然未删除
+      return false;
+    } else {
+      return true;                                       // ★ 版本落后 ⇒ stale
+    }
+  }
+```
+
+**`was_stale()`（无锁版，`buf0buf.h:1210`）**——★ 读顺序必须反向：
+
+```cpp
+  /** ... When false is returned, the status of stale is checked to be
+  guaranteed. */
+  inline bool was_stale() const {
+    ut_a(m_space != nullptr);
+    ut_a(id.space() == m_space->id);
+    /* If the the version is OK, then the space must not be deleted.
+    However, version is modified before the deletion flag is set, so reading
+    these values need to be executed in reversed order. The atomic reads
+    cannot be relaxed for it to work. */
+    bool was_not_deleted = m_space->was_not_deleted();   // ★★ 必须先读 deleted 标志
+    if (m_version == m_space->get_recent_version()) {    // ★★ 再读版本号（顺序不能反，否则有窗口）
+      ut_a(was_not_deleted);
+      return false;
+    } else {
+      return true;
+    }
+  }
+```
+
+**版本号存在哪 & 何时快照**（`buf0buf.h:1237`）:
+
+```cpp
+  /** Tablespace instance that this page belongs to.
+     不属于这个page，只是为了快速访问 */
+  fil_space_t *m_space{};        // buf0buf.h:1610 —— 页持有 fil_space_t*（带引用计数）
+
+  /** @} */
+  /** Version of fil_space_t when the page was updated. It can also be viewed as
+   the truncation number. */
+  uint32_t m_version{};          // buf0buf.h:1620 —— 页内版本号快照（"truncation number"）
+
+  inline void reset_page_id(page_id_t new_page_id) {
+    if (m_space != nullptr) {
+      /* If we reach this line through a call chain: srv_shutdown ->
+         buf_pool_free_all -> ... then we are already past the fil system
+         shutdown, and all fil_space_t objects were already freed. */
+      if (srv_shutdown_state.load() != SRV_SHUTDOWN_EXIT_THREADS) {
+        m_space->dec_ref();
+      }
+    }
+    id = new_page_id;
+    space_id_changed();          // ★ 抓 space 引用 + 快照 m_version
+  }
+
+  /** Updates new space reference and acquires "reference count latch" and the
+  current version of the space object. */
+  inline void space_id_changed() {
+    m_space = nullptr;
+    m_version = 0;
+    if (id.space() != UINT32_UNDEFINED) {
+      m_space = fil_space_get(id.space());       // ★ 按 space_id 查 fil_space_t
+      if (m_space) {
+        m_space->inc_ref();                      // ★ 引用计数 +1，保证 space 不被释放
+        /* We don't have a way to check the MDL locks, which are guarding the
+        version number, so we don't use get_current_version(). */
+        m_version = m_space->get_recent_version();   // ★★ 页里存的就是那一刻的版本号快照
+      }
+    }
+  }
+```
+
+**space 侧的版本号**（`fil0fil.h:380`）：
+
+```cpp
+  /** All pages in the buffer pool that reference this fil_space_t instance with
+  version before this version can be lazily freed or reused as free pages.
+  They should be rejected if there is an attempt to write them to disk.
+
+  Writes to m_version are guarded by the exclusive MDL/table lock latches
+  acquired by the caller... */
+  std::atomic<uint32_t> m_version{};             // fil0fil.h:380 —— 原子 uint32
+```
+
+```cpp
+// fil0fil.cc:11852
+void fil_space_t::set_deleted() {
+  ut_ad(fil_system->shard_by_id(id)->mutex_owned());
+  ut_a(files.size() == 1);
+  ut_a(n_pending_ops == 0);
+  bump_version();          // ★ 先 bump 版本
+  m_deleted = true;        // ★ 再置删除标志 —— 这就是 was_stale() 必须"先读 deleted 再读 version"的原因
+}
+
+// fil0fil.cc:11873
+void fil_space_t::bump_version() {
+  /* Bump the version. This will make all pages in buffer pool that reference
+  the current space version to be stale and freed on first encounter. */
+  ut_a(stop_new_ops);
+  ut_a(!m_deleted);
+  ++m_version;             // ★★ 整个 stale 机制的全部动作就是这一行
+}
+```
+
+> ★ DISCARD / TRUNCATE / DELETE 三种操作**都不去遍历 buffer pool 找页**，只做 `++m_version`；页在**首次被碰到时**才被惰性回收。这是"用版本号代替全局扫描"的经典手法。
+
+**stale 页的四个消费点**：
+
+| 位置 | 代码 | 行为 |
+|---|---|---|
+| 读/查路径 | `buf0buf.cc:3643`、`3695`（`Buf_fetch_*::get`） | `was_stale()` → `buf_page_free_stale()`，失败则 sleep 100µs 重试 |
+| 新建页 | `buf0buf.cc:5029`（`buf_page_create`） | 命中 stale 则回收后 `continue` 重来 |
+| 写路径 | `fil0fil.cc:7689, 7732, 7754, 7809` | `is_stale()` → 直接 `return DB_PAGE_IS_STALE`，**拒绝落盘** |
+| 回收实现 | `buf0buf.cc:5319` | `buf_page_free_stale()` |
+
+```cpp
+// buf0buf.cc:5319
+bool buf_page_free_stale(buf_pool_t *buf_pool, buf_page_t *bpage) noexcept {
+  /* If a page was seen as stale it will still be stale, because we have LRU
+  mutex.*/
+  ut_ad(bpage->was_stale());
+  ut_ad(mutex_own(&buf_pool->LRU_list_mutex));
+
+  auto *block_mutex = buf_page_get_mutex(bpage);
+  mutex_enter(block_mutex);
+
+  /* At this point the page can be queued for flushing. */
+  const auto io_type = buf_page_get_io_fix(bpage);
+
+  bool success = false;
+  if (io_type == BUF_IO_NONE) {          // ★ IO 进行中的页不能回收 → 返回 false → 调用方 sleep 后重试
+    if (bpage->is_dirty()) {
+      buf_flush_remove(bpage);
+    }
+    success = buf_LRU_free_page(bpage, true);
+  }
+
+  if (success) {
+    ut_ad(!mutex_own(&buf_pool->LRU_list_mutex));
+  } else {
+    mutex_exit(block_mutex);
+    ut_ad(mutex_own(&buf_pool->LRU_list_mutex));
+  }
+  ut_ad(!mutex_own(block_mutex));
+  return success;
+}
+```
+
+```cpp
+// buf0buf.cc:3636 —— Buf_fetch_normal::get() 里的消费
+      if (block->page.was_stale()) {
+        if (!buf_page_free_stale(m_buf_pool, &block->page, m_hash_lock)) {
+          /* The page is during IO and can't be released. We wait some to not go
+             into loop that would consume CPU. ... */
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        /* The hash lock was released, we should try again lookup for the page
+           until it's gone - it should disappear eventually when the IO ends. */
+        continue;
+      }
+```
 
 `get` 里的 `was_stale()` 检查、`buf_page_free_stale` 释放，背后是一套**space 版本号协议**——这是 `buf_page_get_gen` 链路上最容易忽略的一环，也是 **TRUNCATE/DROP 表空间能瞬间完成的秘密**。
 
@@ -520,6 +773,217 @@ static void buf_wait_for_read(buf_block_t *block) {
 3. `io_fix = NONE` 的设置在 `x_unlock` **之前**，所以等待者拿到 S 锁时 `was_io_fix_read()` 已是 false，不多转一圈。
 
 ##### ★ `buf_page_io_complete`：后处理收口（`buf0buf.cc`）
+
+⚠️ **勘误**：`io_type` **不是入参**——它由 `bpage->is_io_fix_read_as_opposed_to_write()` 从 `io_fix` 反推（`buf0buf.cc:5628`）。函数是 READ / WRITE 双分支，且带 `evict` 参数。
+
+**函数头 + READ 分支**（`buf0buf.cc:5614`）：
+
+```cpp
+bool buf_page_io_complete(buf_page_t *bpage, bool evict) {
+  const bool uncompressed = (buf_page_get_state(bpage) == BUF_BLOCK_FILE_PAGE);
+  ut_a(buf_page_in_file(bpage));
+
+  /* We do not need protect io_fix here by mutex to read it because this is the
+  only function where we can change the value from BUF_IO_READ or BUF_IO_WRITE
+  to some other value, and our code ensures that this is the only thread that
+  handles the i/o for this block. ... */
+  ut_ad(bpage->current_thread_has_io_responsibility());   // ★ 讲透点①：io_fix 能无锁读的理由
+  const auto io_type =
+      bpage->is_io_fix_read_as_opposed_to_write() ? BUF_IO_READ : BUF_IO_WRITE;
+  const auto flush_type = buf_page_get_flush_type(bpage);
+
+  if (io_type == BUF_IO_READ) {
+    if (bpage->size.is_compressed()) {
+      frame = bpage->zip.data;
+      buf_pool->n_pend_unzip.fetch_add(1);
+      if (uncompressed && !buf_zip_decompress((buf_block_t *)bpage, false)) {
+        buf_pool->n_pend_unzip.fetch_sub(1);
+        compressed_page = false; goto corrupt;
+      }
+      buf_pool->n_pend_unzip.fetch_sub(1);
+    } else {
+      frame = reinterpret_cast<buf_block_t *>(bpage)->frame;
+    }
+
+    read_page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);
+    read_space_id = mach_read_from_4(frame + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+
+    if (bpage->id.space() == TRX_SYS_SPACE &&
+        dblwr::v1::is_inside(bpage->id.page_no())) {
+      ib::error(ER_IB_MSG_78) << "Reading page " << bpage->id
+                              << ", which is in the doublewrite buffer!";
+    } else if (read_space_id == 0 && read_page_no == 0) {
+      /* This is likely an uninitialized page. */
+    } else if ((bpage->id.space() != 0 && bpage->id.space() != read_space_id) ||
+               bpage->id.page_no() != read_page_no) {
+      ib::error(ER_IB_MSG_79) << "Space id and page number stored in "
+                                 "the page read in are " << ... << ", should be "
+                              << bpage->id;
+      is_wrong_page_id = true;
+    }
+
+    compressed_page = Compression::is_compressed_page(frame);
+    /* If the decompress failed then the most likely case is that we are
+       reading in a page for which this instance doesn't support the
+       compression algorithm. */
+    if (compressed_page) { ... }
+
+    {
+      BlockReporter reporter = BlockReporter(true, frame, bpage->size,
+                        fsp_is_checksum_disabled(bpage->id.space()));
+      is_corrupted = reporter.is_corrupted();
+    }
+
+    if (compressed_page || is_corrupted) {
+    corrupt:
+      if (!compressed_page) { ib::error(ER_IB_MSG_81) << ...; buf_page_print(...); }
+      if (srv_force_recovery < SRV_FORCE_IGNORE_CORRUPT) {
+        buf_read_page_handle_error(bpage);   // ★ 损坏收口：unfix + 解锁 + 摘链
+        return (false);                      // ★ false → buf_read_page_low 返回 0 → 计入一次重试
+      }
+    }
+
+    if (recv_recovery_is_on()) {
+      /* Pages must be uncompressed for crash recovery. */
+      ut_a(uncompressed);
+      recv_recover_page(true, (buf_block_t *)bpage);   // ★ 讲透点②：收口前先把 redo 应用到这一页
+    }
+
+    if (uncompressed && !Compression::is_compressed_page(frame) &&
+        !recv_no_ibuf_operations &&
+        fil_page_get_type(frame) == FIL_PAGE_INDEX && page_is_leaf(frame) &&
+        !fsp_is_system_temporary(bpage->id.space()) &&
+        !fsp_is_undo_tablespace(bpage->id.space()) && !bpage->was_stale()) {
+      ibuf_merge_or_delete_for_page((buf_block_t *)bpage, bpage->id,
+                                    &bpage->size, true);   // ★ stale 页不做 ibuf merge
+    }
+  }
+```
+
+**WRITE 分支准备：决定是否驱逐**（`:5781`）——★ 只有 4 行的决策表：
+
+```cpp
+  if (io_type == BUF_IO_WRITE) {
+    /* We decide whether or not to evict the page from the
+    LRU list based on the flush_type.
+    - BUF_FLUSH_LIST: don't evict
+    - BUF_FLUSH_LRU: always evict
+    - BUF_FLUSH_SINGLE_PAGE: eviction preference is passed
+    by the caller explicitly. */
+    ut_ad(!(flush_type == BUF_FLUSH_LIST && evict));
+    if (flush_type == BUF_FLUSH_LRU) {
+      evict = true;
+    }
+    if (evict || buf_page_get_state(bpage) == BUF_BLOCK_ZIP_DIRTY) {
+      has_LRU_mutex = true;
+      mutex_enter(&buf_pool->LRU_list_mutex);   // ★ 提前拿 LRU mutex，因为下面可能摘 flush list
+    }
+  }
+  mutex_enter(block_mutex);
+```
+
+**收口 `switch(io_type)`**（`:5832`）：
+
+```cpp
+  /* Because this thread which does the unlocking is not the same that
+  did the locking, we use a pass value != 0 in unlock, which simply
+  removes the newest lock debug record, without checking the thread id. */
+  //  ★ 讲透点③：加锁线程（发起读的用户线程）≠ 解锁线程（AIO 完成线程）
+
+  buf_page_monitor(bpage, io_type);
+
+  switch (io_type) {
+    case BUF_IO_READ:
+      ut_ad(!has_LRU_mutex);
+      buf_page_set_io_fix(bpage, BUF_IO_NONE);                 // ① 先清 io_fix
+      if (uncompressed) {
+        rw_lock_x_unlock_gen(&((buf_block_t *)bpage)->lock, BUF_IO_READ);  // ② 解 pass-type X lock
+      }
+      mutex_exit(block_mutex);
+      ut_ad(buf_pool->n_pend_reads > 0);
+      buf_pool->n_pend_reads.fetch_sub(1);                     // ③ 挂起读 -1
+      buf_pool->stat.n_pages_read.fetch_add(1);
+      break;
+
+    case BUF_IO_WRITE:
+      /* Write means a flush operation: call the completion
+      routine in the flush system */
+      buf_flush_write_complete(bpage);               // ★ 交给 flush 子系统摘 flush list
+      if (uncompressed) {
+        rw_lock_sx_unlock_gen(&((buf_block_t *)bpage)->lock, BUF_IO_WRITE);  // ★ 解的是 SX 不是 X
+      }
+      buf_pool->stat.n_pages_written.fetch_add(1);
+      ut_ad(!(evict && !has_LRU_mutex));
+      if (evict && buf_LRU_free_page(bpage, true)) {
+        has_LRU_mutex = false;                       // ★ 成功时内部已释放两把锁
+      } else {
+        mutex_exit(block_mutex);
+      }
+      if (has_LRU_mutex) mutex_exit(&buf_pool->LRU_list_mutex);
+      break;
+
+    default:
+      ut_error;
+  }
+  return (true);
+}
+```
+
+> ★★ **必须讲透的三点**
+> 1. **`io_fix` 为什么能无锁读**——本函数是**唯一**把 `BUF_IO_READ/WRITE` 改成别值的地方，且当前线程独占 io responsibility（`ut_ad(bpage->current_thread_has_io_responsibility())`）。
+> 2. **`BUF_IO_READ` 的 X lock 是 pass-type**——加在 `buf_page_init_for_read()`（`rw_lock_x_lock_gen(&block->lock, BUF_IO_READ, ...)`），注释明说："We set a pass-type x-lock on the frame because then the same thread which called for the read operation can wait for the read to complete by waiting for the x-lock on the frame; if the x-lock were recursive, the same thread would illegally get the x-lock before the page read is completed."
+> 3. **写期间持的是 SX lock**（不是 X）——写时仍允许 S 读；`evict` 由 `flush_type` 三分支决定。
+
+**`buf_read_page_handle_error()`（损坏收口，`buf0buf.cc:5284`）**——★ 顺序不能反：
+
+```cpp
+void buf_read_page_handle_error(buf_page_t *bpage) {
+  mutex_enter(&buf_pool->LRU_list_mutex);
+  rw_lock_x_lock(hash_lock, UT_LOCATION_HERE);
+  mutex_enter(buf_page_get_mutex(bpage));
+
+  ut_ad(buf_page_get_io_fix(bpage) == BUF_IO_READ);
+  ut_ad(bpage->buf_fix_count == 0);
+
+  /* Set BUF_IO_NONE before we remove the block from LRU list */
+  buf_page_set_io_fix(bpage, BUF_IO_NONE);          // ★ 先清 io_fix，再从 LRU 摘
+  if (uncompressed) {
+    rw_lock_x_unlock_gen(&((buf_block_t *)bpage)->lock, BUF_IO_READ);
+  }
+  /* The hash lock and block mutex will be released during the "free" */
+  buf_LRU_free_one_page(bpage, true);
+  mutex_exit(&buf_pool->LRU_list_mutex);
+  ut_ad(buf_pool->n_pend_reads > 0);
+  buf_pool->n_pend_reads.fetch_sub(1);
+}
+```
+
+**读失败重试 100 次的判据在 `Buf_fetch<T>::read_page()`**（`buf0buf.cc:4036`），不在 `buf_page_io_complete`：
+
+```cpp
+/** Number of attempts made to read in a page in the buffer pool */
+static const ulint BUF_PAGE_READ_MAX_RETRIES = 100;      // buf0buf.cc:298
+
+template <typename T>
+void Buf_fetch<T>::read_page() {
+  if (buf_read_page(m_page_id, m_page_size)) {
+    if (m_mode != Page_fetch::SCAN) {
+      buf_read_ahead_random(m_page_id, m_page_size, ibuf_inside(m_mtr));
+    }
+    m_retries = 0;                    // ★ 只要成功一次立刻清零 ⇒ 是"连续失败 100 次"不是"累计"
+  } else if (m_retries < BUF_PAGE_READ_MAX_RETRIES) {
+    ++m_retries;
+  } else {
+    ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_74)   // ★ 第 101 次才 fatal（ib::fatal = abort 实例）
+        << "Unable to read page " << m_page_id << " into the buffer pool after "
+        << BUF_PAGE_READ_MAX_RETRIES << " attempts. ...";
+  }
+}
+```
+
+> ★ `buf_read_page()` 返回 false 的三种来源（只有第三种是"真读失败"）：① `buf_read_page_low` 开头页已在池中（`:100` 返回 0）；② `DB_TABLESPACE_DELETED` / `ignore_missing`（`:140`）；③ `buf_page_io_complete` 返回 false（`:148`，校验失败）。
+>
+> ★ **单页缺页读是同步的**：`buf_read_page()` 调 `buf_read_page_low(&err, true /*sync*/, ...)`（`buf0rea.cc:295`），所以同步读由 `buf_read_page_low` 自己调 `buf_page_io_complete(bpage, false)`；异步读由 `fil0fil.cc` 的 AIO 完成路径调（`fil0fil.cc:7775, 7981`）。**预读才是异步**（`buf_read_ahead_*` 传 `sync=false`）。
 
 sync 与 async 共用同一个后处理函数——sync 由发起线程自己调（`buf0rea.cc`），async 由 io-handler 线程调（`fil0fil.cc`）。固定顺序：
 
@@ -937,6 +1401,52 @@ switch (io_type) {
 
 自适应哈希索引（`btr/btr0sea.cc`）在 B-tree 之上建内存哈希索引，**不产生任何文件 I/O**。它降低的是**逻辑读**（减少 B-tree 层数），从而**间接**减少物理读。8.0.30 起分片。完整机制（哈希键自适应算法、双门槛构建、探测验证、失效维护、锁协议）见 [`ahi.md`](../index/ahi.md)。
 
+#### 页进入 BP 的第三条路径：`buf_page_create`（新建页）
+
+`buf_page_get_gen` 处理"读已存在的页"，`buf_page_create`（buf0buf.cc，158 行）处理"**造一个磁盘上此前不存在的新页**"——段/索引分配新页、表重建、`btr_page_create` 等走这里。两条路径的分野：
+
+| | `buf_page_init_for_read`（读） | `buf_page_create`（建） |
+|---|---|---|
+| 触发 | 页不在 BP，从磁盘读 | 上层要新页 |
+| `io_fix` | 置 `BUF_IO_READ`，`n_pend_reads++` | 不置（无 I/O） |
+| LRU 位置 | `buf_LRU_add_block(bpage, true)` → **old 区** | `buf_LRU_add_block(&page, false)` → **LRU 头（young 端）** |
+| 页状态 | 读入后 clean | 新建即 clean（`oldest = newest = 0`） |
+
+主流程：
+
+```cpp
+free_block = buf_LRU_get_free_block(buf_pool);        // ① 先抢一个 block（可能触发淘汰/单页刷）
+// 持 LRU_list_mutex + hash_lock 查 page_hash：
+if (block && buf_page_in_file(&block->page) && !buf_pool_watch_is_sentinel(...)) {
+  if (block->page.was_stale()) {                       // 幽灵页（space 被 truncate）且还在 IO
+    buf_page_free_stale(...) 失败 → 睡 100μs 重试;
+  }
+  buf_block_free(free_block);                          // ② 页已存在 → 归还 block
+  return buf_page_get(...);                            //    退化为正常读路径
+}
+block = free_block;
+buf_page_init(buf_pool, page_id, page_size, block);   // ③ 初始化：set_newest_lsn(0)/set_clean()
+buf_block_buf_fix_inc(block); buf_page_set_accessed(&block->page);
+if (rw_latch == RW_X_LATCH) rw_lock_x_lock(&block->lock); /* MTR_MEMO_PAGE_X_FIX */
+else                        rw_lock_sx_lock(&block->lock); /* MTR_MEMO_PAGE_SX_FIX */
+mtr_memo_push(mtr, block, mtr_latch_type);
+rw_lock_x_unlock(hash_lock);                          // ④ ★ latch 加好后才放 hash lock
+buf_LRU_add_block(&block->page, false);               // ⑤ 放 LRU 头
+if (page_size.is_compressed()) {
+  block->page.zip.data = buf_buddy_alloc(...);        // ⑥ 压缩页：先 buddy 分配
+  buf_unzip_LRU_add_block(block, false);              //    再挂 unzip_LRU（顺序不可颠倒）
+}
+if (!skip_ibuf) ibuf_merge_or_delete_for_page(nullptr, page_id, &page_size, true);
+memset(frame + FIL_PAGE_FILE_FLUSH_LSN, 0, 8);        // ⑦ 清 FILE_FLUSH_LSN（该偏移被压缩/R-Tree 复用）
+mach_write_to_2(frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_ALLOCATED);
+```
+
+- **★ 新建页不写 `FIL_PAGE_LSN`**：create 只清 `FILE_FLUSH_LSN` 的 8 字节（该偏移在压缩页/R-Tree 里被复用，必须清零）、PREV/NEXT 填 `0xffffffff`、type 置 `FIL_PAGE_TYPE_ALLOCATED`。真正的页 LSN 是**刷盘时**由 `buf_flush_init_for_writing` 写入；而 `newest_lsn` 由创建该页的 mtr 提交时 `buf_flush_note_modification` 设置并挂进 flush_list。
+- **④ latch 必须在释放 hash_lock 之前加好**（源码注释明确）：否则并发的 ALTER ENCRYPTION / clone page copy 会看到半初始化的页。
+- **② 命中已存在页则放弃 create**：归还 block 并退化成 `buf_page_get`，避免重复初始化。
+- **stale 页**（space 被 truncate/drop 后的幽灵页）正在 IO：`buf_page_free_stale` 失败 → 睡 100μs 重试直到消失。
+- **压缩页顺序**：`buf_buddy_alloc` 期间会临时释放 `LRU_list_mutex`，故重入后要重新加锁并重设 `zip.data`；`buf_unzip_LRU_add_block` 必须在 `zip.data` 赋值之后。
+
 ### LRU 替换与淘汰
 
 #### LRU 中点替换
@@ -963,6 +1473,60 @@ void buf_LRU_make_block_young(buf_page_t *bpage) {
 **淘汰**：`buf_LRU_scan_and_free_block`从 old 段尾部扫，跳过 io_fixed/buf_fixed 的页，找到可淘汰的干净页 `buf_LRU_free_page` 释放回 free list。`BUF_LRU_SEARCH_SCAN_THRESHOLD=100` 控制 LRU 末尾扫描窗口。
 
 **兜底**：`buf_LRU_get_free_block`取不到 free 且 LRU 扫不出干净页时，被迫单页同步刷脏（`buf_flush_single_page_from_LRU`）——用户线程阻塞等刷完，对应状态变量 `Innodb_buffer_pool_wait_free`，是性能悬崖信号。
+
+#### 淘汰主流程：`buf_LRU_free_from_common_LRU_list`
+
+`buf_LRU_scan_and_free_block` 是**两级分工**（buf0lru.cc）：
+
+```cpp
+if (UT_LIST_GET_LEN(buf_pool->unzip_LRU) > 0) {
+  freed = buf_LRU_free_from_unzip_LRU_list(buf_pool, ...);          // ① 先试：只回收解压帧
+}
+if (!freed) {
+  freed = buf_LRU_free_from_common_LRU_list(buf_pool, scan_all);    // ② 兜底：整块回收
+}
+```
+
+| | unzip 路径（先试） | common 路径（兜底） |
+|---|---|---|
+| 回收对象 | 压缩块的**解压帧**（保留压缩页） | **整个 block** |
+| 是否允许脏 | **允许**（脏压缩页降级为 `ZIP_DIRTY`） | **不允许**（必须干净） |
+| 扫描起点 | `unzip_LRU` 尾端 | `lru_scan_itr` 游标上次位置 |
+| 门控 | `buf_LRU_evict_from_unzip_LRU` 启发式 | `buf_flush_ready_for_replace` |
+| 扫描上限 | `srv_LRU_scan_depth` | `BUF_LRU_SEARCH_SCAN_THRESHOLD`(100) |
+| 代价 | 廉价（部分释放，省一次读盘解压） | 彻底释放 |
+
+**common 路径主循环**：
+
+```cpp
+for (bpage = buf_pool->lru_scan_itr.start();
+     bpage != nullptr && !freed &&
+     (scan_all || scanned < BUF_LRU_SEARCH_SCAN_THRESHOLD);
+     ++scanned, bpage = buf_pool->lru_scan_itr.get()) {
+  auto prev = UT_LIST_GET_PREV(LRU, bpage);
+  buf_pool->lru_scan_itr.set(prev);              // ★ 游标置为"下一个要看的"
+  const auto accessed = buf_page_is_accessed(bpage);
+
+  if (bpage->was_stale()) {
+    freed = buf_page_free_stale(buf_pool, bpage);   // stale 页（space 被 truncate）单独分支，不加 block mutex
+  } else {
+    mutex_enter(block_mutex);
+    if (buf_flush_ready_for_replace(bpage)) {
+      freed = buf_LRU_free_page(bpage, true);       // 成功时内部会释放 LRU_list_mutex
+    }
+    if (!freed) mutex_exit(block_mutex);
+  }
+  if (freed && accessed == std::chrono::steady_clock::time_point{}) {
+    ++buf_pool->stat.n_ra_pages_evicted;           // ★ 预读进来却从未被访问
+  }
+}
+```
+
+- **从游标继续，不是每次从尾部**：`lru_scan_itr` 跨调用保留上次位置（详见 `lru_scan_itr` 节），避免每轮重复扫同一批"扫不动"的页。
+- **★ 脏页是"跳过"，不是"在这里刷"**：`buf_flush_ready_for_replace` 最终要求 `!bpage->is_dirty()`，脏页不满足 → 放锁继续下一页。真正的"淘汰前刷脏"是外层 `buf_LRU_get_free_block` 循环单独调 `buf_flush_single_page_from_LRU`。
+- **★ `n_ra_pages_evicted`**：淘汰掉一个 `access_time == epoch{}`（从未被访问）的页就 +1，用于衡量**预读有效性**——预读进来却没人用的页。
+- `scan_all`：第一轮失败后由 `buf_LRU_get_free_block` 传 true，放开 100 页上限全表扫。
+- 末尾断言 `freed ? !mutex_own(LRU_list_mutex) : mutex_own(LRU_list_mutex)`——成功时 LRU mutex 已在 `buf_LRU_free_page` 内部释放，调用方据此不再重复 unlock（易错点）。
 
 #### 压缩页驱逐与 change buffer 竞态（Bug#120698，S1 真实缺陷）
 
@@ -1059,11 +1623,317 @@ threshold = std::min(static_cast<page_no_t>(64 - srv_read_ahead_threshold),
 
 #### 脏页生成与 flush_list
 
-mtr commit 时若页被改，`buf_flush_note_modification`（buf0flu.cc）设 `oldest_modification`（首脏时，置为 mtr end_lsn）并插入 flush_list；后续修改只更新 `newest_modification`。flush_list 按 `oldest_modification` 升序——这是 page cleaner "刷老不刷新"与 checkpoint 推进的依据。
+⚠️ **勘误**：**不存在 `buf_page_make_dirty()`**。真名是 `buf_flush_note_modification()`，且**定义在 `.ic` 里**（`buf0flu.h` 末尾 `#include "buf0flu.ic"`）；真正挂链是 `buf_flush_insert_into_flush_list()`。
+
+```cpp
+// buf0flu.ic:57
+/** This function should be called at a mini-transaction commit, if a page was
+ modified in it. Puts the block to the list of modified blocks, if it is not
+ already in it. */
+static inline void buf_flush_note_modification(
+    buf_block_t *block, lsn_t start_lsn, lsn_t end_lsn,
+    Flush_observer *observer) {
+  ut_ad(block->page.buf_fix_count > 0);        // ★ mtr 提交时该页必须仍被 fix
+  ut_ad(!buf_flush_list_mutex_own(buf_pool));  // ★ 进来时不持 flush_list_mutex
+
+  mutex_enter(&block->mutex);                  // ★ 只先拿 block->mutex（锁序：block → flush_list）
+
+  if (end_lsn != 0) {
+    ut_ad(block->page.get_newest_lsn() <= end_lsn);
+    block->page.set_newest_lsn(end_lsn);      // ★ 更新 newest_modification
+  } else {
+    /* Do nothing. This is the case with no-redo mtr and it
+    possibly could re-modify some earlier dirtied page, in
+    which case we don't want to change oldest/newest lsns. ... */
+  }
+
+  if (observer != nullptr) {
+    block->page.set_flush_observer(observer);
+  } else {
+    block->page.reset_flush_observer();
+  }
+
+  if (!block->page.is_dirty()) {               // ★★ 已经在 flush_list 上就不用再插
+    buf_flush_insert_into_flush_list(buf_pool, block, start_lsn);   // ★ 首次变脏：挂链
+  } else if (start_lsn != 0) {
+    ut_ad(block->page.get_oldest_lsn() <= start_lsn);  // ★ 已脏：只校验，不动 oldest_modification
+  }
+
+  buf_page_mutex_exit(block);
+  srv_stats.buf_pool_write_requests.inc();
+}
+```
+
+```cpp
+// buf0flu.cc:503
+void buf_flush_insert_into_flush_list(buf_pool_t *buf_pool,
+                                      buf_block_t *block, lsn_t lsn) {
+  ut_ad(mutex_own(buf_page_get_mutex(&block->page)));
+
+  buf_flush_list_mutex_enter(buf_pool);        // ★★ 锁序：block_mutex → flush_list_mutex
+
+  /* If we are in the recovery then we need to update the flush
+  red-black tree as well. */
+  if (buf_pool->flush_rbt != nullptr) {        // ★ 恢复期：委托给有序版本（走红黑树）
+    buf_flush_list_mutex_exit(buf_pool);
+    buf_flush_insert_sorted_into_flush_list(buf_pool, block, lsn);
+    return;
+  }
+
+  if (lsn == 0) {
+    /* This is no-redo dirtied page. Borrow the lsn. */
+    lsn = buf_flush_borrow_lsn(buf_pool);      // ★ 无 redo 的脏页：借 LSN
+    block->page.set_newest_lsn(
+        std::max(lsn, log_sys->flushed_to_disk_lsn.load()));
+    //  ★ 取借来的 LSN 与已刷 redo LSN 的较大者
+  }
+
+  block->page.set_oldest_lsn(lsn);             // ★★ oldest_modification = start_lsn（只设一次）
+
+  UT_LIST_ADD_FIRST(buf_pool->flush_list, &block->page);   // ★★ 头插！
+  incr_flush_list_size_in_bytes(block, buf_pool);
+  buf_flush_list_mutex_exit(buf_pool);
+}
+```
+
+> ★★ **两个关键语义**
+> 1. **头插**（`UT_LIST_ADD_FIRST`）：新脏页永远放链头 ⇒ **链头 LSN 最大、链尾 LSN 最小**。刷脏（`buf_do_flush_list_batch`）从**链尾** `UT_LIST_GET_LAST` 开始，即**最老的脏页先刷**——这正是 checkpoint 能推进的前提。
+> 2. **`oldest_modification` 只在插入时设置一次**；后续同一页被别的 mtr 修改走 `else if (start_lsn != 0)` 分支，**只更新 `newest_lsn`**。所以 oldest_modification = **第一次**把该页弄脏的 mtr 的 start_lsn。
+
+**`buf_flush_borrow_lsn()`（`buf0flu.cc:478`）**：
+
+```cpp
+static inline lsn_t buf_flush_borrow_lsn(const buf_pool_t *buf_pool) {
+  ut_ad(buf_flush_list_mutex_own(buf_pool));
+  const auto page = UT_LIST_GET_FIRST(buf_pool->flush_list);
+  if (page == nullptr) {
+    /* Flush list is empty - use lsn up to which we know that all
+    dirty pages with smaller oldest_modification were added to
+    the flush list (they were flushed as the flush list is empty). */
+    const lsn_t lsn = log_buffer_dirty_pages_added_up_to_lsn(*log_sys);
+    if (lsn < LOG_START_LSN) {
+      ut_ad(srv_read_only_mode);
+      return LOG_START_LSN + LOG_BLOCK_HDR_SIZE;
+    }
+    return lsn;
+  }
+  return page->get_oldest_lsn();      // ★ 借链头那一页的 oldest_modification
+}
+```
+
+**批次组织：single-flight + best effort**：
+
+```cpp
+// buf0flu.cc:2076
+bool buf_flush_do_batch(buf_pool_t *buf_pool, buf_flush_t type, ulint min_n,
+                        lsn_t lsn_limit, ulint *n_processed) {
+  if (!buf_flush_start(buf_pool, type)) {   // ★★ single-flight：同类型批次已在跑 → 直接 false（不等待）
+    return (false);
+  }
+  ulint page_count = buf_flush_batch(buf_pool, type, min_n, lsn_limit);
+  buf_flush_end(buf_pool, type);
+  ...
+}
+
+// buf0flu.cc:2004
+static bool buf_flush_start(buf_pool_t *buf_pool, buf_flush_t flush_type) {
+  mutex_enter(&buf_pool->flush_state_mutex);
+  if (buf_pool->n_flush[flush_type] > 0 ||
+      buf_pool->init_flush[flush_type] == true) {
+    /* There is already a flush batch of the same type running */
+    mutex_exit(&buf_pool->flush_state_mutex);
+    return false;                             // ★ 返回 false 而非等待
+  }
+  buf_pool->init_flush[flush_type] = true;    // ★ 占位：批次"初始化中"
+  os_event_reset(buf_pool->no_flush[flush_type]);
+  mutex_exit(&buf_pool->flush_state_mutex);
+  return true;
+}
+```
+
+```cpp
+// buf0flu.cc:1883 —— flush_list 批次：从链尾（最老）扫，用 hazard pointer 续扫
+static ulint buf_do_flush_list_batch(buf_pool_t *buf_pool, ulint min_n,
+                                     lsn_t lsn_limit) {
+  /* In order not to degenerate this scan to O(n*n) we attempt
+  to preserve pointer of previous block in the flush list. To do
+  so we declare it a hazard pointer. Any thread working on the
+  flush list must check the hazard pointer and if it is removing
+  the same block then it must reset it. */
+  for (buf_page_t *bpage = UT_LIST_GET_LAST(buf_pool->flush_list);
+       count < min_n && bpage != nullptr && len > 0 &&
+       bpage->get_oldest_lsn() < lsn_limit;              // ★ LSN 上限裁剪
+       bpage = buf_pool->flush_hp.get(), ++scanned) {    // ★ hazard pointer 续扫
+    buf_page_t *prev = UT_LIST_GET_PREV(list, bpage);
+    buf_pool->flush_hp.set(prev);                        // ★ 游标先退一格，再动手
+    buf_flush_page_and_try_neighbors(bpage, BUF_FLUSH_LIST, min_n, &count);
+    --len;
+  }
+  buf_pool->flush_hp.set(nullptr);
+  buf_flush_list_mutex_exit(buf_pool);
+  return (count);
+}
+```
+
+```cpp
+// buf0flu.cc:1764 —— LRU 批次：抢不到锁就跳过，绝不等待（best effort）
+    auto acquired = mutex_enter_nowait(block_mutex) == 0;   // ★★ best effort
+    if (acquired && buf_flush_ready_for_replace(bpage)) {
+      if (buf_LRU_free_page(bpage, true)) { ++evict_count; ... }
+      else { mutex_exit(block_mutex); }
+    } else if (acquired && buf_flush_ready_for_flush(bpage, BUF_FLUSH_LRU)) {
+      mutex_exit(block_mutex);                             // ★ 先放 block_mutex，再发 IO
+      buf_flush_page_and_try_neighbors(bpage, BUF_FLUSH_LRU, max, &count);
+    } else if (!acquired) {
+      ut_ad(buf_pool->lru_hp.is_hp(prev));                 // ★ 没抢到锁 → 游标必须还在 prev
+    }
+```
+
+**等待批次结束**——⚠️ **不存在 `buf_flush_wait_flushed()`**（全仓 0 命中）：
+
+```cpp
+// buf0flu.cc:2056
+void buf_flush_wait_batch_end(buf_pool_t *buf_pool, buf_flush_t flush_type) {
+  if (buf_pool == nullptr) {
+    for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
+      auto buf_pool = buf_pool_from_array(i);
+      thd_wait_begin(nullptr, THD_WAIT_DISKIO);
+      os_event_wait(buf_pool->no_flush[flush_type]);   // ★ 等该实例该类型的批次归零
+      thd_wait_end(nullptr);
+    }
+  } else {
+    ... os_event_wait(buf_pool->no_flush[flush_type]); ...
+  }
+}
+
+// buf0flu.cc:2273 —— 只在"确实有批次在跑"时才等
+void buf_flush_wait_LRU_batch_end(void) {
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    buf_pool = buf_pool_from_array(i);
+    mutex_enter(&buf_pool->flush_state_mutex);
+    if (buf_pool->n_flush[BUF_FLUSH_LRU] > 0 ||
+        buf_pool->init_flush[BUF_FLUSH_LRU]) {          // ★ 在途或在初始化 → 才等
+      mutex_exit(&buf_pool->flush_state_mutex);
+      buf_flush_wait_batch_end(buf_pool, BUF_FLUSH_LRU);
+    } else {
+      mutex_exit(&buf_pool->flush_state_mutex);
+    }
+  }
+}
+```
+
+**全量刷脏**（`buf0flu.cc:3658`）：
+
+```cpp
+void buf_flush_sync_all_buf_pools() {
+  bool success;
+  ulint n_pages;
+  do {
+    n_pages = 0;
+    success = buf_flush_lists(ULINT_MAX, LSN_MAX, &n_pages);   // ★ 不限页数、不限 LSN
+    buf_flush_wait_batch_end(nullptr, BUF_FLUSH_LIST);         // ★ 死等所有实例归零
+    if (!success) MONITOR_INC(MONITOR_FLUSH_SYNC_WAITS);       // ★ 被 single-flight 挡住 → 重试
+    ...
+  } while (!success);                                          // ★ 循环直到某次全部实例都成功进入
+  ut_a(success);
+  /* All pages have been written to disk, but we need to make fsync ... */
+  buf_flush_fsync();                                           // ★ 最后 fsync
+}
+```
+
+**邻接刷盘**（`buf_flush_try_neighbors`，`buf0flu.cc:1475`）：
+
+```cpp
+  if (UT_LIST_GET_LEN(buf_pool->LRU) < BUF_LRU_OLD_MIN_LEN ||
+      srv_flush_neighbors == 0) {
+    low = page_id.page_no();
+    high = page_id.page_no() + 1;                  // ★ 退化：只刷自己一页
+  } else {
+    page_no_t buf_flush_area;
+    buf_flush_area = std::min(buf_pool->read_ahead_area,
+                    static_cast<page_no_t>(buf_pool->curr_size / 16));  // ★ 邻接区大小
+    low  = (page_id.page_no() / buf_flush_area) * buf_flush_area;
+    high = (page_id.page_no() / buf_flush_area + 1) * buf_flush_area;
+
+    if (srv_flush_neighbors == 1) {
+      /* adjust 'low' and 'high' to limit for contiguous dirty area */
+      if (page_id.page_no() > low) {
+        for (i = page_id.page_no() - 1; i >= low; i--) {   // ★ 向左扩到第一个不可刷的邻居
+          if (!buf_flush_check_neighbor(page_id_t(page_id.space(), i), flush_type)) break;
+          ...
+        }
+        low = i + 1;
+      }
+      for (i = page_id.page_no() + 1;                      // ★ 向右同样扩
+           i < high && buf_flush_check_neighbor(...); i++) { }
+      high = i;
+    }
+  }
+
+  for (i = low; i < high; i++) {
+    if ((count + n_flushed) >= n_to_flush) {
+      /* ... If the page whose neighbors we are flushing has not been
+      flushed yet then we'll try to flush the victim that we selected
+      originally. */
+      if (i <= page_id.page_no()) { i = page_id.page_no(); }  // ★★ 配额用尽也要保证"受害者自己"被刷
+      else break;
+    }
+    ...
+    if (flush_type == BUF_FLUSH_LIST &&
+        buf_flush_ready_for_flush(bpage, flush_type) &&
+        bpage->buf_fix_count == 0 && bpage->was_stale()) {
+      mutex_exit(block_mutex);
+      buf_page_free_stale(buf_pool, bpage, hash_lock);  // ★ LIST 类型下 stale 页直接丢弃，不写盘
+      continue;
+    }
+    ...
+    if (buf_flush_page(buf_pool, bpage, flush_type, false)) { ++count; }
+    else { mutex_exit(block_mutex); }                   // ★ 失败 → 自己放锁
+  }
+```
+
+> ★ LRU 邻接只刷 **old 区**（`buf_flush_check_neighbor` 里的 `flush_type != BUF_FLUSH_LRU || buf_page_is_old(bpage)`）。
+
+**入口链**：mtr commit → `buf_flush_note_modification`（buf0flu.ic）先 `set_newest_lsn(end_lsn)` → 若该页**首脏**再调 `buf_flush_insert_into_flush_list`（buf0flu.cc，90 行）。非首脏页只断言 `oldest <= start_lsn`，不再入链。
+
+★ **两个 LSN 的分工**（易错点）：
+
+| 字段 | 何时设 | 值 |
+|---|---|---|
+| `newest_modification` | **每次** mtr 提交（含非首脏） | 本次 mtr 的 **end_lsn** |
+| `oldest_modification` | **仅在入 flush_list 那一次** | 本次 mtr 的 **start_lsn** |
+
+`buf_flush_insert_into_flush_list`：
+
+```cpp
+if (buf_pool->flush_rbt != nullptr) {          // ① 恢复期
+  buf_flush_insert_sorted_into_flush_list(buf_pool, block, lsn);  // 红黑树定位前驱后 INSERT_AFTER
+  return;
+}
+ut_ad(buf_block_get_state(block) == BUF_BLOCK_FILE_PAGE);
+ut_ad(!block->page.in_flush_list);             // ② 首脏前提：不在链上
+
+if (lsn == 0) {                                // ③ no-redo 页（临时表空间等）
+  lsn = buf_flush_borrow_lsn(buf_pool);        // 借链首的 oldest_lsn
+  block->page.set_newest_lsn(std::max(lsn, log_sys->flushed_to_disk_lsn.load()));
+}
+ut_ad(buf_flush_list_order_validate(...));     // debug：校验定序
+block->page.set_oldest_lsn(lsn);               // ④ oldest 只在这里设一次
+UT_LIST_ADD_FIRST(buf_pool->flush_list, &block->page);   // ⑤ ★ 追加到链头
+incr_flush_list_size_in_bytes(block, buf_pool);          // 维护 flush_list_bytes
+```
+
+**★ 纠正一个常见误解：正常运行是"追加"而非"排序插入"**。flush_list 从**链头到链尾按 `oldest_modification` 降序**（链头最新、链尾最老）——因为 mtr 的 start_lsn 单调递增，新入链脏页的 oldest 必然最大，`ADD_FIRST` 就足以维持有序，无需 O(n) 找位置。page cleaner 因此从**链尾**（最老）开始扫，这就是"刷老不刷新"。
+
+**只有崩溃恢复期才真正排序插入**：重做回放的 LSN 不按到达顺序递增，故 `flush_rbt`（红黑树，O(log n) 定位前驱）生效，走 `buf_flush_insert_sorted_into_flush_list`（详见 `flush_rbt` 节），并清空 `oldest_hp` 游标（插入使旧的最老页游标失效）。
+
+**no-redo 页（lsn == 0）**：临时表空间等不记 redo 的页，借链首的 oldest_lsn；链空则取 `log_buffer_dirty_pages_added_up_to_lsn`（只读模式退化为 `LOG_START_LSN + LOG_BLOCK_HDR_SIZE`）；newest 取 `max(borrow, flushed_to_disk_lsn)` 兜底——防止借到更小 LSN 造成重复刷盘。
+
+> 入链后 `flush_list_bytes` 由 `incr_flush_list_size_in_bytes` 维护，是自适应刷脏与 checkpoint age 的输入。
 
 #### 脏页刷新（Flush）
 
-三条路径全部汇聚到 `buf_flush_page`→ `buf_flush_write_block_low`（，统一汇聚点）：WAL 约束 + checksum + `dblwr::write`。
+三条路径全部汇聚到 `buf_flush_page`→ `buf_flush_write_block_low`（统一汇聚点，★逐行解析见下）：WAL 约束 + checksum + `dblwr::write`。
 
 刷脏类型 `buf_flush_t`（buf0types.h）：
 
@@ -1159,6 +2029,145 @@ bool buf_flush_do_batch(buf_pool_t *buf_pool, buf_flush_t type, ulint min_n,
 **为什么必须 `nowait`**：LRU flush 的调用链（`buf_LRU_get_free_block`）可能持有 page latch，一旦阻塞在 block mutex 上就可能死锁。
 
 ##### `buf_flush_page` 的锁契约（最容易踩坑）
+
+⚠️ **勘误**：**返回 `false` 时一把锁都没放**，调用者必须自己 `mutex_exit(block_mutex)`——这是最容易踩的坑。
+
+```cpp
+// buf0flu.cc:1282
+/**
+  Writes a flushable page asynchronously from the buffer pool to a file.
+  NOTE: 1. in simulated aio we must call os_aio_simulated_wake_handler_threads
+  after we have posted a batch of writes! 2. buf_page_get_mutex(bpage) must be
+  held upon entering this function. The LRU list mutex must be held if flush_type
+  == BUF_FLUSH_SINGLE_PAGE. Both mutexes will be released by this function if it
+  returns true.
+  @return true if page was flushed */
+bool buf_flush_page(buf_pool_t *buf_pool, buf_page_t *bpage,
+                    buf_flush_t flush_type, bool sync) {
+  ut_ad(flush_type == BUF_FLUSH_SINGLE_PAGE ||
+        !mutex_own(&buf_pool->LRU_list_mutex));        // ★ 非 SINGLE 禁止持 LRU_list_mutex
+  ut_ad(flush_type != BUF_FLUSH_SINGLE_PAGE ||
+        mutex_own(&buf_pool->LRU_list_mutex));         // ★ SINGLE 必须持 LRU_list_mutex
+  ut_ad(!sync || flush_type == BUF_FLUSH_SINGLE_PAGE); // ★ 只有 SINGLE 允许同步 IO
+
+  block_mutex = buf_page_get_mutex(bpage);
+  ut_ad(mutex_own(block_mutex));                       // ★★ 进入契约：必须持 block_mutex
+  ut_ad(buf_flush_ready_for_flush(bpage, flush_type));
+
+  bool no_fix_count = bpage->buf_fix_count == 0;       // ★ 无人 pin 住该页
+
+  if (!is_uncompressed) {
+    flush = true;                                      // 压缩页无 block->lock，直接刷
+  } else if (!(no_fix_count || flush_type == BUF_FLUSH_LIST) || ...) {
+    /* This is a heuristic, to avoid expensive SX attempts. */
+    flush = false;                                     // ★ 启发式放弃
+  } else {
+    rw_lock = &reinterpret_cast<buf_block_t *>(bpage)->lock;
+    if (flush_type != BUF_FLUSH_LIST) {
+      flush = rw_lock_sx_lock_nowait(rw_lock, BUF_IO_WRITE, UT_LOCATION_HERE);  // ★ 不等待
+    } else {
+      /* Will SX lock later */
+      flush = true;                                    // ★★ LIST 类型先放行，稍后才拿 SX
+    }
+  }
+
+  if (flush) {
+    /* We are committed to flushing by the time we get here */
+    mutex_enter(&buf_pool->flush_state_mutex);
+
+    buf_page_set_io_fix(bpage, BUF_IO_WRITE);          // ★★ io_fix 置位
+    buf_page_set_flush_type(bpage, flush_type);        // ★ 记住类型，供完成回调回退 n_flush
+    if (buf_pool->n_flush[flush_type] == 0) {
+      os_event_reset(buf_pool->no_flush[flush_type]);
+    }
+    ++buf_pool->n_flush[flush_type];                   // ★ 在途刷页数 ++（single-flight 判据之一）
+
+    if (bpage->get_oldest_lsn() > buf_pool->max_lsn_io) {
+      buf_pool->max_lsn_io = bpage->get_oldest_lsn();
+    }
+    if (!fsp_is_system_temporary(bpage->id.space()) &&
+        buf_pool->track_page_lsn != LSN_MAX) {         // ★ 归档（clone）页面跟踪
+      arch_page_sys->track_page(bpage, buf_pool->track_page_lsn, frame_lsn, false);
+    }
+    mutex_exit(&buf_pool->flush_state_mutex);
+
+    mutex_exit(block_mutex);                            // ★★ 返回 true 前释放 block_mutex
+    if (flush_type == BUF_FLUSH_SINGLE_PAGE) {
+      mutex_exit(&buf_pool->LRU_list_mutex);            // ★★ SINGLE 还额外释放 LRU_list_mutex
+    }
+
+    if (flush_type == BUF_FLUSH_LIST && is_uncompressed &&
+        !rw_lock_sx_lock_nowait(rw_lock, BUF_IO_WRITE, UT_LOCATION_HERE)) {
+      if (!fsp_is_system_temporary(bpage->id.space()) && dblwr::is_enabled()) {
+        dblwr::force_flush(flush_type, buf_pool_index(buf_pool));  // ★★ 背压①：强制 dblwr 落盘
+      } else {
+        buf_flush_sync_datafiles();                                // ★★ 背压②：等所有 pending 写完成
+      }
+      rw_lock_sx_lock_gen(rw_lock, BUF_IO_WRITE, UT_LOCATION_HERE); // ★ 此时才阻塞等 SX
+    }
+
+    if (bpage->get_flush_observer() != nullptr) {                   // ★ Flush_observer
+      bpage->get_flush_observer()->notify_flush(buf_pool, bpage);
+    }
+
+    /* Even though bpage is not protected by any mutex at this
+    point, it is safe to access bpage, because it is io_fixed and
+    oldest_modification != 0.  Thus, it cannot be relocated in the
+    buffer pool or removed from flush_list or LRU_list. */
+    buf_flush_write_block_low(bpage, flush_type, sync);             // ★ 进入 doublewrite
+  }
+  return flush;                                        // ★ false ⇒ 调用者仍持有 block_mutex
+}
+```
+
+**★ 锁契约总表**
+
+| 阶段 | `block_mutex` | `LRU_list_mutex` | `block->lock` |
+|---|---|---|---|
+| 进入 | **必须持** | SINGLE 必须持；其他必须**不持** | 未持 |
+| 返回 `true` | **已释放** | SINGLE 已释放；其他本来就未持 | 已拿 SX（LIST 可能触发过背压） |
+| 返回 `false` | **仍持有**（调用者自己放） | 仍持有（SINGLE） | 未拿 |
+
+> ★ 返回 `true` 后 `bpage` 靠 `io_fix=BUF_IO_WRITE + oldest_modification!=0` 保护，不会被 relocate / 摘链——所以调用方可以在完全无锁的状态下继续用它。
+>
+> ★ 调用方释放的例子：`buf_flush_try_neighbors()` 的 `:1599` 与 `:1606`、`buf_flush_page_and_try_neighbors()` 的 `:1688` 都是 `if (buf_flush_page(...)) { ++count; } else { mutex_exit(block_mutex); }`。
+
+**`buf_flush_ready_for_flush_gen()`（三态判定，`buf0flu.cc:717`）**：
+
+```cpp
+  ut_ad(mutex_own(buf_page_get_mutex(bpage)) ||
+        (!atomic && flush_type == BUF_FLUSH_LIST &&
+         buf_flush_list_mutex_own(buf_pool)));
+  //  ★ 精确版要 block_mutex；允许 stale 的快筛版只需 flush_list_mutex
+
+  if (!bpage->is_dirty() ||
+      (atomic ? bpage->get_io_fix() != BUF_IO_NONE : bpage->was_io_fixed())) {
+    return false;                   // ★ 不脏 / 已有 IO 在途 → 不可刷
+  }
+  ut_ad(bpage->in_flush_list);
+  switch (flush_type) {
+    case BUF_FLUSH_LIST:
+      return (buf_page_get_state(bpage) != BUF_BLOCK_REMOVE_HASH);
+    case BUF_FLUSH_LRU:
+    case BUF_FLUSH_SINGLE_PAGE:
+      return true;
+    ...
+  }
+```
+
+**`buf_flush_sync_datafiles()`（背压出口，`buf0flu.cc:214`）**：
+
+```cpp
+static void buf_flush_sync_datafiles() {
+  /* Wake possible simulated AIO thread to actually post the
+  writes to the operating system */
+  os_aio_simulated_wake_handler_threads();
+  /* Wait that all async writes to tablespaces have been posted to the OS */
+  os_aio_wait_until_no_pending_writes();       // ★ 等 AIO 写队列排空
+  /* Now we flush the data to disk (for example, with fsync) */
+  fil_flush_file_spaces();
+}
+```
 
 进入时必须持有 `block_mutex`；**返回值决定 mutex 归谁释放**：
 
@@ -1334,6 +2343,8 @@ InnoDB 只有**一个 hp**（不是每线程一个数组），因为同一时刻
 | key | `<oldest_modification, space, offset>`（`buf_flush_block_cmp`，） |
 | 保护 | `flush_list_mutex` |
 
+★ **key 为什么是三元的**：源码注释说得很清楚——*"for the purpose of flush_rbt, we only need to order blocks on the `oldest_modification`. The other two fields are used to **uniquely identify** the blocks."* 同一个 mtr 可能修改**多页**，它们的 `oldest_modification` 完全相同（都等于该 mtr 的 start_lsn），红黑树必须靠 `space + offset` 才能唯一区分这些节点——排序只需要第一个字段，后两个是**唯一性**要求。
+
 ##### 为什么恢复期需要它：避免 O(n²)
 
 恢复时 redo 重放会把**大量页**读入并立即改脏，每个都要按 `oldest_modification` **有序**插入 flush_list。若每次线性查找插入位置：
@@ -1372,7 +2383,11 @@ if (buf_pool->flush_rbt != nullptr) {
 }
 ```
 
-删除（`buf_flush_remove`，）与重定位（`buf_flush_relocate_on_flush_list`，）都要同步维护 rbt——注意 relocate 的顺序是**先删后插**，且必须在 `flush_hp.move()` **之前**（ 注释强调 hp 调整要在摘链表前）。
+删除（`buf_flush_remove`）与重定位（`buf_flush_relocate_on_flush_list`）都要同步维护 rbt：
+
+- **删除顺序不能反**：先 `buf_flush_delete_from_flush_rbt` 再置 `in_flush_list = false`——因为**比较函数本身会断言 `in_flush_list`**（源码注释："Must be done after we have removed it from the flush_rbt because we assert on in_flush_list in comparison function"）。
+- **relocate 是先删后插**，且必须在 `flush_hp.move()` **之前**（注释强调 hp 调整要在摘链表前）；插入后还要断言 `ut_a(prev_b == prev)`——**链表前驱与 rbt 给出的前驱必须一致**（两个结构对同一页的定序不能分歧）。
+- ★ **插入后清空 `oldest_hp`**：`buf_flush_insert_sorted_into_flush_list` 末尾若 `oldest_hp.get() != nullptr` 就 `set(nullptr)`——恢复期新插入的页**可能比原游标指向的页更老**，旧的"最老页游标"因此失效，必须重置（正常期的追加路径不触发，因为追加的页总是最新）。
 
 ##### 一致性与边界
 
@@ -1408,9 +2423,166 @@ LRU 扫描是**从尾部（最冷）向头部（最热）**推进。`m_hp->old =
 
 ---
 
-#### 刷脏前的 WAL：redo 先落盘
+#### ★ 逐行解析：`buf_flush_write_block_low`（刷脏汇聚点）
 
-`buf_flush_write_block_low`写数据页前先同步等 redo fsync：
+⚠️ **勘误**：本函数**只做 doublewrite**。`io_fix` 是**上层** `buf_flush_page():1337` 置的；`flush_list` **不在写路径摘除**，而是在 IO 完成回调 `buf_flush_write_complete():931 → buf_flush_remove()` 摘。
+
+```cpp
+// buf0flu.cc:1174
+static void buf_flush_write_block_low(buf_page_t *bpage, buf_flush_t flush_type,
+                                      bool sync) {
+  ut_ad(!mutex_own(&buf_pool->LRU_list_mutex));   // ★ 进来时不得持有 LRU_list_mutex
+  ut_ad(!buf_flush_list_mutex_own(buf_pool));     // ★ 不持 flush_list_mutex
+  ut_ad(!buf_page_get_mutex(bpage)->is_owned());  // ★ 不持 block_mutex
+  ut_ad(bpage->is_io_fix_write());                // ★ io_fix 必须是 BUF_IO_WRITE（由上层置位）
+  ut_ad(bpage->is_dirty());                       // ★ oldest_modification != 0，仍在 flush_list 上
+
+  /* Force the log to the disk before writing the modified block */
+  if (!srv_read_only_mode) {
+    const lsn_t flush_to_lsn = bpage->get_newest_lsn();     // ★ WAL 铁律
+    /* Do the check before calling log_write_up_to() because in most
+    cases it would allow to avoid call, and because of that we don't
+    want those calls because they would have bad impact on the counter
+    of calls, which is monitored to save CPU on spinning in log threads. */
+    if (log_sys->flushed_to_disk_lsn.load() < flush_to_lsn) {
+      Wait_stats wait_stats;
+      wait_stats = log_write_up_to(*log_sys, flush_to_lsn, true);
+      MONITOR_INC_WAIT_STATS_EX(MONITOR_ON_LOG_, _PAGE_WRITTEN, wait_stats);
+    }
+  }
+
+  switch (buf_page_get_state(bpage)) {
+    case BUF_BLOCK_ZIP_DIRTY: {                   // ★ 只剩压缩页（uncompressed frame 已回收）
+      frame = bpage->zip.data;
+      BlockReporter reporter = BlockReporter(false, frame, bpage->size,
+                        fsp_is_checksum_disabled(bpage->id.space()));
+      mach_write_to_8(frame + FIL_PAGE_LSN, bpage->get_newest_lsn());
+      ut_a(reporter.verify_zip_checksum());
+      break;
+    }
+    case BUF_BLOCK_FILE_PAGE:
+      frame = bpage->zip.data;
+      if (!frame) frame = ((buf_block_t *)bpage)->frame;
+      buf_flush_init_for_writing(                 // ★ 写 LSN + checksum（含 LSN 单调性断言）
+          reinterpret_cast<const buf_block_t *>(bpage),
+          reinterpret_cast<const buf_block_t *>(bpage)->frame,
+          bpage->zip.data ? &bpage->zip : nullptr, bpage->get_newest_lsn(),
+          fsp_is_checksum_disabled(bpage->id.space()),
+          false /* do not skip lsn check */);
+      break;
+    ...（其余 state 均 ut_error）
+  }
+
+  dberr_t err = dblwr::write(flush_type, bpage, sync);   // ★★ doublewrite 唯一汇聚点
+  ut_a(err == DB_SUCCESS || err == DB_TABLESPACE_DELETED);
+
+  /* Increment the counter of I/O operations used for selecting LRU policy. */
+  buf_LRU_stat_inc_io();
+}
+```
+
+> ★ `dblwr::write()` 在 `buf0dblwr.cc:2478`：内部 `flush_type != BUF_FLUSH_SINGLE_PAGE && !sync` 走 `Double_write::submit()` 批量异步；否则走 `Double_write::sync_page_flush()`（`:2529`）。
+
+**`buf_flush_init_for_writing()` 里的 LSN 检查**（`buf0flu.cc:1060`）：
+
+```cpp
+  /* Write the newest modification lsn to the page header and trailer */
+  ut_ad(skip_lsn_check || mach_read_from_8(page + FIL_PAGE_LSN) <= newest_lsn);
+  //  ★ 页上已有 LSN 不得大于待写 LSN（LSN 单调不回退）
+  mach_write_to_8(page + FIL_PAGE_LSN, newest_lsn);                    // 页头
+  mach_write_to_8(page + UNIV_PAGE_SIZE - FIL_PAGE_END_LSN_OLD_CHKSUM,
+                  newest_lsn);                                         // 页尾 8 字节同样写
+```
+
+**`buf_flush_write_complete()` —— flush_list 真正摘链处**（`buf0flu.cc:919`）：
+
+```cpp
+void buf_flush_write_complete(buf_page_t *bpage) {
+  ut_ad(mutex_own(buf_page_get_mutex(bpage)));       // ★ 持 block_mutex
+  const buf_flush_t flush_type = buf_page_get_flush_type(bpage);
+
+  mutex_enter(&buf_pool->flush_state_mutex);
+
+  buf_flush_remove(bpage);                            // ★ 从 flush_list 摘除 + 置 clean
+
+  buf_page_set_io_fix(bpage, BUF_IO_NONE);            // ★ 解除 BUF_IO_WRITE
+  buf_pool->n_flush[flush_type]--;                    // ★ 在途计数回退
+
+  if (buf_pool->n_flush[flush_type] == 0 &&
+      buf_pool->init_flush[flush_type] == false) {
+    /* The running flush batch has ended */
+    os_event_set(buf_pool->no_flush[flush_type]);     // ★ 唤醒 buf_flush_wait_batch_end()
+  }
+  mutex_exit(&buf_pool->flush_state_mutex);
+
+  if (!fsp_is_system_temporary(bpage->id.space()) && dblwr::is_enabled()) {
+    dblwr::write_complete(bpage, flush_type);         // ★ doublewrite 批次完成计数
+  }
+}
+```
+
+```cpp
+// buf0flu.cc:784 —— 摘链 + hazard pointer 修正
+void buf_flush_remove(buf_page_t *bpage) {
+  ut_ad(mutex_own(buf_page_get_mutex(bpage)));
+  ut_ad(bpage->in_flush_list);
+
+  buf_flush_list_mutex_enter(buf_pool);
+
+  /* Important that we adjust the hazard pointer before removing
+  the bpage from flush list. */
+  buf_pool->flush_hp.adjust(bpage);      // ★★ 先修正并发扫描者的游标，再摘链（防 ABA / 悬垂）
+  buf_pool->oldest_hp.adjust(bpage);
+
+  switch (buf_page_get_state(bpage)) {
+    case BUF_BLOCK_ZIP_DIRTY:
+      buf_page_set_state(bpage, BUF_BLOCK_ZIP_PAGE);
+      UT_LIST_REMOVE(buf_pool->flush_list, bpage);
+      buf_LRU_insert_zip_clean(bpage);
+      break;
+    case BUF_BLOCK_FILE_PAGE:
+      UT_LIST_REMOVE(buf_pool->flush_list, bpage);   // ★★ flush_list 摘链
+      break;
+    ...
+  }
+
+  /* If the flush_rbt is active then delete from there as well. */
+  if (buf_pool->flush_rbt != nullptr) {
+    buf_flush_delete_from_flush_rbt(bpage);          // ★ 崩溃恢复期同步删红黑树
+  }
+  ut_d(bpage->in_flush_list = false);
+  buf_pool->stat.flush_list_bytes -= bpage->size.physical();
+  bpage->set_clean();                                 // ★ oldest_modification := 0
+  ...
+  if (bpage->get_flush_observer() != nullptr) {       // ★ Flush_observer（DDL 批量加载）
+    bpage->get_flush_observer()->notify_remove(buf_pool, bpage);
+    bpage->reset_flush_observer();
+  }
+  buf_flush_list_mutex_exit(buf_pool);
+}
+```
+
+三条刷脏路径（LIST / LRU / SINGLE_PAGE）的**唯一出口**，函数全文 93 行（buf0flu.cc）分五段。上游是 `buf_flush_page`，下游是 `dblwr::write`。
+
+**段 1：前置断言链——不持 block_mutex 为什么也安全**：
+
+```c
+ut_ad(buf_page_in_file(bpage));
+
+/* We are not holding block_mutex here. Nevertheless, it is safe to
+access bpage, because it is io_fixed and oldest_modification != 0.
+Thus, it cannot be relocated in the buffer pool or removed from
+flush_list or LRU_list. */
+ut_ad(!buf_flush_list_mutex_own(buf_pool));
+ut_ad(!buf_page_get_mutex(bpage)->is_owned());
+ut_ad(bpage->is_io_fix_write());
+ut_ad(bpage->is_dirty());
+```
+
+- 函数全程**不持 block_mutex**（还断言 flush_list mutex 也没持）——访问 bpage 的安全性由调用方预先置好的**双保险**保证：`io_fix == BUF_IO_WRITE`（页被 I/O 钉住，`buf_flush_page` 里 `buf_page_set_io_fix` 置的，不能 relocate）＋ `oldest_modification != 0`（仍在 flush_list 上，不能被摘除）。
+- 前置断言链是刷脏的**不变量声明**：in_file（有磁盘身份）+ io_fix_write（正被我刷）+ is_dirty（确实脏）。
+
+**段 2：WAL——redo 先落盘**：
 
 ```c
 const lsn_t flush_to_lsn = bpage->get_newest_lsn();  // = newest_modification
@@ -1422,10 +2594,43 @@ if (log_sys->flushed_to_disk_lsn.load() < flush_to_lsn) {
 - **WAL/ARIES**：数据页新版本写盘前，对应 redo 必须先落盘，否则崩溃恢复无法重放/回滚。
 - **用 newest 而非 oldest**：要保证该页**所有**修改的 redo 落盘，水位必须推到 newest（最大 LSN）。`oldest_modification` 是首脏 LSN（进 flush_list 依据），`newest_modification` 是最近修改 LSN。
 - 优化：先查 `flushed_to_disk_lsn < flush_to_lsn`，redo 已 flush 到更新位置就不调（源码注释明说：避免大量无谓进入 log 线程的原子计数自旋）。
-- **随后** `buf_flush_init_for_writing` 把 `newest_lsn` 写进页头 `FIL_PAGE_LSN`（崩溃恢复判断"页是否比 checkpoint 新"的唯一依据）并重算 checksum。
-- **★ `dblwr::write` 是唯一出口，没有 bypass**。
 
-> **与存储介质的关系**：这个 fsync 是每次刷脏批次的固定成本。云盘上 fsync 比本地盘贵一个数量级，所以 **redo 与数据文件应放同一块卷**（跨卷快照不一致 + fsync 打两处）。
+**段 3：按页状态分流——LSN 写页头 + checksum**：
+
+```c
+switch (buf_page_get_state(bpage)) {
+  case BUF_BLOCK_POOL_WATCH: ... case BUF_BLOCK_REMOVE_HASH:
+    ut_error;                    // 不可达：这些状态不可能进刷脏
+  case BUF_BLOCK_ZIP_DIRTY:      // 压缩副本直接刷（frame = zip.data）
+    mach_write_to_8(frame + FIL_PAGE_LSN, bpage->get_newest_lsn());
+    ut_a(reporter.verify_zip_checksum());   // 只校验不重算
+    break;
+  case BUF_BLOCK_FILE_PAGE:      // 完整 block（frame 或压缩副本）
+    buf_flush_init_for_writing(...);        // 按页类型更新 checksum + 写 FIL_PAGE_LSN
+    break;
+}
+```
+
+- `ut_error` 组：`ZIP_PAGE`（干净压缩页，不该被刷）、`NOT_USED`/`READY_FOR_USE`/`MEMORY`/`REMOVE_HASH`（无磁盘身份）——流到这里就是状态机 bug。
+- ZIP_DIRTY / FILE_PAGE 两分支的行为详见「压缩页三态与刷盘」节；要点是 **FIL_PAGE_LSN = newest_modification**——崩溃恢复判断"页版本是否比 checkpoint 新"的唯一依据。
+
+**段 4：`dblwr::write`——唯一出口，没有 bypass**：
+
+```c
+dberr_t err = dblwr::write(flush_type, bpage, sync);
+ut_a(err == DB_SUCCESS || err == DB_TABLESPACE_DELETED);
+```
+
+批量走 batch buffer 攒批，单页走 SYNC 槽位——机制见 [`dblwr.md`](dblwr.md)。
+
+**段 5：写盘后的统计**：`buf_LRU_stat_inc_io()`——LRU 替换策略的 I/O 计数（评估"这轮淘汰成本"用）。
+
+**两个容易被忽略的契约**：
+
+1. **`UNIV_IBUF_COUNT_DEBUG` 下断言该页 ibuf 计数为 0**——刷盘前 change buffer 必须已 merge 完。merge 发生在读完成回调（`buf_page_io_complete` → `ibuf_merge_or_delete_for_page`），页能走到"被修改并被刷"说明它早已被读入、ibuf 已清。这是 change buffer 与刷脏之间的时序契约（debug 版强制）。
+2. **`recv_recovery_is_on() || newest_lsn != 0`**——崩溃恢复期例外：恢复中刷的页可能没被 mtr 修改过（lsn=0），正常期则 newest_lsn 必非 0。
+
+> **与存储介质的关系**：段 2 的 fsync 是每次刷脏批次的固定成本。云盘上 fsync 比本地盘贵一个数量级，所以 **redo 与数据文件应放同一块卷**（跨卷快照不一致 + fsync 打两处）。
 
 #### 自适应刷脏（Adaptive Flushing）
 
@@ -1553,6 +2758,403 @@ buf_flush_write_block_low → dblwr::write → fil_io(NORMAL) → os_aio_func �
 
 > **这解释了为什么 `innodb_io_capacity` 调得过高（超过磁盘真实能力）反而会让刷脏和前台查询一起抖动**：投递速度超过收割速度 → 槽位打满 → 阻塞。（槽位机制见 [`io.md`](io.md)）
 
+#### ★ 线程视角：page cleaner 线程族的调度、唤醒与背压
+
+上面讲的是"刷什么、怎么刷"。这一节讲**执行体本身**——它是谁、睡在哪、被谁叫醒。
+
+**① 1 个协调者 + (N-1) 个 worker，且 worker[0] 就是协调者**
+
+```cpp
+// storage/innobase/buf/buf0flu.cc
+void buf_flush_page_cleaner_init() {
+  page_cleaner->n_slots = static_cast<ulint>(srv_buf_pool_instances);   // slot 数 = 实例数
+  page_cleaner->is_running = true;
+  srv_threads.m_page_cleaner_coordinator = os_thread_create(
+      page_flush_coordinator_thread_key, 0, buf_flush_page_coordinator_thread);
+  srv_threads.m_page_cleaner_workers[0] = srv_threads.m_page_cleaner_coordinator;  // ★ 0 号就是它
+  srv_threads.m_page_cleaner_coordinator.start();
+  ...
+}
+```
+
+worker 由**协调者线程自己**在函数体内创建（`for (size_t i = 1; i < srv_threads.m_page_cleaner_workers_n; ++i)`）。数量约束：`innodb_page_cleaners`（sysvar 真名 `page_cleaners`，定义在 **`ha_innodb.cc` 不在 `sys_vars.cc`**）默认 **4**、READONLY，且**被截断到 buffer pool 实例数**：
+
+```cpp
+if (srv_n_page_cleaners > srv_buf_pool_instances) {
+  /* limit of page_cleaner parallelizability is number of buffer pool instances. */
+  srv_n_page_cleaners = srv_buf_pool_instances;
+}
+```
+
+**② 协作靠两个事件 + 一个互斥，worker 不绑定实例**
+
+```cpp
+struct page_cleaner_t {
+  ib_mutex_t mutex;
+  os_event_t is_requested;   // 协调者 → workers：有活干
+  os_event_t is_finished;    // workers → 协调者：全部 slot 完成
+  bool requested;
+  lsn_t lsn_limit;
+  ulint n_slots;             // = srv_buf_pool_instances
+  ut::unique_ptr<page_cleaner_slot_t[]> slots;   // 状态机 NONE→REQUESTED→FLUSHING→FINISHED
+  bool is_running;
+};
+```
+
+★ **worker 与 buffer pool instance 之间没有固定绑定**：协调者把 N 个 slot 全置 REQUESTED 后 `os_event_set(is_requested)`，workers 与协调者**在 `page_cleaner->mutex` 下先到先得**认领第一个 REQUESTED 的 slot（协调者自己也干活，"Coordinator also treats requests"）。认领后对该 slot 对应的 `buf_pool` 执行 `buf_flush_LRU_list()` + `buf_flush_do_batch(BUF_FLUSH_LIST, n_pages_requested, lsn_limit)`。
+
+**③ 主循环：目标周期 1 秒，靠 `buf_flush_event` 定时/被叫醒**
+
+```cpp
+if ((is_server_active || buf_get_n_pending_read_ios() || n_flushed == 0) && !is_sync_flush) {
+  ret_sleep = pc_sleep_if_needed(loop_start_time + std::chrono::seconds{1}, sig_count);
+}
+```
+
+`pc_sleep_if_needed()` 内部是 `os_event_wait_time_low(buf_flush_event, ≤1s)`——**睡眠上限 1 秒，但可被提前唤醒**。唤醒者（`os_event_set(buf_flush_event)` 的全部调用点，逐一核实）：
+
+| 唤醒者 | 场景 |
+|---|---|
+| **`log0chkp.cc` 的 `log_request_sync_flush()`** | ★ log_checkpointer 发现 oldest dirty page 太老，请求 **sync flush**（这是最关键的唤醒源，见下） |
+| `buf0lru.cc` | 用户线程扫完整条 LRU 仍找不到空闲块，请 page cleaner 做 LRU 批量刷 |
+| `srv0start.cc` / `btr0load.cc` | shutdown / bulk load 路径 |
+
+一轮超过 4 秒会打 warning：*"Page cleaner took Xms to flush ... pages"*。空闲时走 `srv_idle_flush_pct` 比例刷脏。
+
+**④ ★ 刷脏量的三因子合成**
+
+★ 刷脏配额的真实函数名是 **`Adaptive_flush::page_recommendation()`**（命名空间 `Adaptive_flush`，不是网上常写的 `page_cleaner_flush_pages_recommendation()`），内部 `set_flush_target_by_lsn()` / `set_flush_target_by_page()`，最终：
+
+```
+n_pages = ( PCT_IO(pct_total) + page_avg_rate + pages_for_lsn ) / 3     上限 srv_max_io_capacity
+```
+
+其中 LSN 因子：
+
+```cpp
+lsn_t af_lwm = (srv_adaptive_flushing_lwm * limit_for_free_check) / 100;
+if (age < af_lwm) return 0;
+if (age < limit_for_dirty_page_age && !srv_adaptive_flushing) return 0;
+lsn_age_factor = (age * 100.0) / limit_for_dirty_page_age;
+return (srv_max_io_capacity / srv_io_capacity) * (lsn_age_factor * sqrt(lsn_age_factor)) / 7.5;
+```
+
+（平方根曲线：checkpoint age 越接近上限，刷脏速度**超线性**上升。`age = log_get_checkpoint_age() = log_get_lsn() - log.last_checkpoint_lsn`。）
+
+**⑤ ★ 背压链的终点：用户线程的 100µs 忙等**
+
+page cleaner、checkpointer、用户线程三者构成一个闭环，**"写阻塞"的最终落点**是 `log_free_check_wait()`（`log0chkp.cc`）：
+
+```cpp
+void log_free_check_wait(log_t &log) {
+  if (request_chkp) {
+    ...
+    log_request_checkpoint_low(log, current_lsn - log_capacity);   // set log.checkpointer_event
+  }
+  auto stop_condition = [&log, current_lsn](bool) {
+    return current_lsn <= log.free_check_limit_lsn.load();
+  };
+  /* ★ 忙等：每 100 微秒轮询，直到 free_check_limit_lsn 追上 */
+  ut::wait_for(0, std::chrono::microseconds{100}, stop_condition);
+}
+```
+
+闭环：**用户线程 `log_free_check` 忙等 → 唤醒 log_checkpointer → `log_consider_sync_flush()` 唤醒 page cleaner（sync flush）→ 刷最老脏页 → `available_for_checkpoint_lsn` 前移 → `free_check_limit_lsn` 抬高 → 用户线程解除**。checkpoint 本身**始终由 log_checkpointer 写**（`log_consider_checkpoint() → log_checkpoint()`），page cleaner 只刷页不写 checkpoint——两者是"供需"关系：checkpointer 提需求，page cleaner 供产能。
+
+> 全景（线程清单、shutdown 顺序、SyncArray 自旋-休眠模型）见 [`../infra/threading/threading_architecture.md`](../infra/threading/threading_architecture.md)；redo 侧的 6 线程接力与背压见 [`redo_log.md`](redo_log.md) 的「线程视角」一节。
+
+#### ★ `buf_dump` / `buf_resize`：两个按需线程
+
+⚠️ **勘误**：
+- **不存在 `buf_resize()`**——真身是 `static void buf_pool_resize()`（`buf0buf.cc:2137`）+ 线程体 `buf_resize_thread()`（`:2635`）+ `buf_pool_withdraw_blocks()`（`:1850`）。
+- `buf_dump()` / `buf_load()` 都是 **`static`**，对外入口是 `buf_dump_start()` / `buf_load_start()` / `buf_load_abort()`。
+- **只有一个** `buf_dump_thread`——dump 与 load **复用同一线程、同一事件** `srv_buf_dump_event`。
+
+**`buf_dump_thread()`（`buf0dump.cc:676`）**：
+
+```cpp
+/** This is the main thread for buffer pool dump/load. It waits for an
+event and when waked up either performs a dump or load and sleeps again. */
+void buf_dump_thread() {
+  buf_dump_status(STATUS_VERBOSE, "Dumping of buffer pool not started");
+  buf_load_status(STATUS_VERBOSE, "Loading of buffer pool not started");
+
+  if (srv_buffer_pool_load_at_startup) {
+    buf_load();                        // ★ innodb_buffer_pool_load_at_startup=ON → 启动时先 load
+  }
+
+  while (!SHUTTING_DOWN()) {
+    os_event_wait(srv_buf_dump_event);         // ★★ 唯一的事件源，dump 与 load 共用
+
+    if (buf_dump_should_start) {
+      buf_dump_should_start = false;
+      buf_dump(true /* quit on shutdown */);   // ★ obey_shutdown = true
+    }
+
+    if (buf_load_should_start) {
+      buf_load_should_start = false;
+      buf_load();
+    }
+
+    os_event_reset(srv_buf_dump_event);
+  }
+
+  if (srv_buffer_pool_dump_at_shutdown && srv_fast_shutdown != 2) {
+    buf_dump(false /* ignore shutdown down flag,
+                keep going even if we are in a shutdown state */);
+    //  ★★ 关机 dump：obey_shutdown=false，即使已在 shutdown 也坚持写完
+  }
+}
+```
+
+```cpp
+// buf0dump.cc:88 —— MySQL 层的入口只置标志 + set 事件，立即返回
+void buf_dump_start() {
+  buf_dump_should_start = true;
+  os_event_set(srv_buf_dump_event);
+}
+void buf_load_start() {
+  buf_load_should_start = true;
+  os_event_set(srv_buf_dump_event);
+}
+void buf_load_abort() { buf_load_abort_flag = true; }
+```
+
+**`buf_dump()` 的关键设计**（`buf0dump.cc:233`）：
+
+```cpp
+  snprintf(tmp_filename, sizeof(tmp_filename), "%s.incomplete", full_filename);
+  //  ★ 先写 .incomplete，最后 rename —— 保证 dump 文件的原子性
+  ...
+  for (i = 0; i < srv_buf_pool_instances && !SHOULD_QUIT(); i++) {
+    /* obtain buf_pool LRU list mutex before allocate, since
+    UT_LIST_GET_LEN(buf_pool->LRU) could change */
+    mutex_enter(&buf_pool->LRU_list_mutex);
+    size_t n_pages = UT_LIST_GET_LEN(buf_pool->LRU);
+    if (srv_buf_pool_dump_pct != 100) {        // ★ innodb_buffer_pool_dump_pct
+      n_pages = n_pages * srv_buf_pool_dump_pct / 100;
+      if (n_pages == 0) n_pages = 1;
+    }
+    dump = ut::malloc_withkey(...);
+    {
+      size_t j{0};
+      for (auto bpage : buf_pool->LRU) {       // ★ 从 LRU 头开始扫（最热的页优先）
+        if (n_pages <= j) break;
+        dump[j++] = BUF_DUMP_CREATE(bpage->id.space(), bpage->id.page_no());
+      }
+    }
+    mutex_exit(&buf_pool->LRU_list_mutex);
+    //  ★★★ 关键：持 LRU mutex 时只做内存拷贝，文件 IO 放到释放锁之后
+    for (size_t j = 0; j < n_pages && !SHOULD_QUIT(); j++) {
+      ret = fprintf(f, SPACE_ID_PF "," PAGE_NO_PF "\n", ...);
+      ...
+    }
+    ut::free(dump);
+  }
+  ...
+  ret = rename(tmp_filename, full_filename);   // ★ 原子替换
+```
+
+```cpp
+// space 高 32 位 / page_no 低 32 位 打包成 uint64
+inline uint64_t BUF_DUMP_CREATE(space_id_t space, page_no_t page) {
+  return ut_ull_create(space, page);
+}
+```
+
+**`buf_load()` 的两遍扫描 + 排序 + 限速**（`buf0dump.cc:435`）：
+
+```cpp
+  /* First scan the file to estimate how many entries are in it.
+  This file is tiny (approx 500KB per 1GB buffer pool), reading it
+  two times is fine. */
+  dump_n = 0;
+  while (fscanf(f, ULINTPF "," ULINTPF, &space_id, &page_no) == 2 &&
+         !SHUTTING_DOWN()) {
+    dump_n++;                          // ★ 第一遍：只数行数，用来定数组大小
+  }
+  ...
+  /* If dump is larger than the buffer pool(s), then we ignore the
+  extra trailing. This could happen if a dump is made, then buffer
+  pool is shrunk and then load is attempted. */
+  total_buffer_pools_pages = buf_pool_get_n_pages() * srv_buf_pool_instances;
+  if (dump_n > total_buffer_pools_pages) {
+    dump_n = total_buffer_pools_pages;   // ★ bp 变小了就截断，不报错
+  }
+  ...
+  rewind(f);                             // ★ 第二遍：真正读入
+  ...
+  if (!SHUTTING_DOWN()) {
+    std::sort(dump, dump + dump_n);      // ★★ 按 (space, page_no) 排序
+  }
+  //  ★ 好处 1：把随机 IO 变成近似顺序 IO
+  //  ★ 好处 2：同一 tablespace 的页相邻 -> 只需 acquire/release 一次 fil_space_t
+  /* Avoid calling the expensive fil_space_acquire_silent() for each
+  page within the same tablespace. dump[] is sorted by (space, page),
+  so all pages from a given tablespace are consecutive. */
+  space_id_t cur_space_id = BUF_DUMP_SPACE(dump[0]);
+  fil_space_t *space = fil_space_acquire_silent(cur_space_id);
+  page_size_t page_size(space ? space->flags : 0);
+
+  for (i = 0; i < dump_n && !SHUTTING_DOWN(); i++) {
+    const space_id_t this_space_id = BUF_DUMP_SPACE(dump[i]);
+    if (this_space_id != cur_space_id) {
+      if (space != nullptr) fil_space_release(space);
+      cur_space_id = this_space_id;
+      space = fil_space_acquire_silent(cur_space_id);
+      ...
+    }
+    if (space == nullptr) continue;      // ★ 表空间已不存在（被 drop）就静默跳过
+
+    buf_read_page_background(page_id_t(this_space_id, BUF_DUMP_PAGE(dump[i])),
+                             page_size, true);
+    //  ★★ 发异步预读，不等待完成；靠 AIO 线程并发把页灌进 bp
+
+    if (i % 64 == 63) os_aio_simulated_wake_handler_threads();
+
+    if (buf_load_abort_flag) {           // ★ 可被 buf_load_abort() / buf_pool_resize() 中断
+      ...
+      buf_load_status(STATUS_INFO, "Buffer pool(s) load aborted on request");
+      return;
+    }
+    buf_load_throttle_if_needed(&last_check_time, &last_activity_cnt, i);
+  }
+```
+
+```cpp
+// buf0dump.cc:392 —— 限速：不超过 srv_io_capacity IO/秒（每 srv_io_capacity 次才检查一次）
+static inline void buf_load_throttle_if_needed(
+    std::chrono::steady_clock::time_point *last_check_time,
+    ulint *last_activity_count, ulint n_io) {
+  if (n_io % srv_io_capacity < srv_io_capacity - 1) {
+    return;                                    // ★ 摊薄检查开销
+  }
+  /* If no other activity, then keep going without any delay. */
+  if (srv_get_activity_count() == *last_activity_count) {
+    return;                                    // ★ 没别人在干活 → 全速跑
+  }
+  const auto elapsed_time = std::chrono::steady_clock::now() - *last_check_time;
+  if (elapsed_time < std::chrono::seconds{1}) {
+    std::this_thread::sleep_for(std::chrono::seconds{1} - elapsed_time);
+  }
+  ...
+}
+```
+
+**`buf_pool_resize()` 的七步（`buf0buf.cc:2137`）**：
+
+```cpp
+static void buf_pool_resize() {
+  new_instance_size = srv_buf_pool_size / srv_buf_pool_instances;
+  new_instance_size /= UNIV_PAGE_SIZE;         // ★ 按实例数均分，换算成页数
+
+  /* ① 先改目标 curr_size（读者可无锁读） */
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    buf_pool->curr_size = new_instance_size;
+    buf_pool->n_chunks_new =
+        new_instance_size * UNIV_PAGE_SIZE / srv_buf_pool_chunk_unit;
+  }
+  os_wmb;                                      // ★ 写屏障，发布 curr_size / n_chunks_new
+
+  /* ② 关 AHI（AHI 里存着页指针，必须清空） */
+  const bool btr_search_was_enabled = btr_search_disable();
+
+  /* ③ 缩容才算 withdraw_target = 尾部将被删掉的 chunk 大小之和 */
+  if (buf_pool->curr_size < buf_pool->old_size) {
+    const buf_chunk_t *chunk = buf_pool->chunks + buf_pool->n_chunks_new;
+    const buf_chunk_t *echunk = buf_pool->chunks + buf_pool->n_chunks;
+    while (chunk < echunk) { withdraw_target += chunk->size; ++chunk; }
+    buf_pool->withdraw_target = withdraw_target;
+  }
+
+  /* ④ 撤出（可重试）；缩容前先 buf_load_abort() 停掉正在跑的 bp load */
+withdraw_retry:
+  for (...) { should_retry_withdraw |= buf_pool_withdraw_blocks(buf_pool); }
+  buf_load_abort();
+  if (should_retry_withdraw) {
+    /* 打印"谁在占着页不让撤出"（只报 withdraw_start_time 之前启动的事务） */
+    lock_trx_print_wait_and_mvcc_state(stderr, trx);
+    std::this_thread::sleep_for(std::chrono::seconds(retry_interval));
+    if (retry_interval > 5) retry_interval = 10; else retry_interval *= 2;
+    //  ★ 退避序列：1, 2, 4, 10, 10, ... 秒；抱怨间隔 1→2→4→...→30 分钟
+    goto withdraw_retry;
+  }
+
+  /* ⑤ 全局临界区开始（AHI 等模块会检查 buf_pool_resizing） */
+  buf_pool_resizing = true;
+
+  /* ⑥ 7 把锁全部持满，bp 实质停摆 */
+  for (...) mutex_enter(&(buf_pool_from_array(i)->chunks_mutex));      // 1
+  for (...) mutex_enter(&(buf_pool_from_array(i)->LRU_list_mutex));    // 2
+  for (...) hash_lock_x_all(buf_pool_from_array(i)->page_hash);        // 3
+  for (...) mutex_enter(&(buf_pool_from_array(i)->zip_free_mutex));    // 4
+  for (...) mutex_enter(&(buf_pool_from_array(i)->free_list_mutex));   // 5
+  for (...) mutex_enter(&(buf_pool_from_array(i)->zip_hash_mutex));    // 6
+  for (...) mutex_enter(&(buf_pool_from_array(i)->flush_state_mutex)); // 7
+
+  /* ⑦ 增/删 chunk，重建 chunk 地址映射，重算 curr_size，old_size 归位 */
+  ...
+  buf_pool->old_size = buf_pool->curr_size;    // ★ old_size 归位 → buf_get_withdraw_depth() 返回 0
+```
+
+> ★ 为什么 `btr_search_disable()` 必须在最前面：AHI 的 hash 表里存的是**页指针**，而 resize 会**重新分配 chunk 内存**——页地址会变。所以必须先清空 AHI，否则全是悬垂指针。
+>
+> ★ `buf_pool_resizing` 这个全局标志是给其它模块（如 AHI 插入路径）看的：resize 期间它们必须放弃操作。
+>
+> ★ withdraw 撤不出来时会打印**占着页的事务**，这是排查 "resize 卡住" 的第一手信息。
+
+与 page cleaner 的 1 秒轮询不同，这两个是**纯事件驱动、空闲时无限期等待**（`os_event_wait()` 无超时版本）。
+
+```cpp
+void buf_dump_thread() {
+  if (srv_buffer_pool_load_at_startup) buf_load();      // 启动时先同步 load 一次
+  while (!SHUTTING_DOWN()) {
+    os_event_wait(srv_buf_dump_event);                  // ★ 无超时
+    if (buf_dump_should_start) { buf_dump_should_start = false; buf_dump(true); }
+    if (buf_load_should_start) { buf_load_should_start = false; buf_load(); }
+    os_event_reset(srv_buf_dump_event);
+  }
+  if (srv_buffer_pool_dump_at_shutdown && srv_fast_shutdown != 2)
+    buf_dump(false);        // ★ 关机 dump 也由本线程做，且忽略 shutdown 标志坚持跑完
+}
+
+void buf_resize_thread() {
+  while (srv_shutdown_state.load() < SRV_SHUTDOWN_CLEANUP) {
+    os_event_wait(srv_buf_resize_event);                // ★ 无超时
+    os_event_reset(srv_buf_resize_event);
+    ...
+    buf_pool_resize();
+  }
+}
+```
+
+★ **`SET GLOBAL innodb_buffer_pool_dump_now=ON` 是异步触发**——update 回调只置标志 + 打事件就返回，真正在 `buf_dump()` 里干活的是**本线程**。源码注释原文解释了为什么必须立刻返回：
+
+> *"it should return immediately because **the whole MySQL is frozen during its execution**"*
+
+（`SET GLOBAL` 的回调在 `LOCK_global_system_variables` 下执行，绝不能做文件 IO / 遍历 LRU。）进度靠 `innodb_buffer_pool_dump_status` / `..._load_status` 观察。
+
+★ **两个默认值的常见误判**：`innodb_buffer_pool_dump_at_shutdown` 与 `innodb_buffer_pool_load_at_startup` 在 8.0 **默认都是 ON**（不是 OFF）；后者还是 `READONLY | NOPERSIST`，只能启动时给。文件名默认 `ib_buffer_pool`。
+
+**★ resize 的两阶段：为什么必须"先 withdraw 再搬移"**
+
+缩容要整块释放末尾若干 **`buf_chunk_t`**（★ 独立结构体，不是 `buf_pool_t::chunk_t`）的**连续大页内存**。但那些 chunk 里可能还有被用户线程 pin 住的页、LRU 上的页、buddy 压缩帧——直接 `deallocate_chunk()` 会让所有指针悬空。所以：
+
+| 阶段 | 动作 | 是否全局停顿 |
+|---|---|---|
+| 0 准备 | 关 AHI、算 `withdraw_target = Σ chunk->size`（待删区间） | 否 |
+| **1 withdraw** | `buf_pool_withdraw_blocks()`：从 `free` 链表收集命中待撤区的空闲块；再扫 LRU 的 `removable()`，对命中待撤区的页调 `buf_page_realloc()` / `buf_buddy_realloc()` **搬家**；`buf_page_can_relocate()` 为 false（页正被用）就跳过 | 否（只短暂持单实例锁） |
+| **2 搬移** | `buf_pool_resizing = true`；**锁住 7 类 mutex × 所有实例**（chunks / LRU_list / page_hash X-all / zip_free / free_list / zip_hash / flush_state）→ `deallocate_chunk()` → `withdraw.clear()` → 重分配 chunks 数组 | **是（临界区）** |
+| 3 收尾 | 解锁；按需 resize `lock_sys` / `btr_search_sys` / `dict_sys` 哈希表；`ibuf_max_size_update()`；恢复 AHI | 否 |
+
+★ 正因阶段 1 已把待删 chunk **清空**，阶段 2 那 7 步加锁期间只做纯指针操作，全局停顿才短。
+
+搬不走的页怎么办：**退避重试**——`retry_interval` 从 1 秒起翻倍（1→2→4→5→封顶 10 秒），并打印"可能占着 block 的老事务"帮助诊断。每 1000 次还检查是否超过 `srv_fatal_semaphore_wait_threshold()/2`，避免长时间持 LRU 锁触发 fatal semaphore 崩溃。
+
+★ **其它线程的配合**（并发安全的另一半）：`buf_LRU_get_free_block()` 在缩放期不再分配待撤区的块；`buf_LRU_free_page()` 把命中待撤区的块挂进 `withdraw` 而非 `free`；`buf_buddy_alloc_low()` 跳过 `buf_frame_will_withdrawn()` 的帧；page cleaner 的 `scan_depth` 计算也计入 `buf_get_withdraw_depth()`。
+
+> ★ **`buf_resize_thread` 没有 `create_internal_thd()`**（对比 `dict_stats_thread` 有）——它只操作内存 chunk 与 bp 内部锁，不碰 DD/MDL。`lock0lock.cc` 里为此留了注释与 workaround：*"A workaround for buf_resize_thread() not using create_thd()"*，只在 debug 同步点临时造一个 THD。
+
 ### 压缩页与内存管理
 
 #### 压缩页（ROW_FORMAT=COMPRESSED）三态与刷盘
@@ -1667,6 +3269,213 @@ ut_ad(space != BUF_BUDDY_STAMP_FREE);      // 若等于魔数说明这是空闲�
 
 #### zip_hash：被 buddy 征用的 block 的 frame 地址反查索引
 
+⚠️ **勘误**：**压缩页描述符不是从 buddy 分配的**——`buf_page_alloc_descriptor()` 用 `ut::zalloc_withkey`（普通堆，`buf0buf.ic:675`）；**buddy 只分配压缩页帧**。
+
+```cpp
+// buf0buddy.cc:73 —— stamp 机制：复用页格式字段，不额外占空间
+/** Offset within buf_buddy_free_t where free or non_free stamps are written.*/
+constexpr uint32_t BUF_BUDDY_STAMP_OFFSET = FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID;
+
+/** Value that we stamp on all buffers that are currently on the zip_free
+list. This value is stamped at BUF_BUDDY_STAMP_OFFSET offset */
+constexpr uint64_t BUF_BUDDY_STAMP_FREE = dict_sys_t::s_log_space_id;
+//  ★ = 0，一个"不可能的真实 tablespace id"，用来当魔数
+
+/** Stamp value for non-free buffers. */
+constexpr uint64_t BUF_BUDDY_STAMP_NONFREE = 0XFFFFFFFFUL;
+
+/** Return type of buf_buddy_is_free() */
+enum buf_buddy_state_t {
+  BUF_BUDDY_STATE_FREE,          /*!< If the buddy to completely free */
+  BUF_BUDDY_STATE_USED,          /*!< Buddy currently in used */
+  BUF_BUDDY_STATE_PARTIALLY_USED /*!< Some sub-blocks in the buddy are in use */
+};
+
+/** Check if a buddy is stamped free. */
+[[nodiscard]] static inline bool buf_buddy_stamp_is_free(
+    const buf_buddy_free_t *buf) {
+  return (mach_read_from_4(buf->stamp.bytes + BUF_BUDDY_STAMP_OFFSET) ==
+          BUF_BUDDY_STAMP_FREE);      // ★ 真名确认：判定=读 4 字节 == BUF_BUDDY_STAMP_FREE
+}
+
+static inline void buf_buddy_stamp_free(buf_buddy_free_t *buf, ulint i) {
+  mach_write_to_4(buf->stamp.bytes + BUF_BUDDY_STAMP_OFFSET,
+                  BUF_BUDDY_STAMP_FREE);
+  buf->stamp.size = i;                // ★ 额外记下"我是第几级空闲块"，供 PARTIALLY_USED 判定
+}
+
+static inline void buf_buddy_stamp_nonfree(buf_buddy_free_t *buf, ulint i) {
+  memset(buf->stamp.bytes + BUF_BUDDY_STAMP_OFFSET, 0xff, 4);   // 0xFFFFFFFF
+}
+
+/** Get the offset of the buddy of a compressed page frame. */
+static inline void *buf_buddy_get(byte *page, ulint size) {
+  if (((ulint)page) & size) {         // ★ 经典 buddy 位运算：地址第 log2(size) 位为 1 → buddy 在前
+    return (page - size);
+  } else {
+    return (page + size);
+  }
+}
+```
+
+```cpp
+// buf0buddy.cc:203 —— 三态判定（这是教科书 buddy 没有的第三态）
+static buf_buddy_state_t buf_buddy_is_free(buf_buddy_free_t *buf, ulint i) {
+  /* We look inside the allocated objects returned by buf_buddy_alloc() and
+  assume that each block is a compressed page that contains one of the
+  following in space_id. ... */
+  if (!buf_buddy_stamp_is_free(buf)) {
+    return (BUF_BUDDY_STATE_USED);    // ★ stamp 不是 FREE → 整块在用
+  }
+  /* A block may be free but a fragment of it may still be in use.
+  To guard against that we write the free block size in terms of
+  zip_free index at start of stamped block. */
+  ut_ad(buf->stamp.size <= i);
+  return (buf->stamp.size == i ? BUF_BUDDY_STATE_FREE
+                               : BUF_BUDDY_STATE_PARTIALLY_USED);
+  //  ★ stamp.size == i：整块同级空闲，可合并；< i：已被切成更小的子块在用
+}
+```
+
+**分配三级回落 + 切分**（`buf_buddy_alloc_low`，`buf0buddy.cc:417`）：
+
+```cpp
+void *buf_buddy_alloc_low(buf_pool_t *buf_pool, ulint i) {
+  if (i < BUF_BUDDY_SIZES) {
+    /* Try to allocate from the buddy system. */
+    block = (buf_block_t *)buf_buddy_alloc_zip(buf_pool, i);   // ① 先试 buddy 空闲链
+    if (block) goto func_exit;
+  }
+  /* Try allocating from the buf_pool->free list. */
+  block = buf_LRU_get_free_only(buf_pool);                     // ② 再试 free list（不驱逐）
+  if (block) goto alloc_big;
+  /* Try replacing an uncompressed page in the buffer pool. */
+  block = buf_LRU_get_free_block(buf_pool);                    // ③ 最后才允许驱逐 LRU 页
+
+alloc_big:
+  buf_buddy_block_register(block);       // ★ 整帧登记给 buddy：state=MEMORY，入 zip_hash
+  mutex_enter(&buf_pool->zip_free_mutex);
+  block = (buf_block_t *)buf_buddy_alloc_from(buf_pool, block->frame, i,
+                                              BUF_BUDDY_SIZES);  // ★ 从 16K 切到目标 i
+  mutex_exit(&buf_pool->zip_free_mutex);
+
+func_exit:
+  buf_pool->buddy_stat[i].used.fetch_add(1);   // ★ 原子计数，无需 zip_free_mutex
+  return (block);
+}
+```
+
+```cpp
+// buf0buddy.cc:272 —— 切片：把大块对半切，多余半块逐层挂回空闲链
+static void *buf_buddy_alloc_from(buf_pool_t *buf_pool, void *buf, ulint i,
+                                  ulint j) {
+  /* Add the unused parts of the block to the free lists. */
+  while (j > i) {
+    buf_buddy_free_t *zip_buf;
+    offs >>= 1;
+    j--;
+    zip_buf = reinterpret_cast<buf_buddy_free_t *>(
+        reinterpret_cast<byte *>(buf) + offs);
+    buf_buddy_add_to_free(buf_pool, zip_buf, j);
+  }
+  buf_buddy_stamp_nonfree(reinterpret_cast<buf_buddy_free_t *>(buf), i);
+  return (buf);
+}
+```
+
+**zip_hash：为什么需要它 + 怎么用**（`buf_buddy_block_register` / `buf_buddy_block_free`）：
+
+```cpp
+// buf0buddy.cc:452 —— 整帧借给 buddy 时登记
+static void buf_buddy_block_register(buf_block_t *block) {
+  ut_ad(buf_block_get_state(block) == BUF_BLOCK_READY_FOR_USE);
+  buf_block_set_state(block, BUF_BLOCK_MEMORY);   // ★ READY_FOR_USE → MEMORY（符合状态机规格）
+  ut_d(block->page.in_zip_hash = true);
+  mutex_enter(&buf_pool->zip_hash_mutex);
+  HASH_INSERT(buf_page_t, hash, buf_pool->zip_hash, hash_value, &block->page);
+  ut_d(buf_pool->buddy_n_frames++);
+  mutex_exit(&buf_pool->zip_hash_mutex);
+}
+
+// buf0buddy.cc:388 —— 归还时靠 frame 地址反查 bpage
+static void buf_buddy_block_free(buf_pool_t *buf_pool, void *buf) {
+  const auto hash_value = buf_pool_hash_zip_frame(buf);
+  mutex_enter(&buf_pool->zip_hash_mutex);
+  HASH_SEARCH(hash, buf_pool->zip_hash, hash_value, buf_page_t *, bpage,
+              ut_ad(buf_page_get_state(bpage) == BUF_BLOCK_MEMORY &&
+                    bpage->in_zip_hash && !bpage->in_page_hash),
+              ((buf_block_t *)bpage)->frame == buf);   // ★★ frame 地址 → bpage 反查
+  ut_a(bpage);
+  HASH_DELETE(buf_page_t, hash, buf_pool->zip_hash, hash_value, bpage);
+  mutex_exit(&buf_pool->zip_hash_mutex);
+  buf_LRU_block_free_non_file_page(reinterpret_cast<buf_block_t *>(bpage));  // MEMORY → NOT_USED
+}
+```
+
+> ★★ **zip_hash 存在的理由**：整帧借给 buddy 后，这块内存被切成若干压缩页帧，而**子块没有 `buf_page_t` 描述符**。当 `buf_buddy_free_low` 归还一个**整帧**时，手里只有一个 `void*`（frame 地址），必须反查出当初是哪个 `buf_block_t` 借出去的，才能把它放回 free list。`zip_hash` 就是这张"frame 地址 → bpage"的反查表。
+>
+> ★ 另一个用途：`buf_buddy_relocate()` 搬移压缩页时，也靠读帧内容里的 `(space_id, page_no)` 反推页身份：
+> ```cpp
+>   space  = mach_read_from_4((const byte *)src + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+>   offset = mach_read_from_4((const byte *)src + FIL_PAGE_OFFSET);
+>   const page_id_t page_id(space, offset);
+>   ...
+>   if (buf_page_can_relocate(bpage)) {   // ★ io_fix==NONE 且 buf_fix_count==0 才可搬
+>     memcpy(dst, src, size);
+>     bpage->zip.data = reinterpret_cast<page_zip_t *>(dst);   // ★ 改描述符指针
+>   }
+> ```
+
+**释放与合并**（`buf_buddy_free_low`，`buf0buddy.cc:602`）——★ 有一个"懒合并"阈值：
+
+```cpp
+  if (i == BUF_BUDDY_SIZES) {          // ★ 整帧：不再合并，直接归还 bp
+    if (!has_zip_free) mutex_exit(&buf_pool->zip_free_mutex);
+    buf_buddy_block_free(buf_pool, buf);
+    return;
+  }
+
+  /* Do not recombine blocks if there are few free blocks.
+  We may waste up to 15360*max_len bytes to free blocks
+  (1024 + 2048 + 4096 + 8192 = 15360) */
+  if (UT_LIST_GET_LEN(buf_pool->zip_free[i]) < 16 &&
+      buf_pool->curr_size >= buf_pool->old_size) {
+    goto func_exit;                    // ★★ 空闲块 < 16 就懒得合并（避免抖动）
+  }                                    //    resize 缩容中（curr<old）不懒
+
+  buddy = reinterpret_cast<buf_buddy_free_t *>(
+      buf_buddy_get(reinterpret_cast<byte *>(buf), BUF_BUDDY_LOW << i));
+
+  switch (buf_buddy_is_free(buddy, i)) {
+    case BUF_BUDDY_STATE_FREE:
+      buf_buddy_remove_from_free(buf_pool, buddy, i);
+    buddy_is_free:
+      i++;
+      buf = ut_align_down(buf, BUF_BUDDY_LOW << i);
+      goto recombine;                  // ★ 合并后升一级，继续尝试再合并（循环）
+
+    case BUF_BUDDY_STATE_USED:
+      /* The buddy is not free. Is there a free block of this size? */
+      if (buf_buddy_free_t *zip_buf = UT_LIST_GET_FIRST(buf_pool->zip_free[i])) {
+        buf_buddy_remove_from_free(buf_pool, zip_buf, i);
+        /* Try to relocate the buddy of buf to the free block. */
+        if (buf_buddy_relocate(buf_pool, buddy, zip_buf, i, false)) {
+          goto buddy_is_free;          // ★★ 搬走后就变成"两侧都空闲"，继续合并
+        }
+        buf_buddy_add_to_free(buf_pool, zip_buf, i);   // 搬失败则还回去
+      }
+      break;
+    case BUF_BUDDY_STATE_PARTIALLY_USED:
+      /* Some sub-blocks in the buddy are still in use.
+      Relocation will fail. No need to try. */
+      break;
+  }
+func_exit:
+  buf_buddy_add_to_free(buf_pool, reinterpret_cast<buf_buddy_free_t *>(buf), i);
+```
+
+> ★★ **教科书 buddy 的三个工程偏离**：① 加了 `PARTIALLY_USED` 第三态（靠 `stamp.size` 判定）；② 释放时若兄弟在用，**先尝试 relocate 再合并**（提高合并率）；③ 空闲块少于 16 时**放弃合并**（避免抖动）。
+
 除 `page_hash` 外，buffer pool 还有第二张哈希表 `zip_hash`（buf0buf.cc，`zip_hash_mutex` 保护）。**它与 `page_hash` 索引的对象完全不同**：
 
 | 项 | `page_hash` | `zip_hash` |
@@ -1701,6 +3510,417 @@ HASH_SEARCH(hash, buf_pool->zip_hash, hash_value, buf_page_t *, bpage,
 ### 控制块状态机与并发协议
 
 #### buf_page_t 状态机与 buf_page_in_file
+
+⚠️ **勘误**：状态机函数**不在 `buf0buf.cc`**——`buf_page_get_state` / `buf_page_set_state` / `buf_page_in_file` / `buf_page_get_io_fix` 全部在 **`storage/innobase/include/buf0buf.ic`**（`buf0buf.h` 末尾 `#include "buf0buf.ic"`）。
+
+```cpp
+// buf0buf.h:125
+/** @brief States of a control block
+@see buf_page_t
+
+The enumeration values must be 0..7. */
+enum buf_page_state : uint8_t {     // ★ uint8_t 底层；要求 0..7 是因为别处用 3 bit 打包
+  /** A sentinel for the buffer pool watch, element of buf_pool->watch[] */
+  BUF_BLOCK_POOL_WATCH,            // 0：不是真页，是 purge 用的哨兵
+  /** Contains a clean compressed page */
+  BUF_BLOCK_ZIP_PAGE,              // 1：只有压缩帧、无解压帧；干净
+  /** Contains a compressed page that is in the buf_pool->flush_list */
+  BUF_BLOCK_ZIP_DIRTY,             // 2：只有压缩帧、脏，在 flush_list 上
+
+  /** Is in the free list; must be after the BUF_BLOCK_ZIP_ constants for
+  compressed-only pages @see buf_block_state_valid() */
+  BUF_BLOCK_NOT_USED,              // 3：★必须排在 ZIP_* 之后（靠数值比较区分）
+
+  /** When buf_LRU_get_free_block returns a block, it is in this state */
+  BUF_BLOCK_READY_FOR_USE,         // 4：刚从 free list 摘出，尚未挂 hash
+
+  /** Contains a buffered file page */
+  BUF_BLOCK_FILE_PAGE,             // 5：正常文件页（可能同时有 zip.data）
+
+  /** Contains some main memory object */
+  BUF_BLOCK_MEMORY,                // 6：帧被借给 buddy allocator
+
+  /** Hash index should be removed before putting to the free list */
+  BUF_BLOCK_REMOVE_HASH            // 7：已摘 hash、待回收的中间态
+};
+```
+
+```cpp
+// buf0buf.ic:344
+/** Determines if a block is mapped to a tablespace. @return true if mapped */
+static inline bool buf_page_in_file(const buf_page_t *bpage) {
+  switch (buf_page_get_state(bpage)) {
+    case BUF_BLOCK_POOL_WATCH:
+      ut_error;                    // ★★ 不是返回 false，是直接 abort
+      break;
+    case BUF_BLOCK_ZIP_PAGE:
+    case BUF_BLOCK_ZIP_DIRTY:
+    case BUF_BLOCK_FILE_PAGE:
+      return true;                 // ★ "mapped to a tablespace" 的三种态
+    case BUF_BLOCK_NOT_USED:
+    case BUF_BLOCK_READY_FOR_USE:
+    case BUF_BLOCK_MEMORY:
+    case BUF_BLOCK_REMOVE_HASH:
+      break;
+  }
+  return false;
+}
+```
+
+> ★ **状态决定用哪把锁**（`buf_page_get_mutex()`，`buf0buf.ic:378`）：`ZIP_PAGE` / `ZIP_DIRTY` 共用整个 pool 的 `zip_mutex`；其余用 block 自己的 `mutex`。
+> ```cpp
+>   switch (buf_page_get_state(bpage)) {
+>     case BUF_BLOCK_ZIP_PAGE:
+>     case BUF_BLOCK_ZIP_DIRTY:
+>       return (&buf_pool->zip_mutex);      // ★ 压缩页描述符没有自己的 mutex
+>     default:
+>       return (&((buf_block_t *)bpage)->mutex);
+>   }
+> ```
+>
+> ★ `buf_page_belongs_to_unzip_LRU()` = `bpage->zip.data && state == BUF_BLOCK_FILE_PAGE`——unzip_LRU 只装"有压缩帧且也有解压帧"的页。
+
+**`buf_page_set_state` 完整源码（debug switch 全文）**
+
+⚠️ **勘误**：**只在 `UNIV_DEBUG` 下校验**；release 版只剩一行 `bpage->state = state;`（而且 `state` 是 **public** 成员，靠约定 + debug 断言约束）。
+
+```cpp
+// buf0buf.ic:272
+static inline void buf_page_set_state(buf_page_t *bpage,
+                                      enum buf_page_state state) {
+#ifdef UNIV_DEBUG
+  enum buf_page_state old_state = buf_page_get_state(bpage);
+  buf_pool_t *buf_pool = buf_pool_from_bpage(bpage);
+
+  /* If the page is IO-fixed, no one can alter the state, but the thread that is
+  handling the IO. */
+  ut_a(!bpage->someone_has_io_responsibility() ||
+       bpage->current_thread_has_io_responsibility());   // ★ 全局前置条件
+
+  switch (old_state) {
+    case BUF_BLOCK_POOL_WATCH:
+      ut_error;                                          // ★ watch 页永不参与状态迁移
+      break;
+    case BUF_BLOCK_ZIP_PAGE:
+      ut_a(state == BUF_BLOCK_ZIP_DIRTY);                // ★ 干净压缩页唯一出路：变脏
+      break;
+    case BUF_BLOCK_ZIP_DIRTY:
+      ut_a(state == BUF_BLOCK_ZIP_PAGE);                 // ★ 唯一出路：刷完变干净
+      ut_a(mutex_own(buf_page_get_mutex(bpage)));
+      ut_a(buf_flush_list_mutex_own(buf_pool));
+      ut_a(bpage->in_flush_list);
+      break;
+    case BUF_BLOCK_NOT_USED:
+      ut_a(state == BUF_BLOCK_READY_FOR_USE);            // free list → 被摘出
+      ut_a(buf_page_is_private(bpage, false, false));
+      break;
+    case BUF_BLOCK_READY_FOR_USE:
+      ut_a(state == BUF_BLOCK_MEMORY || state == BUF_BLOCK_FILE_PAGE ||
+           state == BUF_BLOCK_NOT_USED);                 // ★ 三岔口
+      ut_a(buf_page_is_private(bpage, state == BUF_BLOCK_FILE_PAGE,
+                               state == BUF_BLOCK_NOT_USED));
+      break;
+    case BUF_BLOCK_MEMORY:
+      ut_a(state == BUF_BLOCK_NOT_USED);                 // buddy 归还整帧
+      ut_a(buf_page_is_private(bpage, false, true));
+      break;
+    case BUF_BLOCK_FILE_PAGE:
+      ut_a(state == BUF_BLOCK_NOT_USED || state == BUF_BLOCK_REMOVE_HASH);
+      if (state == BUF_BLOCK_REMOVE_HASH) {              // ★★ 最严的锁规格
+        ut_a(!bpage->in_page_hash);
+        ut_a(!bpage->in_zip_hash);
+        ut_a(!bpage->in_LRU_list);
+        ut_a(!bpage->in_free_list);
+        ut_a(mutex_own(buf_page_get_mutex(bpage)));
+        ut_a(mutex_own(&buf_pool->LRU_list_mutex));
+        ut_a(buf_page_hash_lock_held_x(buf_pool, bpage));
+      }
+      break;
+    case BUF_BLOCK_REMOVE_HASH:
+      ut_a(state == BUF_BLOCK_MEMORY);                   // ★ 帧交给 buddy
+      break;
+  }
+#endif /* UNIV_DEBUG */
+  bpage->state = state;                                  // ★★ release 版唯一有效的一行
+}
+```
+
+> ★★ **一道暗门**：switch 里**没有 `FILE_PAGE → ZIP_DIRTY` 的合法转换**。所以"释放解压帧、保留压缩帧"必须先 `buf_page_alloc_descriptor()` 造一个新的裸 `buf_page_t`，再用 placement-new 拷过去，最后在 `buf0lru.cc:1872` 直接赋值 `b->state = b->is_dirty() ? BUF_BLOCK_ZIP_DIRTY : BUF_BLOCK_ZIP_PAGE;`（绕过 `buf_page_set_state`）：
+> ```cpp
+>   b = buf_page_alloc_descriptor();      // buf0lru.cc:1777
+>   new (b) buf_page_t(*bpage);           // placement-new + 拷贝构造（里面 m_space->inc_ref()）
+>   ...
+>   b->state = b->is_dirty() ? BUF_BLOCK_ZIP_DIRTY : BUF_BLOCK_ZIP_PAGE;   // :1872
+> ```
+
+**"私有页"判定（`buf_page_is_private`，debug）**：
+
+```cpp
+  ut_a(!bpage->in_page_hash);       // "私有" = 不在任何链表/hash 里，别的线程摸不到
+  ut_a(!bpage->in_zip_hash);
+  ut_a(!bpage->in_flush_list);
+  ut_a(!bpage->in_free_list);
+  ut_a(!bpage->in_LRU_list);
+  ...
+```
+
+**io_fix 源码：`Buf_io_fix_latching_rules` 转换图、责任令牌、sticky**
+
+⚠️ **勘误**：`enum buf_io_fix` 在 **`buf0types.h:98`**，不在 `buf0buf.h`；且是 **4 个值**，含常被漏掉的 `BUF_IO_PIN`。
+
+```cpp
+// buf0types.h:98
+/** Flags for io_fix types */
+enum buf_io_fix : uint8_t {
+  /** no pending I/O */
+  BUF_IO_NONE = 0,
+  /** read pending. aio 正在异步读这个page， aio pending中 */
+  BUF_IO_READ,
+  /** write pending */
+  BUF_IO_WRITE,
+  /** disallow relocation of block and its removal from the flush_list */
+  BUF_IO_PIN            // ★ sticky：防 relocate / 防出 flush_list，不涉及真 I/O
+};
+```
+
+**★ 权威转换图：`Buf_io_fix_latching_rules`（`buf0buf.cc:5498`）**——把锁协议变成可校验的数据：
+
+```cpp
+/* Possible io_buf states and transitions between them, with latches required
+for transition.
+@see buf_page_t::Latching_rules_helpers::get_owned_latches() for the meaning of
+the numbers on edges.
+
++-----------+                       +------------+
+|BUF_IO_NONE|   --------0&&2----->  |BUF_IO_READ |
+|           |   <-------0&&2------  +------------+
+|           |
+|           |                       +------------+
+|           |   -----0&&1&&2----->  |BUF_IO_WRITE|
+|           |   <----0&&1&&2------  +------------+
+|           |
+|           |                       +------------+
+|           |  ---------0-------->  | BUF_IO_PIN |
++-----------+  <--------0---------  +------------+
+*/
+using Buf_io_fix_latching_rules = ut::Stateful_latching_rules<buf_io_fix, 3>;
+Buf_io_fix_latching_rules buf_io_fix_latching_rules{
+    {BUF_IO_NONE, BUF_IO_READ, BUF_IO_WRITE, BUF_IO_PIN},
+    {
+        {BUF_IO_NONE, {0, 2}, BUF_IO_READ},        // 发起读：block mutex + I/O 责任令牌
+        {BUF_IO_READ, {0, 2}, BUF_IO_NONE},        // 读完成
+        {BUF_IO_NONE, {0, 1, 2}, BUF_IO_WRITE},    // ★ 发起写：还要 flush_state_mutex
+        {BUF_IO_WRITE, {0, 1, 2}, BUF_IO_NONE},    // 写完成
+        {BUF_IO_NONE, {0}, BUF_IO_PIN},            // ★ PIN 不需要责任令牌
+        {BUF_IO_PIN, {0}, BUF_IO_NONE},
+    },
+};
+```
+
+> 编号含义：**0** = `buf_page_get_mutex(&page)`；**1** = `buf_pool->flush_state_mutex`；**2** = `io_responsibility.current_thread_is_responsible()`（I/O 责任令牌）。
+
+```cpp
+// buf0buf.cc:5510 —— 把"当前持有哪些锁"编码成 bitset
+  static Buf_io_fix_latching_rules::latches_set_t get_owned_latches(
+      const buf_page_t &page) {
+    const auto buf_pool = buf_pool_from_bpage(&page);
+    Buf_io_fix_latching_rules::latches_set_t result{};
+    result[0] = mutex_own(buf_page_get_mutex(&page));
+    result[1] = mutex_own(&buf_pool->flush_state_mutex);
+    result[2] = page.io_responsibility.current_thread_is_responsible();
+    return result;
+  }
+```
+
+```cpp
+// buf0buf.cc:5593 —— 真正的 io_fix 状态机
+void buf_page_t::set_io_fix(buf_io_fix io_fix) {
+  ut_ad(is_correct_io_fix_value(io_fix));
+  ut_ad(mutex_own(buf_page_get_mutex(this)));      // ★ 0 号锁必须持有
+#ifdef UNIV_DEBUG
+  const auto old_io_fix = this->io_fix.load();
+  if (old_io_fix == BUF_IO_NONE &&
+      (io_fix == BUF_IO_READ || io_fix == BUF_IO_WRITE)) {
+    take_io_responsibility();                      // ★ 领取 2 号"责任令牌"
+  }
+#endif
+  ut_d(Latching_rules_helpers::on_transition_to(*this, io_fix));   // ★ 按图校验锁集
+  this->io_fix.store(io_fix, std::memory_order_relaxed);
+  //  ★★ relaxed！正确性靠锁 + 令牌，不靠内存屏障
+#ifdef UNIV_DEBUG
+  if ((old_io_fix == BUF_IO_READ || old_io_fix == BUF_IO_WRITE) &&
+      io_fix == BUF_IO_NONE) {
+    release_io_responsibility();                   // ★ 交还责任令牌
+  }
+#endif
+}
+```
+
+**I/O 责任令牌（debug-only，`buf0buf.h:1405`）**：
+
+```cpp
+  /* Helper debug-only class used to track which thread is currently responsible
+  for performing I/O operation on this page. There's at most one such thread and
+  the responsibility might be passed from one to another during async I/O. This
+  is used to prove correctness of io_fix state transitions and checking it
+  without a latch in the io_completion threads. */
+  class io_responsibility_t {
+    /** The thread responsible for I/O on this page, or an impossible value if
+    no thread is currently responsible for I/O*/
+    std::thread::id responsible_thread{std::thread().get_id()};
+
+   public:
+    bool someone_is_responsible() const {
+      return responsible_thread != std::thread().get_id();
+    }
+    bool current_thread_is_responsible() const {
+      return responsible_thread == std::this_thread::get_id();
+    }
+    void release() { ut_a(current_thread_is_responsible());
+                     responsible_thread = std::thread().get_id(); }
+    void take() { ut_a(!someone_is_responsible());
+                  responsible_thread = std::this_thread::get_id(); }
+  };
+  io_responsibility_t io_responsibility;
+```
+
+**免锁快照读家族**（命名刻意用 `was_` 前缀警告"值可能过期"）：
+
+```cpp
+  bool was_io_fix_read()  const { return get_io_fix_snapshot() == BUF_IO_READ; }
+  bool was_io_fixed()     const { return get_io_fix_snapshot() != BUF_IO_NONE; }
+  bool was_io_fix_none()  const { return get_io_fix_snapshot() == BUF_IO_NONE; }
+  //  ★ 注释特意说明：请优先用 was_io_fix_none() 而不是 !was_io_fixed()，
+  //    因为后者容易被误读成"不存在某个时刻 io_fix 非空"，而实际语义是
+  //    "存在某个时刻 io_fix 为空"
+```
+
+**sticky（PIN）**：
+
+```cpp
+// buf0buf.ic:471
+/** Makes a block sticky. A sticky block implies that even after we release
+the buf_pool->LRU_list_mutex and the block->mutex:
+* it cannot be removed from the flush_list
+* the block descriptor cannot be relocated
+* it cannot be removed from the LRU list
+Note that:
+* the block can still change its position in the LRU list
+* the next and previous pointers can change. */
+static inline void buf_page_set_sticky(buf_page_t *bpage) {
+  ut_ad(mutex_own(buf_page_get_mutex(bpage)));
+  ut_ad(buf_page_get_io_fix(bpage) == BUF_IO_NONE);
+  ut_ad(bpage->in_LRU_list);
+  bpage->set_io_fix(BUF_IO_PIN);      // ★ 直接调 set_io_fix，绕过 buf_page_set_io_fix 封装
+}
+
+/** Determine if a buffer block can be relocated in memory. The block
+ can be dirty, but it must not be I/O-fixed or bufferfixed. */
+static inline bool buf_page_can_relocate(const buf_page_t *bpage) {
+  return (buf_page_get_io_fix(bpage) == BUF_IO_NONE &&
+          bpage->buf_fix_count == 0);   // ★★ 两道闸门：io_fix==NONE 且 buf_fix_count==0
+}
+```
+
+**`buf_block_dbg_add_level` 源码 + 锁序角色表；`buf_fix_count` 与 `Block_hint`**
+
+⚠️ **勘误**：**release 版是空宏**（`buf0buf.h:716` `#define buf_block_dbg_add_level(block, level) /* nothing */`）。
+
+```cpp
+// buf0buf.ic:1078
+#ifdef UNIV_DEBUG
+/** Adds latch level info for the rw-lock protecting the buffer frame. This
+ should be called in the debug version after a successful latching of a
+ page if we know the latching order level of the acquired latch. */
+static inline void buf_block_dbg_add_level(
+    buf_block_t *block,  /*!< in: buffer page where we have acquired latch */
+    latch_level_t level) /*!< in: latching order level */
+{
+  sync_check_lock(&block->lock, level);   // ★ 把 block->lock 登记进本线程的"锁序栈"
+}
+#endif /* UNIV_DEBUG */
+```
+
+> ★★ **为什么需要它**：`buf_block_t::lock` 是一把**通用 rw-lock**，但它保护的对象角色随上下文变化——可能是 B-tree 节点、可能是 FSP 头页、可能是 ibuf bitmap、可能是 undo 页。锁序检查器（sync_check）需要知道"这次我按什么身份拿的锁"才能判定是否违反全局锁序。所以每个加锁点都要显式声明角色。
+
+常见取值（调用点实读）：
+
+| level | 典型调用点 |
+|---|---|
+| `SYNC_TREE_NODE` | `btr0btr.cc:817`、`row0pread.cc:330/396` |
+| `SYNC_TREE_NODE_NEW` | `btr0btr.cc:458/879/887/902` |
+| `SYNC_TREE_NODE_FROM_HASH` | `btr0sea.cc:908/1289` |
+| `SYNC_FSP_PAGE` | `fsp0fsp.cc:201/596/632/842/917/1009/1516/1543/2024/2069/3917`、`btr0btr.cc:4723`、`row0import.cc:4788` |
+| `SYNC_IBUF_HEADER` / `SYNC_IBUF_TREE_NODE` / `SYNC_IBUF_BITMAP` | `ibuf0ibuf.cc` |
+| `SYNC_DICT_HEADER` | `dict0boot.cc:59` |
+| `SYNC_TRX_UNDO_PAGE` | `row0purge.cc:819` |
+| `SYNC_NO_ORDER_CHECK` | `log0recv.cc:1107/2640`（恢复阶段不做锁序检查） |
+
+#### ★ `buf_fix_count`：无锁原子引用计数
+
+⚠️ **勘误**：**不存在** `buf_page_t::buf_fix_count()` / `buf_fix_inc()` / `buf_fix_dec()` 三个**成员函数**。真相是一个 **public 原子成员** + 一组**自由函数**。
+
+```cpp
+// buf0buf.h:1117
+constexpr uint32_t BUF_PAGE_STATE_BITS = 3;   // ★ 与枚举"必须 0..7"呼应
+
+template <typename T>
+class copyable_atomic_t : public std::atomic<T> {
+ public:
+  copyable_atomic_t(const copyable_atomic_t<T> &other)
+      : std::atomic<T>(other.load(std::memory_order_relaxed)) {}
+};
+using buf_fix_count_atomic_t = copyable_atomic_t<uint32_t>;
+
+// buf0buf.h:1327 —— 成员声明
+  /** Count of how many fold this block is currently bufferfixed. */
+  buf_fix_count_atomic_t buf_fix_count;
+```
+
+```cpp
+// buf0buf.ic:754
+static inline ulint buf_block_fix(buf_page_t *bpage) {
+  auto count = bpage->buf_fix_count.fetch_add(1) + 1;   // ★★ 无锁原子自增，不持任何 mutex
+  ut_ad(count > 0);
+  return (count);
+}
+
+// buf0buf.ic:785
+static inline ulint buf_block_unfix(buf_page_t *bpage) {
+  ut_ad(!mutex_own(buf_page_get_mutex(bpage)));
+  //  ★★ 明确断言"不持 block mutex"：unfix 是完全无锁路径
+  const auto count = bpage->buf_fix_count.fetch_sub(1) - 1;
+  static_assert(std::is_unsigned<decltype(count)>::value, "Must be unsigned");
+  ut_ad(count != std::numeric_limits<decltype(count)>::max());   // ★ 下溢检测
+  return (count);
+}
+
+// buf0buf.ic:770 —— debug 版额外拿一把 debug_latch(S)
+static inline void buf_block_buf_fix_inc_func(IF_DEBUG(ut::Location location, )
+                                              buf_block_t *block) {
+#ifdef UNIV_DEBUG
+  if (!fsp_is_system_temporary(block->page.id.space())) {
+    auto ret = rw_lock_s_lock_nowait(&block->debug_latch, location);
+    ut_a(ret);
+  }
+#endif
+  buf_block_fix(block);
+}
+```
+
+> ★★ **`buf_fix_count` 到底防什么**
+> - **防的是"页被换走"**：`buf_page_can_relocate()` 要求 `io_fix == NONE && buf_fix_count == 0`；驱逐/重定位路径同样以此为前提。计数 > 0 ⇒ **不能被驱逐、不能被 relocate、帧不会被复用**。
+> - **不防并发读写**：页内容的并发读写由 `buf_block_t::lock`（S/X/SX rw-lock）管——这是两套独立机制。
+> - **为什么无锁**：`fetch_add`/`fetch_sub` 是原子 RMW；`buf_block_unfix()` 里甚至断言"不持 block mutex"，说明设计上刻意在**不持页锁**的热路径上 unfix，避免 mtr 提交时再去抢页 mutex。
+> - **代价**：读到的值可能过期，所以配套乐观读语义（`was_io_fix_*()` 系列）而不是强一致读。
+> - 计数是 `uint32_t` 且有下溢断言 ⇒ **不允许对已为 0 的页 unfix**（配对错误在 debug 下立刻炸）。
+
+> ⚠️ **勘误**：**不存在 `Guarded_block` 类**（全仓 0 命中）。做"缓存 block 指针失效检测"的真身是 **`buf::Block_hint`**（`buf0block_hint.h:32`）：
+> ```cpp
+>   /** If m_block is non-null, the m_block->page.id at time it was stored. */
+>   page_id_t m_page_id{0, 0};      // ★ 失效检测的关键：记住当时的 (space, page_no)
+> ```
+> 重新使用前做**三重校验**（`buf0block_hint.cc:41`）：① 指针仍在本实例 chunk 内（`buf_is_block_in_instance`）；② `m_page_id == m_block->page.id`（没被复用成别的页）；③ `state == BUF_BLOCK_FILE_PAGE`（没进 REMOVE_HASH/MEMORY）。任一失败就 `clear()` 并传 `nullptr` 给回调。
 
 `buf_page_in_file(bpage)`（buf0buf.ic）：控制块是否映射到表空间页（有合法 `(space_id,page_no)` 磁盘身份）。是 `state` 字段的规范解释者。
 
@@ -2318,6 +4538,7 @@ purge 删 secondary index 的 delete-marked 记录时，页若不在 buffer pool
 - **没有持久化内存（PMem/NVDIMM）支持**：社区 8.0 没有把 BP 放 PMem 的机制，相关是 Oracle/研究界的探索。
 - **HeatWave 的列式/向量化加速是商业版**：社区 BP 是纯行式页缓存，无列式存储或 SIMD 批处理。
 - **change buffer 在 8.4.0 被 Oracle 禁用、9.5.0 重新启用**（WL#16967），官方理由含糊，普遍怀疑与安全类缺陷（含 Bug#120698 这类）有关。
+- **Percona Server 的 flush 增强不是社区特性**（内核月报 2015/02 曾介绍，8.0 社区版源码 grep 0 命中核实）：`buf_flush_LRU_tail` 按 chunk 轮转刷、刷 LRU/FLUSH LIST 的超时、furious flush（后台独揽刷脏避免用户线程参与）、独立 LRU 刷线程、page cleaner/purge/IO/master 线程的 CPU 调度优先级——均为 Percona Server 5.6 增强。社区版路线是多 page cleaner 并发刷（5.7.4）+ 自适应刷脏。
 
 ---
 
@@ -2334,6 +4555,10 @@ purge 删 secondary index 的 delete-marked 记录时，页若不在 buffer pool
 - *MySQL 8.0 Reference Manual → InnoDB Initialization and Configuration → Configuring Buffer Pool Size*
 - WorkLog: [WL#10314](https://dev.mysql.com/worklog/task/?id=10314) InnoDB: separate double write buffer (8.0.20 doublewrite 重构)
 - WorkLog: [WL#11652](https://dev.mysql.com/worklog/task/?id=11652) InnoDB: Reduce lock contention on flush list (8.0.19 flush 无锁化)
+
+**内核月报（二级源，结论需回源码核实，8.0.39 现状以源码为准）**
+- 数据库内核月报 2015/02《InnoDB buffer pool flush 策略漫谈》——多 page cleaner 并发模型（coordinator + worker + slot 状态机）、5.7 hazard pointer 演进、Percona flush 增强（社区边界）
+- 数据库内核月报 2016/02《InnoDB 文件系统之 IO 系统和内存管理》——instance/chunk 划分演进、free/LRU/flush/unzip_LRU 链表组织
 
 **相关文档**
 - 上游（buffer pool 谁调用）见 [`../server/handler.md`](../server/handler.md)（handler 取行下推到引擎）

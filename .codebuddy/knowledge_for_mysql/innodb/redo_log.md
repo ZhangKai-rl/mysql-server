@@ -285,6 +285,133 @@ lsn(mlog2) − lsn(mlog1) = len(mlog1)
 
 ### 类型分类（`mlog_id_t`，mtr0types.h:63-274，共 76 种）
 
+⚠️ **勘误**：头文件在 **`storage/innobase/include/`**，不在 `include/`。且类型值**不是 1/2/3/4**——低 4 位的真实值是 **11/12/13/14**；`1/2/4/8` 是"写 1/2/4/8 字节"的特殊类型（`MLOG_1BYTE` 等），它们的**类型值恰好等于字节数**（历史设计，因此可以直接当 size 用）。
+
+```cpp
+/*************************************************************/ /**
+ @name Log item types
+ The log items are declared 'byte' so that the compiler can warn if val
+ and type parameters are switched in a call to mlog_write_ulint. NOTE!
+ For 1 - 8 bytes, the flag value must give the length also! @{ */
+enum mlog_id_t {
+  /** if the mtr contains only one log record for one page,
+  i.e., write_initial_log_record has been called only once,
+  this flag is ORed to the type of that first log record */
+  MLOG_SINGLE_REC_FLAG = 128,   // ★ 不是独立类型，是"位或"到首字节的 0x80 标志
+
+  /** one byte is written */
+  MLOG_1BYTE = 1,
+  MLOG_2BYTES = 2,
+  MLOG_4BYTES = 4,
+  MLOG_8BYTES = 8,
+
+  MLOG_REC_INSERT_8027 = 9,
+  MLOG_REC_CLUST_DELETE_MARK_8027 = 10,
+  /** Mark secondary index record deleted */
+  MLOG_REC_SEC_DELETE_MARK = 11,
+  MLOG_REC_UPDATE_IN_PLACE_8027 = 13,
+  MLOG_REC_DELETE_8027 = 14,
+  MLOG_LIST_END_DELETE_8027 = 15,
+  MLOG_LIST_START_DELETE_8027 = 16,
+  MLOG_LIST_END_COPY_CREATED_8027 = 17,
+  MLOG_PAGE_REORGANIZE_8027 = 18,
+  /** Create an index page */
+  MLOG_PAGE_CREATE = 19,
+
+  /** Insert entry in an undo log */
+  MLOG_UNDO_INSERT = 20,
+  /** erase an undo log page end */
+  MLOG_UNDO_ERASE_END = 21,
+  /** initialize a page in an undo log */
+  MLOG_UNDO_INIT = 22,
+  /** reuse an insert undo log header */
+  MLOG_UNDO_HDR_REUSE = 24,
+  /** create an undo log header */
+  MLOG_UNDO_HDR_CREATE = 25,
+
+  MLOG_REC_MIN_MARK = 26,
+  MLOG_IBUF_BITMAP_INIT = 27,
+#ifdef UNIV_LOG_LSN_DEBUG
+  MLOG_LSN = 28,
+#endif /* UNIV_LOG_LSN_DEBUG */
+
+  /** this means that a file page is taken into use and the prior
+  contents of the page should be ignored: in recovery we must not
+  trust the lsn values stored to the file page.
+  Note: it's deprecated because it causes crash recovery problem
+  in bulk create index, and actually we don't need to reset page
+  lsn in recv_recover_page_func() now. */
+  MLOG_INIT_FILE_PAGE = 29,        // ★ 已废弃，被 MLOG_INIT_FILE_PAGE2=59 取代
+
+  /** write a string to a page */
+  MLOG_WRITE_STRING = 30,
+
+  /** If a single mtr writes several log records, this log
+  record ends the sequence of these records */
+  MLOG_MULTI_REC_END = 31,
+  /** dummy log record used to pad a log block full */
+  MLOG_DUMMY_RECORD = 32,
+
+  /** log record about creating an .ibd file, with format */
+  MLOG_FILE_CREATE = 33,
+  /** rename a tablespace file that starts with (space_id,page_no) */
+  MLOG_FILE_RENAME = 34,
+  /** delete a tablespace file that starts with (space_id,page_no) */
+  MLOG_FILE_DELETE = 35,
+
+  MLOG_COMP_REC_MIN_MARK = 36,
+  MLOG_COMP_PAGE_CREATE = 37,
+  /** compact record insert */
+  MLOG_COMP_REC_INSERT_8027 = 38,   // ★ 只为解析 ≤8.0.27 的 redo 保留
+  ...
+  MLOG_INIT_FILE_PAGE2 = 59,        // ★ "新页初始化"当前使用的类型
+  MLOG_INDEX_LOAD = 61,
+  MLOG_TABLE_DYNAMIC_META = 62,
+  MLOG_FILE_EXTEND = 65,
+  MLOG_TEST = 66,
+
+  /* ★ 8.0.28+ 的统一命名：不再区分 COMPACT / REDUNDANT */
+  MLOG_REC_INSERT = 67,
+  MLOG_REC_CLUST_DELETE_MARK = 68,
+  MLOG_REC_DELETE = 69,
+  MLOG_REC_UPDATE_IN_PLACE = 70,
+  MLOG_LIST_END_COPY_CREATED = 71,
+  MLOG_PAGE_REORGANIZE = 72,
+  MLOG_ZIP_PAGE_REORGANIZE = 73,
+  MLOG_ZIP_PAGE_COMPRESS_NO_DATA = 74,
+  MLOG_LIST_END_DELETE = 75,
+  MLOG_LIST_START_DELETE = 76,
+
+  /** biggest value (used in assertions) */
+  MLOG_BIGGEST_TYPE = MLOG_LIST_START_DELETE
+};
+```
+
+```cpp
+// mtr0types.h:280 —— memo 槽位类型（注意前 3 个必须等于 RW_S/X/SX_LATCH，才能按位 OR 匹配）
+enum mtr_memo_type_t {
+  MTR_MEMO_PAGE_S_FIX = RW_S_LATCH,
+  MTR_MEMO_PAGE_X_FIX = RW_X_LATCH,
+  MTR_MEMO_PAGE_SX_FIX = RW_SX_LATCH,
+  MTR_MEMO_BUF_FIX = RW_NO_LATCH,
+  MTR_MEMO_S_LOCK = 64,
+  MTR_MEMO_X_LOCK = 128,
+  MTR_MEMO_SX_LOCK = 256
+};
+
+// mtr0types.h:330
+enum mtr_state_t {
+  MTR_STATE_INIT = 0,
+  MTR_STATE_ACTIVE = 12231,
+  MTR_STATE_COMMITTING = 56456,
+  MTR_STATE_COMMITTED = 34676
+};
+```
+
+> ⚠️ **不存在** `MLOG_COMP_REC_INSERT`（8.0.28 起统一为 `MLOG_REC_INSERT`）；也不存在 `LOG_INIT_NEW_PAGE` / `LOG_INSERT` / `LOG_WRITE`（4.x/5.0 时代的名字）。
+>
+> ★ 记 redo 的**关键前提**：类型值 ≤ `MLOG_BIGGEST_TYPE`，且 **`MLOG_SINGLE_REC_FLAG` 是位标志不是类型**——解析侧用 `type & ~MLOG_SINGLE_REC_FLAG` 剥掉。
+
 | 类别 | 代表类型 | body 内容 |
 |------|----------|-----------|
 | 定长值写入 | `MLOG_1/2/4/8BYTES`（1/2/4/8） | 1/2/4/8B 原值 |
@@ -300,6 +427,136 @@ lsn(mlog2) − lsn(mlog1) = len(mlog1)
 | 控制/填充 | `MLOG_MULTI_REC_END`(31) / `DUMMY_RECORD`(32) / `TEST`(66) | 无或填充 |
 
 ### 写入原语：`mlog_open` / `mlog_close` / `mlog_catenate`
+
+⚠️ **勘误**：`mlog_open()` **返回 `bool`**（且 `[[nodiscard]]`），缓冲区是出参 `byte *&buffer`——不是常见的"返回 `byte*`、NULL 表示失败"。
+
+```cpp
+// storage/innobase/include/mtr0log.ic:41
+static inline bool mlog_open(mtr_t *mtr, ulint size, byte *&buffer) {
+  mtr->set_modified();   // ★ 只要开了 mlog 就标记"本 mtr 可能改了页"
+  return (mlog_open_metadata(mtr, size, buffer));
+}
+
+static inline bool mlog_open_metadata(mtr_t *mtr, ulint size, byte *&buffer) {
+  if (mtr_get_log_mode(mtr) == MTR_LOG_NONE ||
+      mtr_get_log_mode(mtr) == MTR_LOG_NO_REDO) {
+    // ★ 两种"不写 redo"：完全不落日志 / 只加 flush list
+    buffer = nullptr;
+    return (false);
+  }
+  buffer = mtr->get_log()->open(size);   // → mtr_buf_t::open()，见 dyn0buf.h:184
+  return (buffer != nullptr);
+}
+
+/** Closes a buffer opened to mlog. */
+static inline void mlog_close(mtr_t *mtr, byte *ptr) {
+  ut_ad(mtr_get_log_mode(mtr) != MTR_LOG_NONE);
+  ut_ad(mtr_get_log_mode(mtr) != MTR_LOG_NO_REDO);
+  mtr->get_log()->close(ptr);
+  // ★ ptr 是"实际用到哪儿"，close 把 block 的 m_used 回退到 ptr-begin()，回收未用空间
+}
+```
+
+**`mtr_buf_t` 是 512 字节分块的链式缓冲**（`typedef dyn_buf_t<DYN_ARRAY_DATA_SIZE> mtr_buf_t`，`DYN_ARRAY_DATA_SIZE = 512`）：
+
+```cpp
+// storage/innobase/include/dyn0buf.h:184
+  [[nodiscard]] byte *open(ulint size) {
+    ut_ad(size > 0);
+    ut_ad(size <= MAX_DATA_SIZE);
+    block_t *block;
+    block = has_space(size) ? back() : add_block();   // ★ 放不下就新开一个 512B block
+    ut_d(block->m_buf_end = block->m_used + size);
+    return (block->end());
+  }
+
+  void close(const byte *ptr) {
+    block_t *block = back();
+    m_size -= block->used();
+    block->close(ptr);
+    m_size += block->used();
+  }
+```
+
+`mlog_catenate_*` 系列：
+
+```cpp
+// mtr0log.ic:69 —— 注意 static_assert 暴露的历史包袱：类型值 == 字节数
+static inline void mlog_catenate_ulint(mtr_buf_t *mtr_buf, ulint val,
+                                       mlog_id_t type) {
+  static_assert(MLOG_1BYTE == 1);
+  static_assert(MLOG_2BYTES == 2);
+  static_assert(MLOG_4BYTES == 4);
+  static_assert(MLOG_8BYTES == 8);
+
+  byte *ptr = mtr_buf->push<byte *>(type);   // ★ type 直接当 size 用
+
+  switch (type) {
+    case MLOG_4BYTES: mach_write_to_4(ptr, val); break;
+    case MLOG_2BYTES: mach_write_to_2(ptr, val); break;
+    case MLOG_1BYTE:  mach_write_to_1(ptr, val); break;
+    default: ut_error;
+  }
+}
+
+// mtr0log.cc:60 —— 字符串直接 push，不需要 open/close 配对
+void mlog_catenate_string(mtr_t *mtr, const byte *str, ulint len) {
+  if (mtr_get_log_mode(mtr) == MTR_LOG_NONE) return;
+  mtr->get_log()->push(str, uint32_t(len));
+}
+
+// mtr0log.ic:111 —— 变长压缩（1~5 字节）
+static inline void mlog_catenate_ulint_compressed(mtr_t *mtr, ulint val) {
+  byte *log_ptr = nullptr;
+  if (!mlog_open(mtr, 10, log_ptr)) return;
+  log_ptr += mach_write_compressed(log_ptr, val);
+  mlog_close(mtr, log_ptr);
+}
+```
+
+`mlog_write_ulint()` —— "先改页、再记日志"的典型（页必须先被改成期望结果，redo 才能从页上拷 payload）：
+
+```cpp
+// mtr0log.cc:256
+void mlog_write_ulint(byte *ptr, ulint val, mlog_id_t type, mtr_t *mtr) {
+  switch (type) {                       // ★ 第一步：改内存里的页
+    case MLOG_1BYTE:  mach_write_to_1(ptr, val); break;
+    case MLOG_2BYTES: mach_write_to_2(ptr, val); break;
+    case MLOG_4BYTES: mach_write_to_4(ptr, val); break;
+    default: ut_error;
+  }
+  if (mtr == nullptr) return;
+
+  byte *log_ptr = nullptr;
+  // 11B 头 + 2B 页内偏移 + 最多 5B 压缩值
+  if (!mlog_open(mtr, REDO_LOG_INITIAL_INFO_SIZE + 2 + 5, log_ptr)) return;
+
+  log_ptr = mlog_write_initial_log_record_fast(ptr, type, log_ptr, mtr);
+
+  mach_write_to_2(log_ptr, page_offset(ptr));   // ★ 页内偏移固定 2 字节，不压缩
+  log_ptr += 2;
+  log_ptr += mach_write_compressed(log_ptr, val);
+
+  mlog_close(mtr, log_ptr);
+}
+```
+
+```cpp
+// mtr0log.cc:342 —— MLOG_WRITE_STRING：payload 直接从"已改过的页"上拷
+void mlog_log_string(byte *ptr, ulint len, mtr_t *mtr) {
+  byte *log_ptr = nullptr;
+  if (!mlog_open(mtr, 30, log_ptr)) return;
+
+  log_ptr = mlog_write_initial_log_record_fast(ptr, MLOG_WRITE_STRING,
+                                               log_ptr, mtr);
+  mach_write_to_2(log_ptr, page_offset(ptr));  log_ptr += 2;
+  mach_write_to_2(log_ptr, len);               log_ptr += 2;
+  mlog_close(mtr, log_ptr);
+
+  mlog_catenate_string(mtr, ptr, len);
+  // ★ 布局：offset(2) + len(2) + payload(len)
+}
+```
 
 redo 记录不是"算好长度再写"，而是**先预留、再回填**——因为写的时候往往还不知道最终长度（比如 insert 要写"与 cursor 记录的差异尾段"，长度得比对完才知道）。
 
@@ -343,6 +600,79 @@ redo 记录不是"算好长度再写"，而是**先预留、再回填**——因
 
 ### `mlog_write_initial_log_record_fast` / `_low`
 
+```cpp
+// storage/innobase/include/mtr0log.ic:169
+static inline byte *mlog_write_initial_log_record_low(mlog_id_t type,
+                                                      space_id_t space_id,
+                                                      page_no_t page_no,
+                                                      byte *log_ptr,
+                                                      mtr_t *mtr) {
+  ut_ad(type <= MLOG_BIGGEST_TYPE);
+
+  mach_write_to_1(log_ptr, type);           // ★ 第 1 字节：type
+  log_ptr++;
+
+  log_ptr += mach_write_compressed(log_ptr, space_id);   // 变长 1~5B
+  log_ptr += mach_write_compressed(log_ptr, page_no);    // 变长 1~5B → 整头 3~11B
+
+  mtr->added_rec();     // ★ m_n_log_recs++；这是"是否单记录"的唯一判据来源
+  return (log_ptr);
+}
+```
+
+> ★★ **重要澄清**：`mlog_write_initial_log_record_low()` 里**没有任何 single-rec 判据代码**。`MLOG_SINGLE_REC_FLAG` 是在 commit 阶段的 `mtr_t::Command::prepare_write()` 里 OR 上去的（见「mtr record group」一节）。
+
+```cpp
+// mtr0log.ic:191
+static inline byte *mlog_write_initial_log_record_fast(const byte *ptr,
+                                                       mlog_id_t type,
+                                                       byte *log_ptr,
+                                                       mtr_t *mtr) {
+  const byte *page;
+  space_id_t space;
+  page_no_t offset;
+
+  ut_d(mtr->memo_modify_page(ptr));   // ★ debug：确认该页已被 X/SX latch 住
+
+  page = (const byte *)ut_align_down(ptr, UNIV_PAGE_SIZE);   // ★ 由页内任意指针反推页框基址
+  space = mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+  // ★★ space_id 从【页头现读】——这就是 8.0 没有 mtr_t::set_named_space() 的原因
+  offset = mach_read_from_4(page + FIL_PAGE_OFFSET);
+
+  /* We don't redo log the double write buffer */
+  if (space == TRX_SYS_SPACE && offset >= FSP_EXTENT_SIZE &&
+      offset < 3 * FSP_EXTENT_SIZE) {
+    return (log_ptr);   // ★★ 双写缓冲页：一个字节都不写，直接返回原 log_ptr
+  }
+
+  return (mlog_write_initial_log_record_low(type, space, offset, log_ptr, mtr));
+}
+```
+
+```cpp
+// mtr0log.cc:72
+void mlog_write_initial_log_record(const byte *ptr, mlog_id_t type,
+                                   mtr_t *mtr) {
+  byte *log_ptr = nullptr;
+  ut_ad(type <= MLOG_BIGGEST_TYPE);
+  ut_ad(type > MLOG_8BYTES);   // ★ 只用于"非 1/2/4/8 字节"的复杂记录类型
+
+  if (!mlog_open(mtr, REDO_LOG_INITIAL_INFO_SIZE, log_ptr)) return;  // 11B
+  log_ptr = mlog_write_initial_log_record_fast(ptr, type, log_ptr, mtr);
+  mlog_close(mtr, log_ptr);
+}
+```
+
+```cpp
+// mtr0log.h:65 —— 一条 redo 记录"头部"的最大字节数
+constexpr size_t REDO_LOG_INITIAL_INFO_SIZE = 11;
+// = 1B type + 5B space(上限) + 5B page(上限)
+```
+
+> ⚠️ **不存在** `mtr_t::set_named_space()`（全仓 `named_space` 0 命中）。
+>
+> ★ `mlog_write_initial_log_record()` 在 `UNIV_HOTBACKUP` 构建下被宏替换成 `((void)0)`（`mtr0log.h:194`）。
+
 | | `_low`（`mtr0log.ic:169`） | `_fast`（`mtr0log.ic:191`） |
 |---|---|---|
 | 入参 | 显式 `space_id` / `page_no` | 页内指针 `ptr`（自动推 space/page） |
@@ -368,6 +698,154 @@ redo 记录不是"算好长度再写"，而是**先预留、再回填**——因
 （先判小值再判极大值——接近 2^32 的大数用扩展短编码更省）
 
 ### ★ `mlog_open_and_write_index()`：记录级 redo 的核心
+
+⚠️ **勘误**：真实签名**只有 6 个参数**，**没有** `space_id` / `page_no` / `offsets`——space/page 由 `rec` 指针经 `mlog_write_initial_log_record_fast()` 从页头现读，字段长度从 `dict_index_t` 重新推导。
+
+```cpp
+// mtr0log.h:247
+bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
+                               const dict_index_t *index, mlog_id_t type,
+                               size_t size, byte *&log_ptr);
+```
+
+```cpp
+// mtr0log.cc:795
+bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
+                               const dict_index_t *index, mlog_id_t type,
+                               size_t size, byte *&log_ptr) {
+  const bool is_instant = index->has_instant_cols();
+  const bool is_versioned = index->has_row_versions();
+  const bool is_comp = dict_table_is_comp(index->table);
+
+  uint16_t n = is_versioned ? index->get_n_total_fields()
+                            : dict_index_get_n_fields(index);
+  /* For spatial index, on non-leaf page, we just keep
+  2 fields, MBR and page no. */
+  if (dict_index_is_spatial(index) && !page_is_leaf(page_align(rec))) {
+    n = DICT_INDEX_SPATIAL_NODEPTR_SIZE;
+  }
+  ...
+
+  size_t size_needed = 0;
+  log_index_get_size_needed(index, size, n, is_comp, is_versioned, is_instant,
+                            fields_with_changed_order, size_needed);
+  size_t total = size_needed;
+  size_t alloc = total;
+  if (alloc > mtr_buf_t::MAX_DATA_SIZE) {   // ★ 单次 open 不能超过 512B
+    alloc = mtr_buf_t::MAX_DATA_SIZE;
+  }
+
+  if (!mlog_open(mtr, alloc, log_ptr)) { return false; }
+
+  log_start = log_ptr;
+  log_end = log_ptr + alloc;
+
+  log_ptr = mlog_write_initial_log_record_fast(rec, type, log_ptr, mtr);
+  // ★ 1B type + space_id(compress) + page_no(compress)，并 mtr->added_rec()++
+
+  uint8_t index_log_version = INDEX_LOG_VERSION_CURRENT;   // = 1
+  log_index_log_version(index_log_version, log_ptr);       // 1B 版本
+
+  uint8_t flag = 0;
+  if (is_instant)   SET_INSTANT(flag);     // 0x04
+  if (is_versioned) SET_VERSIONED(flag);   // 0x02
+  if (is_comp)      SET_COMPACT(flag);     // 0x01
+  log_index_flag(flag, log_ptr);           // 1B flag
+
+  log_index_column_counts(index, n, rec, is_comp, is_versioned, is_instant,
+                          log_ptr);        // n(2B) [+ n_instant_cols(2B)] [+ n_uniq(2B)]
+
+  /* To check _size is available on buffer. If not, close and reopen buffer */
+  auto f = [&](const size_t _size) {       // ★ 写字段前先确认剩余空间
+    if (log_ptr + _size > log_end) {
+      if (!close_and_reopen_log(log_ptr, log_start, log_end, mtr, alloc, total))
+        return false;
+    }
+    return true;
+  };
+
+  if (is_comp) {
+    if (!log_index_fields(index, n, is_versioned, instant_fields_to_log,
+                          fields_with_changed_order, log_ptr, f)) {
+      return false;
+    }
+  } else if (is_versioned) { ... }
+
+  if (!instant_fields_to_log.empty()) {
+    if (!log_index_versioned_fields(instant_fields_to_log, log_ptr, f, index))
+      return false;
+  }
+
+  if (size == 0) {
+    mlog_close(mtr, log_ptr);
+    log_ptr = nullptr;      // ★ 调用方只要"写 index 头"，不需要后续 payload
+  } else if (log_ptr + size > log_end) {
+    mlog_close(mtr, log_ptr);
+    bool success = mlog_open(mtr, size, log_ptr);  // ★ 为 payload 单独再开一段连续空间
+    ut_a(success);
+  }
+
+  return (log_ptr != nullptr);
+}
+```
+
+**`MLOG_REC_INSERT` 的最终二进制布局**（由上面的 helper 推导）：
+
+```
+[1B]     type = MLOG_REC_INSERT(67)   ← commit 时若整 mtr 仅 1 条记录则 |= 0x80
+[1~5B]   space_id   (mach_write_compressed)
+[1~5B]   page_no    (mach_write_compressed)
+[1B]     index_log_version = 1
+[1B]     flag = COMPACT(0x01) | VERSIONED(0x02) | INSTANT(0x04)
+[2B]     n                (is_comp || is_versioned)
+[2B]     n_instant_cols   (若 flag & INSTANT)
+[2B]     n_uniq           (若 is_comp)
+[2B × n] 每个字段的 len（0x8000 = NOT NULL；0x7fff = 变长大列）
+[2B]     n_inst + 6B × n_inst   (若 flag & VERSIONED)
+[size B] 调用方的 payload（记录正文）
+```
+
+```cpp
+// mtr0log.cc:521 —— 空间预算（决定一次能不能装下，装不下就分段）
+size_needed += REDO_LOG_INITIAL_INFO_SIZE + size;
+size_needed += 1;   // INDEX_LOG_VERSION
+size_needed += 1;   // flag
+if (!is_versioned && !is_comp) return;
+size_needed += 2;   // n
+if (!is_comp) { size_needed += size_for_versioned_fields(index); return; }
+if (is_instant) size_needed += 2;   // n_instant_cols
+size_needed += 2;                   // n_uniq
+size_needed += n * 2;               // 每个字段的 len
+if (is_versioned) size_needed += size_for_versioned_fields(index);
+```
+
+```cpp
+// mtr0log.cc:656 —— 分段续写
+static bool close_and_reopen_log(byte *&log_ptr, const byte *&log_start,
+                                 const byte *&log_end, mtr_t *&mtr,
+                                 size_t &alloc, size_t &total) {
+  mlog_close(mtr, log_ptr);
+  total -= log_ptr - log_start;      // ★ 扣掉已写字节
+  alloc = total;
+  if (alloc > mtr_buf_t::MAX_DATA_SIZE) alloc = mtr_buf_t::MAX_DATA_SIZE;
+  if (!mlog_open(mtr, alloc, log_ptr)) return false;
+  log_start = log_ptr;
+  log_end = log_ptr + alloc;
+  return true;
+}
+```
+
+```cpp
+// mtr0log.cc:687 —— 每字段 2 字节，最高位编码 NOT NULL
+  ulint len = field->fixed_len;
+  if (len == 0 && (DATA_BIG_COL(col))) len = 0x7fff;   // 变长大列
+  if (col->prtype & DATA_NOT_NULL) len |= 0x8000;      // ★ NOT NULL 标志
+  if (!func(2)) return false;
+  mach_write_to_2(log_ptr, len);
+  log_ptr += 2;
+```
+
+> ★ 这就是"**索引元数据也进 redo**"的实现：恢复时不依赖数据字典，只靠 redo 里这份 index 快照就能正确解析记录（支持 INSTANT ADD/DROP COLUMN 后的行版本）。
 
 **定义**：`mtr/mtr0log.cc:795`；声明与文档 `mtr0log.h:247`。
 
@@ -498,7 +976,7 @@ bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
 
 ### 解析侧：如何把 redo 变回页面
 
-> ⚠️ 位置澄清：`mlog_parse_index()` / `mlog_parse_index_8027()` 定义在 **`mtr/mtr0log.cc`**，不是 `log0recv.cc`（那里只调用）。
+> ⚠️ 位置澄清：`mlog_parse_index()` / `mlog_parse_index_8027()` 定义在 **`mtr/mtr0log.cc`**，不是 `log0recv.cc`（那里只调用）。本节与相邻小节分工：**写侧字节布局**（与本节逐字节对称）见上文 [`mlog_open_and_write_index`](#-mlog_open_and_write_index记录级-redo-的核心)；**dummy index 的深层语义**（`LOG_DUMMY` 三处特判、`cached=true` 伪装、`n_uniq` 一致性）在 [`recovery.md`](recovery.md#索引-redo-的自描述mlog_parse_index-的-dummy-index)。
 
 `mlog_parse_index`（`mtr0log.cc:1215`）→ `mlog_parse_index_v1`（`:1242`）做四件事：
 
@@ -520,6 +998,96 @@ bool mlog_open_and_write_index(mtr_t *mtr, const byte *rec,
 每个 case 后都有 `ut_a(!page || page_is_comp(page) == dict_table_is_comp(index->table));` —— 校验内联的 COMPACT 标志与页面实际行格式一致。
 
 ### mtr record group（原子应用单位）
+
+**关键实现：`mtr_t::Command::prepare_write()`**（`mtr0mtr.cc:760`）——这就是 `MLOG_SINGLE_REC_FLAG` 与 `MLOG_MULTI_REC_END` 的**唯一**决策点：
+
+```cpp
+ulint mtr_t::Command::prepare_write() {
+  switch (m_impl->m_log_mode) {
+    case MTR_LOG_SHORT_INSERTS:
+      ut_d(ut_error);
+      [[fallthrough]];
+    case MTR_LOG_NO_REDO:
+    case MTR_LOG_NONE:
+      ut_ad(m_impl->m_log.size() == 0);
+      return 0;
+    case MTR_LOG_ALL:
+      break;
+    default:
+      ut_d(ut_error);
+      ut_o(return 0);
+  }
+
+  ut_a(!recv_recovery_is_on() || !recv_no_ibuf_operations);
+
+  ulint len = m_impl->m_log.size();
+  ut_ad(len > 0);
+
+  const auto n_recs = m_impl->m_n_log_recs;
+  ut_ad(n_recs > 0);
+
+  if (n_recs <= 1) {
+    ut_ad(n_recs == 1);
+
+    /* Flag the single log record as the only record in this
+    mini-transaction. */
+    *m_impl->m_log.front()->begin() |= MLOG_SINGLE_REC_FLAG;
+    // ★★★ 把整段 mtr log 的【第一个字节】（即第一条记录的 type）OR 上 0x80
+
+  } else {
+    /* Because this mini-transaction comprises multiple log records,
+    append MLOG_MULTI_REC_END at the end. */
+    mlog_catenate_ulint(&m_impl->m_log, MLOG_MULTI_REC_END, MLOG_1BYTE);
+    ++len;
+    // ★★★ 多记录时尾部补 1 字节 MLOG_MULTI_REC_END(31)，恢复时靠它判定记录组结束
+  }
+
+  ut_ad(m_impl->m_log_mode == MTR_LOG_ALL);
+  ut_ad(m_impl->m_log.size() == len);
+  ut_ad(len > 0);
+
+  return len;
+}
+```
+
+> ★★ **判据就是 `m_n_log_recs <= 1`**，而 `m_n_log_recs` 由每次 `mlog_write_initial_log_record_low()` 里的 `mtr->added_rec()` 累加。所以"mtr 里有几条 redo 记录"这个计数，是唯一决定单/多记录的依据。
+>
+> ★ 恢复侧据此二选一：
+> - 首字节 `& MLOG_SINGLE_REC_FLAG` ≠ 0 ⇒ **整条 mtr 只有这一条**，直接应用，天然原子
+> - 否则 ⇒ 一直应用到遇到 `MLOG_MULTI_REC_END`，中途若发现块头 `first_rec_group` 指向新组则丢弃尾组（见「mtr 的原子性如何实现」）
+
+配套的两个边界（同一 commit 路径上的完整性保障）：
+
+```cpp
+// mtr0mtr.cc:502 —— 逐 block 拷贝到 log buffer，并在跨块时回填 first_rec_group
+struct mtr_write_log_t {
+  bool operator()(const mtr_buf_t::block_t *block) {
+    if (block->used() == 0) return true;
+
+    lsn_t start_lsn = m_lsn;
+    lsn_t end_lsn =
+        log_buffer_write(*log_sys, block->begin(), block->used(), start_lsn);
+    // ★ 每个 mtr_buf_t block 一次 memcpy 到 log buffer
+
+    m_left_to_write -= block->used();
+
+    if (m_left_to_write == 0 &&
+        m_handle.start_lsn / OS_FILE_LOG_BLOCK_SIZE !=
+            end_lsn / OS_FILE_LOG_BLOCK_SIZE) {
+      log_buffer_set_first_record_group(*log_sys, end_lsn);
+      // ★ 跨 block 时，为下一个记录组在新 block 头写 first_rec_group 偏移
+    }
+
+    log_buffer_write_completed(*log_sys, start_lsn, end_lsn);
+    // ★ 链接进 recent_written，log writer 才可见
+    m_lsn = end_lsn;
+    return true;
+  }
+  Log_handle m_handle;
+  lsn_t m_lsn;
+  ulint m_left_to_write;
+};
+```
 
 一个 mtr 写出的所有 record 构成一个 **record group**，它是恢复时的**原子应用单位**。为了让解析方能找出组的边界，用了两个控制标记：
 
@@ -636,6 +1204,138 @@ mtr 是 InnoDB 对**底层页面操作**的原子单元（区别于 trx 这种�
 
 ### 结构（mtr_t::Impl，mtr0mtr.h:180）
 
+```cpp
+/** Mini-transaction handle and buffer */
+struct mtr_t {
+  /** State variables of the mtr */
+  struct Impl {
+    /** memo stack for locks etc. */
+    mtr_buf_t m_memo;      // ★ memo 也是 mtr_buf_t（512B 分块），元素是 mtr_memo_slot_t
+
+    /** mini-transaction log */
+    mtr_buf_t m_log;       // ★★ 核心：本 mtr 攒下来的 redo，commit 时逐块拷进 log buffer
+
+    /** true if inside ibuf changes */
+    bool m_inside_ibuf;
+
+    /** true if the mini-transaction might have modified buffer pool pages */
+    bool m_modifications;  // ★ 由 mlog_open() → set_modified() 置位
+
+    /** true if mtr is forced to NO_LOG mode because redo logging is
+    disabled globally. ... */
+    bool m_marked_nolog;
+
+    /** Shard index used for incrementing global counter at ::start. */
+    size_t m_shard_index;
+
+    /** Count of how many page initial log records have been
+    written to the mtr log */
+    uint32_t m_n_log_recs;  // ★★ "记录条数"；==1 时 commit 阶段打 MLOG_SINGLE_REC_FLAG
+
+    /** specifies which operations should be logged; default MTR_LOG_ALL */
+    mtr_log_t m_log_mode;
+
+    /** State of the transaction */
+    mtr_state_t m_state;    // INIT / ACTIVE / COMMITTING / COMMITTED
+
+    /** Flush Observer */
+    Flush_observer *m_flush_observer;
+
+#ifdef UNIV_DEBUG
+    ulint m_magic_n;        // MTR_MAGIC_N = 54551
+#endif
+
+    /** Owning mini-transaction */
+    mtr_t *m_mtr;           // ★ 反向指针，供 Command 拿回 mtr 设 m_commit_lsn
+  };
+  ...
+ private:
+  Impl m_impl;
+
+  /** LSN at commit time */
+  lsn_t m_commit_lsn;   // ★★ mtr 里【只有这一个】lsn 成员
+
+  /** true if it is synchronous mini-transaction */
+  bool m_sync;
+
+  class Command;
+  friend class Command;
+};
+```
+
+> ⚠️ **勘误**：mtr **没有** `m_start_lsn` / `m_end_lsn` 成员。区间 LSN 来自 `Log_handle{start_lsn, end_lsn}`（`log0buf.h:68`），commit 后只把 `end_lsn` 写进 `m_commit_lsn`。
+
+```cpp
+// mtr0mtr.h:594-630 —— 常用访问器
+  size_t get_expected_log_size() const {
+    return (m_impl.m_log.size() + (m_impl.m_n_log_recs > 1 ? 1 : 0));
+    // ★ 多记录时预留 1 字节 MLOG_MULTI_REC_END
+  }
+  void added_rec() { ++m_impl.m_n_log_recs; }
+  [[nodiscard]] mtr_buf_t *get_log() { return (&m_impl.m_log); }
+```
+
+`mtr_t::start()`（`mtr0mtr.cc:565`）——用 **placement new** 复用两个缓冲，避免 malloc：
+
+```cpp
+void mtr_t::start(bool sync) {
+  m_sync = sync;
+  m_commit_lsn = 0;
+
+  new (&m_impl.m_log) mtr_buf_t();
+  new (&m_impl.m_memo) mtr_buf_t();
+
+  m_impl.m_mtr = this;
+  m_impl.m_log_mode = MTR_LOG_ALL;
+  m_impl.m_inside_ibuf = false;
+  m_impl.m_modifications = false;
+  m_impl.m_n_log_recs = 0;        // ★ 计数清零 —— single-rec 优化的起点
+  m_impl.m_state = MTR_STATE_ACTIVE;
+  m_impl.m_flush_observer = nullptr;
+  m_impl.m_marked_nolog = false;
+
+  check_nolog_and_mark();         // ★ 若全局 redo 被 disable，这里改成 MTR_LOG_NO_REDO
+  ut_d(m_impl.m_magic_n = MTR_MAGIC_N);
+}
+```
+
+memo（锁/页的登记栈，逆序释放）：
+
+```cpp
+// mtr0mtr.ic:38
+void mtr_t::memo_push(void *object, mtr_memo_type_t type) {
+  ut_ad(ut_is_2pow(type));   // ★ type 必须是 2 的幂，才能按位 OR 做 flags 匹配
+  mtr_memo_slot_t *slot = m_impl.m_memo.push<mtr_memo_slot_t *>(sizeof(*slot));
+  slot->type = type;
+  slot->object = object;
+}
+
+// mtr0mtr.cc:1087 —— 要改页必须持有 X 或 SX latch
+void mtr_t::memo_modify_page(const byte *ptr) {
+  buf_block_t *block = memo_contains_page_flagged(
+      ptr, MTR_MEMO_PAGE_X_FIX | MTR_MEMO_PAGE_SX_FIX);
+  ut_ad(block != nullptr);
+  if (!memo_contains(get_memo(), block, MTR_MEMO_MODIFY)) {
+    memo_push(block, MTR_MEMO_MODIFY);
+  }
+}
+```
+
+log mode 切换矩阵（`mtr0mtr.cc:431`）——不是所有切换都生效：
+
+```cpp
+/*   A  - MTR_LOG_ALL
+     N  - MTR_LOG_NONE
+     NR - MTR_LOG_NO_REDO
+     S  - MTR_LOG_SHORT_INSERTS */
+bool mtr_t::s_mode_update[MTR_LOG_MODE_MAX][MTR_LOG_MODE_MAX] = {
+    /*      |  A      N    NR     S  */
+    /* A */ {false, true, true, true},
+    /* N */ {true, false, true, false},
+    /* NR*/ {false, true, false, false},
+    /* S */ {true, false, false, false}};
+```
+
 | 成员 | 作用 |
 |------|------|
 | `m_log`（mtr_buf_t） | 拼接 redo 的**私有 buffer**：mlog 系列函数写到这里，commit 时一次性拷进共享 log buffer |
@@ -725,6 +1425,118 @@ mtr.start()                                    # 标记同步/异步（m_sync）
 
 ### mtr commit 写入路径
 
+⚠️ **勘误**：8.0 把 commit 拆给了内部类 `mtr_t::Command`；`mtr_t::commit()` 本身很短。**不存在** `log_reserve_and_write_fast`（已删，仅注释残留），也**不存在** `mtr_commit_enter` / `mtr_commit_exit`（改为 `DEBUG_SYNC_C`）。
+
+```cpp
+// mtr0mtr.cc:662
+void mtr_t::commit() {
+  ut_ad(is_active());
+  m_impl.m_state = MTR_STATE_COMMITTING;
+
+  Command cmd(this);
+
+  if (has_any_log_record() ||
+      (has_modifications() && m_impl.m_log_mode == MTR_LOG_NO_REDO)) {
+    cmd.execute();        // ★ 有 redo → 完整路径
+  } else {
+    cmd.release_all();    // ★ 无 redo → 只放锁
+    cmd.release_resources();
+  }
+  check_nolog_and_unmark();
+}
+```
+
+**`mtr_t::Command::execute()`（`mtr0mtr.cc:842`）——完整路径，顺序极其讲究**：
+
+```cpp
+void mtr_t::Command::execute() {
+  ut_ad(m_impl->m_log_mode != MTR_LOG_NONE);
+
+  ulint len = prepare_write();      // ★① 决定 single / multi，返回待写字节数
+
+  if (len > 0) {
+    mtr_write_log_t write_log;
+    write_log.m_left_to_write = len;
+
+    auto handle = log_buffer_reserve(*log_sys, len);
+    // ★★② 一次性预留 [start_lsn, end_lsn) 区间（含 block 头尾开销）
+    //      8.0 的并发 redo 就靠这一步——不需要 log_reserve_and_open
+
+    write_log.m_handle = handle;
+    write_log.m_lsn = handle.start_lsn;
+
+    m_impl->m_log.for_each_block(write_log);
+    // ★★③ mtr 私有缓冲 → 全局 log buffer：逐 512B block memcpy
+
+    ut_ad(write_log.m_left_to_write == 0);
+    ut_ad(write_log.m_lsn == handle.end_lsn);
+
+    log_wait_for_space_in_log_recent_closed(*log_sys, handle.start_lsn);
+    // ★④ 等 recent_closed 腾出空间（否则会覆盖尚未完成 flush-list 链接的旧数据）
+
+    DEBUG_SYNC_C("mtr_redo_before_add_dirty_blocks");
+
+    add_dirty_blocks_to_flush_list(handle.start_lsn, handle.end_lsn);
+    // ★★⑤ 必须在 log_buffer_close()【之前】！顺序反了 checkpoint 会丢脏页
+
+    log_buffer_close(*log_sys, handle);
+    // ★⑥ 把区间挂进 recent_closed，此后 log writer 才可刷盘
+
+    m_impl->m_mtr->m_commit_lsn = handle.end_lsn;
+    // ★⑦ end_lsn 写回 mtr（mtr 没有 m_start_lsn / m_end_lsn）
+
+  } else {
+    DEBUG_SYNC_C("mtr_noredo_before_add_dirty_blocks");
+    add_dirty_blocks_to_flush_list(0, 0);
+  }
+
+  release_all();        // ★⑧ 逆序遍历 memo，放锁 + unfix block
+  release_resources();  // ★⑨ erase m_log / m_memo，state → COMMITTED
+}
+```
+
+> ★★ **⑤ 与 ⑥ 的顺序是正确性关键**：脏页必须先挂进 flush list，才能宣布"这段 redo 已 closed"。反过来的话，checkpoint 线程可能在脏页还没进 flush list 时就把 checkpoint_lsn 推过这段 redo——崩溃后就丢修改了。
+
+```cpp
+// mtr0mtr.cc:819
+void mtr_t::Command::release_all() {
+  Release_all release;
+  Iterate<Release_all> iterator(release);
+  m_impl->m_memo.for_each_block_in_reverse(iterator);   // ★ 逆序释放，与加锁顺序相反
+  m_locks_released = 1;
+}
+
+// mtr0mtr.cc:638
+void mtr_t::Command::release_resources() {
+  ut_ad(m_impl->m_state == MTR_STATE_COMMITTING);
+  m_impl->m_log.erase();
+  m_impl->m_memo.erase();
+  m_impl->m_state = MTR_STATE_COMMITTED;
+  m_impl = nullptr;
+}
+```
+
+**log buffer 接口签名**（`log0buf.h`，供交叉引用）：
+
+```cpp
+struct Log_handle {
+  /** LSN of the first data byte. */
+  lsn_t start_lsn;
+  /** LSN after the last data byte. */
+  lsn_t end_lsn;
+};
+
+Log_handle log_buffer_reserve(log_t &log, size_t len);              // :101
+lsn_t log_buffer_write(log_t &log, const byte *str, size_t str_len,
+                       lsn_t start_lsn);                            // :120
+void log_buffer_write_completed(log_t &log, lsn_t start_lsn,
+                                lsn_t end_lsn);                     // :135
+void log_buffer_set_first_record_group(log_t &log,
+                                       lsn_t rec_group_end_lsn);    // :153
+void log_buffer_close(log_t &log, const Log_handle &handle);        // :163
+void log_wait_for_space_in_log_recent_closed(log_t &log, lsn_t lsn);// :295
+```
+
 ```mermaid
 flowchart TD
     A["页面修改：mlog_open / mlog_write_initial_log_record_fast<br/>写 mtr 私有 buffer（mtr_buf_t）"] --> B["mtr_t::commit<br/>mtr0mtr.cc:672 分发"]
@@ -791,6 +1603,119 @@ lsn = sn / 496 * 512 + sn % 496 + 12
 - mtr 先按数据长度预留 sn 区间（无锁 fetch_add），再换算成 lsn 区间拷贝——这是 8.0 并发写 buffer 的基础
 
 ### lsn / sn / offset 三者关系与换算
+
+⚠️ **勘误**：换算函数**不在** `log0log.cc`，而在 **`storage/innobase/include/log0log.h:85` / `:94`**，且 `sn→lsn` 是 `constexpr inline`。
+
+```cpp
+/** Calculates lsn value for given sn value. Sequence of sn values
+enumerate all data bytes in the redo log. Sequence of lsn values
+enumerate all data bytes and bytes used for headers and footers
+of all log blocks in the redo log. For every LOG_BLOCK_DATA_SIZE
+bytes of data we have OS_FILE_LOG_BLOCK_SIZE bytes in the redo log.
+NOTE that LOG_BLOCK_DATA_SIZE + LOG_BLOCK_HDR_SIZE + LOG_BLOCK_TRL_SIZE
+== OS_FILE_LOG_BLOCK_SIZE. The calculated lsn value will always point
+to some data byte (will be % OS_FILE_LOG_BLOCK_SIZE >= LOG_BLOCK_HDR_SIZE,
+and < OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE). */
+constexpr inline lsn_t log_translate_sn_to_lsn(sn_t sn) {
+  return sn / LOG_BLOCK_DATA_SIZE * OS_FILE_LOG_BLOCK_SIZE +
+         sn % LOG_BLOCK_DATA_SIZE + LOG_BLOCK_HDR_SIZE;
+}
+```
+
+> ★ 三个项的含义：①跨过几个完整 block（`sn/496*512`）②当前 block 内偏移（`sn%496`）③块头 12 字节。结果必然落在 `[12, 508)`，即一定指向数据字节。
+
+```cpp
+/** Calculates sn value for given lsn value. */
+inline sn_t log_translate_lsn_to_sn(lsn_t lsn) {
+  /* Calculate sn of the beginning of log block, which contains
+  the provided lsn value. */
+  const sn_t sn = lsn / OS_FILE_LOG_BLOCK_SIZE * LOG_BLOCK_DATA_SIZE;
+
+  /* Calculate offset for the provided lsn within the log block.
+  The offset includes LOG_BLOCK_HDR_SIZE bytes of block's header. */
+  const uint32_t diff = lsn % OS_FILE_LOG_BLOCK_SIZE;
+
+  if (diff < LOG_BLOCK_HDR_SIZE) {
+    /* The lsn points to some bytes inside the block's header.
+    Return sn for the beginning of the block. Note, that sn
+    values don't enumerate bytes of blocks' headers, so the
+    value of diff does not matter at all. */
+    return sn;
+  }
+
+  if (diff > OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE) {
+    /* The lsn points to some bytes inside the block's footer.
+    Return sn for the beginning of the next block. */
+    return sn + LOG_BLOCK_DATA_SIZE;
+  }
+
+  /* Add the offset but skip bytes of block's header. */
+  return sn + diff - LOG_BLOCK_HDR_SIZE;
+}
+```
+
+> ★ 三分支：块头 → 本块起点；块尾 → 下块起点；数据区 → `sn + diff - 12`。注意第二个判据是 `diff > 508` 而非 `>=`（`diff == 508` 恰好是最后一个数据字节）。
+
+```cpp
+// log0log.h:127 —— 配套校验（断言用）
+inline bool log_is_data_lsn(lsn_t lsn) {
+  const uint32_t offset = lsn % OS_FILE_LOG_BLOCK_SIZE;
+  return lsn >= LOG_START_LSN && offset >= LOG_BLOCK_HDR_SIZE &&
+         offset < OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE;
+}
+```
+
+**常量**（`log0constants.h:294`，注意**不在** `log0types.h`）：
+
+```cpp
+/** Size of the log block's header in bytes. */
+constexpr uint32_t LOG_BLOCK_HDR_SIZE = 12;                       // :297
+
+/* Offsets used in a log block's footer (refer to the end of the block). */
+constexpr uint32_t LOG_BLOCK_CHECKSUM =
+    OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE;
+
+/** Size of the log block footer (trailer) in bytes. */
+constexpr uint32_t LOG_BLOCK_TRL_SIZE = 4;                        // :306
+
+static_assert(LOG_BLOCK_HDR_SIZE + LOG_BLOCK_TRL_SIZE < OS_FILE_LOG_BLOCK_SIZE,
+              "Header + footer cannot be larger than the whole log block.");
+
+/** Size of log block's data fragment (where actual data is stored). */
+constexpr uint32_t LOG_BLOCK_DATA_SIZE =
+    OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE - LOG_BLOCK_TRL_SIZE;  // 496
+
+/** Ensure, that 64 bits are enough to represent lsn values, when 63 bits
+are used for sn values, and that is guaranteed if the overhead enumerated
+in lsn sequence is not bigger than number of actual data bytes. */
+static_assert(LOG_BLOCK_HDR_SIZE + LOG_BLOCK_TRL_SIZE < LOG_BLOCK_DATA_SIZE,
+              "Overhead in LSN sequence cannot be bigger than actual data.");
+```
+
+```cpp
+// os0file.h:193
+constexpr uint32_t OS_FILE_LOG_BLOCK_SIZE = 512;
+
+// log0constants.h:50 —— buffer 起始地址按 512 对齐
+constexpr size_t LOG_BUFFER_ALIGNMENT = OS_FILE_LOG_BLOCK_SIZE;
+
+// log0constants.h:152 —— LSN 不从 0 开始
+constexpr lsn_t LOG_START_LSN = 16 * OS_FILE_LOG_BLOCK_SIZE;   // = 8192
+
+// log0constants.h:175 —— 每个 redo 文件的 4 个 header block
+constexpr os_offset_t LOG_FILE_HDR_SIZE = 4 * OS_FILE_LOG_BLOCK_SIZE;  // = 2048
+```
+
+```
+一个 512B block:
+ +--------+---------------+--------+
+ | HDR 12 |  DATA 496     | TRL 4  |
+ +--------+---------------+--------+
+ 0       12              508      512
+
+ lsn 覆盖全部 512 字节（含头尾）；sn 只覆盖中间 496 字节。
+ ⇒ lsn ≈ sn × 512/496 ≈ sn × 1.032（开销约 3.2%）
+```
 
 同一段 redo 数据有三个坐标视角：
 
@@ -864,6 +1789,188 @@ file_0: [8192, 3,282,944)        file_1: [3,282,944, 6,557,696)    …
 - 等待/唤醒按 lsn 分槽（`log.write_events[]`，notify 见 log0write.cc:1590）
 
 ### 并发 mtr 写 buffer：生产者侧的并发模型
+
+⚠️ **勘误**：这四个函数**不在** `log0log.cc`，而在 **`storage/innobase/log/log0buf.cc`**。且 `log_t` **没有** `buf_free`（被原子 `sn` 取代）也**没有** `max_buf_free`（被 `buf_limit_sn` 取代）。
+
+**第 0 步：s-lock 的"加锁/解锁"其实是两个原子操作**
+
+```cpp
+// log0buf.cc:527
+static inline sn_t log_buffer_s_lock_enter_reserve(log_t &log, size_t len) {
+  /* Reserve space in sequence of data bytes: */
+  sn_t start_sn = log.sn.fetch_add(len);
+  // ★★ 唯一的原子 RMW —— 全局无锁分配点。sn 只算数据字节，不含块头块尾
+
+  if (UNIV_UNLIKELY((start_sn & SN_LOCKED) != 0)) {
+    start_sn &= ~SN_LOCKED;
+    /* log.sn is locked. Should wait for unlocked. */
+    log_buffer_s_lock_wait(log, start_sn);
+    // ★ 撞上 x-lock（如 log_buffer_x_lock_enter / resize）→ 退化为等 sn_lock_event
+  }
+  return start_sn;
+}
+
+// log0buf.cc:566 —— 对应的"解锁"
+static inline void log_buffer_s_lock_exit_close(log_t &log, lsn_t start_lsn,
+                                                lsn_t end_lsn) {
+  log.recent_closed.add_link_advance_tail(start_lsn, end_lsn);
+  // ★★ 这一步就是 5.7 的 log_flush_order_mutex "unlock" —— 8.0 用 Link_buf 无锁化
+}
+```
+
+**第 1 步：`log_buffer_reserve()`（:859）**
+
+```cpp
+Log_handle log_buffer_reserve(log_t &log, size_t len) {
+  Log_handle handle;
+  srv_stats.log_write_requests.inc();
+  ut_a(len > 0);
+
+  /* Reserve space in sequence of data bytes: */
+  const sn_t start_sn = log_buffer_s_lock_enter_reserve(log, len);
+  const sn_t end_sn = start_sn + len;
+
+  /* Headers in redo blocks are not calculated to sn values: */
+  handle.start_lsn = log_translate_sn_to_lsn(start_sn);
+  handle.end_lsn = log_translate_sn_to_lsn(end_sn);
+  // ★ sn → lsn，这一步才把块头字节"摊"进去
+
+  if (unlikely(end_sn > log.buf_limit_sn.load())) {
+    log_wait_for_space_after_reserving(log, handle);
+    // ★ 环形 buffer 放不下就背压（必要时自动扩容）
+  }
+  return handle;
+}
+```
+
+**第 2 步：`log_buffer_write()`（:922）—— 环形 buffer 的跨块 memcpy**
+
+```cpp
+lsn_t log_buffer_write(log_t &log, const byte *str, size_t str_len,
+                       lsn_t start_lsn) {
+  byte *buf_end = log.buf + log.buf_size;
+  byte *ptr = log.buf + (start_lsn % log.buf_size);   // ★ 环形寻址
+  lsn_t lsn = start_lsn;
+
+  while (true) {
+    const auto offset = lsn % OS_FILE_LOG_BLOCK_SIZE;
+    /* Calculate how many free data bytes are available
+    within current log block. */
+    const auto left = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE - offset;
+    // ★ 本块还剩多少数据字节（扣掉 4 字节 trailer）
+
+    size_t len, lsn_diff;
+
+    if (left > str_len) {
+      len = str_len;
+      lsn_diff = str_len;            // ★ 没跨块：lsn 前进 = 复制的字节数
+    } else {
+      len = left;
+      lsn_diff = left + LOG_BLOCK_TRL_SIZE + LOG_BLOCK_HDR_SIZE;
+      // ★★ 跨块：lsn 还要额外跳过 4B trailer + 12B 下一块 header
+    }
+
+    /* This is the critical memcpy operation, which copies data
+    from internal mtr's buffer to the shared log buffer. */
+    std::memcpy(ptr, str, len);
+
+    str_len -= len; str += len;
+    lsn += lsn_diff; ptr += lsn_diff;
+
+    if (ptr >= buf_end) ptr -= log.buf_size;   // ★ 环形回绕
+
+    if (lsn_diff > left) {
+      /* We have crossed boundaries between consecutive log blocks. ... */
+      log_block_set_first_rec_group(
+          reinterpret_cast<byte *>(uintptr_t(ptr) & ~uintptr_t(LOG_BLOCK_HDR_SIZE)),
+          0);
+      // ★ 新块先把 first_rec_group 清零，后续由 set_first_record_group 回填
+      if (str_len == 0) break;
+    } else {
+      break;
+    }
+  }
+  return lsn;
+}
+```
+
+**第 3 步：`log_buffer_write_completed()`（:1061）**
+
+```cpp
+void log_buffer_write_completed(log_t &log, lsn_t start_lsn, lsn_t end_lsn) {
+  uint64_t wait_loops = 0;
+
+  while (!log.recent_written.has_space(start_lsn)) {
+    os_event_set(log.writer_event);   // ★ 背压：催 log_writer 快推进 tail
+    ++wait_loops;
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+
+  /* Disallow reordering of writes to log buffer after this point. ... */
+  std::atomic_thread_fence(std::memory_order_release);
+  // ★ 确保 memcpy 的写入对 log_writer 可见（release 语义）
+
+  log.recent_written.add_link_advance_tail(start_lsn, end_lsn);
+  // ★★ 告诉 log_writer "我这段写完了"，并尝试推进 tail
+}
+```
+
+**第 4 步：`log_buffer_close()`（:1142）**
+
+```cpp
+void log_buffer_close(log_t &log, const Log_handle &handle) {
+  std::atomic_thread_fence(std::memory_order_release);
+  // ★ 保证"页面已挂入 flush list"这个副作用对后续 recent_closed 观察者可见
+
+  log_buffer_s_lock_exit_close(log, handle.start_lsn, handle.end_lsn);
+  // → log.recent_closed.add_link_advance_tail(...)
+}
+```
+
+**背压上限的计算**（`log_update_buf_limit`，:818）：
+
+```cpp
+void log_update_buf_limit(log_t &log, lsn_t write_lsn) {
+  const sn_t limit_for_end = log_translate_lsn_to_sn(write_lsn) +
+                             log.buf_size_sn.load() -
+                             2 * OS_FILE_LOG_BLOCK_SIZE;
+  // ★ 留 2 个 block 的安全余量，避免边界竞态
+  log.buf_limit_sn.store(limit_for_end);
+}
+```
+
+`log_t` 中生产者侧的关键字段（`log0sys.h:88-159`）：
+
+```cpp
+  /** Current sn value. Used to reserve space in the redo log,
+  and used to acquire an exclusive access to the log buffer.
+  Represents number of data bytes that have ever been reserved.
+  Bytes of headers and footers of log blocks are not included.
+  Its highest bit is used for locking the access to the log buffer. */
+  alignas(ut::INNODB_CACHE_LINE_SIZE) atomic_sn_t sn;   // ★ 取代 5.7 的 buf_free
+
+  /** Aligned log buffer. ... */
+  alignas(ut::INNODB_CACHE_LINE_SIZE)
+      ut::aligned_array_pointer<byte, LOG_BUFFER_ALIGNMENT> buf;
+
+  /** Size of the log buffer expressed in number of data bytes,
+  that is excluding bytes for headers and footers of log blocks. */
+  atomic_sn_t buf_size_sn;
+
+  /** Size of the log buffer expressed in number of total bytes,
+  that is including bytes for headers and footers of log blocks. */
+  size_t buf_size;
+
+  /** The recent written buffer. */
+  alignas(ut::INNODB_CACHE_LINE_SIZE) Link_buf<lsn_t> recent_written;
+
+  /** The recent closed buffer. */
+  alignas(ut::INNODB_CACHE_LINE_SIZE) Link_buf<lsn_t> recent_closed;
+
+  /** Maximum sn up to which there is free space in both the log buffer
+  and the log files. */
+  alignas(ut::INNODB_CACHE_LINE_SIZE) atomic_sn_t buf_limit_sn;  // ★ 取代 max_buf_free
+```
 
 8.0 的核心改造：多个用户线程的 mtr commit **并发往 log buffer 拷 redo**，无需全局锁（5.7 是 log mutex 串行写 buffer + 用户线程自己写盘/fsync，高并发下是瓶颈）。
 
@@ -959,6 +2066,208 @@ os_event_set(log.sn_lock_event);                  // ④ 唤醒等锁的 S 方
 **为什么不用真 rwlock**：S 方核心需求是"无锁 fetch_add 发号"，真 rwlock 的 S 锁与发号是两步、有额外原子开销；用最高位当锁位，S 发号与 X 抢锁共享同一条原子指令，零额外同步。代价：X 期间 S 方可能加出"伪号"（抹位等待），且可用 sn 空间只剩 63 位。
 
 ### Link_buf 内部结构（ut0link_buf.h:78）
+
+`Link_buf` 是 8.0 无锁 redo 的**核心数据结构**。它的职责（源码注释原文）：*"informed about finished concurrent operations and tracks up to which point in a total order all operations have been finished (**there are no holes**)"*。
+
+```cpp
+template <typename Position = uint64_t>
+class Link_buf {
+ public:
+  typedef Position Distance;
+
+  explicit Link_buf(size_t capacity);
+
+  /** Add a directed link between two given positions. ... */
+  void add_link(Position from, Position to);
+
+  /** ... In addition, advances the tail pointer in the buffer if possible. */
+  void add_link_advance_tail(Position from, Position to);
+
+  /** Advances the tail pointer in the buffer by following connected
+  path created by links. ... */
+  template <typename Stop_condition>
+  bool advance_tail_until(Stop_condition stop_condition,
+                          uint32_t max_retry = 1);
+  bool advance_tail();
+
+  size_t capacity() const;
+  Position tail() const;
+  bool has_space(Position position);
+
+ private:
+  size_t slot_index(Position position) const;
+  bool next_position(Position position, Position &next);
+
+  /** Capacity of the buffer. */
+  size_t m_capacity;
+
+  /** Pointer to the ring buffer (unaligned). */
+  std::atomic<Distance> *m_links;
+
+  /** Tail pointer in the buffer (expressed in original unit). */
+  alignas(ut::INNODB_CACHE_LINE_SIZE) std::atomic<Position> m_tail;
+};
+```
+
+```cpp
+// ut0link_buf.h:197 —— capacity 必须是 2 的幂
+template <typename Position>
+Link_buf<Position>::Link_buf(size_t capacity)
+    : m_capacity(capacity), m_tail(0) {
+  if (capacity == 0) { m_links = nullptr; return; }
+
+  ut_a((capacity & (capacity - 1)) == 0);
+  // ★ 2 的幂，slot_index 才能用 & (cap-1)
+  ...
+}
+
+// :252 —— 建链接就是往 slot 里写一个"目标位置"
+template <typename Position>
+inline void Link_buf<Position>::add_link(Position from, Position to) {
+  const auto index = slot_index(from);
+  auto &slot = m_links[index];
+  slot.store(to);
+}
+
+// :264 —— next <= position 表示"没有向前的链接"，即该停了
+template <typename Position>
+inline bool Link_buf<Position>::next_position(Position position,
+                                              Position &next) {
+  const auto index = slot_index(position);
+  next = m_links[index].load(std::memory_order_relaxed);
+  return next <= position;
+}
+
+// :276 —— 快路径 vs 慢路径
+template <typename Position>
+inline void Link_buf<Position>::add_link_advance_tail(Position from,
+                                                      Position to) {
+  auto position = m_tail.load(std::memory_order_acquire);
+  ut_ad(position <= from);
+
+  if (position == from) {
+    /* can advance m_tail directly and exclusively, and it is unlock */
+    m_tail.store(to, std::memory_order_release);
+    // ★ 快路径：我正好是 tail，无需建链接，直接推进
+  } else {
+    auto &slot = m_links[slot_index(from)];
+    slot.store(to, std::memory_order_release);   // 建链接
+    auto stop_condition = [&](Position prev_pos, Position) {
+      return (prev_pos > from);
+    };
+    advance_tail_until(stop_condition);
+  }
+}
+
+// :389
+template <typename Position>
+inline size_t Link_buf<Position>::slot_index(Position position) const {
+  return position & (m_capacity - 1);
+}
+
+template <typename Position>
+inline bool Link_buf<Position>::has_space(Position position) {
+  auto tail = m_tail.load(std::memory_order_acquire);
+  if (tail + m_capacity > position) return true;   // 快路径：已在窗口内
+
+  auto stop_condition = [](Position, Position) { return false; };
+  advance_tail_until(stop_condition, 0);
+  // ★ 慢路径：调用者自己尝试推进 tail（max_retry=0，失败就放弃）
+
+  tail = m_tail.load(std::memory_order_acquire);
+  return tail + m_capacity > position;
+}
+```
+
+**`advance_tail_until()`（:304）——最精妙的一段：CAS 把走过的链接"抹掉"来实现独占推进**
+
+```cpp
+template <typename Position>
+template <typename Stop_condition>
+bool Link_buf<Position>::advance_tail_until(Stop_condition stop_condition,
+                                            uint32_t max_retry) {
+  auto position = m_tail.load(std::memory_order_acquire);
+  auto from = position;
+
+  uint32_t retry = 0;
+  while (true) {
+    auto index = slot_index(position);
+    auto &slot = m_links[index];
+    auto next_load = slot.load(std::memory_order_acquire);
+
+    if (next_load >= position + m_capacity) {
+      /* either we wrapped and tail was advanced meanwhile,
+      or there is link start_lsn -> end_lsn of length >= m_capacity */
+      position = m_tail.load(std::memory_order_acquire);
+      if (position != from) { from = position; continue; }
+    }
+
+    if (next_load <= position || stop_condition(position, next_load)) {
+      return false;      // ★ 没有链接 or 满足外部 stop 条件 → 推进失败
+    }
+
+    /* try to lock as storing the end */
+    if (slot.compare_exchange_strong(next_load, position,
+                                     std::memory_order_acq_rel)) {
+      // ★★ CAS 把 slot 值改回 position —— 这就是"加锁"：把走过的链接抹掉，
+      //    别的线程再走到这里会看到 next<=position 而停下，
+      //    只有一个线程能独占推进
+      position = m_tail.load(std::memory_order_acquire);
+      if (position == from) {
+        position = next_load;
+        break;
+      }
+    }
+
+    retry++;
+    if (retry > max_retry) return false;
+    UT_RELAX_CPU();
+    position = m_tail.load(std::memory_order_acquire);
+    if (position == from) return false;
+    from = position;
+  }
+
+  while (true) {          // ★ 拿到独占权后，沿链接一路向前"吃"到底
+    Position next;
+    bool stop = next_position(position, next);
+    if (stop || stop_condition(position, next)) break;
+    position = next;
+  }
+
+  ut_a(from == m_tail.load(std::memory_order_acquire));
+  m_tail.store(position, std::memory_order_release);   // unlock
+  return position != from;
+}
+```
+
+**两个 Link_buf 实例的语义**（`log0buf.h:247`）：
+
+```cpp
+/** @return lsn up to which all writes to log buffer have been finished */
+inline lsn_t log_buffer_ready_for_write_lsn(const log_t &log) {
+  return log.recent_written.tail();
+}
+
+/** @return lsn up to which all dirty pages have been added to flush list */
+inline lsn_t log_buffer_dirty_pages_added_up_to_lsn(const log_t &log) {
+  return log.recent_closed.tail();
+}
+
+/** @return capacity of the recent_closed, or 0 if !log_use_threads() */
+inline lsn_t log_buffer_flush_order_lag(const log_t &log) {
+  return log.recent_closed.capacity();
+}
+```
+
+```
+recent_written：消除"log buffer 里的洞" —— 多个 mtr 并发 memcpy，
+                谁先写完不确定；tail 只推进到"连续无洞"的位置。
+                log_writer 只能写 tail 之前的数据。
+
+recent_closed：消除"flush list 里的洞" —— 保证 checkpoint_lsn
+                之前的所有脏页都已挂进 flush list。
+                替代 5.7 的 log_flush_order_mutex。
+```
 
 无锁并发区间完成度跟踪的环形数组，是 8.0 无锁化的核心数据结构。
 
@@ -1239,6 +2548,318 @@ static void log_flush_low(log_t &log) {
 
 **关键分支**：**只有 `innodb_flush_method != O_DSYNC` 时才调 fsync**——因为 O_DSYNC 模式下 redo 文件是用 `O_SYNC` 打开的，内核在每次 `pwrite` 返回时已保证落盘。
 
+#### ★ 线程视角：事件驱动链、背压链与并发控制
+
+**`log_writer()` 主循环**（`log0write.cc:2236`）——整条链的"发动机"：
+
+```cpp
+void log_writer(log_t *log_ptr) {
+  log_t &log = *log_ptr;
+  lsn_t ready_lsn = 0;
+
+  log_writer_mutex_enter(log);
+
+  Log_thread_waiting waiting{log, log.writer_event, srv_log_writer_spin_delay,
+                             get_srv_log_writer_timeout()};
+  Log_write_to_file_requests_monitor write_to_file_requests_monitor{log};
+
+  for (uint64_t step = 0;; ++step) {
+    bool released = false;
+
+    auto stop_condition = [&](bool wait) {
+      if (released) { log_writer_mutex_enter(log); released = false; }
+
+      /* Advance lsn up to which data is ready in log buffer. */
+      log_advance_ready_for_write_lsn(log);
+      // ★★ 唯一的"推进 recent_written.tail()"正式调用点（取代旧 log_closer 线程）
+
+      ready_lsn = log_buffer_ready_for_write_lsn(log);
+
+      /* Wait until any of following conditions holds:
+              1) There is some unwritten data in log buffer
+              2) We should close threads. */
+      if (log.write_lsn.load() < ready_lsn || log.should_stop_threads.load()) {
+        return true;      // ★ 轮询条件
+      }
+      if (UNIV_UNLIKELY(log.writer_threads_paused.load())) return true;
+
+      if (wait) {
+        write_to_file_requests_monitor.update();
+        log_writer_mutex_exit(log);   // ★ 等待前放锁
+        released = true;
+      }
+      return false;
+    };
+
+    const auto wait_stats = waiting.wait(stop_condition);
+
+    if (UNIV_UNLIKELY(log.writer_threads_paused.load() &&
+                      !log.should_stop_threads.load())) {
+      log_writer_mutex_exit(log);
+      os_event_wait(log.writer_threads_resume_event);
+      // ★ 暂停点：innodb_log_writer_threads=OFF 时在此挂起
+      log_writer_mutex_enter(log);
+      ready_lsn = log_buffer_ready_for_write_lsn(log);
+    }
+
+    /* Do the actual work. */
+    if (log.write_lsn.load() < ready_lsn) {
+      log_writer_write_buffer(log, ready_lsn);
+
+      if (step % 1024 == 0) {
+        log_writer_mutex_exit(log);
+        std::this_thread::sleep_for(std::chrono::seconds(0));  // ★ 让出 CPU
+        log_writer_mutex_enter(log);
+      }
+    } else if (log.should_stop_threads.load() &&
+               log_writer_is_allowed_to_stop(log)) {
+      break;
+    }
+  }
+  log_writer_mutex_exit(log);
+}
+```
+
+**`log_flusher()` + `log_flush_low()`（:2501 / :2427）——fsync 只有一行**
+
+```cpp
+void log_flusher(log_t *log_ptr) {
+  log_t &log = *log_ptr;
+
+  Log_thread_waiting waiting{log, log.flusher_event, srv_log_flusher_spin_delay,
+                             get_srv_log_flusher_timeout()};
+  log_flusher_mutex_enter(log);
+
+  for (uint64_t step = 0;; ++step) {
+    if (log.should_stop_threads.load()) {
+      if (!log_writer_is_active()) break;
+    }
+    if (UNIV_UNLIKELY(log.writer_threads_paused.load())) {
+      log_flusher_mutex_exit(log);
+      os_event_wait(log.writer_threads_resume_event);
+      log_flusher_mutex_enter(log);
+    }
+
+    bool released = false;
+    auto stop_condition = [&](bool wait) {
+      if (released) { log_flusher_mutex_enter(log); released = false; }
+
+      const lsn_t last_flush_lsn = log.flushed_to_disk_lsn.load();
+      ut_a(last_flush_lsn <= log.write_lsn.load());
+
+      if (last_flush_lsn < log.write_lsn.load()) {
+        log_flush_low(log);         // ★ flushed < written → 立即 fsync
+        if (step % 1024 == 0) { log_flusher_mutex_exit(log);
+                                std::this_thread::sleep_for(std::chrono::seconds(0));
+                                log_flusher_mutex_enter(log); }
+        return true;
+      }
+      ...
+      if (wait) { log_flusher_mutex_exit(log); released = true; }
+      return false;
+    };
+
+    if (srv_flush_log_at_trx_commit != 1) {
+      /* 最多每 innodb_flush_log_at_timeout 秒强制 flush 一次 */
+      const auto time_elapsed = ...;
+      const auto flush_every = get_srv_flush_log_at_timeout();
+      if (time_elapsed < flush_every) {
+        log_flusher_mutex_exit(log);
+        if (!log.should_stop_threads.load()) {
+          os_event_wait_time_low(log.flusher_event,
+                                 flush_every - time_elapsed, 0);
+        }
+        log_flusher_mutex_enter(log);
+      }
+    }
+
+    const auto wait_stats = waiting.wait(stop_condition);
+  }
+
+  if (log.write_lsn.load() > log.flushed_to_disk_lsn.load()) log_flush_low(log);
+  log_flusher_mutex_exit(log);
+}
+```
+
+```cpp
+// log0write.cc:2427 —— 取代了 8.0 早期名字 log_files_fsync()
+static void log_flush_low(log_t &log) {
+#ifndef _WIN32
+  bool do_flush = srv_unix_file_flush_method != SRV_UNIX_O_DSYNC;
+  // ★ O_DSYNC 打开时每次 write 已带同步语义，无需额外 fsync
+#else
+  bool do_flush = true;
+#endif
+
+  const lsn_t last_flush_lsn = log.flushed_to_disk_lsn.load();
+  const lsn_t flush_up_to_lsn = log.write_lsn.load();
+
+  if (flush_up_to_lsn == last_flush_lsn) {
+    os_event_set(log.old_flush_event);
+    return;
+  }
+
+  log.last_flush_start_time = Log_clock::now();
+
+  if (do_flush) {
+    log.m_current_file_handle.fsync();   // ★★ 真正的 fsync 就这一行
+  }
+
+  log.last_flush_end_time = Log_clock::now();
+
+  log.flushed_to_disk_lsn.store(flush_up_to_lsn);
+
+  /* Notify other thread(s). */
+  if (!log.writer_threads_paused.load()) {
+    const auto first_slot =
+        log_compute_flush_event_slot(log, last_flush_lsn + 1);
+    const auto last_slot = log_compute_flush_event_slot(log, flush_up_to_lsn);
+
+    if (first_slot == last_slot) {
+      os_event_set(log.flush_events[first_slot]);
+      // ★ 优化：同一槽 → 直接唤醒用户线程，不必惊动 flush_notifier
+    } else {
+      os_event_set(log.flush_notifier_event);
+      // ★ 跨槽 → 交给 log_flush_notifier 批量广播
+    }
+  }
+  log_flush_update_stats(log);
+}
+```
+
+> ⚠️ **勘误（重要）**：**`log_closer` 线程在 8.0.39 已移除**。后台线程实际创建 **6 个**（`log0log.cc:920-936`）：`log_checkpointer` / `log_flush_notifier` / `log_flusher` / `log_write_notifier` / `log_writer` / `log_files_governor`。`recent_closed` 的推进改由 `log_writer` 的 `log_advance_ready_for_write_lsn()` 与 `log_buffer_x_lock_enter()` 内的 `advance_tail()` 承担，只留下 `closer_event` / `closer_mutex` 用于"等 buffer 中数据 ready"的退避路径。
+>
+> ⚠️ 也**不存在** `log_write_ahead()` / `log_files_write_ahead_if_needed()`——write-ahead 被拆成 `compute_next_write_ahead_end()` / `prepare_for_write_ahead()` / `copy_to_write_ahead_buffer()` / `update_current_write_ahead()` 四个 helper。
+>
+> ★ write-ahead 的**核心取舍**（`compute_how_much_to_write`，:1414）：
+> ```cpp
+> write_from_log_buffer = write_size >= OS_FILE_LOG_BLOCK_SIZE;
+> // ★ 只有"至少一个完整块"才敢零拷贝直写 log buffer；
+> //   不完整的块必须先拷到 write_ahead_buf（因为用户线程还在并发往里写）
+> ```
+
+上表给出了"谁做什么"。这一节讲**执行体本身**：线程怎么创建、睡在哪、被谁叫醒、卡了谁。
+
+**① 创建：一个函数造齐 6 个线程，成员名不带 `_thread` 后缀**
+
+```cpp
+// storage/innobase/log/log0log.cc
+void log_start_background_threads(log_t &log) {
+  srv_threads.m_log_checkpointer   = os_thread_create(log_checkpointer_thread_key, 0, log_checkpointer, &log);
+  srv_threads.m_log_flush_notifier = os_thread_create(log_flush_notifier_thread_key, 0, log_flush_notifier, &log);
+  srv_threads.m_log_flusher        = os_thread_create(log_flusher_thread_key, 0, log_flusher, &log);
+  srv_threads.m_log_write_notifier = os_thread_create(log_write_notifier_thread_key, 0, log_write_notifier, &log);
+  srv_threads.m_log_writer         = os_thread_create(log_writer_thread_key, 0, log_writer, &log);
+  srv_threads.m_log_files_governor = os_thread_create(log_files_governor_thread_key, 0, log_files_governor, &log);
+  ...
+}
+```
+
+★ **`Srv_threads` 成员是 `m_log_writer` 不是 `srv_threads.log_writer_thread`**（后者是流传写法，源码无此名）。6 个线程里 `log_files_governor` 是 8.0.30+ 新增（#30 redo 容量体系，管文件的创建/删除，不写 checkpoint）；`log_closer` 线程已不存在（见上节的 ★ 注）。8.0.30+ 还支持 `SET GLOBAL innodb_log_writer_threads=false` 暂停 writer+flusher（`log_pause_writer_threads()`），此时**用户线程走 `log_self_write_up_to()` 自己写自己刷**。
+
+**② 等待模型统一：spin → event（`Log_thread_waiting`）**
+
+每个线程的主循环都是同一骨架，参数不同：
+
+| 线程 | 事件（`log_t` 成员） | 自旋 | 超时 |
+|---|---|---|---|
+| `log_writer` | `log.writer_event` | 250000µs（`INNODB_LOG_WRITER_SPIN_DELAY_DEFAULT`） | 10ms |
+| `log_flusher` | `log.flusher_event` | 各自的 `srv_log_flusher_spin_delay` | 各自 timeout |
+| `log_checkpointer` | `log.checkpointer_event` | — | ★ **空闲睡 `innodb_log_checkpoint_every`（默认 1000ms）**；系统繁忙时拉长到 `log_busy_checkpoint_interval(=7) × every` |
+| `log_write_notifier` | `log.write_notifier_event` | | |
+| `log_flush_notifier` | `log.flush_notifier_event` | | |
+
+★ **这些事件不是全局变量**，全部是 `log_t`（`log0sys.h`）的成员。且用户线程等的是**分槽事件数组**而非 notifier 的中央事件：
+
+```cpp
+os_event_t *write_events;    // 按 lsn 取模分槽：log_compute_write_event_slot()
+os_event_t *flush_events;    // log_compute_flush_event_slot()
+```
+
+**③ ★ 完整接力链（`innodb_flush_log_at_trx_commit=1`）**
+
+```
+用户线程 mtr commit
+  └─ log_buffer_reserve()                        sn 原子预留
+  └─ log_buffer_write_completed()                recent_written.add_link_advance_tail
+        └─ (recent_written 无空间) set log.writer_event，20µs 自旋等
+用户线程 trx commit（trx0trx.cc）
+  └─ log_write_up_to(lsn, flush=true)
+        ├─ log_wait_for_write():  set log.writer_event → 等 log.write_events[slot]
+        └─ log_wait_for_flush():  set log.writer_event + log.flusher_event
+                                   → 等 log.flush_events[slot]   ← ★ 用户线程最终在此睡觉
+
+log_writer  → 写 OS 页缓存（无 fsync）
+      ├─ set log.flusher_event            （trx_commit==1 时）
+      └─ set log.write_events[slot]（同 slot）或 set log.write_notifier_event
+log_write_notifier → set log.write_events[slot]          （跨 slot 接力）
+log_flusher  → log_flush_low() → fsync → flushed_to_disk_lsn
+      └─ set log.flush_events[slot]（同 slot）或 set log.flush_notifier_event
+log_flush_notifier → set log.flush_events[slot]          （跨 slot 接力）
+
+用户线程从 log.flush_events[slot] 醒 → commit 返回
+```
+
+★ **notifier 只在"一次推进跨越多个 slot"时才被启用接力**；同 slot 由写线程直接 set。这就是"为什么有 5 个线程却只看到 2~3 个干活"的原因——notifier 是低频接力员。
+
+**用户线程可以不等**（`trx0trx.cc` 的真实 switch）：
+
+```cpp
+switch (srv_flush_log_at_trx_commit) {
+  case 2:  flush = false;  [[fallthrough]];   // 只等 write，不等 fsync
+  case 1:  wait_stats = log_write_up_to(*log_sys, lsn, flush); return;
+  case 0:  return;                            // 完全不等
+}
+```
+
+`=2` 时 writer 写完也**不再** set `flusher_event`，fsync 由 flusher 按 `innodb_flush_log_at_timeout`（默认 1s）限频兜底。
+
+**④ ★ 两级背压：卡谁、谁来解**
+
+**(a) log buffer 满** → 卡**用户线程自己**：
+
+```cpp
+// log0buf.cc  log_buffer_reserve()
+srv_stats.log_waits.inc();                       // Innodb_log_waits 计数
+wait_stats = log_write_up_to(log, lsn, false);   // 用户线程自己等 write_lsn 推进
+```
+
+解锁者：**log_writer**（把 buffer 写出去腾空间）。
+
+**(b) redo 文件容量满**（`log_free_check()`）→ 卡**所有要写 redo 的用户线程**，闭环解铃：
+
+```
+用户线程 log_free_check_wait()：100µs 忙等（★ 是轮询不是睡眠！）
+  └─ log_request_checkpoint_low() → set log.checkpointer_event
+log_checkpointer 醒
+  ├─ log_consider_sync_flush(): checkpoint_age > adaptive_flush_max_age
+  │     └─ log_request_sync_flush() → set buf_flush_event → page cleaner sync flush
+  └─ log_consider_checkpoint() → log_checkpoint()
+page cleaner 刷最老脏页 → available_for_checkpoint_lsn 前移
+  → log_update_limits 抬高 log.free_check_limit_lsn → 用户线程解除忙等
+```
+
+（page cleaner 侧的细节与 Adaptive_flush 公式见 [`buffer_pool.md`](buffer_pool.md) 的「线程视角」一节。容量层级 `hard → soft → free_check_margin → free_check_capacity` 的推导见本篇「容量限制体系：梯度限流」。）
+
+**(c) 第三级**：`recent_written` / `recent_closed` 环满 → 用户线程 20µs sleep 自旋（性能背压，非长阻塞）。log_writer 自身**从不死等 buf flush**——它持有比 soft 容量多 `LOG_EXTRA_WRITER_MARGIN_PCT` 的**私有余量**用于自救（`log0files_capacity.cc` 顶部注释的容量图）。
+
+**⑤ 并发控制小结**
+
+- **sn 的最高位就是锁位**（`log0sys.h` 注释原文）：用户线程 `log_buffer_s_lock_enter_reserve()` S 锁预留；x 锁（buffer resize）走 `log.sn_x_lock_mutex` + `sn_locked` 目标值。细节见本篇「sn_lock 与 SNLOCKED」。
+- **writer / flusher 互不越界，无共享 barrier**：writer 持 `log.writer_mutex` 推进 `log.write_lsn`；flusher 持 `log.flusher_mutex`，stop_condition 里断言 `ut_a(last_flush_lsn <= log.write_lsn)`，fsync 后 `log.flushed_to_disk_lsn.store(...)`。
+- ★ `Log_sn_lock` 类**不存在**——真实组织是 `log_t` 的内嵌字段（`sn` / `sn_lock_event` / `sn_x_lock_mutex`）；`log_sys` 单例仍是 `extern log_t *log_sys;`，8.0.30 未改名（`log0sys.h` 是 8.0.30 拆出的新头文件）。
+- ★ **`log_sync()` 在 8.0.39 不存在**（`log0sync.cc` 文件也已并入）——fsync 就在 `log_flush_low()` 里。早期 8.0 资料（含部分官方注释）里的 `log_sync` 已过时。
+
+**⑥ 流传但不存在/已改名清单（log 线程族）**
+
+| 流传 | 真实 |
+|---|---|
+| `srv_threads.log_writer_thread` | `srv_threads.m_log_writer` |
+| 全局事件 `log_writer_event` | `log.writer_event`（`log_t` 成员） |
+| `log_sync()` | `log_flush_low()` 内 `fsync()` |
+| 专用 `log_closer` 线程 | 不存在；`log_advance_ready_for_write_lsn()` 由 writer/用户线程完成 |
+| `log_flush_to_disk` 线程 | 不存在；8.0.30+ 新增的是 `log_files_governor` |
+
 ### ★ redo 与数据文件的 I/O 方式差异
 
 | | 数据文件 | redo 文件 |
@@ -1250,6 +2871,8 @@ static void log_flush_low(log_t &log) {
 | 文件锁 | 加 `os_file_lock` | 不加 |
 
 > **一句话**：**redo 永远不走 AIO**（`os_aio_func` 里有 `ut_a(!type.is_log())`），也**永不开 O_DIRECT**。它只有同步 `pwrite` + `fsync`（或 `O_SYNC`）。这与数据文件"异步 AIO + 可选 O_DIRECT"是完全不同的两条路。
+>
+> ★ 同样地 redo **无 `fadvise DONTNEED` 清理**（InnoDB 全部 4 处 fadvise 都在 DDL 临时文件/探测读，不碰 redo）。为什么不给 O_DIRECT 开关、为什么不用清理——三个决策变量（双重缓存 / write-through / 读模式）的完整剖析见 [`io.md`](io.md)「page cache 参与决策」节。
 
 ### write-ahead：避免 read-on-write
 
@@ -1302,6 +2925,140 @@ redo 文件固定容量循环复用，要让旧 redo 可被覆盖，必须保证
 
 ### checkpoint_lsn 的选择（三个上限）
 
+**真实函数：`log_compute_available_for_checkpoint_lsn()`**（`log0chkp.cc:193`）：
+
+```cpp
+static lsn_t log_compute_available_for_checkpoint_lsn(const log_t &log) {
+  /* The log_buffer_dirty_pages_added_up_to_lsn() can only increase,
+  and that happens only after all related dirty pages have been added
+  to the flush lists.
+
+  Hence, to avoid issues related to race conditions, we follow order:
+          1. Note lsn up to which all dirty pages have already been
+             added to flush lists.
+          2. Check buffer pool to get LWM lsn for unflushed dirty pages
+             added to flush lists.
+          3. Flush lists were empty (no LWM) => use [1] as LWM.
+          4. Checkpoint LSN could be min(LWM, flushed_to_disk_lsn). */
+
+  const lsn_t dpa_lsn = log_buffer_dirty_pages_added_up_to_lsn(log);
+  // ★ 上限②：recent_closed.tail() —— "所有 mtr 的脏页都已挂进 flush list"的保证点
+
+  lsn_t lwm_lsn = buf_pool_get_oldest_modification_lwm();
+  // ★ 上限①：flush list 最老脏页的安全下界
+
+  /* We cannot return lsn larger than dpa_lsn, because some mtr's commit
+  could be in the middle, after its log records have been written to log
+  buffer, but before its dirty pages have been added to flush lists. */
+  if (lwm_lsn == 0) {
+    lwm_lsn = dpa_lsn;              // 空 flush list
+  } else {
+    lwm_lsn = std::min(lwm_lsn, dpa_lsn);   // ★ ①②取小
+  }
+
+  /* Cannot go beyond flushed lsn. ...
+
+  We cannot write checkpoint at higher lsn than lsn up to which
+  redo is flushed to disk. We must not wait for log writer/flusher
+  in log_checkpoint(). Therefore we need to limit lsn for checkpoint.
+  That's because we would risk a deadlock otherwise - because writer
+  waits for advanced checkpoint, when it detected that there is no
+  free space in log files. */
+
+  const lsn_t flushed_lsn = log.flushed_to_disk_lsn.load();
+  // ★★ 上限③：redo 已 fsync 落盘的点（【不是】"log buffer 上限"！）
+
+  lsn_t lsn = std::min(lwm_lsn, flushed_lsn);   // ★ 最终 = min(①②, ③)
+
+  /* We expect in recovery that checkpoint_lsn is within data area
+  of log block. ... */
+  if (lsn % OS_FILE_LOG_BLOCK_SIZE == 0) {
+    /* Do not make checkpoints at block boundary. */
+    lsn = lsn - OS_FILE_LOG_BLOCK_SIZE + LOG_BLOCK_HDR_SIZE;
+    // ★★ checkpoint_lsn 不许落在 block 边界，必须落在数据区
+  }
+
+  lsn = std::max(lsn, log.last_checkpoint_lsn.load());   // ★ 单调不减
+  ut_a(lsn <= log.flushed_to_disk_lsn.load());
+
+  return lsn;
+}
+```
+
+> ⚠️ **勘误**：第三个上限常被误写成"log buffer 上限"，实际是 **`log.flushed_to_disk_lsn`**。理由源码写得很清楚：如果允许 checkpoint 超过已 fsync 点，就得在 checkpoint 里等 writer/flusher —— 那会**死锁**（writer 又因为没空间在等 checkpoint 前进）。
+>
+> ⚠️ **不存在** `log_checkpoint_low()`；`log_checkpoint()` 是 static（`log0chkp.cc:471`）。
+
+```cpp
+// log0chkp.cc:471
+static void log_checkpoint(log_t &log) {
+  const lsn_t checkpoint_lsn = log_determine_checkpoint_lsn(log);
+
+  if (arch_page_sys != nullptr) {
+    arch_page_sys->flush_at_checkpoint(checkpoint_lsn);
+  }
+
+  buf_flush_fsync();
+  // ★★ 只 fsync 数据文件（buf0flu.cc:3630 = fil_flush_file_spaces），【不刷脏页】
+
+  const dberr_t err = log_files_next_checkpoint(log, checkpoint_lsn);
+  // ★ 真正写 checkpoint header
+  ...
+  log.last_checkpoint_time = current_time;
+  MONITOR_INC(MONITOR_LOG_CHECKPOINTS);
+}
+```
+
+```cpp
+// log0chkp.cc:343 —— 第 4 个约束：DD 动态元数据也会压住 checkpoint
+static lsn_t log_determine_checkpoint_lsn(log_t &log) {
+  const lsn_t oldest_lsn = log.available_for_checkpoint_lsn;
+  const lsn_t dict_lsn = log.dict_max_allowed_checkpoint_lsn;
+
+  if (dict_lsn == 0) {
+    return oldest_lsn;
+  } else {
+    return std::min(oldest_lsn, dict_lsn);
+    // ★ dict_persist（DD 动态元数据）未落盘时进一步压低 checkpoint
+  }
+}
+```
+
+```cpp
+// log0chkp.cc:364 —— 两个 header 交替写，防止写一半崩溃
+dberr_t log_files_next_checkpoint(log_t &log, lsn_t next_checkpoint_lsn) {
+  ...
+  const dberr_t err = log_files_write_checkpoint_low(
+      log, next_file_handle, log.next_checkpoint_header_no,
+      next_checkpoint_lsn);
+  if (err != DB_SUCCESS) return err;
+
+  next_file_handle.fsync();         // ★ checkpoint header 必须 fsync
+
+  log.next_checkpoint_header_no =
+      log_next_checkpoint_header(log.next_checkpoint_header_no);
+  // ★ HEADER_1 ↔ HEADER_2 交替
+
+  log.last_checkpoint_lsn.store(next_checkpoint_lsn);
+
+  log_update_limits_low(log);       // ★ 重算 free_check_limit_lsn，放行用户线程
+  log.dict_max_allowed_checkpoint_lsn = 0;
+  ...
+}
+
+Log_checkpoint_header_no log_next_checkpoint_header(
+    Log_checkpoint_header_no checkpoint_header_no) {
+  switch (checkpoint_header_no) {
+    case Log_checkpoint_header_no::HEADER_1:
+      return Log_checkpoint_header_no::HEADER_2;
+    case Log_checkpoint_header_no::HEADER_2:
+      return Log_checkpoint_header_no::HEADER_1;
+  }
+}
+```
+
+> ★ 交替写两个 header 是经典的**原子扇区写**技巧：若写 HEADER_1 时崩溃，HEADER_2 仍是上一次成功的 checkpoint，恢复照样能跑。
+
 `log_compute_available_for_checkpoint_lsn`（log0chkp.cc:208）：
 
 ```
@@ -1317,6 +3074,81 @@ available_lsn = min( 最老脏页 oldest_modification 的 LWM,
 附加约束：不落在 block 边界（:274-280，恢复假设 checkpoint 在块数据区）；单调不减（:287）；`dict_max_allowed_checkpoint_lsn` 可临时压低（`log_determine_checkpoint_lsn`:343，DD 动态元数据未持久化时）。
 
 ### 脏页的 oldest/newest_modification 与 recent_closed 的必要性
+
+⚠️ **勘误**：`buf_pool_get_oldest_modification()` 这个**精确**函数在 8.0 已不用（只留下 `_approx()` 版本）。checkpoint 用的是 **`buf_pool_get_oldest_modification_lwm()`**（"lwm" = low water mark / 安全下界）。
+
+```cpp
+// buf0buf.cc:422
+lsn_t buf_pool_get_oldest_modification_lwm(void) {
+  const lsn_t lsn = buf_pool_get_oldest_modification_approx();
+
+  if (lsn == 0) {
+    return (0);    // ★ 没有脏页
+  }
+
+  ut_a(lsn % OS_FILE_LOG_BLOCK_SIZE >= LOG_BLOCK_HDR_SIZE);
+
+  const log_t &log = *log_sys;
+
+  const lsn_t lag = log_buffer_flush_order_lag(log);
+  // ★★ lag = recent_closed.capacity()，即 flush list 顺序松弛带来的最大滞后
+
+  ut_a(lag % OS_FILE_LOG_BLOCK_SIZE == 0);
+
+  const lsn_t checkpoint_lsn = log_get_checkpoint_lsn(log);
+
+  ut_a(checkpoint_lsn != 0);
+
+  if (lsn > lag) {
+    return (std::max(checkpoint_lsn, lsn - lag));
+    // ★★ 安全下界 = approx 结果【减去】recent_closed 的容量
+  } else {
+    return (checkpoint_lsn);
+  }
+}
+```
+
+> ★★ **为什么要减 `lag`**：8.0 允许多个 mtr 并发把脏页挂进 flush list，所以 flush list 里**顺序是松弛的**——某个 mtr 可能已经写了 lsn=1000 的 redo，但它的脏页还没挂进去；此时另一个 lsn=1200 的脏页却已经挂好了。`_approx()` 看到的"最老"可能是 1200，实际上还有个 1000 的在路上。减去 `recent_closed.capacity()`（默认 1MB 量级）就把这个不确定性兜住，得到一个**保证安全**的下界。
+
+```cpp
+// buf0buf.h:280-326（节选）—— 精确版 vs 近似版
+/** Returns the oldest modification ... NOTE: this function is not
+lock-free and it traverses all flush lists, so it is expensive. */
+lsn_t buf_pool_get_oldest_modification(void);          // 精确但昂贵
+
+/** Returns the oldest modification ... approximate, lock-free. */
+lsn_t buf_pool_get_oldest_modification_approx(void);   // 近似、无锁
+```
+
+**`oldest_modification` / `newest_modification` 的赋值点**（`buf0flu.cc` / `buf0buf.cc`）：
+
+- `oldest_modification`：页**第一次**变脏时写入（mtr commit 的 `add_dirty_blocks_to_flush_list()`，即 `buf_flush_note_modification()`）
+- `newest_modification`：该页**每次**被修改都更新
+- 页被刷盘时两者清零
+
+> ★ 这正是"**刷脏页前必须先保证对应 redo 已落盘**"的判据来源：`buf_flush_page()` 里会检查 `log_write_up_to(log, newest_modification, true)`——即 WAL 规则在代码里的体现。
+
+**recent_closed 的必要性**（`log_buffer_dirty_pages_added_up_to_lsn`）：
+
+```cpp
+// log0buf.h:253
+inline lsn_t log_buffer_dirty_pages_added_up_to_lsn(const log_t &log) {
+  return log.recent_closed.tail();
+}
+```
+
+```
+没有 recent_closed 会怎样：
+  mtr A 写 redo 到 lsn 1000，还没来得及把脏页挂进 flush list
+  mtr B 写 redo 到 lsn 1200，脏页已挂好
+  checkpoint 线程若认为"dpa 到 1200"，就会把 checkpoint_lsn 推到 1200
+  → 崩溃后：A 的 redo（1000 之前）已被回收，但 A 的修改还没进 flush list
+  → 数据丢失
+
+有 recent_closed：
+  每个 mtr 在"脏页挂完"后才 add_link 到 recent_closed
+  tail 只推进到"连续无洞"处 ⇒ 保证 tail 之前的【所有】脏页都已挂好
+```
 
 **脏页的两个 lsn**（`buf_page_t`，buf0buf.h:1576-1587）：
 
@@ -1455,7 +3287,7 @@ checkpoint_age = current_lsn − last_checkpoint_lsn ≤ soft_logical_capacity  
 
 8.0.30 把"谁还需要旧 redo"抽象为注册的 `Log_consumer`（`include/log0consumer.h`）。`oldest_needed_lsn` = 最滞后消费者的 `consumed_lsn`，是文件回收与容量计算的下界。
 
-> ⚠️ **与 Performance Schema 的 consumer 无关**：这里 `Log_consumer` 是 **InnoDB 内部**（`storage/innobase`）的抽象——"谁还需要旧 redo 文件、别回收"。而 PFS 的 consumer（`setup_consumers` 表、`storage/perfschema`）是**观测层**的"性能数据采集开关"（`events_waits_current/history` 等表的数据流向哪个 consumer）。两者只是英文同名，分属完全不同的子系统，没有调用关系。见 [`../server/infra/pfs.md`](../server/infra/pfs.md)。
+> ⚠️ **与 Performance Schema 的 consumer 无关**：这里 `Log_consumer` 是 **InnoDB 内部**（`storage/innobase`）的抽象——"谁还需要旧 redo 文件、别回收"。而 PFS 的 consumer（`setup_consumers` 表、`storage/perfschema`）是**观测层**的"性能数据采集开关"（`events_waits_current/history` 等表的数据流向哪个 consumer）。两者只是英文同名，分属完全不同的子系统，没有调用关系。见 [`../server/infra/pfs.md`](../infra/observability/pfs/pfs.md)。
 
 **接口本身极简**——三个纯虚函数就是"消费者"的全部契约：
 
@@ -2090,6 +3922,53 @@ LOG NONE 的典型用法：操作过程中关日志省掉大量物理日志，�
 
 
 ## 参考
+
+> 本节是**书目/文档索引**，性质上不使用代码块，豁免代码占比要求（与「关键源码位置速查」同理）。
+>
+> 本篇所有行号可用下面的命令复核（`MYSQL_VERSION` = 8.0.39）：
+
+```bash
+# mlog 与 mtr
+grep -n "enum mlog_id_t"                          storage/innobase/include/mtr0types.h
+grep -n "static inline bool mlog_open"            storage/innobase/include/mtr0log.ic
+grep -n "mlog_write_initial_log_record_low"       storage/innobase/include/mtr0log.ic
+grep -n "bool mlog_open_and_write_index"          storage/innobase/mtr/mtr0log.cc
+grep -n "ulint mtr_t::Command::prepare_write"     storage/innobase/mtr/mtr0mtr.cc
+grep -n "void mtr_t::Command::execute"            storage/innobase/mtr/mtr0mtr.cc
+grep -n "struct Impl"                             storage/innobase/include/mtr0mtr.h
+
+# LSN / SN 与常量（注意在 log0log.h 与 log0constants.h，不在 log0log.cc）
+grep -n "constexpr inline lsn_t log_translate_sn_to_lsn" storage/innobase/include/log0log.h
+grep -n "constexpr uint32_t LOG_BLOCK_HDR_SIZE"   storage/innobase/include/log0constants.h
+
+# log buffer（注意在 log0buf.cc，不在 log0log.cc）
+grep -n "^Log_handle log_buffer_reserve"          storage/innobase/log/log0buf.cc
+grep -n "^lsn_t log_buffer_write"                 storage/innobase/log/log0buf.cc
+grep -n "void log_buffer_write_completed"         storage/innobase/log/log0buf.cc
+grep -n "^void log_buffer_close"                  storage/innobase/log/log0buf.cc
+
+# Link_buf 与写盘线程
+grep -n "class Link_buf"                          storage/innobase/include/ut0link_buf.h
+grep -n "^void log_writer("                       storage/innobase/log/log0write.cc
+grep -n "^void log_flusher("                      storage/innobase/log/log0write.cc
+grep -n "static void log_flush_low"               storage/innobase/log/log0write.cc
+grep -n "^Wait_stats log_write_up_to"             storage/innobase/log/log0write.cc
+
+# checkpoint / 容量
+grep -n "log_compute_available_for_checkpoint_lsn" storage/innobase/log/log0chkp.cc
+grep -n "static void log_checkpoint("             storage/innobase/log/log0chkp.cc
+grep -n "dberr_t log_files_next_checkpoint"       storage/innobase/log/log0chkp.cc
+grep -n "lsn_t buf_pool_get_oldest_modification_lwm" storage/innobase/buf/buf0buf.cc
+grep -n "class Log_files_capacity"                storage/innobase/include/log0files_capacity.h
+grep -n "Log_consumer \*log_consumer_get_oldest"  storage/innobase/log/log0consumer.cc
+
+# 本篇纠正过的"不存在"符号，可直接验证
+grep -rn "\btrx_rollback\s*("        storage/innobase/   # redo 篇不适用，见 undo 篇
+grep -rn "MLOG_COMP_REC_INSERT\b"     storage/innobase/   # 0 命中
+grep -rn "log_calc_max_ages"          storage/innobase/   # 仅注释
+grep -rn "log_files_fsync\|log_closer(" storage/innobase/ # 0 命中（closer 线程已移除）
+grep -rn "buf_pool_get_oldest_modification\b" storage/innobase/buf/  # 仅 _approx/_lwm
+```
 
 **论文**
 - Mohan, C., et al. *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging*. ACM TODS, 1992.

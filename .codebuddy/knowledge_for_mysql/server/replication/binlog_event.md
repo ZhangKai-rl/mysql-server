@@ -34,6 +34,72 @@ Xid_log_event(16)            ← 内部 2PC 的 commit 记录
 
 读侧（dump 线程、从库 IO 线程、mysqlbinlog、崩溃恢复）就是反复做同一件事：**读 19 字节头 → 查 FDE 得知 post-header 长度 → 反序列化出具体事件对象 → apply 或转发**。
 
+**★ 源码对"事件"的权威定义**（`libbinlogevents/include/binlog_event.h:24`）：
+
+```cpp
+/**
+  @addtogroup Replication
+  @{
+
+  @file binlog_event.h
+
+  @brief Contains the classes representing events occurring in the replication
+  stream. Each event is represented as a byte sequence with logical divisions
+  as event header, event specific data and event footer. The header and footer
+  are common to all the events and are represented as two different subclasses.
+*/
+```
+
+**★ 四段式 + packed integer 编码表**（`binlog_event.h:758`，★ 官方 Doxygen 里的完整定义）：
+
+```cpp
+/**
+  This is the abstract base class for binary log events.
+
+  @section Binary_log_event_binary_format Binary Format
+
+  Any @c Binary_log_event saved on disk consists of the following four
+  components.
+
+  - Common-Header       /* ★ 19 字节，所有事件同一格式 */
+  - Post-Header         /* ★ 长度由 FDE 的 post_header_len[] 决定 */
+  - Body                /* ★ 同类型事件也可变长 */
+  - Footer              /* ★ checksum */
+  ...
+  @anchor packed_integer
+  - Some events, used for RBR use a special format for efficient representation
+  of unsigned integers, called Packed Integer.  A Packed Integer has the
+  capacity of storing up to 8-byte integers, while small integers
+  still can use 1, 3, or 4 bytes.  The value of the first byte
+  determines how to read the number, according to the following table:
+
+  <table>
+  <caption>Format of Packed Integer</caption>
+  <tr><th>First byte</th><th>Format</th></tr>
+  <tr><td>0-250</td><td>The first byte is the number (in the range 0-250),
+      and no more bytes are used.</td></tr>
+  <tr><td>252</td><td>Two more bytes are used. The number is in the range
+      251-0xffff.</td></tr>
+  <tr><td>253</td><td>Three more bytes are used. The number is in the range
+      0xffff-0xffffff.</td></tr>
+  <tr><td>254</td><td>Eight more bytes are used. The number is in the range
+      0xffffff-0xffffffffffffffff.</td></tr>
+  </table>
+*/
+```
+> ★ `251` 是保留的 `NULL_LENGTH`，`255` 是非法值——**没有 5/6/7 字节的形态**。
+> ★ Row event 的列数（`m_width`）、TABLE_MAP 的 metadata 长度、optional metadata 的 TLV 长度全靠这套变长整数压缩。
+
+**★ 一个常被说错的数：单事件上限是 1 GB 不是 4 GB**（`binlog_event.h:424`）：
+
+```cpp
+/// The maximum value for MAX_ALLOWED_PACKET.  This is also the
+/// maxmium size of binlog events, and dump threads always use this
+/// value for max_allowed_packet.
+constexpr size_t max_log_event_size = 1024 * 1024 * 1024;
+```
+> ★ 协议字段 `event_size` 确实是 4 字节（理论 4GB），但 **server 侧硬限 1GB**，且 dump 线程用它当 `max_allowed_packet`。
+
 ### 用途
 
 event 承担了复制协议里「自描述 + 版本兼容 + 完整性校验」三个职责：
@@ -41,6 +107,39 @@ event 承担了复制协议里「自描述 + 版本兼容 + 完整性校验」�
 1. **自描述**：每个 event 自己声明类型和长度，读侧无需任何外部 schema 就能定位边界——这是 binlog 能按「位点」随机访问、能跨版本读的前提。
 2. **版本兼容**：`Format_description_event`（FDE）里有一个「每种事件 post-header 长度」的数组，旧版本读到不认识的 event 类型时，靠这个数组**跳过**而不是报错，保证升级路径平滑。
 3. **完整性**：尾部 4 字节 CRC32 覆盖整个 event（含公共头），从库能检测 binlog 传输中的损坏。
+
+**★ "用法/边界"的反证：哪些东西故意不进 libbinlogevents**（`binlog_event.h:894`）：
+
+```cpp
+ public:
+#ifndef HAVE_MYSYS
+  /*
+    The print_event_info functions are used in the free standing version of
+    the library only. Since MySQL server does not use them, and it does not
+    link to standard input/output library on Windows 32 bit system ,these
+    methods are commented out when the library(libbinlogevents) is built
+    with the server.
+  */
+  virtual void print_event_info(std::ostream &info) = 0;
+  virtual void print_long_info(std::ostream &info) = 0;
+#endif
+  virtual ~Binary_log_event() = 0;
+```
+> ★★ 只有 **mysqlbinlog（standalone 构建）** 才有 `print_*`；server 构建时整个 iostream 被 `#ifndef HAVE_MYSYS` 裁掉。这就是"纯数据层"的边界：**只留编解码 + 打印，不留任何 server 运行时依赖**。
+
+**★ 同一个"双实现"开关也管内存分配**（`libbinlogevents/include/wrapper_functions.h:149`）：
+
+```cpp
+inline const char *bapi_strndup(const char *destination, size_t n) {
+#ifdef HAVE_MYSYS
+  /* Call the function in mysys library, required for memory instrumentation */
+  return my_strndup(key_memory_log_event, destination, n, MYF(MY_WME));
+#else
+  return strndup(destination, n);
+#endif
+}
+```
+> ★ server 侧走 `my_strndup` + PSI 内存监控（`key_memory_log_event`），独立库侧走裸 libc。**同一个头文件，两套内存账本**。
 
 ### 版本演进
 
@@ -54,6 +153,77 @@ event 承担了复制协议里「自描述 + 版本兼容 + 完整性校验」�
 | 8.0 | 新增 `TRANSACTION_CONTEXT_EVENT=36`、`VIEW_CHANGE_EVENT=37`（组复制）、`PARTIAL_UPDATE_ROWS_EVENT=39`（JSON 部分更新）、`TRANSACTION_PAYLOAD_EVENT=40`（事务压缩）、`HEARTBEAT_LOG_EVENT_V2=41`；`START_EVENT_V3` 在 8.0.2 标记废弃 |
 
 关键演进动机在「理论基础 → 他库对比与演进动机」，此处只记变化本身。需要特别注意的是一条**冻结约定**：`Rotate` 的 post-header 长度被明确注释为 "frozen"（`ROTATE_HEADER_LEN=8`），一旦定死永远不改——因为 rotate 发生在 FDE 可被读到之前，读侧只能靠硬编码跳过它。
+
+**★ 版本演进的源码证据（12 条，全部 grep 实证）**：
+
+| 文件:行 | 版本证据原文 |
+|---|---|
+| `binlog_event.h:88` | `binlog_version 3 is MySQL 4.x; 4 is MySQL 5.0.0.` → `#define BINLOG_VERSION 4` |
+| `binlog_event.h:286` | `Deprecated since mysql 8.0.2. It is just a placeholder`（`START_EVENT_V3`） |
+| `binlog_event.h:309` | `The V1 event numbers are used from 5.1.16 until mysql-5.6.`（行事件 V1） |
+| `binlog_event.h:336` | `/** Version 2 of the Row events */`（30/31/32） |
+| `statement_events.h:437` | `/* It is just a placeholder after 8.0.2*/`（`Q_MASTER_DATA_WRITTEN_CODE`） |
+| `statement_events.h:434` | `Status vars were introduced in version 5.0.` / `Q_CATALOG_CODE ... 0<=x<=3 ... The '\0' was removed in 5.0.4` |
+| `control_events.h:281` | `It should only be 4, old versions are not compatible anymore since 8.0.2.` |
+| `control_events.h:948` | `In 5.6, 5.7.0-5.7.18, and 8.0.0-8.0.1, this flag is always set. Starting in 5.7.19 and 8.0.2, this flag is cleared...` |
+| `control_events.h:1506` | `...only for the source server with version > 8.0.26`（`Heartbeat_event_v2`） |
+| `control_events.cpp:79` | `case 4: /* MySQL 5.0 and above*/` |
+| `control_events.cpp:458` | `5.6 did not have TS_TYPE and the following fields. 5.7.4 and ...` |
+| `statement_events.cpp:182` | `/* variable-part: the status vars; only in MySQL 5.0  */` |
+
+**★ 事件类型总数的精确算法**（`binlog_event.h:834`，⚠️ 常见说法"40 种"是错的）：
+
+```cpp
+class Binary_log_event {
+ public:
+  /*
+     The number of types we handle in Format_description_event (UNKNOWN_EVENT
+     is not to be handled, it does not exist in binlogs, it does not have a
+     format).
+  */
+  static const int LOG_EVENT_TYPES = (ENUM_END_EVENT - 1);
+```
+> ★★ `ENUM_END_EVENT` 无显式值（上一个显式值是 `HEARTBEAT_LOG_EVENT_V2 = 41`），所以 **`ENUM_END_EVENT = 42`**，故 **`LOG_EVENT_TYPES = 41`**。`UNKNOWN_EVENT = 0` 只存在于内存（解析失败的兜底），**永不落盘**——`post_header_len[]` 的下标是 `type - 1`。
+
+**★ `PARTIAL_UPDATE_ROWS_EVENT` 的注释里没有版本号**（`binlog_event.h:353`，⚠️ 常见说法"注释写 8.0.3"是错的）：
+
+```cpp
+  /**
+    Extension of UPDATE_ROWS_EVENT, allowing partial values according
+    to binlog_row_value_options.
+  */
+  PARTIAL_UPDATE_ROWS_EVENT = 39,
+```
+
+**★ 枚举末尾的"新增分组"哨兵**（`binlog_event.h:362`，★ 扩展点铁律）：
+
+```cpp
+  /**
+    Add new events here - right above this comment!
+    Existing events (except ENUM_END_EVENT) should never change their numbers
+  */
+  ENUM_END_EVENT /* end marker */
+};
+```
+
+**★ FDE 头部版本字段**（`control_events.h:168`）：
+
+```cpp
+  /**
+    @class Format_description_event
+    For binlog version 4.
+    This event is saved by threads which read it, as they need it for future
+    use (to decode the ordinary events).
+    ...
+    <tr>
+      <td>binlog_version</td>
+      <td>2 byte unsigned integer</td>
+      <td>This is 1 in MySQL 3.23 and 3 in MySQL 4.0 and 4.1
+          (In MySQL 5.0 and up, FORMAT_DESCRIPTION_EVENT is
+          used instead of START_EVENT_V3 and for them its 4).</td>
+    </tr>
+```
+> ★ 5.0 起 `START_EVENT_V3`(type=1) 被 `FORMAT_DESCRIPTION_EVENT`(type=15) 取代，`binlog_version` 定格为 **4**。
 
 ---
 
@@ -89,6 +259,186 @@ sql/log_event.h/cc   Log_event / Xxx_log_event —— 带 THD、apply 逻辑，m
 - 旧版本读新 binlog：遇到不认识的 event type，如果该 type 有 `LOG_EVENT_IGNORABLE_F` 标志就直接跳过；即使没有，只要 `event_type <= fde->number_of_event_types`，也能靠 FDE 数组里新版本预填的长度跳过。
 - 代价是「鸡生蛋」：读 FDE 本身时还没有 FDE 可用。解法是 FDE（以及可能先到的 `Rotate`）**保证只用 19 字节固定头**，且 `binlog_version` 字段在永不变动的偏移上。这就是为什么 `ROTATE_HEADER_LEN` 被冻结、为什么 FDE 的第一个字段必须稳定。
 
+**★★★ 官方对"鸡生蛋"的完整论述**（`libbinlogevents/src/control_events.cpp:173`，★ 这是权衡二最权威的源码答案）：
+
+```cpp
+/**
+  The problem with this constructor is that the fixed header may have a
+  length different from this version, but we don't know this length as we
+  have not read the Format_description_log_event which says it, yet. This
+  length is in the post-header of the event, but we don't know where the
+  post-header starts.
+
+  So this type of event HAS to:
+  - either have the header's length at the beginning (in the header, at a
+  fixed position which will never be changed), not in the post-header. That
+  would make the header be "shifted" compared to other events.
+  - or have a header of size LOG_EVENT_MINIMAL_HEADER_LEN (19), in all future
+  versions, so that we know for sure.
+
+  I (Guilhem) chose the 2nd solution. Rotate has the same constraint (because
+  it is sent before Format_description_log_event).
+*/
+```
+```cpp
+/* binlog_event.h:429 —— 配套常量 */
+/**
+   Fixed header length, where 4.x and 5.0 agree. That is, 5.0 may have a longer
+   header (it will for sure when we have the unique event's ID), but at least
+   the first 19 bytes are the same in 4.x and 5.0. So when we have the unique
+   event's ID, LOG_EVENT_HEADER_LEN will be something like 26, but
+   LOG_EVENT_MINIMAL_HEADER_LEN will remain 19.
+*/
+#define LOG_EVENT_MINIMAL_HEADER_LEN 19U
+```
+> ★★ 自描述头的致命问题是"**你连公共头有多长都不知道**"——因为告诉你长度的 FDE 本身也是个事件。MySQL 的解法：FDE 与 ROTATE 的公共头**永远锁死 19 字节**，其余事件的公共头长度由 FDE 事后通告。
+
+**★ 数组真名是 `post_header_len`（`std::vector<uint8_t>`），不是 `m_event_data_sizes[]`**（`control_events.h:261`）：
+
+```cpp
+  /**
+     The size of the fixed header which _all_ events have
+     (for binlog versions written by this version, this is equal to
+     LOG_EVENT_HEADER_LEN), except FORMAT_DESCRIPTION_EVENT and ROTATE_EVENT
+     (those have a header of size LOG_EVENT_MINIMAL_HEADER_LEN).
+  */
+  uint8_t common_header_len;
+  /*
+    The list of post-headers' lengths followed
+    by the checksum alg description byte
+  */
+  std::vector<uint8_t> post_header_len;
+  unsigned char server_version_split[ST_SERVER_VER_SPLIT_LEN];
+```
+
+**★ FDE 的 ASCII 布局图**（`control_events.h:287`，★ 文件内绝对偏移）：
+
+```cpp
+  /**
+    The layout of Format_description_event data part is as follows:
+
+    <pre>
+    +=====================================+
+    | event  | binlog_version   19 : 2    | = 4
+    | data   +----------------------------+
+    |        | server_version   21 : 50   |
+    |        +----------------------------+
+    |        | create_timestamp 71 : 4    |
+    |        +----------------------------+
+    |        | header_length    75 : 1    |
+    |        +----------------------------+
+    |        | post-header      76 : n    | = array of n bytes, one byte
+    |        | lengths for all            |   per event type that the
+    |        | event types                |   server knows about
+    +=====================================+
+    </pre>
+```
+
+**★★★ 数组本体：`server_event_header_length[]`**（`control_events.cpp:96`，★ 41 项）：
+
+```cpp
+      static uint8_t server_event_header_length[] = {
+          0, QUERY_HEADER_LEN, STOP_HEADER_LEN, ROTATE_HEADER_LEN,
+          INTVAR_HEADER_LEN, 0,
+          /*
+            Unused because the code for Slave log event was removed.
+            (15th Oct. 2010)
+          */
+          0, 0, APPEND_BLOCK_HEADER_LEN, 0, DELETE_FILE_HEADER_LEN, 0,
+          RAND_HEADER_LEN, USER_VAR_HEADER_LEN, FORMAT_DESCRIPTION_HEADER_LEN,
+          XID_HEADER_LEN, BEGIN_LOAD_QUERY_HEADER_LEN,
+          EXECUTE_LOAD_QUERY_HEADER_LEN, TABLE_MAP_HEADER_LEN, 0, 0, 0,
+          ROWS_HEADER_LEN_V1,     /* WRITE_ROWS_EVENT_V1*/
+          ROWS_HEADER_LEN_V1,     /* UPDATE_ROWS_EVENT_V1*/
+          ROWS_HEADER_LEN_V1,     /* DELETE_ROWS_EVENT_V1*/
+          INCIDENT_HEADER_LEN, 0, /* HEARTBEAT_LOG_EVENT*/
+          IGNORABLE_HEADER_LEN, IGNORABLE_HEADER_LEN, ROWS_HEADER_LEN_V2,
+          ROWS_HEADER_LEN_V2, ROWS_HEADER_LEN_V2,
+          Gtid_event::POST_HEADER_LENGTH, /*GTID_EVENT*/
+          Gtid_event::POST_HEADER_LENGTH, /*ANONYMOUS_GTID_EVENT*/
+          IGNORABLE_HEADER_LEN, TRANSACTION_CONTEXT_HEADER_LEN,
+          VIEW_CHANGE_HEADER_LEN, XA_PREPARE_HEADER_LEN, ROWS_HEADER_LEN_V2,
+          TRANSACTION_PAYLOAD_EVENT, 0 /* HEARTBEAT_LOG_EVENT_V2*/
+      };
+      post_header_len.insert(post_header_len.begin(), server_event_header_length,
+                             server_event_header_length + number_of_event_types);
+      // Sanity-check that all post header lengths are initialized.
+#ifndef NDEBUG
+      for (int i = 0; i < number_of_event_types; i++)
+        BAPI_ASSERT(post_header_len[i] != 255);
+#endif
+```
+> ⚠️⚠️ **一处源码 quirk**：倒数第 2 项（对应 `TRANSACTION_PAYLOAD_EVENT=40`）填的是枚举值 **`TRANSACTION_PAYLOAD_EVENT`（=40）**，而同文件 enum 里明明定义了 `TRANSACTION_PAYLOAD_HEADER_LEN = 0`。即 `post_header_len[39] == 40` 而非 0。这是 8.0.39 源码里的真实瑕疵（上游亦如此），`TRANSACTION_PAYLOAD_HEADER_LEN` 这个常量**从未被使用**。
+> ★ `255` 是"未初始化"哨兵——**debug 构建下新增事件类型却忘了同步这张表，断言立刻炸**。这就是"加类型必须改这里"的强制机制。
+
+**★ 数组怎么用：两行代码定位到 Body**（`control_events.cpp:326`）：
+
+```cpp
+XA_prepare_event::XA_prepare_event(const char *buf,
+                                   const Format_description_event *fde)
+    : Binary_log_event(&buf, fde) {
+  READER_TRY_INITIALIZATION;
+  READER_ASSERT_POSITION(fde->common_header_len);       /* ① 用 FDE 通告的公共头长度定位 post-header 起点 */
+  READER_TRY_CALL(forward, fde->post_header_len[XA_PREPARE_LOG_EVENT - 1]);  /* ② 按该类型长度跳过 */
+  READER_TRY_SET(one_phase, read<bool>);
+```
+> ★ 同构调用点：`control_events.cpp:40`（ROTATE）、`:293`（INCIDENT）、`:320`（XID）、`:332`（XA_PREPARE）、`:601`（PREVIOUS_GTIDS）。
+
+**★★ 读侧不信任 `number_of_event_types`，改用剩余字节数反推**（`control_events.cpp:203`）：
+
+```cpp
+  available_bytes = READER_CALL(available_to_read);
+  if (available_bytes == 0)
+    READER_THROW("Invalid Format_description common header length");
+
+  calc_server_version_split();
+  if ((ver_calc = get_product_version()) >= checksum_version_product) {
+    /* the last bytes are the checksum alg desc and value (or value's room) */
+    available_bytes -= BINLOG_CHECKSUM_ALG_DESC_LEN;
+  }
+
+  number_of_event_types = available_bytes;   /* ★★ 数组长度 = 剩余可读字节数 */
+  READER_TRY_CALL(assign, &post_header_len, number_of_event_types);
+
+  if ((ver_calc = get_product_version()) >= checksum_version_product) {
+    BAPI_ASSERT(ver_calc != checksum_version_product ||
+                number_of_event_types == LOG_EVENT_TYPES);
+    uint8_t alg;
+    READER_TRY_SET(alg, read<uint8_t>);
+    footer()->checksum_alg = static_cast<enum_binlog_checksum_alg>(alg);
+  } else {
+    footer()->checksum_alg = BINLOG_CHECKSUM_ALG_UNDEF;
+  }
+```
+> ★★ 这是"不自描述"换来的弹性：**老主（数组短）/ 新主（数组长）都能被正确解析**，因为长度是算出来的不是读出来的。
+> ★ 注意所有 `ASSERT_POSITION` 都用 `LOG_EVENT_MINIMAL_HEADER_LEN(19)` 而不是 `fde->common_header_len`——**此刻还不知道对方版本的头长度**。
+
+**★ 写侧的三分支跨版本对齐**（`sql/log_event.cc:5367`）：
+
+```cpp
+  if (post_header_len_size == Binary_log_event::LOG_EVENT_TYPES)
+    // Replicating between master and slave with same version.
+    number_of_events = Binary_log_event::LOG_EVENT_TYPES;
+  else if (post_header_len_size > Binary_log_event::LOG_EVENT_TYPES)
+    /*
+      Replicating between new master and old slave.
+      In that case there won't be any memory issues, as there won't be
+      any out of memory read.
+    */
+    number_of_events = Binary_log_event::LOG_EVENT_TYPES;
+  else
+    /*
+      Replicating between old master and new slave. ... we might end up
+      reading more bytes as post_header_len.size() < LOG_EVENT_TYPES;
+      causing memory issues.
+    */
+    number_of_events = post_header_len_size;
+
+  memcpy((char *)buff + ST_COMMON_HEADER_LEN_OFFSET + 1,
+         &post_header_len.front(), number_of_events);
+```
+> ★ 数组就写在 `common_header_len` 那 1 字节之后——与上面的 ASCII 图完全吻合。
+
 #### 权衡三：checksum 放在 event 尾部而不是独立文件头
 
 CRC32 是**边写边算**的流式校验，覆盖范围是「整个 event 除 checksum 自身外的所有字节，**含 19 字节公共头**」。**本来可以**只对 body 校验（头在传输中也会损坏，但对头单独做校验更复杂），或者用文件级校验（但 binlog 是流式追加、可能被截断，文件级校验无法定位坏点）。**实际选择**每个 event 独立 crc32，坏一个 event 只影响这一个，恢复时能精确到「哪个 event 坏了」。
@@ -111,6 +461,21 @@ CRC32 是**边写边算**的流式校验，覆盖范围是「整个 event 除 ch
 - **PostgreSQL WAL**：WAL 是**页级物理日志 + 逻辑解码（logical decoding）**两套东西。逻辑解码的复制协议（`pgoutput` 插件）在 9.4+ 才出现，且是「每事务一个消息流」，没有 MySQL 这种「按 event 类型分派、FDE 版本协商」的强自描述体系——因为 PG 的复制槽/位点机制下，从库版本基本受约束，不像 MySQL 主从可以跨大版本。MySQL 的 FDE + post_header_len 数组 + IGNORABLE 标志这套「尽力向前兼容」的设计，根源是 MySQL 主从长期支持**跨版本复制**（5.6 主 → 8.0 从）。
 - **MariaDB**：同样从 MySQL 分叉出 binlog，但 MariaDB 10.x 的 GTID 是「(domain_id, server_id, seq_no)」三元组，event 类型编号有分叉（如 `ANNOTATE_ROWS_EVENT` 是 MariaDB 私有），这是「别家分支私有特性」，社区 MySQL 没有。
 - **演进动机**：从 v1 行事件到 v2（post-header 8→10）是为了塞进 `extra_data`（NDB 分区信息、JSON 部分更新）；GTID 事件、`Transaction_payload` 压缩事件都是「事务粒度」能力叠加的结果，各自新增一个 event type 而不是改现有格式——这正是「加新类型而非改旧类型」的协议演进纪律。
+
+**★ 源码里的"新旧风格断层"证据**（★ 老代码 `enum` / `#define`，新代码 `enum class` / `constexpr`）：
+
+```cpp
+/* 老风格：裸 enum（无作用域） */
+enum enum_binlog_checksum_alg { ... };        /* binlog_event.h:438 */
+#define LOG_EVENT_HEADER_LEN 19U              /* binlog_event.h:422 */
+
+/* 新风格：enum class + constexpr */
+enum class enum_extra_row_info_typecode { NDB = 0, PART = 1 };  /* rows_event.h:63 */
+enum class Grow_status { ... };               /* buffer/grow_status.h:37 */
+constexpr size_t max_log_event_size = 1024 * 1024 * 1024;       /* binlog_event.h:424 */
+static constexpr Size_t machine_max_size = std::numeric_limits<Size_t>::max();  /* buffer/grow_constraint.h:73 */
+```
+> ★ 8.0 里新写的组件（`buffer/` / `compression/`）一律用 `enum class`，而老的 `binlog_event.h` 仍是裸 `enum`——**演进断层在源码里清晰可见**。
 
 ---
 
@@ -465,6 +830,181 @@ Intvar_event::Intvar_event(const char *buf, const Format_description_event *fde)
 
 它是「把二进制缓冲区封装成类型安全游标」的典型实现：事件类只声明「我要读一个 uint32、一个 string」，不必关心当前指针、剩余长度（越界由 reader 统一兜底并设 `m_error`）。每个 `read<Type>()` 都有边界检查，越界返回 0 值并设置错误。
 
+**★ 存在意义与核心不变量**（`libbinlogevents/include/event_reader.h:44`，⚠️ 独立头文件**不在** `binlog_event.h`）：
+
+```cpp
+/**
+  Event_reader class purpose is to avoid out-of-buffer reads when deserializing
+  binary log events and increase robustness when dealing with corrupted event
+  buffers.                              /* ★ 存在意义：防越界读 + 抗损坏 buffer */
+
+  The Event_reader is composed by a pointer to the beginning of the serialized
+  event buffer (m_buffer), a variable containing the buffer length (m_length), a
+  cursor pointer that tells the current position to be read from the buffer
+  (m_ptr) and the buffer limit the reader shall respect (m_limit <= m_length).
+
+  All buffer reading functions shall move the cursor forward.
+
+  Before reading from the buffer, the Event_reader will check if the amount of
+  bytes expected to be read are less or equal to the remaining bytes to read:
+
+    remaining = m_limit - (m_ptr - m_buffer)   /* ★ 核心不变量 */
+  ...
+*/
+class Event_reader {
+ public:
+  Event_reader(const char *buffer, unsigned long long length)
+      : m_buffer(buffer), m_ptr(buffer), m_length(length),
+        m_limit(length), m_error(nullptr) {}
+```
+> ★★ `m_length` vs `m_limit` 的区别（官方注释讲得很清楚）：`length` **含** checksum，`limit` 是 footer 收缩后**不含** checksum 的可用上界——否则"剩余长度即数据长度"的推断会被 checksum 污染。
+
+**★★★ `read<T>()` 的完整实现**（★ 本节核心，六步）：
+
+```cpp
+  template <typename T>
+  T read(unsigned char bytes = sizeof(T)) {    /* ★ 默认读 sizeof(T) 字节 */
+    PRINT_READER_STATUS("Event_reader::read");
+    if (!can_read(bytes)) {                    /* ① 越界检查：所有读操作的唯一闸门 */
+      set_error("Cannot read from out of buffer bounds");
+      return 0;                                /* ② 越界返回 0，同时置 error 态（不抛异常） */
+    }
+    T value = 0;                               /* ③ 先清零：bytes < sizeof(T) 时高位自然为 0 */
+    ::memcpy((char *)&value, m_ptr, bytes);    /* ④ 小端原样拷进低位 */
+    m_ptr = m_ptr + bytes;                     /* ⑤ 按实际读取字节数推进（不是 sizeof(T)） */
+    return (bytes > 1) ? letoh(value) : value; /* ⑥ 多字节才做 leXXtoh 转换 */
+  }
+
+  bool can_read(unsigned long long bytes) {
+    return (available_to_read() >= bytes);
+  }
+  unsigned long long available_to_read() {
+    BAPI_ASSERT(position() <= m_limit);
+    return m_limit - position();
+  }
+```
+
+**★ 字节序转换用"重载决议"而非模板特化**（`event_reader.h:471`，★ 一个精巧设计）：
+
+```cpp
+ private:
+  /* The buffer with the serialized binary log event */
+  const char *m_buffer;
+  const char *m_ptr;      /* The cursor */
+  unsigned long long m_length;
+  unsigned long long m_limit;
+  const char *m_error;    /* ★ 错误态 = "错误字符串指针非空"，不是异常也不是 errno */
+
+  uint16_t letoh(uint16_t value) { return le16toh(value); }
+  int32_t  letoh(int32_t value)  { return le32toh(value); }
+  uint32_t letoh(uint32_t value) { return le32toh(value); }
+  int64_t  letoh(int64_t value)  { return le64toh(value); }
+  uint64_t letoh(uint64_t value) { return le64toh(value); }
+```
+> ★★ 五个 `letoh()` 重载——`read<uint32_t>()` 自然选中 `letoh(uint32_t)`。**比 SFINAE/模板特化更轻量**，`Event_reader` **没有任何模板特化**。
+
+**★ 关键辅助函数的实现**（`libbinlogevents/src/event_reader.cpp`：
+
+```cpp
+void Event_reader::set_error(const char *error) {
+  BAPI_ASSERT(error != nullptr);
+  m_error = error;      /* ★ 只赋指针不拷贝 → 实参必须是静态生命周期的字符串字面量 */
+}
+
+void Event_reader::set_length(unsigned long long length) {
+  if (length < m_length) set_error("Buffer length cannot shrink");  /* 只许增不许减 */
+  else m_limit = m_length = length;   /* ★ 读出真实 event_size 后用它扩大可用区 */
+}
+
+void Event_reader::shrink_limit(unsigned long long bytes) {
+  if (bytes > m_limit || position() > m_limit - bytes)
+    set_error("Unable to shrink buffer limit");
+  else m_limit = m_limit - bytes;    /* ★ footer 用它砍掉末尾 4 字节 checksum */
+}
+```
+
+**★★ `alloc_and_memcpy`：先检查再分配的演进动机**（★ 防"伪造超长 length 打爆内存"）：
+
+```cpp
+void Event_reader::alloc_and_memcpy(unsigned char **destination, size_t length,
+                                    int flags) {
+  if (!can_read(length)) {           /* ★★ 先检查能不能读 */
+    set_error("Cannot read from out of buffer bounds");
+    return;
+  }
+  *destination = static_cast<unsigned char *>(bapi_malloc(length, flags));
+  ...
+```
+```cpp
+  /**
+    Before implementing this function and the Event_reader, the deserialization
+    process did like:
+
+      memcpy(length, ptr, sizeof(length);
+      ptr+=sizeof(length);
+      field = malloc(length);
+      memcpy(field, ptr, length);
+
+    Allocating the memory for the field before knowing if the content can be
+    read from the event buffer is a mistake, as it might allocate a very large
+    amount of memory that will not be used.
+
+    So, alloc_and_memcpy ensures that it will only allocate memory for the field
+    if it can be read from the event buffer...
+  */
+```
+> ★★ 这是 `Event_reader` **存在的直接原因**：旧代码"先 malloc 再读"，一个损坏/恶意的 `length` 字段就能触发巨型分配。
+
+**★ packed integer 的两阶段读取**（`net_field_length_ll()`）：
+
+```cpp
+uint64_t Event_reader::net_field_length_ll() {
+  if (!can_read(sizeof(uint8_t))) { set_error(...); return 0; }
+  unsigned char *ptr_length = reinterpret_cast<unsigned char *>(const_cast<char *>(m_ptr));
+  unsigned int length_size = net_field_length_size(ptr_length);  /* ① 先窥第 1 字节得知 {1,3,4,9} */
+  if (!can_read(length_size)) {                                  /* ② 再按 length_size 检查 */
+    set_error("Cannot read from out of buffer bounds");
+    return 0;
+  }
+  uint64_t value = ::net_field_length_ll(&ptr_length);
+  m_ptr = m_ptr + length_size;
+  return value;
+}
+```
+> ★ 两阶段检查是必须的——**9 字节长度形态**下第 1 字节不足以判断是否越界。
+
+**★ `read_str_at_most_255_bytes` 是零拷贝**（★ 只把指针指进 buffer）：
+
+```cpp
+  ::memcpy(lenght, m_ptr, sizeof(uint8_t));   /* ① 读 1 字节长度前缀 */
+  m_ptr = m_ptr + sizeof(uint8_t);
+  if (!can_read(*lenght)) {                   /* ② 检查长度前缀声称的字节数是否真存在 */
+    set_error("Cannot read from out of buffer bounds");
+    return;
+  }
+  *destination = m_ptr;                       /* ③ 零拷贝：destination 直接指向事件 buffer 内部 */
+  m_ptr = m_ptr + *lenght;
+```
+
+**★ 全库唯一一处 try/catch**（`assign()`，★ C++ 异常被就地转成 error 态）：
+
+```cpp
+void Event_reader::assign(std::vector<uint8_t> *vector, size_t length) {
+  BAPI_ASSERT(vector->empty());
+  if (!can_read(length)) { set_error("Cannot read from out of buffer bounds"); return; }
+  try {
+    vector->assign(m_ptr, m_ptr + length);   /* ★ 迭代器区间赋值：整段吞进 vector */
+  } catch (const std::bad_alloc &) {
+    vector->clear();
+    set_error("std::bad_alloc");
+  }
+  BAPI_ASSERT(vector->size() == length);
+  m_ptr = m_ptr + length;
+}
+```
+
+> ⚠️ **真名核查**：`advance()` **不存在**（真名 `forward()`）；`read_data_into_buffer` **不存在**（真名 `alloc_and_memcpy` / `assign` / `read_data_set` / `read_data_map`）；**没有 `Error` 枚举**。完整方法清单：`ptr()` / `ptr(len)` / `go_to` / `forward` / `position` / `available_to_read` / `can_read` / `memcpy<T>` / `read<T>` / `strndup<T>` / `alloc_and_memcpy` / `alloc_and_strncpy` / `read_str_at_most_255_bytes` / `net_field_length_ll` / `read_data_set` / `read_data_map` / `strncpyz` / `assign` / `set_length` / `shrink_limit` / `set_error` / `get_error` / `has_error`。
+
 #### Log_event_header / Log_event_footer 的反序列化
 
 `Log_event_header` 构造函数从 buf 解析 19 字节的 `when/type_code/unmasked_server_id/data_written/log_pos/flags`，并把 `m_is_valid` 置初值；`Log_event_footer` 在读 FD 时解析 checksum 算法描述符。这两者的解析结果在 5 步模板的 `READER_CATCH_ERROR` 阶段统一汇总。
@@ -580,6 +1120,68 @@ Basic_istream（文件 IO）
 
 其中 `Binlog_event_data_istream::fill_event_data` 里做 CRC32 校验：`Log_event_footer::event_checksum_test(event_data, event_len, alg)` 对读到的字节重算 crc 比对。校验失败返回 `CHECKSUM_FAILURE`，dump 线程据此报「binlog 损坏」。
 
+**★★ 四层流水线的组装点**（`sql/binlog_reader.h:275`，⚠️ 不存在 `binlog_reader` / `Binlog_event_reader` 类）：
+
+```cpp
+/**
+   It owns an allocator, a byte stream, an event_data stream and an event object
+   stream. The stream pipeline is setup in the constructor. All the objects
+   required for reading a binlog file is initialized in reader class.
+
+   It maintains the Format_description_event which is needed for reading the
+   following binlog events. A default format_description_event is initialized
+   at the beginning. Then it will be replaced by the one read from the binlog
+   file.
+   ...
+*/
+template <class IFILE, class EVENT_DATA_ISTREAM,
+          template <class> class EVENT_OBJECT_ISTREAM, class ALLOCATOR>
+class Basic_binlog_file_reader : public IBasic_binlog_file_reader {
+ public:
+  typedef EVENT_DATA_ISTREAM Event_data_istream;
+  typedef EVENT_OBJECT_ISTREAM<Event_data_istream> Event_object_istream;
+
+  Basic_binlog_file_reader(bool verify_checksum,
+                           unsigned int max_event_size = UINT_MAX)
+      : m_ifile(&m_error),
+        m_data_istream(&m_error, &m_ifile, max_event_size),
+        m_object_istream(&m_error, &m_data_istream),
+        m_fde(BINLOG_VERSION, ::server_version),      /* ★ 默认 FDE 先占位 */
+        m_verify_checksum(verify_checksum) {}
+```
+> ★★ "先有 FDE 才能解其它事件"的工程落地：**默认 FDE 用 `BINLOG_VERSION + ::server_version` 占位，读到真实 FDE 后替换**。
+
+**★ 第 1 层：先读头再分配**（`sql/binlog_reader.h:53`）：
+
+```cpp
+/**
+   Binlog_event_data_istream fetches byte data from Basic_istream and
+   divides them into event_data chunk according to the format. Event_data is a
+   serialized event object. It is a chunk of data in buffer.
+*/
+  template <class ALLOCATOR>
+  bool read_event_data(unsigned char **data, unsigned int *length,
+                       ALLOCATOR *allocator, bool verify_checksum,
+                       enum_binlog_checksum_alg checksum_alg) {
+    if (read_event_header() || check_event_header()) return true;
+    /* ★ 先读 19 字节公共头并校验，才知道这个事件有多长 */
+
+    unsigned char *event_data = allocator->allocate(m_event_length);
+    if (event_data == nullptr)
+      return m_error->set_type(Binlog_read_error::MEM_ALLOCATE);
+
+    if (fill_event_data(event_data, verify_checksum, checksum_alg)) {
+      allocator->deallocate(event_data);
+      return true;
+    }
+    *data = event_data;
+    *length = m_event_length;
+    return false;
+  }
+```
+> ⚠️ 真名核查：`Binlog_read_error` 定义在 **`sql/binlog_istream.h:37`**，不在 `sql/binlog_reader.h`。
+> ⚠️ `libbinlogevents/include/binlog_reader.h` **该文件不存在**。
+
 ### checksum 机制
 
 #### 能力协商：藏在 FDE 尾部
@@ -591,6 +1193,110 @@ checksum 算法不用独立配置下发，而是编码在 FDE 里：
 - 读侧读完 FDE 就知道「后续 event 有没有 checksum、用哪种」。
 
 这就是为什么 `binlog_checksum` 参数能在线切换、为什么 5.6 之前的老从库能读新主库——它看 FDE 的 A 字节，A=0 就按无 checksum 处理。
+
+**★ 枚举与 5 字节常量**（`binlog_event.h:438`）：
+
+```cpp
+enum enum_binlog_checksum_alg {
+  /**
+    Events are without checksum though its generator is checksum-capable
+    New Master (NM).
+  */
+  BINLOG_CHECKSUM_ALG_OFF = 0,
+  /** CRC32 of zlib algorithm */
+  BINLOG_CHECKSUM_ALG_CRC32 = 1,
+  /** the cut line: valid alg range is [1, 0x7f] */
+  BINLOG_CHECKSUM_ALG_ENUM_END,
+  /**
+    Special value to tag undetermined yet checksum or events from
+    checksum-unaware servers
+  */
+  BINLOG_CHECKSUM_ALG_UNDEF = 255
+};
+
+#define CHECKSUM_CRC32_SIGNATURE_LEN 4
+#define BINLOG_CHECKSUM_LEN CHECKSUM_CRC32_SIGNATURE_LEN
+#define BINLOG_CHECKSUM_ALG_DESC_LEN 1 /* 1 byte checksum alg descriptor */
+```
+> ★ `OFF=0` 与 `UNDEF=255` **必须严格区分**：0 = "有能力但本文件关闭"，255 = "老服务器压根没这概念"。
+> ★ `BINLOG_CHECKSUM_ALG_ENUM_END` 无显式值 = 2，它是"合法算法上界"哨兵，不是可用算法。
+
+**★★ `(A)` 字节的写入点与"能力协商"完整解释**（`sql/log_event.cc:5408`）：
+
+```cpp
+  buff[Binary_log_event::FORMAT_DESCRIPTION_HEADER_LEN] =
+      need_checksum() ? (uint8)common_footer->checksum_alg
+                      : (uint8)binary_log::BINLOG_CHECKSUM_ALG_OFF;
+  /*
+     FD of checksum-aware server is always checksum-equipped, (V) is in,
+     regardless of @@global.binlog_checksum policy.
+     Thereby a combination of (A) == 0, (V) != 0 means
+     it's the checksum-aware server's FD event that heads checksum-free binlog
+     file.
+     Here 0 stands for checksumming OFF to evaluate (V) as 0 is that case.
+     A combination of (A) != 0, (V) != 0 denotes FD of the checksum-aware server
+     heading the checksummed binlog.
+     (A), (V) presence in FD of the checksum-aware server makes the event
+     1 + 4 bytes bigger comparing to the former FD.
+  */
+  if ((no_checksum = (common_footer->checksum_alg ==
+                      binary_log::BINLOG_CHECKSUM_ALG_OFF))) {
+    // Forcing (V) room to fill anyway
+    common_footer->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
+  }
+```
+> ★★ `(A)` 写在偏移 `FORMAT_DESCRIPTION_HEADER_LEN(=98)` 处，**紧贴 `post_header_len[]` 数组之后**。
+> ★★ `need_checksum()==false` 时写 `OFF(0)` 而非 `UNDEF`——因为"能写 FDE 的服务器一定是 checksum-aware 的"。
+> ★ 即便关闭 checksum，`(V)` 的 4 字节空间也**必须留出来并算上**，保证 FDE 长度恒定——否则读侧无法用 `available_bytes` 反推数组长度。
+
+**★ checksum 版本门槛是 5.6.1**（`binlog_event.h:236` + `control_events.cpp:169`）：
+
+```cpp
+/**
+   Replication event checksum is introduced in the following "checksum-home"
+   version. The checksum-aware servers extract FD's version to decide whether
+   the FD event  carries checksum info.
+*/
+extern const unsigned char checksum_version_split[3];   /* = {5, 6, 1} */
+extern const unsigned long checksum_version_product;
+```
+```cpp
+bool Format_description_event::is_version_before_checksum() const {
+  return get_product_version() < checksum_version_product;
+}
+```
+> ★ 判定链路：`FDE.server_version` → `do_server_version_split` → `version_product(X*65536+Y*256+Z)` → 与 `checksum_version_product` 比大小。**是比版本号，不是比标志位**。
+
+**★ `Log_event_footer` 为什么只有一个成员**（`binlog_event.h:516`）：
+
+```cpp
+  @note checksum *value* is not generated with the event. On master's side, it
+        is calculated right before writing the event into the binary log. The
+        data_written field of the event is adjusted (+BINLOG_CHECKSUM_LEN) to
+        consider the checksum value as part of the event. On reading the event,
+        ... the checksum value can be retrieved from a particular offset of the
+        serialized event buffer (event length - BINLOG_CHECKSUM_LEN) and checked
+        for corruption ... It is not required after that. Therefore, the
+        checksum value is not required to be stored in the instance as a class
+        member.
+```
+> ⚠️ **不存在 `m_checksum_buf`**——checksum 值只是 `buf[event_len - 4]` 的一个临时字节。
+```cpp
+  /**
+     @verbatim
+     Master side:
+     The value is set by caller of FD(Format Description) constructor
+     In the FD case it's propagated into the last byte
+     of post_header_len[].
+     Slave side:
+     On the slave side the value is assigned from post_header_len[last]
+     of the last seen FD event.
+     @endverbatim
+     TODO(WL#7546): Revisit this comment when encoder is moved in libbinlogevent
+  */
+  enum_binlog_checksum_alg checksum_alg;
+```
+> ★ "propagated into the last byte of post_header_len[]"——把 FDE 尾部那 1 字节理解为数组的"第 42 个元素"。
 
 #### CRC 的三个精确落点（写侧三段式）
 
@@ -741,7 +1447,102 @@ mi->rli->relay_log.relay_log_checksum_alg = new_fdle->common_footer->checksum_al
 | 13 | `log_pos` | 4 | 下一个事件在 binlog 的起始偏移 |
 | 17 | `flags` | 2 | 标志位 |
 
-`flags` 关键位：`LOG_EVENT_BINLOG_IN_USE_F=0x1`（binlog 未正常关闭，仅 FDE）、`LOG_EVENT_THREAD_SPECIFIC_F=0x4`（依赖线程，如临时表）、`LOG_EVENT_SUPPRESS_USE_F=0x8`（抑制 USE 语句）、`LOG_EVENT_ARTIFICIAL_F=0x20`（人为生成不落盘）、`LOG_EVENT_RELAY_LOG_F=0x40`（从库 IO 线程写入 relay log）、`LOG_EVENT_IGNORABLE_F=0x80`（不认识的 type 可忽略）。
+**★ 五个偏移宏 + 长度常量**（`binlog_event.h:406`）：
+
+```cpp
+/*
+   Event header offsets;
+   these point to places inside the fixed header.
+*/
+#define EVENT_TYPE_OFFSET 4
+#define SERVER_ID_OFFSET 5
+#define EVENT_LEN_OFFSET 9
+#define LOG_POS_OFFSET 13
+#define FLAGS_OFFSET 17
+
+#define LOG_EVENT_HEADER_LEN 19U /* the fixed header length */
+```
+> ★ `4 + 1 + 4 + 4 + 4 + 2 = 19`。⚠️ **没有 `TIMESTAMP_OFFSET` 宏**——因为它恒为 0，代码里直接写 `int4store(buf, ...)`。
+> ⚠️ 另一个易混常量：`LOG_EVENT_HEADER_SIZE 20`（`binlog_event.h:465`）是 **dump 线程发包**用的，**不是**公共头长度。
+
+**★ 官方字节表**（`binlog_event.h:597`，★ Doxygen 原表的六个字段）：
+
+```cpp
+/**
+  @class Log_event_header
+
+  The Common-Header always has the same form and length within one
+  version of MySQL.  Each event type specifies a format and length
+  of the Post-Header.  The length of the Common-Header is the same
+  for all events of the same type.
+  ...
+  Summing up the numbers above, we see that the total size of the
+  common header is 19 bytes.
+*/
+```
+```cpp
+  /*
+    Timestamp on the master(for debugging and replication of
+    NOW()/TIMESTAMP).  It is important for queries and LOAD DATA
+    INFILE. This is set at the event's creation time, except for Query
+    and Load (and other events) events where this is set at the query's
+    execution time, which guarantees good replication (otherwise, we
+    could have a query and its event with different timestamps).
+  */
+  struct timeval when;
+  /* 【注】★"NOW() 要能正确复制"就是 timestamp 存在的根本理由 */
+  ...
+  unsigned long long log_pos;
+  /* 【注】★语义注意：是"下一个事件"的起始位置，不是本事件的起始位置 */
+  uint16_t flags;
+
+  explicit Log_event_header(Log_event_type type_code_arg = ENUM_END_EVENT)
+      : type_code(type_code_arg), data_written(0), log_pos(0), flags(0) { ... }
+  /* 【注】默认 type_code = ENUM_END_EVENT(42，非法值) —— 子类忘了设类型，解码时会早失败 */
+```
+
+**★ `flags` 完整位图（11 位，含 3 个"墓碑"）**：
+
+| 值 | 宏 | 位置 | 含义 |
+|---|---|---|---|
+| 0x1 | `LOG_EVENT_BINLOG_IN_USE_F` | `binlog_event.h:271`（**库侧**） | 仅 FDE：binlog 未正常关闭 |
+| 0x1 | ~~`LOG_EVENT_TIME_F`~~ | `sql/log_event.h:235`（注释墓碑） | 从未被设置，位被 0x1 复用 |
+| 0x2 | ~~`LOG_EVENT_FORCED_ROTATE_F`~~ | `sql/log_event.h:236`（注释墓碑） | 4.x Rotate 曾设，**位永久冻结** |
+| 0x4 | `LOG_EVENT_THREAD_SPECIFIC_F` | `sql/log_event.h:247` | 查询依赖线程（临时表） |
+| 0x8 | `LOG_EVENT_SUPPRESS_USE_F` | `sql/log_event.h:262` | 不生成 `USE db` |
+| 0x10 | ~~`LOG_EVENT_UPDATE_TABLE_MAP_VERSION_F`~~ | `sql/log_event.h:266`（注释占位） | 已废弃，**位永久冻结** |
+| 0x20 | `LOG_EVENT_ARTIFICIAL_F` | `sql/log_event.h:279` | 人造事件，不推进 master log pos |
+| 0x40 | `LOG_EVENT_RELAY_LOG_F` | `sql/log_event.h:287` | IO 线程写入 relay log |
+| 0x80 | `LOG_EVENT_IGNORABLE_F` | `binlog_event.h:162` / `sql/log_event.h:298` | 从库不认识也可安全忽略 |
+| 0x100 | `LOG_EVENT_NO_FILTER_F` | `sql/log_event.h:307` | 不受库级过滤规则影响 |
+| 0x200 | `LOG_EVENT_MTS_ISOLATE_F` | `sql/log_event.h:318` | MTS：强制该事务独占执行 |
+
+```cpp
+/* binlog_event.h:250 —— ★ 唯一一个"写完后还会被改写"的字节 */
+/*
+   This flag only makes sense for Format_description_event. It is set
+   when the event is written, and *reset* when a binlog file is
+   closed (yes, it's the only case when MySQL modifies an already written
+   part of the binlog).  Thus it is a reliable indicator that the binlog was
+   closed correctly.  ...  To solve this we use this
+   flag and automatically append ROLLBACK to every non-closed binlog (append
+   virtually, on reading, file itself is not changed). If this flag is found,
+   mysqlbinlog simply prints "ROLLBACK".
+*/
+#define LOG_EVENT_BINLOG_IN_USE_F 0x1
+```
+```cpp
+/* sql/log_event.h:826 —— 四个判定入口 */
+  bool is_artificial_event() const { return common_header->flags & LOG_EVENT_ARTIFICIAL_F; }
+  bool is_relay_log_event() const { return common_header->flags & LOG_EVENT_RELAY_LOG_F; }
+  bool is_ignorable_event() const { return common_header->flags & LOG_EVENT_IGNORABLE_F; }
+  bool is_no_filter_event() const { return common_header->flags & LOG_EVENT_NO_FILTER_F; }
+```
+> ★ `LOG_EVENT_IGNORABLE_F` 是"能力协商"的**第二条通道**：不是 FDE 里的集中协商，而是每个事件自带 1 bit 声明"你可以不认识我"。判定时**只读公共头 2 字节**即可，无需解析整个事件：
+> ```cpp
+>   event_info.ignorable_event = uint2korr(buf + FLAGS_OFFSET) & LOG_EVENT_IGNORABLE_F;  /* log_event.cc:14487 */
+> ```
+> ⚠️ `LOG_EVENT_NO_FILTER_F=0x100` 已超出低 8 位，但仍在 `uint16_t` 范围内。
 
 #### 控制事件（control_events.h）
 
@@ -958,6 +1759,154 @@ body（变长，逐代追加）
 
 **User_var_event（type=14）**：post-header=0，body = `name + is_null(1) + type(1) + charset(4) + value_len(4) + value`。用户变量值，SBR 下传递。
 
+**★ `statement_events.h` 里只有 4 个类**（⚠️ `XA_prepare_event` **不在**这里，在 `control_events.h:580`）：
+
+| 行号 | 类 | 事件类型 |
+|---|---|---|
+| `451` | `Query_event` | `QUERY_EVENT(2)` / `EXECUTE_LOAD_QUERY_EVENT(18)` |
+| `804` | `User_var_event` | `USER_VAR_EVENT(14)` |
+| `921` | `Intvar_event` | `INTVAR_EVENT(5)` |
+| `1033` | `Rand_event` | `RAND_EVENT(13)` |
+
+**★ `Query_event` 的两个枚举原文**（`statement_events.h:451`）：
+
+```cpp
+class Query_event : public Binary_log_event {
+ public:
+  /** query event post-header */
+  enum Query_event_post_header_offset {
+    Q_THREAD_ID_OFFSET = 0,
+    Q_EXEC_TIME_OFFSET = 4,
+    Q_DB_LEN_OFFSET = 8,
+    Q_ERR_CODE_OFFSET = 9,
+    Q_STATUS_VARS_LEN_OFFSET = 11,
+    Q_DATA_OFFSET = QUERY_HEADER_LEN
+  };
+  /* ★ 4+4+1+2+2 = 13 = QUERY_HEADER_LEN = QUERY_HEADER_MINIMAL_LEN(11) + 2
+       多出的 2 字节就是 5.0 新增的 status_vars_len */
+
+  /* these are codes, not offsets; not more than 256 values (1 byte). */
+  enum Query_event_status_vars {
+    Q_FLAGS2_CODE = 0,
+    Q_SQL_MODE_CODE,
+    /*
+      Q_CATALOG_CODE is catalog with end zero stored; it is used only by MySQL
+      5.0.x where 0<=x<=3. We have to keep it to be able to replicate these
+      old masters.
+    */
+    Q_CATALOG_CODE,
+    Q_AUTO_INCREMENT,
+    Q_CHARSET_CODE,
+    Q_TIME_ZONE_CODE,
+    /*
+      Q_CATALOG_NZ_CODE is catalog withOUT end zero stored; it is used by MySQL
+      5.0.x where x>=4. Saves one byte in every Query_event in binlog,
+      compared to Q_CATALOG_CODE. The reason we didn't simply re-use
+      Q_CATALOG_CODE is that then a 5.0.3 slave of this 5.0.x (x>=4)
+      master would crash (segfault etc) because it would expect a 0 when there
+      is none.
+    */
+    Q_CATALOG_NZ_CODE,
+    Q_LC_TIME_NAMES_CODE,
+    Q_CHARSET_DATABASE_CODE,
+    Q_TABLE_MAP_FOR_UPDATE_CODE,
+    /* It is just a placeholder after 8.0.2*/
+    Q_MASTER_DATA_WRITTEN_CODE,
+    Q_INVOKER,
+    Q_UPDATED_DB_NAMES,
+    Q_MICROSECONDS,
+    Q_COMMIT_TS,
+    Q_COMMIT_TS2,
+    Q_EXPLICIT_DEFAULTS_FOR_TIMESTAMP,
+    Q_DDL_LOGGED_WITH_XID,
+    Q_DEFAULT_COLLATION_FOR_UTF8MB4,
+    Q_SQL_REQUIRE_PRIMARY_KEY,
+    Q_DEFAULT_TABLE_ENCRYPTION        /* = 20，共 21 个 code */
+  };
+```
+
+**★ status_vars 区的落盘顺序与"N 位变长"设计**（`statement_events.h:555`）：
+
+```cpp
+  /*
+    We want to be able to store a variable number of N-bit status vars:
+    (generally N=32; but N=64 for SQL_MODE) a user may want to log the number
+    of affected rows (for debugging) while another does not want to lose 4
+    bytes in this.
+    The storage on disk is the following:
+    status_vars_len is part of the post-header,
+    status_vars are in the variable-length part, after the post-header, before
+    the db & query.
+    status_vars on disk is a sequence of pairs (code, value) where 'code' means
+    'sql_mode', 'affected' etc. Sometimes 'value' must be a short string, so
+    its first byte is its length. For now the order of status vars is:
+    flags2 - sql_mode - catalog - autoinc - charset
+    ...
+    The new way of logging LOAD DATA INFILE would use a derived class of
+    Query_event, so automatically benefit from the work already done for
+    status variables in Query_event.
+  */
+```
+> ★ 最后一句解释了 `Execute_load_query_event : public virtual Query_event` 的由来。
+
+**★ `Intvar_event` 的 `Int_event_type` 枚举**（`statement_events.h:921`，★ 真名不是 `I_TYPE`）：
+
+```cpp
+  /*
+    The enum recognizes the type of variables that can occur in an
+    INTVAR_EVENT. The two types supported are LAST_INSERT_ID and
+    INSERT_ID, in accordance to the SQL query using LAST_INSERT_ID
+    or INSERT_ID.
+  */
+  enum Int_event_type {
+    INVALID_INT_EVENT,      /* = 0 */
+    LAST_INSERT_ID_EVENT,   /* = 1 */
+    INSERT_ID_EVENT         /* = 2 */
+  };
+
+  enum Intvar_event_offset { I_TYPE_OFFSET = 0, I_VAL_OFFSET = 1 };
+```
+> ⚠️ 构造函数注释画的是 `| type (4 bytes) | val (8 bytes) |`，与 Doxygen 表（`type` 1 字节）**自相矛盾**——以 Doxygen 表为准（`I_TYPE_OFFSET=0` 读 1 字节，`I_VAL_OFFSET=1` 读 8 字节）。
+
+**★ `Rand_event` 存在的原因**（`statement_events.h:995`）：
+
+```cpp
+/**
+  Logs random seed used by the next RAND(), and by PASSWORD() in 4.1.0.
+  ...
+  The state of the random number generation consists of 128 bits,
+  which are stored internally as two 64-bit numbers.
+*/
+class Rand_event : public Binary_log_event {
+ public:
+  unsigned long long seed1;
+  unsigned long long seed2;
+  enum Rand_event_data { RAND_SEED1_OFFSET = 0, RAND_SEED2_OFFSET = 8 };
+```
+> ★ `RAND()` 非确定性 ⇒ 只能把 RNG 的两个 64 位种子一起发过去。
+
+**★ `User_var_event` 的 body 布局**（`statement_events.h:804`）：
+
+```cpp
+  enum { UNDEF_F, UNSIGNED_F };          /* ★ 只有 2 个 flag */
+  enum User_var_event_data {
+    UV_VAL_LEN_SIZE = 4,
+    UV_VAL_IS_NULL = 1,
+    UV_VAL_TYPE_SIZE = 1,
+    UV_NAME_LEN_SIZE = 4,
+    UV_CHARSET_NUMBER_SIZE = 4
+  };
+```
+```cpp
+    The buffer layout for variable data part is as follows:
+    <pre>
+    +-------------------------------------------------------------------+
+    | name_len | name | is_null | type | charset_number | val_len | val |
+    +-------------------------------------------------------------------+
+    </pre>
+```
+> ★ `USER_VAR_HEADER_LEN = 0`，上面这些是**字段宽度**而非偏移，全部落在 Body 里。
+
 #### 行事件（rows_event.h）
 
 **Table_map_event（type=19）**：post-header 8 字节：
@@ -1111,6 +2060,164 @@ body
 
 每行 = `null bitmap（ceil(该镜像列数/8)）` + 逐列值（NULL 列不占值空间）。行 flags：`STMT_END_F`、`NO_FOREIGN_KEY_CHECKS_F`、`RELAXED_FK_CHECKS`、`COMPLETE_ROWS_F` 等。`PARTIAL_UPDATE_ROWS_EVENT` 的 AI 前另有 `value_options + partial bits`，用于 `binlog_row_value_options=PARTIAL_JSON`。
 
+**★ 三组字节级宏**（`rows_event.h:42`）：
+
+```cpp
+/**
+   1 byte length, 1 byte format
+   Length is total length in bytes, including 2 byte header
+   Length values 0 and 1 are currently invalid and reserved.
+*/
+#define EXTRA_ROW_INFO_LEN_OFFSET 0
+#define EXTRA_ROW_INFO_FORMAT_OFFSET 1
+#define EXTRA_ROW_INFO_HEADER_LENGTH 2
+#define EXTRA_ROW_INFO_MAX_PAYLOAD (255 - EXTRA_ROW_INFO_HEADER_LENGTH)
+
+#define ROWS_MAPID_OFFSET 0
+#define ROWS_FLAGS_OFFSET 6
+#define ROWS_VHLEN_OFFSET 8
+/* ★ post-header 推导：6(table_id) + 2(flags) + 2(var_header_len) = 10 = ROWS_HEADER_LEN_V2
+     V1 只有 8 字节 = 6 + 2，**没有 var_header_len** —— 这就是 V1/V2 唯一的结构差异 */
+
+enum class enum_extra_row_info_typecode { NDB = 0, PART = 1 };
+```
+```cpp
+/* rows_event.h:527 —— Table_map 的 post-header = 6 + 2 = 8 */
+  enum Table_map_event_offset {
+    /** TM = "Table Map" */
+    TM_MAPID_OFFSET = 0,
+    TM_FLAGS_OFFSET = 6
+  };
+```
+
+**★ `Rows_event::enum_flag` 与 `COMPLETE_ROWS_F`**（`rows_event.h:713`）：
+
+```cpp
+  enum enum_flag {
+    /** Last event of a statement */
+    STMT_END_F = (1U << 0),
+    /** Value of the OPTION_NO_FOREIGN_KEY_CHECKS flag in thd->options */
+    NO_FOREIGN_KEY_CHECKS_F = (1U << 1),
+    /** Value of the OPTION_RELAXED_UNIQUE_CHECKS flag in thd->options */
+    RELAXED_UNIQUE_CHECKS_F = (1U << 2),
+    /**
+      Indicates that rows in this event are complete, that is contain
+      values for all columns of the table.
+    */
+    COMPLETE_ROWS_F = (1U << 3)
+  };
+```
+> ★★ `COMPLETE_ROWS_F` **就是 PARTIAL_UPDATE 的开关**：partial JSON 模式下该位被清掉，表示"行像不完整，只含被修改的列"。
+```cpp
+/* ★ mysqlbinlog -v 里 "### Complete Rows" 那行注释就出自这里 */
+  static std::string get_flag_string(enum_flag flag) {
+    std::string str = "";
+    if (flag & STMT_END_F) str.append(" Last event of the statement");
+    if (flag & NO_FOREIGN_KEY_CHECKS_F) str.append(" No foreign Key checks");
+    if (flag & RELAXED_UNIQUE_CHECKS_F) str.append(" No unique key checks");
+    if (flag & COMPLETE_ROWS_F) str.append(" Complete Rows");
+    if (flag & ~(STMT_END_F | NO_FOREIGN_KEY_CHECKS_F |
+                 RELAXED_UNIQUE_CHECKS_F | COMPLETE_ROWS_F))
+      str.append("Unknown Flag");
+    return str;
+  }
+```
+
+**★★ `Optional_metadata_field_type` 完整枚举（12 项）**（`rows_event.h:535`）：
+
+```cpp
+  /**
+    DEFAULT_CHARSET and COLUMN_CHARSET don't appear together, and
+    ENUM_AND_SET_DEFAULT_CHARSET and ENUM_AND_SET_COLUMN_CHARSET don't
+    appear together. They are just alternative ways to pack character
+    set information. When binlogging, it logs character sets in the
+    way that occupies least storage.
+
+    SIMPLE_PRIMARY_KEY and PRIMARY_KEY_WITH_PREFIX don't appear together.
+    SIMPLE_PRIMARY_KEY is for the primary keys which only use whole values of
+    pk columns. PRIMARY_KEY_WITH_PREFIX is
+    for the primary keys which just use part value of pk columns.
+   */
+  enum Optional_metadata_field_type {
+    SIGNEDNESS = 1,  // UNSIGNED flag of numeric columns
+    DEFAULT_CHARSET,
+    COLUMN_CHARSET,
+    COLUMN_NAME,                     /* 仅 binlog_row_metadata=FULL */
+    SET_STR_VALUE,                   /* 仅 FULL */
+    ENUM_STR_VALUE,                  /* 仅 FULL */
+    GEOMETRY_TYPE,                   /* 仅 FULL */
+    SIMPLE_PRIMARY_KEY,              /* 仅 FULL */
+    PRIMARY_KEY_WITH_PREFIX,         /* 仅 FULL */
+    ENUM_AND_SET_DEFAULT_CHARSET,
+    ENUM_AND_SET_COLUMN_CHARSET,
+    COLUMN_VISIBILITY                /* 8.0.23+ 不可见列 */
+  };
+```
+> ★ 从 **1** 开始编号（0 留给"数组结束"），共 12 项。TLV 编码：`1 字节 type + packed integer length + payload`。
+> ⚠️ `ENUM_AND_SET_COLUMN_CHARSET` 的注释是复制粘贴的（仍写 "many columns have the same charset"，实际应为 "many different charsets"）。
+
+**★ 解析后的结构化容器**（`rows_event.h:573`）：
+
+```cpp
+  /**
+    Metadata_fields organizes m_optional_metadata into a structured format which
+    is easy to access.
+  */
+  struct Optional_metadata_fields {
+    typedef std::pair<unsigned int, unsigned int> uint_pair;
+    typedef std::vector<std::string> str_vector;
+
+    struct Default_charset {
+      Default_charset() : default_charset(0) {}
+      bool empty() const { return default_charset == 0; }
+      // Default charset for the columns which are not in charset_pairs.
+      unsigned int default_charset;
+      /* The uint_pair means <column index, column charset number>. */
+      std::vector<uint_pair> charset_pairs;
+    };
+
+    Default_charset m_default_charset;
+    Default_charset m_enum_and_set_default_charset;
+    std::vector<bool> m_signedness;
+    std::vector<unsigned int> m_column_charset;
+    std::vector<unsigned int> m_enum_and_set_column_charset;
+    std::vector<std::string> m_column_name;
+    std::vector<str_vector> m_enum_str_value;
+    std::vector<str_vector> m_set_str_value;
+    std::vector<unsigned int> m_geometry_type;
+    /*
+      The uint_pair means <column index, prefix length>.  Prefix length is 0 if
+      whole column value is used.
+    */
+    std::vector<uint_pair> m_primary_key;
+    std::vector<bool> m_column_visibility;
+```
+
+**★★ `PARTIAL_UPDATE_ROWS_EVENT` 没有独立子类**（`rows_event.h:1079`）：
+
+```cpp
+class Update_rows_event : public virtual Rows_event {
+ public:
+  Update_rows_event(const char *buf, const Format_description_event *fde);
+  Update_rows_event(Log_event_type event_type) : Rows_event(event_type) {}
+  /* ★★ 靠这个带 event_type 参数的构造函数复用 —— 39 与 31 共用同一个类 */
+};
+```
+> ★ 两者 post-header 长度相同（都是 `ROWS_HEADER_LEN_V2 = 10`），区别只在 flags 里的 `COMPLETE_ROWS_F` 是否被清掉。
+
+**★ before/after image 的官方对照表**（`rows_event.h:761`，★ 讲 BI/AI 最好的一张图）：
+
+```cpp
+          +-------------------------------------------------------+
+          | Event Type | Cols_before_image | Cols_after_image     |
+          +-------------------------------------------------------+
+          |  DELETE    |   Deleted row     |    NULL              |
+          |  INSERT    |   NULL            |    Inserted row      |
+          |  UPDATE    |   Old     row     |    Updated row       |
+          +-------------------------------------------------------+
+```
+> ★ `enum_row_image_type` 真名在 **`sql/rpl_record.h:40`**（不在 libbinlogevents），4 个值：`WRITE_AI` / `UPDATE_BI` / `UPDATE_AI` / `DELETE_BI`。⚠️ **不存在 `enum_row_event_type`**。
+
 #### Rows 反序列化：两层架构 + 逐列 unpack 完整走读
 
 **一个必须先建立的认知**：Rows 的反序列化是**分两层的**，职责边界很清晰：
@@ -1258,6 +2365,103 @@ LOAD DATA 在大文件场景把数据分块传输，对应四个事件：
 
 这套事件在 RBR 下用来传递「从库无法从行事件反推」的 LOAD DATA 上下文。
 
+**★ 官方说明：LOAD DATA 是唯一"不以明文语句落盘"的语句**（`load_data_events.h:25`）：
+
+```cpp
+  @file load_data_events.h
+
+  @brief LOAD DATA INFILE is not written to the binary log like other
+  statements. It is written as one or more events in a packed format,
+  not as a cleartext statement in the binary log. The events indicate
+  what options are present in the statement and how to process the data file.
+```
+> ★ 事件序列：`Begin_load_query_event`(17) → `Append_block_event`(9) ×N → `Execute_load_query_event`(18) → `Delete_file_event`(11)。
+
+**★ 分块阈值 ≈ 128 KB**（`load_data_events.h:241`）：
+
+```cpp
+/**
+  This event is created to contain the file data. One LOAD_DATA_INFILE
+  can have 0 or more instances of this event written to the binary log
+  depending on the size of the file. If the file to be loaded is greater
+  than the threshold value, which is roughly 2^17 bytes, the file is
+  divided into blocks of size equal to the threshold, and each block
+  is sent across as a separate event.
+*/
+```
+```cpp
+  enum Append_block_offset {
+    /** AB = "Append Block" */
+    AB_FILE_ID_OFFSET = 0,
+    AB_DATA_OFFSET = APPEND_BLOCK_HEADER_LEN    /* = 4 */
+  };
+```
+
+**★ `Execute_load_query_event` 的偏移链**（`load_data_events.h:119`，★ 13+4+4+4+1 = 26）：
+
+```cpp
+class Execute_load_query_event : public virtual Query_event {
+ public:
+  enum Execute_load_query_event_offset {
+    /** ELQ = "Execute Load Query" */
+    ELQ_FILE_ID_OFFSET = QUERY_HEADER_LEN,        /* = 13 */
+    ELQ_FN_POS_START_OFFSET = ELQ_FILE_ID_OFFSET + 4,
+    ELQ_FN_POS_END_OFFSET = ELQ_FILE_ID_OFFSET + 8,
+    ELQ_DUP_HANDLING_OFFSET = ELQ_FILE_ID_OFFSET + 12
+  };
+
+  int32_t file_id;       /** file_id of temporary file */
+  uint32_t fn_pos_start; /** pointer to the part of the query that should
+                            be substituted */
+  uint32_t fn_pos_end;   /** pointer to the end of this part of query */
+
+  /**
+    We have to store type of duplicate handling explicitly, because
+    for LOAD DATA it also depends on LOCAL option. And this part
+    of query will be rewritten during replication so this information
+    may be lost...
+  */
+  enum_load_dup_handling dup_handling;
+```
+> ★★ `fn_pos_start` / `fn_pos_end` 的作用：把 query 文本里**原始文件名的字节区间**替换成从库本地临时文件名——这是 LOAD DATA 复制的核心技巧。
+
+**★ option 宏与 dup 枚举**（`load_data_events.h:43`）：
+
+```cpp
+#define DUMPFILE_FLAG 0x1
+#define OPT_ENCLOSED_FLAG 0x2
+#define REPLACE_FLAG 0x4
+#define IGNORE_FLAG 0x8
+
+#define FIELD_TERM_EMPTY 0x1
+#define ENCLOSED_EMPTY 0x2
+#define LINE_TERM_EMPTY 0x4
+#define LINE_START_EMPTY 0x8
+#define ESCAPED_EMPTY 0x10
+
+enum enum_load_dup_handling {
+  LOAD_DUP_ERROR = 0,
+  LOAD_DUP_IGNORE,
+  LOAD_DUP_REPLACE
+};
+```
+
+**★ 一个易忽略的设计细节：`db` 只用于过滤、不落盘**（`load_data_events.h:241`）：
+
+```cpp
+  /**
+    'db' is filled when the event is created in mysql_load() (the
+    event needs to have a 'db' member to be well filtered by
+    binlog-*-db rules). 'db' is not written to the binlog (it's not
+    used by Append_block_log_event::write()), so it can't be read in
+    the Append_block_event(const char* buf, int event_len)
+    constructor. ...
+  */
+  const char *db;
+```
+
+> ⚠️ `Begin_load_query_event` 的 Doxygen 说"Post-Header and Body 都空"，但它是 `Append_block_event` 的**子类**，实际 post-header 就是 4 字节 `file_id`、body 是 block 数据——**注释与继承关系不一致**（上游瑕疵）。
+
 ### 内存管理与生命周期
 
 事件对象在写侧和读侧的持有方式不同：
@@ -1275,6 +2479,161 @@ LOAD DATA 在大文件场景把数据分块传输，对应四个事件：
 ```
 
 这一层「对象是否接管内存」的契约，正是「工程实现技法」里 C 与 C++ 边界的一个典型。
+
+**★★ `Log_event::operator new` 走 `MY_FAE`——OOM 直接 abort**（`sql/log_event.cc:1016`）：
+
+```cpp
+/*
+  This method is not on header file to avoid using key_memory_log_event
+  outside log_event.cc, allowing header file to be included on plugins.
+*/
+void *Log_event::operator new(size_t size) {
+  return my_malloc(key_memory_log_event, size, MYF(MY_WME | MY_FAE));
+}
+```
+```cpp
+/* sql/log_event.h:765 —— 声明（含 sized delete 与 placement 版本） */
+  void *operator new(size_t size);
+  static void operator delete(void *ptr, size_t) { my_free(ptr); }
+  /* Placement version of the above operators */
+  static void *operator new(size_t, void *ptr) { return ptr; }
+  static void operator delete(void *, void *) {}
+```
+> ★★ **`MY_FAE` = Fatal Always Error** ⇒ 不是 `std::nothrow`，**永远不返回 nullptr**，分配失败直接 abort 进程。
+> ★ 注释解释了为什么实现放 `.cc`：把 PSI 内存 key `key_memory_log_event` 锁在 `.cc` 里，头文件才能被插件 include。
+
+**★ `temp_buf` 的所有权标志位**（`sql/log_event.h:654`，★ 手工实现"借用 vs 拥有"）：
+
+```cpp
+  /*
+    This variable determines whether the event is responsible for deallocating
+    the memory pointed by temp_buf. When set to true temp_buf is deallocated
+    and when it is set to false just make temp_buf point to NULL.
+  */
+  bool m_free_temp_buf_in_destructor;
+```
+```cpp
+  virtual void claim_memory_ownership([[maybe_unused]] bool claim) {}
+  virtual ~Log_event() { free_temp_buf(); }      /* ★ 析构只做一件事 */
+  void register_temp_buf(char *buf, bool free_in_destructor = true) {
+    m_free_temp_buf_in_destructor = free_in_destructor;
+    temp_buf = buf;
+  }
+  void free_temp_buf() {
+    if (temp_buf) {
+      if (m_free_temp_buf_in_destructor) my_free(temp_buf);   /* ★ false 时只置空不释放 */
+      temp_buf = nullptr;
+    }
+  }
+```
+> ★ `claim_memory_ownership()` 是**多态钩子**，让子类在事件被长期持有/移交时改变所有权语义。
+
+**★★ `Rows_log_event` 的五个裸指针**（⚠️ **不存在 `m_row_image`**）：
+
+```cpp
+/* sql/log_event.h:2811 */
+  uchar *m_rows_buf; /* The rows in packed format */    /* 起点 = &row[0] */
+  uchar *m_rows_cur; /* One-after the end of the data */ /* 写路径游标 */
+  uchar *m_rows_end; /* One-after the end of the allocated space */
+
+#if defined(MYSQL_SERVER)
+  const uchar *m_curr_row;     /* Start of the row being processed */
+  const uchar *m_curr_row_end; /* One-after the end of the current row */
+#endif
+```
+> ★ `m_curr_row` / `m_curr_row_end` **只在 `MYSQL_SERVER` 编译时存在**——mysqlbinlog 侧根本没有这两个成员。
+
+**★ 裸指针指向 `std::vector` 内部**（`sql/log_event.cc:7935`，★ 两个世界的接缝）：
+
+```cpp
+  /*
+    m_rows_buf, m_curr_row and m_rows_end are pointers to the vector rows.
+    ... These pointers are used while applying the events on to the slave, and
+    are not required for decoding.
+  */
+  if (likely(!row.empty())) {
+    m_rows_buf = &row[0];       /* ★ 借用 libbinlogevents 的 vector 内存，不额外 malloc */
+#if defined(MYSQL_SERVER)
+    m_curr_row = m_rows_buf;
+#endif
+    m_rows_end = m_rows_buf + row.size() - 1;
+    m_rows_cur = m_rows_end;
+  }
+```
+```cpp
+/* :8189 —— ★ vector 扩容后必须重新绑定 */
+    if (new_alloc && &row[0] != m_rows_buf) {
+      m_rows_buf = &row[0];
+      common_header->set_is_valid(m_rows_buf && m_cols.bitmap);
+      m_rows_cur = m_rows_buf + cur_size;
+    }
+    m_rows_end = m_rows_buf + new_alloc;
+```
+> ★★ 这是最容易踩的坑：**写路径追加行时 vector 可能 realloc，裸指针全部失效**，所以 8189 行必须重新绑定。
+
+**★ `~Rows_log_event()` 完全不碰 `m_rows_buf`**（`sql/log_event.cc:7966`）：
+
+```cpp
+Rows_log_event::~Rows_log_event() {
+  if (m_cols.bitmap) {
+    if (m_cols.bitmap == m_bitbuf)  // no my_malloc happened
+      m_cols.bitmap = nullptr;      // so no my_free in bitmap_free
+    bitmap_free(&m_cols);           // To pair with bitmap_init().
+  }
+  ...
+}
+```
+> ★ 因为 `m_rows_buf` **借自 vector**，由 vector 自己释放。
+> ★ 小表优化：列数 ≤128 时用栈上 `m_bitbuf`，靠"**指针相等**"判断是否走过 malloc。
+
+**★ 事件何时被删：`shall_delete_event_after_apply()`**（`sql/log_event.cc:14166`）：
+
+```cpp
+static bool shall_delete_event_after_apply(Log_event *ev) {
+  bool res = false;
+  if (ev == nullptr) return res;
+  switch (ev->get_type_code()) {
+    case binary_log::FORMAT_DESCRIPTION_EVENT:
+      /*
+        Format_description_log_event should not be deleted because it will
+        be used to read info about the relay log's format; it will be
+        deleted when the SQL thread does not need it, i.e. when this
+        thread terminates.
+      */
+      [[fallthrough]];                /* ★ C++17 属性：显式声明故意穿透 */
+    case binary_log::ROWS_QUERY_LOG_EVENT:
+      res = false;
+      break;
+    default:
+      res = true;                     /* ★ 默认：apply 完立刻 delete */
+      break;
+  }
+  return res;
+}
+```
+> ⚠️ **不存在统一的 `delete_event()` / `free_event()`**——释放就是 `delete ev`（配合 `operator delete` → `my_free`）。
+
+**★ 不能立刻删的事件必须拷贝自己的 buffer**（`sql/log_event.cc:14228`）：
+
+```cpp
+  if (!shall_delete_event_after_apply(ev)) {
+    copy_buffer = (uchar *)my_malloc(key_memory_log_event, event_len, MYF(MY_WME));
+    memcpy(copy_buffer, ptr, event_len);
+    copied_buffer = true;             /* 长命事件 → 拷贝一份 */
+  } else {
+    copy_buffer = const_cast<uchar *>(ptr);
+    copied_buffer = false;            /* 短命事件 → 直接借用，零拷贝 */
+  }
+  ev->register_temp_buf((char *)copy_buffer, copied_buffer);
+```
+> ★ 第二实参就是 `free_in_destructor`——**所有权决定被写进事件对象**。
+
+**★ 观测路径用 `shared_ptr`，与复制路径的裸 `new/delete` 形成对比**（`sql/binlog.cc:3551`）：
+
+```cpp
+    std::shared_ptr<Log_event> ev;
+    while (istream >> ev) { ... }
+```
 
 ---
 
@@ -1341,6 +2700,101 @@ class Binlog_sender::Event_allocator {
 | 编译期枚举切换所有权 | `DELEGATE_MEMORY_TO_EVENT_OBJECT` | 同一类两种内存语义，零运行时开销 | 读代码必须先知道实例化的是哪个分配器 |
 | 虚函数三段式模板方法 | `write` 编排 header/data_header/data_body/footer | 序列化骨架复用，子类只填两段 | 每加字段要动 header/data 两处 |
 | RAII（`Binlog_cache_compressor`） | 压缩上下文析构写统计 | 异常安全，路径必写统计 | 析构副作用，排查时易忽略 |
+
+**★ 补充：libbinlogevents 里真正在用的 8 个 C++ 特性（逐个有源码实证）**：
+
+**① SFINAE + `constexpr` 三连**（`libbinlogevents/include/math/math.h:28`）：
+
+```cpp
+namespace mysqlns::math {          /* ★ C++17 嵌套命名空间简写 */
+
+/// Return x+y, limited to the given maximum.
+/// @note This works even when x+y would exceed the maximum for the datatype.
+template <typename T, std::enable_if_t<std::is_integral<T>::value &&
+                                           std::is_unsigned<T>::value,
+                                       bool> = true>
+constexpr T add_bounded(const T x, const T y, const T maximum) {
+  if (y >= maximum || maximum - y < x) return maximum;   /* ★ 先减后比，规避 x+y 溢出 UB */
+  return x + y;
+}
+
+/// Return ceil(x / y), where x and y are unsigned integer types
+template <typename T, std::enable_if_t<std::is_integral<T>::value &&
+                                           std::is_unsigned<T>::value,
+                                       bool> = true>
+constexpr T ceil_div(const T x, const T y) {
+  return (x + y - 1) / y;          /* ★ 位图字节数 (n+7)/8 的通用版 */
+}
+```
+
+**② `[[NODISCARD]]` 宏绕 GCC bug**（`libbinlogevents/include/nodiscard.h:27`，★ 少见写法）：
+
+```cpp
+/// The function attribute [[NODISCARD]] is a replacement for
+/// [[nodiscard]] to workaround a gcc bug.
+/// ...
+/// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=84476
+/// OTOH, gnu::warn_unused_result is unaffected by the bug.
+/// ...
+/// MSVC gives a warning for gnu::warn_unused_result because it does
+/// not recognize it, so we use gnu::warn_unused_result only on gnuc.
+#ifdef __GNUC__
+#define NODISCARD nodiscard, gnu::warn_unused_result    /* ★ 一个宏里挂两个属性，逗号分隔 */
+#else
+#define NODISCARD nodiscard
+#endif
+```
+
+**③ Rule of Five + 纯虚析构**（`binlog_event.h:894`）：
+
+```cpp
+  virtual ~Binary_log_event() = 0;       /* ★ 纯虚析构：无其他纯虚函数也能让类抽象 */
+
+  Binary_log_event(const Binary_log_event &) = default;
+  Binary_log_event(Binary_log_event &&) = default;
+  Binary_log_event &operator=(const Binary_log_event &) = default;
+  Binary_log_event &operator=(Binary_log_event &&) = default;
+```
+> ★ 因为有虚析构，移动操作**本会被编译器抑制**，这里显式 `= default` 恢复——教科书式的 Rule of Five。
+
+**④ 析构也能写 `override`**（`rows_event.h:941`）：
+
+```cpp
+  ~Rows_event() override;
+```
+> ★ 基类析构是虚函数，这样基类析构签名一改**编译期就报错**。
+
+**⑤ 重载决议代替模板特化**（`event_reader.h:464`，★ 见「Event_reader」节）：五个 `letoh()` 重载按参数类型分发。
+
+**⑥ NSDMI 类内成员初始化**（`binlog_event.h:386`）：
+
+```cpp
+struct Log_event_basic_info {
+  Log_event_type event_type{UNKNOWN_EVENT};
+  const char *query{nullptr};
+  size_t query_length{0};
+  bool ignorable_event{false};
+};
+```
+
+**⑦ `[[fallthrough]]` / `[[maybe_unused]]`**（C++17 标准属性）：
+
+```cpp
+      [[fallthrough]];                   /* sql/log_event.cc:14178 —— 显式声明故意穿透 */
+  virtual void claim_memory_ownership([[maybe_unused]] bool claim) {}  /* sql/log_event.h:863 */
+inline void *bapi_malloc(size_t size, int flags [[maybe_unused]]) {    /* wrapper_functions.h:192 */
+```
+
+**⑧ `std::unique_ptr` + RAII**（`sql/rpl_record.cc:496`）：
+
+```cpp
+  std::unique_ptr<cs::util::ReplicatedColumnsView> fields =
+      cs::util::ReplicatedColumnsViewFactory::
+          get_columns_view_with_inbound_filters(rli->info_thd, table, tabledef);
+```
+> ★ 工厂返回 `unique_ptr`，逐行 unpack 全程 RAII，无手工 `delete`。
+
+**⑨ 模板化的 `show_binlog_events<READER>`**（`sql/binlog.cc:3476`）：用模板参数而非虚基类区分 binlog/relaylog reader，**零运行时开销的编译期多态**。
 
 ### 二、经典算法的实现落地
 
@@ -1435,6 +2889,81 @@ classDiagram
 | `binlog_transaction_compression` | OFF | Global | 事务压缩（产生 Transaction_payload_event） |
 | `log_bin_use_v1_row_events` | OFF | Session | 是否用 v1 行事件 |
 
+**★ 补齐：8 个变量的注册原文（逐个带行号）**：
+
+| 变量名 | 文件:行 | 默认值 | 作用域 |
+|---|---|---|---|
+| `binlog_format` | `sql/sys_vars.cc:1428` | `BINLOG_FORMAT_ROW` | SESSION（**已 DEPRECATED**） |
+| `binlog_row_image` | `sql/sys_vars.cc:1475` | `BINLOG_ROW_IMAGE_FULL` | SESSION |
+| `binlog_row_metadata` | `sql/sys_vars.cc:1490` | `BINLOG_ROW_METADATA_MINIMAL` | GLOBAL |
+| `binlog_transaction_compression` | `sql/sys_vars.cc:1511` | `false` | SESSION |
+| `binlog_expire_logs_seconds` | `sql/sys_vars.cc:2238` | `2592000`（30 天） | GLOBAL |
+| `binlog_error_action` | `sql/sys_vars.cc:2512` | `ABORT_SERVER` | GLOBAL |
+| `binlog_row_value_options` | `sql/sys_vars.cc:7163` | `0` | SESSION |
+| `binlog_checksum` | `sql/sys_vars.cc:4841` | `BINLOG_CHECKSUM_ALG_CRC32` | GLOBAL |
+
+```cpp
+/* sql/sys_vars.cc:4841 —— 专用类而非通用 Sys_var_enum */
+static Sys_var_enum_binlog_checksum Binlog_checksum_enum(
+    "binlog_checksum",
+    "Type of BINLOG_CHECKSUM_ALG. Include checksum for "
+    "log events in the binary log. Possible values are NONE and CRC32; "
+    "default is CRC32.",
+    GLOBAL_VAR(binlog_checksum_options), CMD_LINE(REQUIRED_ARG),
+    binlog_checksum_type_names, DEFAULT(binary_log::BINLOG_CHECKSUM_ALG_CRC32),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_outside_trx));
+                                       /* ★ check_outside_trx → 事务内不许改 */
+```
+```cpp
+/* sql/sys_vars.cc:1473 —— 字符串顺序即枚举顺序 */
+static const char *binlog_row_image_names[] = {"MINIMAL", "NOBLOB", "FULL", NullS};
+static Sys_var_enum Sys_binlog_row_image(
+    "binlog_row_image",
+    "Controls whether rows should be logged in 'FULL', 'NOBLOB' or "
+    "'MINIMAL' formats. ... 'MINIMAL', means that a PK equivalent (PK "
+    "columns or full row if there is no PK in the table) is logged in the "
+    "before image, and only changed columns are logged in the after image. "
+    "(Default: FULL).", ...);
+```
+```cpp
+/* sql/sys_vars.cc:1489 —— 只有两个取值，没有 NOBLOB */
+static const char *binlog_row_metadata_names[] = {"MINIMAL", "FULL", NullS};
+static Sys_var_enum Sys_binlog_row_metadata(
+    "binlog_row_metadata",
+    "Controls how much type information is written to the binary log when "
+    "using ROW format. FULL causes all metadata to be logged. MINIMAL means "
+    "that only metadata actually needed by replicas is logged.", ...);
+```
+
+**★ 枚举取值**（`sql/system_variables.h:44`）：
+
+```cpp
+enum enum_binlog_format {
+  BINLOG_FORMAT_MIXED = 0,  ///< statement if safe, otherwise row - autodetected
+  BINLOG_FORMAT_STMT = 1,   ///< statement-based
+  BINLOG_FORMAT_ROW = 2,    ///< row-based
+  BINLOG_FORMAT_UNSPEC = 3  ///< thd_binlog_format() returns it when binlog is closed
+};
+
+enum enum_binlog_row_image {
+  BINLOG_ROW_IMAGE_MINIMAL = 0,  /** PKE in the before image and changed columns in the after image */
+  BINLOG_ROW_IMAGE_NOBLOB = 1,   /** all columns except blobs, whenever possible */
+  BINLOG_ROW_IMAGE_FULL = 2      /** All columns in both before and after image. */
+};
+
+enum enum_binlog_row_value_options {
+  /// Store JSON updates in partial form
+  PARTIAL_JSON_UPDATES = 1              /* ★ 位标志，配合 Sys_var_set */
+};
+
+enum enum_binlog_row_metadata {
+  BINLOG_ROW_METADATA_MINIMAL = 0,
+  BINLOG_ROW_METADATA_FULL = 1
+};
+```
+
+> ⚠️ **不存在 binlog event 专属状态变量**。`sql/mysqld.cc` 的 `SHOW STATUS` 列表里 grep `Binlog_...` / `Com_binlog` **无命中**——binlog event 的运行时可观测数据落在 PFS（`binary_log_transaction_compression_stats`，`sql/binlog.cc:2076`）而非 status var。
+
 ### 观测对象 → 手段 速查
 
 | 我想看 | 手段 | 入口 |
@@ -1444,6 +2973,75 @@ classDiagram
 | 每个 event 的类型/偏移 | SQL/CLI | `mysqlbinlog` 输出的 `# at <offset>` 与 `end_log_pos` |
 | checksum 是否校验失败 | trace | 从库 IO 线程报 `Got fatal error 1236`（`CHECKSUM_FAILURE`） |
 | 事务压缩统计 | SQL | `performance_schema.binary_log_transaction_compression_stats` |
+
+**★ `SHOW BINLOG EVENTS` 是 6 列**（`sql/log_event.cc:1122`）：
+
+```cpp
+/**
+  init_show_field_list() prepares the column names and types for the
+  output of SHOW BINLOG EVENTS; it is used only by SHOW BINLOG
+  EVENTS.
+*/
+void Log_event::init_show_field_list(mem_root_deque<Item *> *field_list) {
+  field_list->push_back(new Item_empty_string("Log_name", 20));
+  field_list->push_back(new Item_return_int("Pos", MY_INT32_NUM_DECIMAL_DIGITS,
+                                            MYSQL_TYPE_LONGLONG));
+  field_list->push_back(new Item_empty_string("Event_type", 20));
+  field_list->push_back(new Item_return_int("Server_id", 10, MYSQL_TYPE_LONG));
+  field_list->push_back(new Item_return_int(
+      "End_log_pos", MY_INT32_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG));
+  field_list->push_back(new Item_empty_string("Info", 20));
+}
+```
+```cpp
+/* :1102 —— 每行填充；★ Info 列 = 多态 pack_info() */
+int Log_event::net_send(Protocol *protocol, const char *log_name, my_off_t pos) {
+  const char *p = strrchr(log_name, FN_LIBCHAR);
+  if (p) log_name = p + 1;                   /* ★ Log_name 只显示 basename */
+  protocol->start_row();
+  protocol->store(log_name, &my_charset_bin);
+  protocol->store((ulonglong)pos);
+  event_type = get_type_str();               /* ★ Event_type = 虚函数 */
+  protocol->store_string(event_type, strlen(event_type), &my_charset_bin);
+  protocol->store((uint32)server_id);
+  protocol->store((ulonglong)common_header->log_pos);   /* ★ End_log_pos = header 的 log_pos */
+  if (pack_info(protocol)) return 1;         /* ★ Info = 多态，基类默认空串 */
+  return protocol->end_row();
+}
+```
+
+**★ 实现是函数模板，binlog/relaylog 两份实例化**（`sql/binlog.cc:3589`，⚠️ 常见说法"在 sql_show.cc"是错的）：
+
+```cpp
+/* Helper function for SHOW BINLOG/RELAYLOG EVENTS */
+template <class BINLOG_FILE_READER>
+bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) { ... }
+
+bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
+  if (binary_log->is_relay_log)
+    return show_binlog_events<Relaylog_file_reader>(thd, binary_log);
+  return show_binlog_events<Binlog_file_reader>(thd, binary_log);
+}
+```
+> ★ `sql/sql_show.cc:305-310` 只是命令类（`Sql_cmd_show_binlog_events`）的转发入口。
+> ★ 一个一致性细节：`mysql_show_binlog_events()` 里先调 `ha_binlog_wait(thd)`——**等异步引擎（NDB）把 pending 信息落盘再读**：
+> ```cpp
+>   /*
+>     Wait for handlers to insert any pending information
+>     into the binlog.  For e.g. ndb which updates the binlog asynchronously
+>     this is needed so that the uses sees all its own commands in the binlog
+>   */
+>   ha_binlog_wait(thd);
+> ```
+
+**★ 单事件读取上限**（`sql/binlog.cc:3517`）：
+
+```cpp
+    BINLOG_FILE_READER binlog_file_reader(
+        opt_source_verify_checksum,       /* ★ 受 source_verify_checksum 控制是否校验 */
+        std::max(thd->variables.max_allowed_packet,
+                 binlog_row_event_max_size + MAX_LOG_EVENT_HEADER));
+```
 
 ---
 
@@ -1461,6 +3059,78 @@ classDiagram
 
 若希望老版本从库能「跳过」而不是报错，还要在第 1 步对应的类里设置 `LOG_EVENT_IGNORABLE_F` 标志。
 
+**★ 完整改动清单（8 处，逐个带行号）**：
+
+| # | 改动点 | 文件:行 | 不改会怎样 |
+|---|---|---|---|
+| 1 | `Log_event_type` 枚举：显式赋号，插在 `ENUM_END_EVENT` 之上 | `libbinlogevents/include/binlog_event.h:276,362` | **注释明令** |
+| 2 | `server_event_header_length[]` 追加一项 | `libbinlogevents/src/control_events.cpp:96` | **post-header 长度整体错位** |
+| 3 | `enum_post_header_length` 加长度常量 | `libbinlogevents/include/binlog_event.h:840` | 配套 |
+| 4 | `binlog_event_deserialize()` 工厂加 case | `sql/binlog_reader.cc:118` | 反序列化出 `Unknown_event` |
+| 5 | `Log_event::get_type_str(Log_event_type)` 加 case | `sql/log_event.cc:871` | `SHOW BINLOG EVENTS` 显示 "Unknown" |
+| 6 | `mysqlbinlog` 的 `switch (ev_type)` | `client/mysqlbinlog.cc:1431` | mysqlbinlog 不打印 |
+| 7 | `shall_delete_event_after_apply()`（特殊生命周期时） | `sql/log_event.cc:14166` | 默认走 `delete ev` |
+| 8 | libbinlogevents 侧 override `print_event_info` / `print_long_info` | 各 `*_events.h` | **纯虚，不实现编译不过** |
+
+**★★ 第 1 步的"两条铁律"原文**（`binlog_event.h:277`）：
+
+```cpp
+enum Log_event_type {
+  /**
+    Every time you add a type, you have to
+    - Assign it a number explicitly. Otherwise it will cause trouble
+      if a event type before is deprecated and removed directly from
+      the enum.
+    - Fix Format_description_event::Format_description_event().
+  */
+```
+```cpp
+  /**
+    Add new events here - right above this comment!
+    Existing events (except ENUM_END_EVENT) should never change their numbers
+  */
+  ENUM_END_EVENT /* end marker */
+```
+
+**★ 第 5 步的兜底**（`sql/log_event.cc:866`，★ 新事件不加 case 就落到这里）：
+
+```cpp
+const char *Log_event::get_type_str(uint type) {
+  if (type > binary_log::ENUM_END_EVENT) return "Unknown";
+  return get_type_str(Log_event_type(type));
+}
+
+const char *Log_event::get_type_str(Log_event_type type) {
+  switch (type) {
+    ...
+    case binary_log::HEARTBEAT_LOG_EVENT:
+    case binary_log::HEARTBEAT_LOG_EVENT_V2:
+      return "Heartbeat";                /* ★ V1/V2 合并返回同一个字符串 */
+    case binary_log::PARTIAL_UPDATE_ROWS_EVENT:
+      return "Update_rows_partial";
+    case binary_log::TRANSACTION_PAYLOAD_EVENT:
+      return "Transaction_payload";
+    default:
+      return "Unknown"; /* impossible */
+  }
+}
+```
+> ⚠️ **真名核查**：`get_type_str()` **没有废弃**，存在且活跃（三个重载：`(uint)` / `(Log_event_type)` / `() const`），被 `SHOW BINLOG EVENTS` 与 mysqlbinlog 同时使用。
+
+**★ 第 6 步：mysqlbinlog 里 9 种 Rows 事件集中处理**（`client/mysqlbinlog.cc:1614`）：
+
+```cpp
+      case binary_log::ROWS_QUERY_LOG_EVENT:
+      case binary_log::WRITE_ROWS_EVENT:
+      case binary_log::DELETE_ROWS_EVENT:
+      case binary_log::UPDATE_ROWS_EVENT:
+      case binary_log::WRITE_ROWS_EVENT_V1:
+      case binary_log::UPDATE_ROWS_EVENT_V1:
+      case binary_log::DELETE_ROWS_EVENT_V1:
+      case binary_log::PARTIAL_UPDATE_ROWS_EVENT: {
+```
+> ★ 新 Rows 类事件必须加进这个 fall-through 组。
+
 ### 坑与已知缺陷
 
 - **`binary_log::Log_event` 不存在**：这是最容易踩的命名陷阱。libbinlogevents 的抽象基类是 `Binary_log_event`，server 侧的才是 `Log_event`。很多老资料（内核月报、博客）把两者混称，照抄会张冠李戴。
@@ -1469,6 +3139,76 @@ classDiagram
 - **GTID 时间戳是 7 字节**：bit55 兼作「是否跟随 original 时间戳」标志，不是常规 8 字节，读代码容易误判。
 - **payload 内层事件无 checksum**：`Transaction_payload_event` 解压后的事件不携带 checksum（外层才校验），读解压流时须临时禁用校验，见 [`binlog.md`](binlog.md)「binlog 事务压缩」。
 - **社区边界**：MariaDB 的 `ANNOTATE_ROWS_EVENT`、`Gtid_list` 等是私有 event type，社区 MySQL 没有；不要混用两边的 type 编号。
+
+**★ 源码自认的缺陷（TODO/FIXME 实证）**：
+
+```cpp
+/* sql/rpl_record.cc:653 —— ★ calc_field_size 可能越界读，靠后置检查兜底 */
+        /// @todo calc_field_size may read out of bounds /Sven
+        uint32 len = tabledef->calc_field_size(col_i, pack_ptr);
+        uint32 event_len = event_end - pack_ptr;
+        if (len > event_len) {           /* ★ 但此时 calc_field_size 已经读过了 */
+          my_error(ER_REPLICA_CORRUPT_EVENT, MYF(0));
+          return true;
+        }
+```
+```cpp
+/* libbinlogevents/src/rows_event.cpp:478 —— ★ 作者自己都写 TODO 说不清为什么 */
+  data_size = READER_CALL(available_to_read);
+  READER_TRY_CALL(assign, &row, data_size);
+  // JAG: TODO: Investigate and comment here about the need of this extra byte
+  row.push_back(0);                      /* ★ 末尾补 1 个 0 字节 */
+```
+```cpp
+/* libbinlogevents/include/binlog_event.h:56 —— ★ 库边界的"不干净"自白 */
+/*
+  The symbols below are a part of the common definitions between
+  the MySQL server and the client. Since they should not be a part of
+  this library but the server, these should be placed in a header file
+  common to the library and the MySQL server code...
+  TODO(WL#7984): Moving the binlog constant in library libbinlogevents into a
+                 separate file and make them const variables
+*/
+```
+```cpp
+/* libbinlogevents/include/binlog_event.h:582 —— ★ 拆层的历史债 */
+     TODO(WL#7546): Revisit this comment when encoder is moved in libbinlogevent
+```
+
+**★ `Transaction_payload_event` 填表的 quirk**（`control_events.cpp:117`）：`post_header_len[TRANSACTION_PAYLOAD_EVENT - 1]` 填的是枚举值 **`TRANSACTION_PAYLOAD_EVENT`（=40）** 而非同文件定义的 `TRANSACTION_PAYLOAD_HEADER_LEN（=0）`——后者**从未被使用**。
+
+**★ `Intvar_event` 的注释自相矛盾**（`statement_events.h:883`）：Doxygen 表格说 `type` 是 **1 字节**，但构造函数注释画的是 `| type (4 bytes) | val (8 bytes) |`。实际按 `I_TYPE_OFFSET=0` 读 1 字节、`I_VAL_OFFSET=1` 读 8 字节——**以 Doxygen 表为准**。
+
+**★ `XA_prepare_event` 的注释自相矛盾**（`control_events.h:539`）：先列了 Body 三组件，又说"Post-Header and Body are empty"。实际 Body = `one_phase(1B) + formatID(4B) + gtrid_length(4B) + bqual_length(4B) + data`（见 `control_events.cpp:332`）。
+
+### ★★★ 真名勘误全表（本轮新增）
+
+| 常见说法 | 8.0.39 真相 |
+|---|---|
+| `Event_reader` 在 `binlog_event.h` | **不在** → 独立头 `libbinlogevents/include/event_reader.h`（`binlog_event.h` 只 include 它） |
+| `Event_reader` 有 `advance()` / `read_data_into_buffer()` | **都不存在** → 真名 `forward()` / `alloc_and_memcpy()` / `assign()` |
+| `Log_event_footer` 有 `m_checksum_buf` | **不存在** → checksum 值不作为类成员（源码原话），footer 只有 `checksum_alg` |
+| `Binary_log_event` 有 `String *m_packet` | **不存在** → 私有成员只有 `m_reader` / `m_header` / `m_footer` 三个 |
+| `Rows_log_event` 有 `m_row_image` | **不存在** → 五个裸指针 `m_rows_buf` / `m_rows_cur` / `m_rows_end` / `m_curr_row` / `m_curr_row_end` |
+| 事件用 `new (std::nothrow)` 分配 | **不是** → 重载 `Log_event::operator new`，用 `my_malloc(..., MY_FAE)`，OOM **直接 abort** |
+| 有统一的 `delete_event()` / `free_event()` | **不存在** → `delete ev` + `shall_delete_event_after_apply()` 判定 |
+| 单 event 上限 4GB | 协议字段 4 字节，但 **`max_log_event_size = 1GB`** 硬限 |
+| 有个 `binlog_reader` 基类 / `Binlog_event_reader` 类 | **都不存在** → `Binlog_event_data_istream` / `Binlog_event_object_istream` / `Basic_binlog_file_reader<...>` |
+| `Binlog_read_error` 在 `sql/binlog_reader.h` | 定义在 **`sql/binlog_istream.h:37`** |
+| `libbinlogevents/include/binlog_reader.h` | **该文件不存在**（`include/` 下 44 个头文件里没有） |
+| FDE 里有 `m_event_data_sizes[]` | **不存在** → 真名 `std::vector<uint8_t> post_header_len`（`control_events.h:272`） |
+| 8.0 有 40 种事件类型 | `ENUM_END_EVENT = 42` ⇒ **`LOG_EVENT_TYPES = 41`**，`UNKNOWN_EVENT=0` 永不落盘 |
+| `PARTIAL_UPDATE_ROWS_EVENT` 注释写"8.0.3 新增" | **注释里没有版本号**，只说 "Extension of UPDATE_ROWS_EVENT..." |
+| `enum_row_event_type` | **不存在** → `enum class enum_row_image_type` 在 **`sql/rpl_record.h:40`**（4 值：WRITE_AI/UPDATE_BI/UPDATE_AI/DELETE_BI） |
+| `rows_event.h` 里有 `Partial_update_rows_event` 类 | **不存在** → 靠 `Update_rows_event(Log_event_type event_type)` 复用 |
+| `statement_events.h` 里有 `XA_prepare_event` | **不在** → 在 **`control_events.h:580`**；`statement_events.h` 只有 4 个类 |
+| `SHOW BINLOG EVENTS` 在 `sql_show.cc` 实现 | 只有命令入口 → 实现是 `sql/binlog.cc` 的**函数模板** `show_binlog_events<READER>` |
+| `get_type_str()` 已废弃 | **存在且活跃**，三个重载 |
+| 有 binlog event 专属状态变量 | **未发现** → 观测面只有 sysvar + `SHOW BINLOG EVENTS` + PFS 压缩统计表 |
+| `LOG_EVENT_BINLOG_IN_USE_F` 在 `sql/log_event.h` | 在 **`libbinlogevents/include/binlog_event.h:271`**（库侧） |
+| `unpack_row` 直接读事件 buffer | **否**，两层：`Rows_log_event::unpack_current_row()` → 自由函数 `::unpack_row()` |
+| libbinlogevents 是"纯 C 风格"库 | **错** → 用了 SFINAE / `constexpr` / `enum class` / `[[NODISCARD]]` / `[[fallthrough]]` / move 语义 / `std::unique_ptr` |
+| 新事件类型会自动被 FDE 数组接纳 | **不会** → 必须手动在 `server_event_header_length[]` 追加，否则 debug 下 `BAPI_ASSERT(post_header_len[i] != 255)` 立刻炸 |
 
 ---
 

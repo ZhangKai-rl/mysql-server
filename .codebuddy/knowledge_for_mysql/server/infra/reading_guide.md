@@ -5,7 +5,7 @@
 > "读不懂"的自诊断流程、参考资料与学术索引。
 
 > **边界**：本篇是**阅读源码的前置知识与方法论**（通用能力），不是某个机制的实现剖析；
-> 具体机制见 [`pfs.md`](pfs.md)、[`memory.md`](memory.md) 等同目录各篇，
+> 具体机制见 [`pfs.md`](../../infra/observability/pfs/pfs.md)、[`allocator.md`](../../infra/memory/allocator.md)（内存分配器矩阵，已迁至 `infra/memory/`）等同目录各篇，
 > 链表（`ut_list_base` / `SQL_I_List`）见 [`infra/structure/list.md`](../../infra/structure/list.md)，
 > 以及 [`variables.md`](variables.md)、[`encoding.md`](encoding.md)。
 > 本目录的文件索引见 [`README.md`](README.md)。
@@ -82,13 +82,13 @@
 
 | 读到哪里 | 会遇到什么困惑 | 需要补充的知识 | 补什么资料 |
 |---------|--------------|--------------|----------|
-| `mem0mem.h:86-91` 看到三种 type | "DYNAMIC 和 BUFFER 到底有什么区别？为什么还有 BTR_SEARCH 这个奇怪的组合值？" | Bump/Arena allocator 的设计取舍：从堆分配 vs 从预分配池分配，不可失败 vs 可返回 NULL | [`memory.md`](memory.md)；Knuth TAOCP Vol.1 §2.5 |
-| `buf0buddy.cc:buf_buddy_alloc_low` | "为什么按 `1 << i` 分裂？释放时怎么找到伙伴？" | Buddy allocator 的分裂/合并算法，伙伴地址公式 `buddy = addr XOR (1 << order)` | Knowlton 1965 (CACM)；[`memory.md`](memory.md)「buddy allocator」 |
+| `mem0mem.h:86-91` 看到三种 type | "DYNAMIC 和 BUFFER 到底有什么区别？为什么还有 BTR_SEARCH 这个奇怪的组合值？" | Bump/Arena allocator 的设计取舍：从堆分配 vs 从预分配池分配，不可失败 vs 可返回 NULL | [`allocator.md`](../../infra/memory/allocator.md)；Knuth TAOCP Vol.1 §2.5 |
+| `buf0buddy.cc:buf_buddy_alloc_low` | "为什么按 `1 << i` 分裂？释放时怎么找到伙伴？" | Buddy allocator 的分裂/合并算法，伙伴地址公式 `buddy = addr XOR (1 << order)` | Knowlton 1965 (CACM)；[`allocator.md`](../../infra/memory/allocator.md)「buddy allocator」 |
 | `my_alloc.cc:103` 看到 `m_block_size += m_block_size / 2` | "为什么每次增加 50%？固定大小不好吗？" | Arena allocator 的指数增长策略 vs 固定块策略的适用场景 | mem_heap 作为对比：InnoDB 场景可预测 vs Server 层不可预测 |
 | `memory.cc:278` 看到 `type == MEM_HEAP_DYNAMIC \|\| len < UNIV_PAGE_SIZE / 2` | "为什么 BUFFER 类型的小块也走 malloc？" | Buffer Pool 页面的机会成本：16KB 的 BP 页面换几 KB 临时数据是赔本买卖 | Buffer Pool 管理基础知识 |
-| `jemalloc` 的设计 | "size class 和 buddy 的 2^n 级别有什么区别？" | Segregated-fit：对象按大小分类，每类独立 free list，释放后可**立即**被同大小请求复用 | Bonwick 1994 Slab Allocator 论文；[`memory.md`](memory.md)「jemalloc / size class」 |
+| `jemalloc` 的设计 | "size class 和 buddy 的 2^n 级别有什么区别？" | Segregated-fit：对象按大小分类，每类独立 free list，释放后可**立即**被同大小请求复用 | Bonwick 1994 Slab Allocator 论文；[`allocator.md`](../../infra/memory/allocator.md)「jemalloc / size class」 |
 | PFS `events_waits_summary_*` 表 | "event tracing 和 sampling 哪个好？为什么 PFS 选前者？" | Event-based Tracing vs Sampling 的理论基础：精确度、因果关系、开销模型 | Anderson SOSP 1997；DTrace USENIX ATC 2004 |
-| `mysql_mutex.h` 中嵌套的 `#define` | "为什么 lock 一个 mutex 要通过这么多层宏？" | AOP 的 weaving 思想：横切关注点分离 + 编译期零开销注入 | Kiczales ECOOP 1997；[`pfs.md`](pfs.md)「AOP 编织」 |
+| `mysql_mutex.h` 中嵌套的 `#define` | "为什么 lock 一个 mutex 要通过这么多层宏？" | AOP 的 weaving 思想：横切关注点分离 + 编译期零开销注入 | Kiczales ECOOP 1997；[`pfs.md`](../../infra/observability/pfs/pfs.md)「AOP 编织」 |
 
 ---
 
@@ -122,7 +122,7 @@
 
 ## 4. 第三域：设计模式（决定了你"看不看得懂代码组织"）
 
-详见 [`pfs.md`](pfs.md) 的设计模式各节。最重要的三个：**Strategy**（PSI vtable）、**Template Method**（start/do/end）、**Observer**（Delegate）。
+详见 [`pfs.md`](../../infra/observability/pfs/pfs.md) 的设计模式各节。最重要的三个：**Strategy**（PSI vtable）、**Template Method**（start/do/end）、**Observer**（Delegate）。
 
 ---
 
@@ -145,7 +145,7 @@
 |-------------|----------|-------------------|---------|
 | **mutex vs rwlock 的语义差异** | PFS 单独为两类 lock 设计了不同的 event 类型 | `PFS_events_waits` 中的 `WAIT_CLASS_MUTEX` vs `WAIT_CLASS_RWLOCK` | 任何并发编程教材 |
 | **spinlock 与 blocking lock 的选择** | 不懂就看不懂 `replication_optimize_for_static_plugin_config` 为什么切换锁类型 | `Delegate` 中根据配置选择 `mysql_rwlock_t` 或 `Shared_spin_lock` | `rpl_handler.h:175-226` |
-| **死锁的四个必要条件 + 锁顺序** | 不懂就看不懂 `MEM_HEAP_BTR_SEARCH` 的设计 | 持有 AHI latch 时不能从 BP 分配页面（防止递归锁）→ 预留在先 | [`memory.md`](memory.md)「死锁与锁顺序」；Coffman 1971 "deadlock conditions" |
+| **死锁的四个必要条件 + 锁顺序** | 不懂就看不懂 `MEM_HEAP_BTR_SEARCH` 的设计 | 持有 AHI latch 时不能从 BP 分配页面（防止递归锁）→ 预留在先 | [`allocator.md`](../../infra/memory/allocator.md)「死锁与锁顺序」；Coffman 1971 "deadlock conditions" |
 | **CAS（Compare-And-Swap）语义** | 不懂就看不懂 `compare_exchange_strong` | `free_block_for_heap.compare_exchange_strong(expected, block)` | cppreference: atomic::compare_exchange |
 | **C++11 Memory Order（内存序）** | 不懂就看不懂 PFS `m_enabled` 为什么有时用 `relaxed` 有时用 `acquire/release` | PFS consumer flags：`m_enabled.load(std::memory_order_relaxed)` | C++ Concurrency in Action §5.3 |
 | **Lock-free 编程基础** | `free_block_ptr` 的原子操作设计 | `heap->free_block_ptr->load()` + `store(nullptr)` 的无锁模式 | Herlihy & Shavit, "The Art of Multiprocessor Programming" |
@@ -254,14 +254,14 @@ gcc -E -I include -I include/mysql -I build/include \
     │   → gcc -E 展开看实际代码
     │
     ├─ 是不知道这段代码"为什么存在"（看懂了语法但不理解设计）？
-    │   → 查 [`pfs.md`](pfs.md) 的设计模式各节，看是哪种设计模式
+    │   → 查 [`pfs.md`](../../infra/observability/pfs/pfs.md) 的设计模式各节，看是哪种设计模式
     │
     ├─ 是不知道底层 OS/CPU 行为？
     │   → 查本篇第五~七域，补对应 OS/并发/体系结构知识
     │
     ├─ 是不知道业务动机（为什么需要这个功能）？
     │   → git log + git blame 看 commit message
-    │   → 在 [`pfs.md`](pfs.md) / [`memory.md`](memory.md) 中找对应理论解释
+    │   → 在 [`pfs.md`](../../infra/observability/pfs/pfs.md) / [`allocator.md`](../../infra/memory/allocator.md) 中找对应理论解释
     │
     └─ 都不是？
         → 很可能是一段历史遗留代码或为了兼容性的 workaround
@@ -283,7 +283,7 @@ gcc -E -I include -I include/mysql -I build/include \
 | OS 深入 | 《Advanced Programming in the UNIX Environment》(APUE) §14 mmap | 4.0.5 | ⭐⭐⭐ |
 | 分配器理论 | Knuth TAOCP Vol.1 §2.5; Knowlton CACM 1965; Bonwick USENIX 1994 | 第二章 | ⭐⭐⭐ |
 | MySQL 内幕 | 《MySQL 技术内幕: InnoDB 存储引擎》(姜承尧, 第2版) | 全局 | ⭐⭐⭐⭐ 中文首选 |
-| MySQL 源码 | 官方 Developer Guide: storage/perfschema/README（另见 [`pfs.md`](pfs.md)） | 第一、三章 | ⭐⭐⭐⭐ |
+| MySQL 源码 | 官方 Developer Guide: storage/perfschema/README（另见 [`pfs.md`](../../infra/observability/pfs/pfs.md)） | 第一、三章 | ⭐⭐⭐⭐ |
 
 ---
 
@@ -464,6 +464,6 @@ AOP 1997        InnoDB/B+tree/AHI        分支预测理论
 **相关文档**
 
 - 本目录文件索引：[`README.md`](README.md)
-- Performance Schema（AOP 编织、Strategy/Template Method 的实际落地）：[`pfs.md`](pfs.md)
-- 内存分配器矩阵（Bump/Arena/Buddy/Slab 理论与实现）：[`memory.md`](memory.md)
+- Performance Schema（AOP 编织、Strategy/Template Method 的实际落地）：[`pfs.md`](../../infra/observability/pfs/pfs.md)
+- 内存分配器矩阵（Bump/Arena/Buddy/Slab 理论与实现）：[`allocator.md`](../../infra/memory/allocator.md)
 - 变量体系：[`variables.md`](variables.md)　|　数据编码：[`encoding.md`](encoding.md)

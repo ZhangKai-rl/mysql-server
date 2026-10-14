@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。涵盖 MATCH AGAINST 的 SQL 层实现、FTS 辅助表体系、倒排索引编码、分词、fts_cache 与后台 sync/optimize、布尔模式 AST、相关性排序算法、事务与崩溃恢复。
 >
-> **边界**：FTS 是同时改动 SQL 层（语法、`Item_func_match`、优化器、迭代器、filesort）与引擎层（辅助表、内存 cache、后台线程）的特性，因此单篇讲完整条链路。**引擎差异**：社区版只有 InnoDB 与 MyISAM 两家，MyISAM 只在篇内小节对比，不单独开篇。纯引擎内部机制（B-tree、redo、buffer pool）见 [`../innodb/`](../innodb/) 相应篇；server↔引擎的接口本身见 [`../server/handler.md`](../server/handler.md)。
+> **边界**：FTS 是同时改动 SQL 层（语法、`Item_func_match`、优化器、迭代器、filesort）与引擎层（辅助表、内存 cache、后台线程）的特性，因此单篇讲完整条链路。**引擎差异**：社区版只有 InnoDB 与 MyISAM 两家，MyISAM 只在篇内小节对比，不单独开篇。纯引擎内部机制（B-tree、redo、buffer pool）见 [`../innodb/`](../innodb/) 相应篇；server↔引擎的接口本身见 [`../server/handler.md`](../server/handler.md)；**与 `LIKE` 的选型对比**见 [`../server/query/15_like.md`](../server/query/15_like.md) §十。
 
 ## 目录
 
@@ -120,6 +120,111 @@ FT 谓词走的是独立通道（`add_ft_keys` → `FT_KEYPART` 哨兵 → `JT_F
 
 `MATCH()` 的值不从 `record[0]` 读，而是"问"handler 要（`get_relevance` / `find_relevance`）。于是只要表被 MATCH 引用，filesort 就**强制禁用 addon fields**（`Addon_fields_status::fulltext_searched`）——因为 addon 模式排序后直接从 buffer 反序列化，handler 根本没被定位到该行，取到的 rank 是错的。这是"打分职责跨界"带来的直接代价。
 
+**★ 设计意图的源码自述（三条原文）**：
+
+**（A）为什么用辅助表 —— 建表 DDL 就写在注释里**（`fts0fts.h:495`，★ 最直白的一条）：
+
+```cpp
+/** Creates the common auxiliary tables needed for supporting an FTS index
+on the given table. ...
+The following tables are created.
+CREATE TABLE $FTS_PREFIX_DELETED
+        (doc_id BIGINT UNSIGNED, UNIQUE CLUSTERED INDEX on doc_id)
+...
+CREATE TABLE $FTS_PREFIX_CONFIG
+        (key CHAR(50), value CHAR(200), UNIQUE CLUSTERED INDEX on key) */
+```
+```cpp
+/** Creates the column specific ancillary tables needed for supporting an
+FTS index on the given table. ...
+
+All FTS AUX Index tables have the following schema.
+CREATE TABLE $FTS_PREFIX_INDEX_[1-6](
+        word            VARCHAR(FTS_MAX_WORD_LEN),
+        first_doc_id    INT NOT NULL,
+        last_doc_id     UNSIGNED NOT NULL,
+        doc_count       UNSIGNED INT NOT NULL,
+        ilist           VARBINARY NOT NULL,
+        UNIQUE CLUSTERED INDEX ON (word, first_doc_id)) */
+```
+> ★★ 这就是"用普通表模拟倒排索引"的完整答案：倒排项被映射成**聚簇 B-tree 上的一行**，主键 `(word, first_doc_id)`，posting list 塞进 VARBINARY 的 `ilist`。**事务、redo、MVCC、buffer pool、崩溃恢复全部免费得到**。
+
+**（B）Unicode 支持不足的自我批评**（`fts0fts.h:284`，★ 罕见的"吐槽式"注释）：
+
+```cpp
+// FIXME: Get rid of this if possible.
+/** Since MySQL's character set support for Unicode is woefully inadequate
+(it supports basic operations like isalpha etc. only for 8-bit characters),
+we have to implement our own. We use UTF-16 without surrogate processing
+as our in-memory format. This typedef is a single such character. */
+typedef unsigned short ib_uc_t;
+```
+> ★ 因为 MySQL 的 charset API 对 Unicode 支持不足（`isalpha` 等只支持 8-bit），InnoDB FTS 不得不**自己实现一套 UTF-16（不做 surrogate 处理）**的分词字符处理。
+
+**（C）辅助表的 DML 用独立事务**（`fts0sql.cc:301`，★ 与 12.2 呼应）：
+
+```cpp
+/** Commit a transaction.
+ @return DB_SUCCESS or error code */
+dberr_t fts_sql_commit(trx_t *trx) /*!< in: transaction */
+{
+  dberr_t error;
+
+  error = trx_commit_for_mysql(trx);
+  /* 【注】参数 trx 是 FTS 自己 trx_allocate_for_background() 出来的独立后台事务 */
+
+  /* Commit should always succeed */
+  ut_a(error == DB_SUCCESS);
+
+  return (DB_SUCCESS);
+}
+```
+
+**★ 三个关键阈值的源码落点**：
+
+```cpp
+/* storage/innobase/include/fts0fts.h:102 */
+/** The number of FTS index partitions for a fulltext index. */
+constexpr size_t FTS_NUM_AUX_INDEX = 6;      /* ★ constexpr 不是 #define */
+
+/** The number of FTS AUX common table for a fulltext index. */
+constexpr size_t FTS_NUM_AUX_COMMON = 5;     /* ★ 常被误当作 6 */
+
+/** Threshold where our optimize thread automatically kicks in */
+#define FTS_OPTIMIZE_THRESHOLD 10000000      /* ★ 1000 万个已删文档才自动 OPTIMIZE */
+
+/** Threshold to avoid exhausting of doc ids. Consecutive doc id difference
+should not exceed FTS_DOC_ID_MAX_STEP */
+#define FTS_DOC_ID_MAX_STEP 65535            /* ★ 由 VLC 的 delta 上限反推 */
+```
+> ★ `FTS_DOC_ID_MAX_STEP = 65535` 的来历（`row0mysql.cc:1676` 注释明说）：*"Difference between Doc IDs are restricted within 4 bytes integer. See fts_get_encoded_len()"* —— 业务约束是从编码格式反推出来的。
+
+**★ 为什么要"耗尽 doc_id"保护**（`row0mysql.cc:1661`）：
+
+```cpp
+      if (doc_id < next_doc_id) {
+        ib::error(ER_IB_MSG_981)
+            << "FTS Doc ID must be large than " << next_doc_id - 1
+            << " for table " << table->name;
+        err = DB_FTS_INVALID_DOCID;
+        ...
+      }
+
+      /* Difference between Doc IDs are restricted within
+      4 bytes integer. See fts_get_encoded_len(). Consecutive
+      doc_ids difference should not exceed
+      FTS_DOC_ID_MAX_STEP value. */
+
+      if (doc_id - next_doc_id >= FTS_DOC_ID_MAX_STEP) {
+        ib::error(ER_IB_MSG_982) << "Doc ID " << doc_id
+                                 << " is too big. Its difference with"
+                                    " largest used Doc ID "
+                                 << next_doc_id - 1 << " cannot"
+                                    " exceed or equal to "
+                                 << FTS_DOC_ID_MAX_STEP;
+        err = DB_FTS_INVALID_DOCID;
+```
+
 ### 理论溯源
 
 | 理论 / 论文 | 源码落点 |
@@ -153,6 +258,138 @@ FT 谓词走的是独立通道（`add_ft_keys` → `FT_KEYPART` 哨兵 → `JT_F
 | 倒排索引 | `FTS_*_index_1..6` | `word → (doc_id, positions...)` |
 | 分片路由（区间） | `fts_select_index_by_range` `fts0types.ic:120` | 非 CJK：首字符 sort weight 在 `fts_index_selector[]`（`fts0fts.cc:151`）上线性查找；分界 9/65/70/75/80/85 |
 | 分片路由（哈希） | `fts_select_index_by_hash` `fts0types.ic:146` | CJK：首字符走 collation 的 `hash_sort`（种子 `nr1=1,nr2=4`），**强制截断成 32 位 ulong** 再 `% 6`（注释明说 Windows/Linux 结果不同，但必须与磁盘数据一致） |
+
+**★ 倒排索引的三个核心结构**（`storage/innobase/include/fts0types.h`，⚠️ 真名核查：三者都存在，但都在 `fts0types.h` 不在 `fts0fts.h`）：
+
+```cpp
+/** Columns of the FTS auxiliary INDEX table */
+struct fts_node_t {           /* fts0types.h:210 —— INDEX 表的一行 */
+  doc_id_t first_doc_id; /*!< First document id in ilist. */
+  doc_id_t last_doc_id;  /*!< Last document id in ilist. */
+  byte *ilist;           /*!< Binary list of documents & word
+                         positions the token appears in. */
+  ulint doc_count;       /*!< Number of doc ids in ilist */
+  ulint ilist_size;      /*!< Used size of ilist in bytes. */
+  ulint ilist_size_alloc;/*!< Allocated size of ilist in bytes */
+  bool synced;           /*!< flag whether the node is synced */
+};
+                    /* ★ 一个 word 因 ilist 太大被切成多个 node，每个 node 覆盖
+                       一段 doc_id 区间，主键是 (word, first_doc_id) */
+
+/** A tokenizer word. Contains information about one word. */
+struct fts_tokenizer_word_t {   /* fts0types.h:243 */
+  fts_string_t text;      /*!< Token text. */
+  ib_vector_t *nodes;     /*!< Word node ilists, each element is fts_node_t */
+};
+
+/** Word text plus it's array of nodes as on disk in FTS index */
+struct fts_word_t {             /* fts0types.h:298 */
+  fts_string_t text;  /*!< Word value in UTF-8 */
+  ib_vector_t *nodes; /*!< Nodes read from disk */
+  ib_alloc_t *heap_alloc; /*!< For handling all allocations */
+};
+```
+
+**★ 索引期（内存）结构：token 与文档**（`fts0types.h`）：
+
+```cpp
+/** A token and its positions within a document. */
+struct fts_token_t {
+  fts_string_t text;      /*!< token text */
+  ib_vector_t *positions; /*!< 该 token 在文档中出现的所有位置 */
+};
+
+/** This type represents a single document field. ... */
+struct fts_doc_t {
+  fts_string_t text;    /*!< document text */
+  bool found;           /*!< true if the document was found successfully */
+  ib_rbt_t *tokens;     /*!< 分词结果；键 fts_string_t*，值 fts_token_t* */
+  ib_alloc_t *self_heap;
+  CHARSET_INFO *charset;
+  st_mysql_ftparser *parser;  /*!< fts plugin parser */
+  bool is_ngram;              /*!< Whether it is a ngram parser */
+  ib_rbt_t *stopwords;        /*!< Stopwords */
+};
+```
+
+**★★ 6 张分片表的路由算法**（`fts0types.ic:95`，★ 这是"为什么是 6"的唯一直观证据 —— 源码里**没有**写"为什么是 6"的设计说明）：
+
+```cpp
+/** Check if fts index charset is cjk */
+static inline bool fts_is_charset_cjk(const CHARSET_INFO *cs) {
+  if (strcmp(cs->m_coll_name, "gb2312_chinese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "gbk_chinese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "big5_chinese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "gb18030_chinese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "ujis_japanese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "sjis_japanese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "cp932_japanese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "eucjpms_japanese_ci") == 0 ||
+      strcmp(cs->m_coll_name, "euckr_korean_ci") == 0) {
+    return (true);
+  } else {
+    return (false);
+  }
+}
+
+/** Select the FTS auxiliary index for the given character by range. */
+static inline ulint fts_select_index_by_range(const CHARSET_INFO *cs,
+                                              const byte *str, ulint len) {
+  ulint selected = 0;
+  ulint value = innobase_strnxfrm(cs, str, len);   /* ★ 首字符的排序权重 */
+
+  while (fts_index_selector[selected].value != 0) {
+    if (fts_index_selector[selected].value == value) {
+      return (selected);
+    } else if (fts_index_selector[selected].value > value) {
+      return (selected > 0 ? selected - 1 : 0);    /* ★ 落在两边界间 → 取左边界那张 */
+    }
+    ++selected;
+  }
+  return (selected - 1);                           /* ★ 大于 'U'(85) 全落 index_6 */
+}
+
+/** Select the FTS auxiliary index for the given character by hash. */
+static inline ulint fts_select_index_by_hash(const CHARSET_INFO *cs,
+                                             const byte *str, ulint len) {
+  ...
+  /*
+    Get collation hash code. Force truncation to ulong for legacy reasons;
+    it gives different results for Windows and Linux, but it needs to match
+    on-disk data.
+   */
+  uint64_t nr1 = 1;
+  uint64_t nr2 = 4;
+  cs->coll->hash_sort(cs, str, char_len, &nr1, &nr2);
+
+  return (static_cast<ulong>(nr1) % FTS_NUM_AUX_INDEX);  /* ★ CJK: hash % 6 */
+}
+
+/** Select the FTS auxiliary index for the given character. */
+static inline ulint fts_select_index(const CHARSET_INFO *cs, const byte *str,
+                                     ulint len) {
+  ulint selected;
+
+  if (fts_is_charset_cjk(cs)) {
+    selected = fts_select_index_by_hash(cs, str, len);
+  } else {
+    selected = fts_select_index_by_range(cs, str, len);
+  }
+
+  return (selected);
+}
+```
+> ★★ 注意最后那段注释：CJK 的哈希值**强制截断成 32 位 ulong**，且 Windows/Linux 结果不同 —— 但必须与磁盘数据一致，所以不敢改。这是典型的历史包袱。
+
+**★ 分片边界常量**（`fts0fts.cc:151`）：
+
+```cpp
+/** FTS auxiliary INDEX split intervals. */
+const fts_index_selector_t fts_index_selector[] = {
+    {9, "index_1"},  {65, "index_2"}, {70, "index_3"}, {75, "index_4"},
+    {80, "index_5"}, {85, "index_6"}, {0, nullptr}};
+```
+> ★ `9`=控制字符、`65`='A'、`70`='F'、`75`='K'、`80`='P'、`85`='U'。非 CJK 按首字符落区间，CJK 走 hash % 6 —— **"6"这个数字同时服务两种算法**。
 
 **（3）倒排压缩（真正落盘的压缩，只有这一套）**
 
@@ -403,8 +640,12 @@ return ft_handler->please->find_relevance(ft_handler, table->record[0], 0);  // 
 | **MATCH 的列集合必须与某个 FULLTEXT 索引完全一致**（不能多也不能少） | `ER_FT_MATCHING_KEY_NOT_FOUND` | `item_func.cc:7739`（判定 `:7680-7731`） |
 | 不能用于生成列 / 函数索引 | `check_function_as_value_generator` | `item_func.h:3472` |
 | 不能在物化子查询上执行 | `ER_NO_FT_MATERIALIZED_SUBQUERY` | `item_func.cc:7494` |
+| **不能引用 ROLLUP 列** | `ER_FULLTEXT_WITH_ROLLUP` | `sql_resolver.cc:371-374` |
 
-> **8.0 允许 `ORDER BY MATCH(...)` 且可能免排序**（`sql_optimizer.cc:1733` `test_if_ft_index_order`），所以"FT 只能用 WHERE"是过时的说法。
+> **"FTS 只能用在 WHERE"是过时的说法。** 8.0 里：
+> - `ORDER BY MATCH(...)` 合法且**可能免排序**（`test_if_ft_index_order`，`sql_optimizer.cc:1733`）
+> - `HAVING` / `GROUP BY` 里出现 MATCH **也是允许的**——`fulltext_uses_rollup_column()`（`sql_resolver.cc:5090`）明确把 "SELECT list / GROUP BY / HAVING / ORDER BY" 都列为受检查位置，说明这些位置本身合法
+> - 真正被禁的只有 **ROLLUP 列**（以及上面表里那些"必须是裸列、必须同表"的约束）
 
 ### 2.4 优化器如何选上 FT 索引
 
@@ -431,6 +672,159 @@ cur_fanout = 1.0;
 即 **fanout 恒为 1.0、成本恒为 1 次页读**——MySQL 对 FT 命中多少行没有估算模型（连注释都在自嘲）。这也是 EXPLAIN 里 `rows=1` 的来源。另外 FT 的 `cur_keytype` 排在 `NOT_UNIQUE` 之后，只要已找到 `EQ_REF` 之类就整条跳过；semijoin loosescan 也不用 fulltext。
 
 计划类型 **`JT_FT`**（= 8，`sql_opt_exec_shared.h:221`），EXPLAIN 打印 `"fulltext"`（`join_type_str[8]`，`opt_explain.cc:117`）。`FT_SELECT` 是 5.x 遗留名，本版本不存在。
+
+**★★★ `add_ft_keys()` 完整实现**（`sql/sql_optimizer.cc:7822`，★ 真名是**复数** `add_ft_keys`，不存在单数的 `add_ft_key`）：
+
+```cpp
+static bool add_ft_keys(Key_use_array *keyuse_array, Item *cond,
+                        table_map usable_tables, bool simple_match_expr) {
+  Item_func_match *cond_func = nullptr;
+
+  if (!cond) return false;
+
+  assert(cond->is_bool_func());
+
+  if (cond->type() == Item::FUNC_ITEM) {
+    Item_func *func = down_cast<Item_func *>(cond);
+    Item_func::Functype functype = func->functype();
+    if (functype == Item_func::MATCH_FUNC) {
+      func = down_cast<Item_func *>(func->arguments()[0]);
+      functype = func->functype();
+    }
+    enum ft_operation op_type = FT_OP_NO;
+    double op_value = 0.0;
+    if (functype == Item_func::FT_FUNC) {
+      cond_func = down_cast<Item_func_match *>(func)->get_master();
+      cond_func->set_hints_op(op_type, op_value);      /* ① 裸 MATCH(...) */
+    } else if (func->arg_count == 2) {
+      Item *arg0 = func->arguments()[0];
+      Item *arg1 = func->arguments()[1];
+      if (arg1->const_item() && is_function_of_type(arg0, Item_func::FT_FUNC) &&
+          ((functype == Item_func::GE_FUNC &&
+            (op_value = arg1->val_real()) > 0) ||      /* ② MATCH >= const, const>0 */
+           (functype == Item_func::GT_FUNC &&
+            (op_value = arg1->val_real()) >= 0))) {    /* ③ MATCH >  const, const>=0 */
+        cond_func = down_cast<Item_func_match *>(arg0)->get_master();
+        if (functype == Item_func::GE_FUNC)
+          op_type = FT_OP_GE;
+        else if (functype == Item_func::GT_FUNC)
+          op_type = FT_OP_GT;
+        cond_func->set_hints_op(op_type, op_value);
+      } else if (arg0->const_item() &&                 /* ④ const <= MATCH */
+                 is_function_of_type(arg1, Item_func::FT_FUNC) && ... ) {
+        cond_func = down_cast<Item_func_match *>(arg1)->get_master();
+        ...
+      }
+    }
+  } else if (cond->type() == Item::COND_ITEM) {
+    List_iterator_fast<Item> li(*down_cast<Item_cond *>(cond)->argument_list());
+
+    if (down_cast<Item_cond *>(cond)->functype() == Item_func::COND_AND_FUNC) {
+      Item *item;
+      while ((item = li++))
+        if (add_ft_keys(keyuse_array, item, usable_tables, false)) return true;
+    }                       /* ★★ 只递归 AND —— OR 明确不支持 */
+  }
+
+  if (!cond_func || cond_func->key == NO_SUCH_KEY ||
+      !(usable_tables & cond_func->table_ref->map()))
+    return false;
+
+  Table_ref *tbl = cond_func->table_ref;
+  if (!tbl->table->keys_in_use_for_query.is_set(cond_func->key)) return false;
+
+  cond_func->set_simple_expression(simple_match_expr);
+
+  const Key_use keyuse(tbl, cond_func, cond_func->key_item()->used_tables(),
+                       cond_func->key, FT_KEYPART,   /* ★★ keypart 填哨兵值 */
+                       0,            // optimize
+                       0,            // keypart_map
+                       ~(ha_rows)0,  // ref_table_rows
+                       false,        // null_rejecting
+                       nullptr,      // cond_guard
+                       UINT_MAX);    // sj_pred_no
+  tbl->table->reginfo.join_tab->keys().set_bit(cond_func->key);
+  return keyuse_array->push_back(keyuse);
+}
+```
+> ★★ 三个要点：① **只支持 AND**（`COND_AND_FUNC`），所以 `WHERE MATCH(a) OR MATCH(b)` 用不上 FT 索引；② 支持 `MATCH(...) >= v / > v / <= v / < v` 四种比较，并把 `(op_type, op_value)` 写进 `Ft_hints` 下推给引擎 —— 这就是 `FT_OP_GT`/`FT_OP_GE` 的**唯一来源**；③ `keyuse` 的 keypart 填常量 `FT_KEYPART` 而非真实列号，这是 FT 在整个优化器里的"识别码"。
+
+调用点（`sql_optimizer.cc:8380`，位于 `update_ref_and_keys()` 内）：
+
+```cpp
+  if (query_block->ftfunc_list->elements) {
+    if (add_ft_keys(keyuse, cond, normal_tables, true)) return true;
+  }
+```
+> ★ 仅当 query_block 有 FT 函数时才走；首个调用 `simple_match_expr=true`。
+
+**★ `JT_FT` 的唯一判定入口**（`create_ref_for_key` `sql/sql_select.cc:2419`）：
+
+```cpp
+bool create_ref_for_key(JOIN *join, JOIN_TAB *j, Key_use *org_keyuse,
+                        table_map used_tables) {
+  const uint key = org_keyuse->key;
+  const bool ftkey = (org_keyuse->keypart == FT_KEYPART);   /* ★★ 就是靠这个哨兵 */
+  ...
+  if (ftkey) {
+    Item_func_match *ifm = down_cast<Item_func_match *>(org_keyuse->val);
+
+    length = 0;                 /* ★ FT 的 key length 恒为 0 */
+    keyparts = 1;               /* ★ 恒为 1 */
+    ifm->get_master()->score_from_index_scan = true;
+                                /* ★ 置位后可直接 get_relevance() 拿分，不必回表算 */
+  } else /* not ftkey */
+    calc_length_and_keyparts(...);
+  ...
+  if (ftkey) {
+    Key_use *keyuse = org_keyuse;
+    j->ref().items[0] = ((Item_func *)(keyuse->val))->key_item();
+    /* Predicates pushed down into subquery can't be used FT access */
+    j->ref().cond_guards[0] = nullptr;
+    // not supported yet. SerG
+    assert(!(keyuse->used_tables & ~PSEUDO_TABLE_BITS));
+
+    j->set_type(JT_FT);                                    /* ★★ 唯一 set_type(JT_FT) 处 */
+    j->set_ft_func(down_cast<Item_func_match *>(keyuse->val));
+    memset(j->ref().key_copy, 0, sizeof(j->ref().key_copy[0]) * keyparts);
+                                /* ★ key_copy 全清零：FT 不走"键值比较"，走 ft_handler 回调 */
+    return false;
+  }
+```
+
+**★ `FT_KEYPART` 哨兵常量的定义**（`sql/sql_select.h:105`）：
+
+```cpp
+/* Values in optimize */
+#define KEY_OPTIMIZE_EXISTS 1
+#define KEY_OPTIMIZE_REF_OR_NULL 2
+#define FT_KEYPART (MAX_REF_PARTS + 10)
+```
+> ★ 一个超出任何合法 keypart 编号的值，用于把 FT 的 `Key_use` 混进同一个数组但能被区分出来。
+
+**★ FT 在代价/行数估算里的两处特例**（`sql/sql_planner.cc`）：
+
+```cpp
+    enum idx_type cur_keytype =
+        (keyuse->keypart == FT_KEYPART) ? FULLTEXT : NOT_UNIQUE;
+```
+```cpp
+  if (keyuse) {
+    const KEY *key = table->key_info + keyuse->key;
+
+    if (keyuse[0].keypart == FT_KEYPART) {
+      /*
+        Fulltext indexes are special because keyuse->keypart does not
+        contain the keypart number but a constant (FT_KEYPART)
+        defining that it is a fulltext index. However, since fulltext
+        search demands that all indexed keyparts are used, iterating
+        over the next 'actual_key_parts' works.
+      */
+      for (uint i = 0; i < key->actual_key_parts; i++)
+        bitmap_set_bit(&table->tmp_set, key->key_part[i].field->field_index());
+    } else {
+```
+> ★ 因为 keypart 不是列号，计算 filtering effect 时改成遍历 `actual_key_parts` 把所有列标进 `tmp_set`。这印证"FT 要求所有索引列都被用到"。
 
 **可下推的谓词形态共 5 种**（`IsSargableFullTextIndexPredicate` `join_optimizer.cc:5132`）：
 
@@ -867,6 +1261,250 @@ static inline ulint fts_encode_int(ulint val, byte *buf) {
 2. **位置 delta 在每个新文档开始时重置为 0**，不是跨文档累积。
 3. 第一个 doc 的 delta 是相对 `node->last_doc_id` 的（新 node 为 0，所以等于绝对值），解码端用 `ut_a(pos == node->first_doc_id)` 断言了这一点（`fts0que.cc:2985`）。
 
+**★★ VLC 三个函数的真名与完整实现**（`fts0vlc.ic`，★ 真名核查：是 `fts_encode_int` / `fts_decode_vlc` / `fts_get_encoded_len`，**不存在** `fts_vlc_encode` / `fts_encode_ulint`）：
+
+```c
+/** Return length of val if it were encoded using our VLC scheme.
+ FIXME: We will need to be able encode 8 bytes value
+ @return length of value encoded, in bytes */
+static inline ulint fts_get_encoded_len(ulint val) /* in: value to encode */
+{
+  if (val <= 127) {           /* 2^7 - 1 */
+    return (1);
+  } else if (val <= 16383) {  /* 2^14 - 1 */
+    return (2);
+  } else if (val <= 2097151) {/* 2^21 - 1 */
+    return (3);
+  } else if (val <= 268435455) { /* 2^28 - 1 */
+    return (4);
+  } else {
+    /* Possibly we should care that on 64-bit machines ulint can
+    contain values that we can't encode in 5 bytes, but
+    fts_encode_int doesn't handle them either so it doesn't much
+    matter. */
+    return (5);               /* ★ 最多 5 字节 = 35 位有效位 */
+  }
+}
+
+/** Encode an integer using our VLC scheme and return the length in bytes.
+ @return length of value encoded, in bytes */
+static inline ulint fts_encode_int(
+    ulint val, /* in: value to encode */
+    byte *buf) /* in: buffer, must have enough space */
+{
+  ulint len;
+
+  if (val <= 127) {
+    *buf = (byte)val;
+    len = 1;
+  } else if (val <= 16383) {
+    *buf++ = (byte)(val >> 7);
+    *buf = (byte)(val & 0x7F);
+    len = 2;
+  } else if (val <= 2097151) {
+    *buf++ = (byte)(val >> 14);
+    *buf++ = (byte)((val >> 7) & 0x7F);
+    *buf = (byte)(val & 0x7F);
+    len = 3;
+  } else if (val <= 268435455) {
+    *buf++ = (byte)(val >> 21);
+    *buf++ = (byte)((val >> 14) & 0x7F);
+    *buf++ = (byte)((val >> 7) & 0x7F);
+    *buf = (byte)(val & 0x7F);
+    len = 4;
+  } else {
+    /* Best to keep the limitations of the 32/64 bit versions
+    identical, at least for the time being. */
+    ut_ad(val <= 4294967295u);
+
+    *buf++ = (byte)(val >> 28);
+    *buf++ = (byte)((val >> 21) & 0x7F);
+    *buf++ = (byte)((val >> 14) & 0x7F);
+    *buf++ = (byte)((val >> 7) & 0x7F);
+    *buf = (byte)(val & 0x7F);
+    len = 5;
+  }
+
+  /* High-bit on means "last byte in the encoded integer". */
+  *buf |= 0x80;               /* ★★ 末字节高位置 1 = 终止标志 */
+
+  return (len);
+}
+
+/** Decode and return the integer that was encoded using our VLC scheme.
+ @return value decoded */
+static inline ulint fts_decode_vlc(
+    byte **ptr) /* in: ptr to decode from, this ptr is
+                incremented by the number of bytes decoded */
+{
+  ulint val = 0;
+
+  for (;;) {
+    byte b = **ptr;
+
+    ++*ptr;
+    val |= (b & 0x7F);        /* ★ 每字节贡献 7 位有效数据 */
+
+    /* High-bit on means "last byte in the encoded integer". */
+    if (b & 0x80) {
+      break;
+    } else {
+      val <<= 7;
+    }
+  }
+
+  return (val);
+}
+```
+> ★ 为什么终止符可以是 `0x00`：**VLC 编码的 0 是 `0x80`（低位 0 + 高位 1）**，与 `0x00` 天然可区分。
+
+**★★★ ilist 编码主函数**（`fts0fts.cc:1052`，★ 编码就内联在这里，**不存在** `fts_encode_ilist`）：
+
+```c
+/** Add the given doc_id/word positions to the given node's ilist. */
+void fts_cache_node_add_positions(
+    fts_cache_t *cache,     /*!< in: cache */
+    fts_node_t *node,       /*!< in: word node */
+    doc_id_t doc_id,        /*!< in: doc id */
+    ib_vector_t *positions) /*!< in: fts_token_t::positions */
+{
+  ...
+  ut_ad(doc_id >= node->last_doc_id);   /* ★ ilist 内 doc_id 必须单调递增 */
+
+  /* Calculate the space required to store the ilist. */
+  doc_id_delta = (ulint)(doc_id - node->last_doc_id);
+  enc_len = fts_get_encoded_len(doc_id_delta);
+
+  last_pos = 0;
+  for (i = 0; i < ib_vector_size(positions); i++) {
+    ulint pos = *(static_cast<ulint *>(ib_vector_get(positions, i)));
+
+    ut_ad(last_pos == 0 || pos > last_pos);
+
+    enc_len += fts_get_encoded_len(pos - last_pos);  /* ★ 位置也是 delta 编码 */
+    last_pos = pos;
+  }
+
+  /* The 0x00 byte at the end of the token positions list. */
+  enc_len++;                            /* ★ 每段末尾 1 字节 0x00 */
+
+  if ((node->ilist_size_alloc - node->ilist_size) >= enc_len) {
+    ilist = nullptr;
+    ptr = node->ilist + node->ilist_size;
+  } else {
+    ulint new_size = node->ilist_size + enc_len;
+
+    /* Over-reserve space by a fixed size for small lengths and
+    by 20% for lengths >= 48 bytes. */
+    if (new_size < 16) {
+      new_size = 16;
+    } else if (new_size < 32) {
+      new_size = 32;
+    } else if (new_size < 48) {
+      new_size = 48;
+    } else {
+      new_size = (ulint)(1.2 * new_size);   /* ★ >=48 字节后按 1.2 倍扩容 */
+    }
+    ...
+    cache->total_size += new_size;          /* ★ 计入 cache 总量，SYNC 阈值看它 */
+  }
+
+  ptr_start = ptr;
+
+  /* Encode the new fragment. */
+  ptr += fts_encode_int(doc_id_delta, ptr); /* ① doc_id delta */
+
+  last_pos = 0;
+  for (i = 0; i < ib_vector_size(positions); i++) {
+    ulint pos = *(static_cast<ulint *>(ib_vector_get(positions, i)));
+    ptr += fts_encode_int(pos - last_pos, ptr);  /* ② 依次 position delta */
+    last_pos = pos;
+  }
+
+  *ptr++ = 0;                              /* ③ 0x00 终止符 */
+
+  ut_a(enc_len == (ulint)(ptr - ptr_start));
+  ...
+  node->ilist_size += enc_len;
+
+  if (node->first_doc_id == FTS_NULL_DOC_ID) {
+    node->first_doc_id = doc_id;
+  }
+
+  node->last_doc_id = doc_id;              /* ★ 下一个 doc 的 delta 基准 */
+  ++node->doc_count;
+}
+```
+
+**★ 何时开一个新 node（新行）**（`fts_cache_add_doc` `fts0fts.cc:1194`，★ 四个条件）：
+
+```c
+    if (fts_node == nullptr || fts_node->synced ||
+        fts_node->ilist_size > FTS_ILIST_MAX_SIZE ||     /* ★ 超 64KB → 新 node */
+        doc_id < fts_node->last_doc_id) {                /* ★ doc_id 回退 → 也必须新开 */
+      fts_node =
+          static_cast<fts_node_t *>(ib_vector_push(word->nodes, nullptr));
+      memset(fts_node, 0x0, sizeof(*fts_node));
+      cache->total_size += sizeof(*fts_node);
+    }
+```
+```c
+/* storage/innobase/include/fts0priv.h:73 */
+/** Approx. upper limit of ilist length in bytes. */
+#define FTS_ILIST_MAX_SIZE (64 * 1024)
+```
+> ★ `doc_id < fts_node->last_doc_id` 这一条很关键：**并发/乱序写入导致 doc_id 回退时也要切新 node**，因为 delta 编码要求单调递增。
+
+**★ 唯一的完整"读"侧样板**（`i_s.cc:2632`，★ `INNODB_FT_INDEX_TABLE` 就是靠它把 ilist 展开成人能看的行）：
+
+```c
+    /* Decrypt the ilist, and display Dod ID and word position */
+    for (ulint i = 0; i < ib_vector_size(word->nodes); i++) {
+      fts_node_t *node;
+      byte *ptr;
+      ulint decoded = 0;
+      doc_id_t doc_id = 0;            /* ★ 跨 doc 段的累加器 */
+
+      node = static_cast<fts_node_t *>(ib_vector_get(word->nodes, i));
+      ptr = node->ilist;
+
+      while (decoded < node->ilist_size) {
+        ulint pos = fts_decode_vlc(&ptr);
+        doc_id += pos;                /* ① doc_id = 累加 delta */
+
+        /* Get position info */
+        while (*ptr) {                /* ② 遇 0x00 表示该 doc 位置列表结束 */
+          pos = fts_decode_vlc(&ptr);
+          ...
+        }
+        ++ptr;                        /* ③ 跳过 0x00 终止符 */
+        decoded = ptr - (byte *)node->ilist;
+      }
+    }
+```
+
+**★ 落盘**（`fts_write_node` `fts0fts.cc:3952`，★ 辅助表访问用的是 InnoDB 内部 SQL）：
+
+```c
+  pars_info_bind_varchar_literal(info, "token", word->f_str, word->f_len);
+  fts_write_doc_id((byte *)&first_doc_id, node->first_doc_id);
+  fts_bind_doc_id(info, "first_doc_id", &first_doc_id);
+  fts_write_doc_id((byte *)&last_doc_id, node->last_doc_id);
+  fts_bind_doc_id(info, "last_doc_id", &last_doc_id);
+  mach_write_to_4((byte *)&doc_count, node->doc_count);
+  pars_info_bind_int4_literal(info, "doc_count", (const uint32_t *)&doc_count);
+
+  /* Set copy_name to false since it's a static. */
+  pars_info_bind_literal(info, "ilist", node->ilist, node->ilist_size,
+                         DATA_BLOB, DATA_BINARY_TYPE);   /* ★ ilist 整段作 BLOB */
+  ...
+    *graph = fts_parse_sql(fts_table, info,
+                           "BEGIN\n"
+                           "INSERT INTO $index_table_name VALUES"
+                           " (:token, :first_doc_id,"
+                           "  :last_doc_id, :doc_count, :ilist);");
+```
+
 ---
 
 ## 六、写入路径与 fts_cache
@@ -1259,6 +1897,168 @@ FROM $table_name WHERE word LIKE :word ORDER BY first_doc_id;
 
 > 另外注意一个与直觉相反的顺序：**短语搜索是先查磁盘、后查内存缓存**（`fts_query_phrase_search` `:2575` 磁盘、`:2587` 缓存），而 union/intersect/difference 是**先缓存后磁盘**（`fts_query_union` `:1308` 缓存、`:1316` 磁盘）。原因在于短语需要按位置归并，缓存里的 node 未必完整，实现上选择了先铺满磁盘结果。
 
+**★ `ft_read()` 回表主路径**（`ha_innodb.cc:11095`，★ 精简版保留关键分支）：
+
+```cpp
+int ha_innobase::ft_read(uchar *buf) {
+  ...
+  result = reinterpret_cast<NEW_FT_INFO *>(ft_handler)->ft_result;
+
+  if (result->current == nullptr) {
+    /* This is the case where the FTS query did not
+    contain and matching documents. */
+    if (result->rankings_by_id != nullptr) {
+      /* Now that we have the complete result, we
+      need to sort the document ids on their rank
+      calculation. */
+
+      fts_query_sort_result_on_rank(result);       /* ★★ 惰性排序：首次 ft_read 才建树 */
+
+      result->current =
+          const_cast<ib_rbt_node_t *>(rbt_first(result->rankings_by_rank));
+    } else {
+      ut_a(result->current == nullptr);
+    }
+  } else {
+    result->current = const_cast<ib_rbt_node_t *>(
+        rbt_next(result->rankings_by_rank, result->current));
+  }
+
+next_record:
+
+  if (result->current != nullptr) {
+    doc_id_t search_doc_id;
+    dtuple_t *tuple = m_prebuilt->search_tuple;
+
+    /* If we only need information from result we can return
+       without fetching the table row */
+    if (ft_prebuilt->read_just_key) {              /* ★ 覆盖索引式快路径 */
+      const fts_ranking_t *ranking = rbt_value(fts_ranking_t, result->current);
+      m_prebuilt->fts_doc_id = ranking->doc_id;
+      if (m_prebuilt->fts_doc_id_in_read_set) {
+        innobase_fts_store_docid(table, ranking->doc_id);
+      }
+      return (0);                                  /* ★ 完全不回表 */
+    }
+
+    dict_index_t *index;
+    index = m_prebuilt->table->fts_doc_id_index;   /* ★ 切到 FTS_DOC_ID_INDEX */
+    ut_a(index != nullptr);
+    m_prebuilt->index = index;
+
+    fts_ranking_t *ranking = rbt_value(fts_ranking_t, result->current);
+    search_doc_id = ranking->doc_id;
+
+    innobase_fts_create_doc_id_key(tuple, index, &search_doc_id);
+
+    auto ret = innobase_srv_conc_enter_innodb(m_prebuilt);
+    if (ret == DB_SUCCESS) {
+      ret = row_search_for_mysql((byte *)buf, PAGE_CUR_GE, m_prebuilt,
+                                 ROW_SEL_EXACT, 0);   /* ★★ doc_id → 聚簇索引行 */
+      innobase_srv_conc_exit_innodb(m_prebuilt);
+    }
+
+    switch (ret) {
+      case DB_SUCCESS:
+        error = 0;
+        break;
+      case DB_RECORD_NOT_FOUND:                    /* ★ 已删但墓碑未生效 */
+        result->current = const_cast<ib_rbt_node_t *>(
+            rbt_next(result->rankings_by_rank, result->current));
+        if (!result->current) {
+          error = HA_ERR_END_OF_FILE;
+        } else {
+          goto next_record;                        /* ★ 跳下一个继续 */
+        }
+        break;
+      ...
+```
+
+**★ 构造 doc_id 搜索键**（`ha_innodb.cc:11056`，★ 注意字节序转换）：
+
+```cpp
+static void innobase_fts_create_doc_id_key(
+    dtuple_t *tuple, const dict_index_t *index, doc_id_t *doc_id) {
+  doc_id_t temp_doc_id;
+  dfield_t *dfield = dtuple_get_nth_field(tuple, 0);
+
+  ut_a(dict_index_get_n_unique(index) == 1);
+  dtuple_set_n_fields(tuple, index->n_fields);
+  dict_index_copy_types(tuple, index, index->n_fields);
+
+#ifdef UNIV_DEBUG
+  /* The unique Doc ID field should be an eight-bytes integer */
+  dict_field_t *field = index->get_field(0);
+  ut_a(field->col->mtype == DATA_INT);
+  ut_ad(sizeof(*doc_id) == field->fixed_len);
+  ut_ad(!strcmp(index->name, FTS_DOC_ID_INDEX_NAME));
+#endif
+
+  /* Convert to storage byte order */
+  mach_write_to_8(reinterpret_cast<byte *>(&temp_doc_id), *doc_id);
+  *doc_id = temp_doc_id;
+  dfield_set_data(dfield, doc_id, sizeof(*doc_id));
+
+  dtuple_set_n_fields_cmp(tuple, 1);
+
+  for (ulint i = 1; i < index->n_fields; i++) {
+    dfield = dtuple_get_nth_field(tuple, i);
+    dfield_set_null(dfield);
+  }
+}
+```
+
+**★ `NEW_FT_INFO` 与两张虚函数表**（`ha_innodb.h:690`、`ha_innodb.cc:590`）：
+
+```cpp
+/** Structure Returned by ha_innobase::ft_init_ext() */
+typedef struct new_ft_info {
+  struct _ft_vft *please;
+  struct _ft_vft_ext *could_you;
+  row_prebuilt_t *ft_prebuilt;
+  fts_result_t *ft_result;
+} NEW_FT_INFO;
+```
+```cpp
+/* Call back function array defined by MySQL and used to
+retrieve FTS results. */
+const struct _ft_vft ft_vft_result = {nullptr, innobase_fts_find_ranking,
+                                      innobase_fts_close_ranking,
+                                      innobase_fts_retrieve_ranking, nullptr};
+                    /* ★ read_next 与 reinit_search 为 nullptr —— InnoDB 不通过
+                       _ft_vft 取行，而是由 FullTextSearchIterator 直接调 ft_read() */
+```
+```cpp
+/** @return version of the extended FTS API */
+static uint innobase_fts_get_version() {
+  return (2);
+}
+
+/** @return Which part of the extended FTS API is supported */
+static ulonglong innobase_fts_flags() {
+  return (FTS_ORDERED_RESULT | FTS_DOCID_IN_RESULT);
+}
+```
+> ★★ `FTS_ORDERED_RESULT`：告诉 server"结果已按 rank 降序"，**server 可据此省掉 filesort** —— 这是 §2.8「filesort 的 FTS 特例」的接口依据。
+
+**★ 分数如何回到 SQL 层**（`ha_innodb.cc:21575`，★ `MATCH` 最终返回的那个 float）：
+
+```cpp
+static float innobase_fts_retrieve_ranking(FT_INFO *fts_hdl) {
+  fts_result_t *result;
+  row_prebuilt_t *ft_prebuilt [[maybe_unused]];
+
+  result = reinterpret_cast<NEW_FT_INFO *>(fts_hdl)->ft_result;
+  ft_prebuilt = reinterpret_cast<NEW_FT_INFO *>(fts_hdl)->ft_prebuilt;
+
+  fts_ranking_t *ranking = rbt_value(fts_ranking_t, result->current);
+  assert(ft_prebuilt->fts_doc_id == ranking->doc_id);
+                      /* ★★ 两层之间唯一的"游标对齐断言"：doc_id 必须相等 */
+
+  return (ranking->rank);   /* ★ 未做任何归一化/clamp */
+}
+```
+
 ---
 
 ## 十一、相关性排序（rank）算法
@@ -1342,6 +2142,94 @@ $$\operatorname{idf}(t) \;=\; \log_{10}\!\left(\frac{N}{\operatorname{df}(t)}\ri
 - `df(t)` = INDEX 表的 `doc_count` 列
 - **没有**文档长度归一化、没有余弦归一化、没有 `tf/(tf+k1)` 饱和
 
+**★ 打分函数的真名核查**：真名是 **`fts_query_calculate_ranking()`**（`fts0que.cc:3251`）；**不存在** `fts_rank_doc`（全仓库 grep 无命中）。
+
+**★★ IDF 的完整实现**（`fts0que.cc:3214`）：
+
+```c
+/** Calculate the inverse document frequency (IDF) for all the terms. */
+static void fts_query_calculate_idf(fts_query_t *query) /*!< in: Query state */
+{
+  const ib_rbt_node_t *node;
+  uint64_t total_docs = query->total_docs;
+
+  for (node = rbt_first(query->word_freqs); node;
+       node = rbt_next(query->word_freqs, node)) {
+    fts_word_freq_t *word_freq;
+
+    word_freq = rbt_value(fts_word_freq_t, node);
+
+    if (word_freq->doc_count > 0) {
+      if (total_docs == word_freq->doc_count) {
+        /* QP assume ranking > 0 if we find
+        a match. Since Log10(1) = 0, we cannot
+        make IDF a zero value if do find a
+        word in all documents. So let's make
+        it an arbitrary very small number */
+        word_freq->idf = log10(1.0001);      /* ★ df == N 时的兜底，不是 0 */
+      } else {
+        word_freq->idf = log10(total_docs / (double)word_freq->doc_count);
+      }                                      /* ★★ log10，不是 ln；无 +0.5 平滑 */
+
+      if (fts_enable_diag_print) {
+        ib::info(ER_IB_MSG_515) << "'" << word_freq->word.f_str << "' -> "
+                                << query->total_docs << "/"
+                                << word_freq->doc_count << " "
+                                << std::setw(6) << std::setprecision(5)
+                                << word_freq->idf;
+      }
+    }
+  }
+}
+```
+> ★ `innodb_ft_enable_diag_print=ON` 可以把每个词的 `idf` 打进 error log —— **这是唯一能直接观察打分输入的手段**。
+
+**★★★ 打分主函数完整实现**（`fts0que.cc:3251`，★ 全篇最关键的一段）：
+
+```c
+/** Calculate the ranking of the document. */
+static void fts_query_calculate_ranking(
+    const fts_query_t *query, /*!< in: query state */
+    fts_ranking_t *ranking)   /*!< in: Document to rank */
+{
+  ulint pos = 0;
+  fts_string_t word;
+
+  /* At this stage, ranking->rank should not exceed the 1.0 bound */
+  ut_ad(ranking->rank <= 1.0 && ranking->rank >= -1.0);
+              /* ★ 只是断言：此时 rank 仅含布尔算子的 ±1 调整，尚未乘 idf */
+  ut_ad(rbt_size(query->word_map) == query->word_vector->size());
+
+  while (fts_ranking_words_get_next(query, ranking, &pos, &word)) {
+              /* ★ 遍历该文档命中的词位图 */
+    int ret;
+    ib_rbt_bound_t parent;
+    double weight;
+    fts_doc_freq_t *doc_freq;
+    fts_word_freq_t *word_freq;
+
+    ret = rbt_search(query->word_freqs, &parent, &word);
+    /* It must exist. */
+    ut_a(ret == 0);
+    word_freq = rbt_value(fts_word_freq_t, parent.last);
+                                      /* ★ 取该词的 idf 与 doc_freqs 树 */
+
+    ret = rbt_search(word_freq->doc_freqs, &parent, &ranking->doc_id);
+    /* It must exist. */
+    ut_a(ret == 0);
+    doc_freq = rbt_value(fts_doc_freq_t, parent.last);
+                                      /* ★ tf = doc_freq->freq */
+
+    weight = (double)doc_freq->freq * word_freq->idf;
+                                      /* ① weight = tf × idf —— tf 是裸词频，无饱和 */
+
+    ranking->rank += (fts_rank_t)(weight * word_freq->idf);
+                                      /* ② 再乘一次 idf ⇒ 每 term 贡献 tf × idf² */
+  }
+}
+```
+> ★★ **整个函数没有任何文档长度项，也没有 clamp**。BM25 的两个参数在这里连影子都没有。
+
 ### 11.2 源码
 
 IDF（`fts_query_calculate_idf` `fts0que.cc:3215`）：
@@ -1365,6 +2253,93 @@ IDF（`fts_query_calculate_idf` `fts0que.cc:3215`）：
 ```
 
 底数是 **log10**（不是 ln）。`doc_freq->freq` 是**原始出现次数**（解码 ilist 时每解出一个 position 就 `++freq`，`fts0que.cc:3026`）。
+
+**★ tf 是怎么数出来的**（`fts_query_filter_doc_ids` `fts0que.cc:2955`，★ ilist 解码现场）：
+
+```c
+  /* Decode the ilist and add the doc ids to the query doc_id set. */
+  while (decoded < len) {
+    ulint freq = 0;
+    ...
+    ulint pos = fts_decode_vlc(&ptr);       /* doc_id 以 vlc 增量编码 */
+    ...
+    doc_id += pos;                          /* 累加 delta 得绝对 doc_id */
+
+    if (calc_doc_count) {
+      word_freq->doc_count++;
+    }
+
+    /* Unpack the positions within the document. */
+    while (*ptr) {                          /* 遇 0x00 表示该 doc 的位置列表结束 */
+      last_pos += fts_decode_vlc(&ptr);
+
+      if (query->collect_positions) {
+        ib_vector_push(match->positions, &last_pos);
+      }
+
+      ++freq;                               /* ★★ tf 就在这里数：每个 position +1 */
+    }
+
+    doc_freq = fts_query_add_doc_freq(query, doc_freqs, doc_id);
+
+    /* Avoid duplicating frequency tally. */
+    if (doc_freq->freq == 0) {
+      doc_freq->freq = freq;                /* ★ tf 落盘到 fts_doc_freq_t::freq */
+    }
+
+    ++ptr;                                  /* 跳过 0x00 终止符 */
+    decoded = ptr - (byte *)data;
+```
+> ★ tf = ilist 里该 doc 的 **position 个数**，即原始出现次数。没有 log、没有饱和。
+
+**★ 两个关键数据结构**（`fts0que.cc:277`，★ "缺了两块"的硬证据）：
+
+```c
+/** For storing the frequency of a word/term in a document */
+struct fts_doc_freq_t {
+  doc_id_t doc_id; /*!< Document id */
+  ulint freq;      /*!< Frequency of a word in a document */
+};
+                    /* ★★ 这就是 tf 的载体 —— 结构体里没有任何文档长度信息 */
+
+/** To determine the word frequency per document. */
+struct fts_word_freq_t {
+  fts_string_t word;   /*!< Word for which we need the freq */
+  ib_rbt_t *doc_freqs; /*!< RB Tree for storing per document word frequencies */
+  uint64_t doc_count;  /*!< Total number of documents that contain this word */
+  double idf;          /*!< Inverse document frequency */
+};                      /* ★★ 整个结构体 = {df, idf}，没有 avgdl、没有 dl */
+```
+> ★★ 补充第三块差异：除了"缺两块"，InnoDB 还**多乘了一次 idf**（`idf²`）。
+> ★ 另一条硬证据：`fts_query_t::total_words`（`fts0que.cc:157`）**声明后全仓库从未使用** —— 它本可作为长度归一化的基础，但没人用。
+
+**★ BM25 逐项对照表**（每条都有源码落点）：
+
+| BM25 项 | BM25 公式 | InnoDB 8.0.39 | 源码证据 |
+|---|---|---|---|
+| IDF | `ln(1+(N-df+0.5)/(df+0.5))` | `log10(N/df)`，**底数 10、无 +0.5 平滑** | `fts0que.cc:3237` |
+| IDF 的幂 | 一次方 | **二次方**（连续乘两次同一 double，非 `pow`） | `fts0que.cc:3284,3286` |
+| **① 长度归一化** | `1-b+b·dl/avgdl` | **完全缺失** | 无 `avgdl`/`dl`；`fts0que.cc:283-294` |
+| **② tf 饱和** | `tf·(k1+1)/(tf+k1·(...))` | **完全缺失**，tf 是裸线性值 | `fts0que.cc:3026,3043,3284` |
+| k1 / b 参数 | 可调 | **不存在** | 全 innobase grep 无命中 |
+| 结果量纲 | 无界正分 | 无界，**不 clamp 到 [0,1]** | clamp 只在布尔算子路径 |
+
+**★★ 一个必须纠正的说法**：常见以为"InnoDB rank 被 clamp 到 [0,1]"，**这是错的**。`fts_query_calculate_ranking` 里只有两个 `ut_ad`（断言），没有任何 clamp。clamp 只发生在**布尔算子**路径：
+
+```c
+/* fts0que.cc:754-761 —— 布尔算子的 ±1 调整后才 clamp，且范围是 [-1, 1] */
+    ranking->rank += downgrade ? RANK_DOWNGRADE : RANK_UPGRADE;
+
+    /* Allow at most 2 adjustment by RANK_DOWNGRADE (-0.5)
+    and RANK_UPGRADE (0.5) */
+    if (ranking->rank >= 1.0F) {
+      ranking->rank = 1.0F;
+    } else if (ranking->rank <= -1.0F) {
+      ranking->rank = -1.0F;
+    }
+```
+> ⚠️ **注释滞后于代码**：注释还写 `RANK_DOWNGRADE (-0.5)` / `RANK_UPGRADE (0.5)`，但 `fts0que.cc:56-57` 的实际值是 **±1.0F**。
+> ★ 最终 `rank = Σ tf·idf²` 可以**远大于 1**；`fts_rank_t` 的注释声称"0..1 inclusive"是过时的。
 
 ### 11.3 布尔算子的调整与唯一的 clamp
 
@@ -1462,18 +2437,261 @@ else if (ranking->rank <= -1.0F) ranking->rank = -1.0F;
 
 > **`row0ftsort.cc` / `fts0ftsort` 在 8.0.39 已完全不存在**（全仓库 0 命中）。5.7 时代建 FTS 索引走它，8.0 起全部改由 `ddl/ddl0fts.cc` 的 `ddl::FTS` 负责——这是 8.0 把 DDL 统一到新 DDL 框架（`ddl/` 目录）的一部分。读旧资料时注意这个文件名已成历史。
 
-### 12.5 已知限制
+### 12.5 已知限制（完整清单）
 
-| 限制 | 位置 |
-|------|------|
-| **分区表不支持 FULLTEXT** | `handler0alter.cc:10110-10123`，`ER_FULLTEXT_NOT_SUPPORTED_WITH_PARTITIONING` |
-| **临时表不支持** | `ha_innodb.cc:13172`，`ER_INNODB_NO_FT_TEMP_TABLE` |
-| 一次只能建一个 FTS 索引 | `handler0alter.cc:4479`，`ER_INNODB_FT_LIMIT` |
-| 虚拟列 / 函数索引不支持 FULLTEXT | `ha_innodb.cc:11991`；`ER_FULLTEXT_FUNCTIONAL_INDEX` |
-| `FTS_DOC_ID_INDEX` 不能降序 | `ha_innodb.cc:13187` |
-| `ft_min_word_len` / `ft_boolean_syntax` 对 InnoDB 无效 | 用 `innodb_ft_min_token_size`；`fts0tokenize.h:43` 是静态常量 |
+> 本章是 FTS 局限的**唯一详写处**，按"限制落在哪一层"分组。语法层的另有 §2.3，此处只给指针。
 
-> `ER_INNODB_FT_LIMIT` 的语义常被误读：它不是"一张表只能有一个 FTS 索引"，而是**"一条 DDL 只能 ADD 一个 FTS 索引"**（`handler0alter.cc:4479`）以及**"已有 FTS 索引的表不能再走 inplace rebuild"**（`:1319`）。一张表可以有多组 FULLTEXT 索引，分多次 ADD 即可。
+**A. 对象模型与列约束**
+
+| 限制 | 报错 / 位置 |
+|---|---|
+| 列类型只限 `CHAR` / `VARCHAR` / `TEXT(BLOB)`；数值、JSON、ENUM/SET、空间类型全部被拒 | `ER_BAD_FT_COLUMN`（`sql_table.cc:4952-4958`） |
+| **同一索引的各列必须同一字符集且同一排序规则**（比较的是 `CHARSET_INFO*` 指针，所以 `_general_ci` 与 `_0900_ai_ci` 也算不同） | 同上（`sql_table.cc:4957`） |
+| 禁止 `binary` 字符集、禁止 `mbminlen > 1`（**ucs2 / utf16 / utf32 全部不支持**） | 同上 |
+| **不支持前缀索引，且是静默忽略**——`FULLTEXT(col(10))` 不报错，前缀被丢弃、按整列索引 | `sql_table.cc:5264-5272`（注释 "fulltext indexes ignores prefixes"） |
+| 不能建在虚拟生成列 / 函数索引上 | `ER_FULLTEXT_FUNCTIONAL_INDEX`（`sql_table.cc:4898`） |
+| **可以为 NULL**（`ER_NULL_COLUMN_IN_INDEX` 检查只对非 FULLTEXT 索引生效） | `sql_table.cc:5111-5130` |
+| 词长上限 **84 字符 / 336 字节**；短语与邻近搜索词数上限 **128** | `HA_FT_MAXBYTELEN=336`（`ft_global.h:42`）、`MAX_PROXIMITY_ITEM=128`（`fts0que.cc:60`） |
+| 外键可以与 FTS **共存**（常被误认为不行），但 FTS 索引不能充当外键的支撑索引 | `sql_table.cc:5510/5702/6169/6243` 四处跳过 `HA_FULLTEXT` |
+
+**B. 表类型**
+
+| 限制 | 报错 / 位置 |
+|---|---|
+| **分区表不支持 FULLTEXT** | `ER_FULLTEXT_NOT_SUPPORTED_WITH_PARTITIONING`（`handler0alter.cc:10117`） |
+| **临时表不支持** | `ER_INNODB_NO_FT_TEMP_TABLE`（`ha_innodb.cc:13174`、`dict0dd.cc:1582`） |
+
+**C. DDL**
+
+| 限制 | 报错 / 位置 |
+|---|---|
+| **ADD / DROP FULLTEXT 是 INPLACE，但 `LOCK=SHARED`——会阻塞 DML 写**（不是 Online DDL） | `handler0alter.cc:1332-1354` 返回 `HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE`，理由码 `ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_FTS` |
+| **不支持 `ALGORITHM=INSTANT`** | `INNOBASE_INSTANT_ALLOWED` 不含 `ADD_INDEX`（`handler0alter.cc:148-156`） |
+| 一条 ALTER 只能 ADD 一个 FTS 索引 | `ER_INNODB_FT_LIMIT`（`handler0alter.cc:4479`） |
+| **已有 FTS 索引的表不能再走 inplace rebuild** | `ER_INNODB_FT_LIMIT`（`handler0alter.cc:1317`，理由是重建会牵动 aux 表） |
+| `FTS_DOC_ID_INDEX` 不能降序、名字必须精确 | `ha_innodb.cc:13187` |
+| 多个变量是**只读**：`innodb_ft_min/max_token_size`、`ngram_token_size`——改了要重建索引 | `ha_innodb.cc:22512/22518`、`plugin_ngram.cc:250` |
+| **辅助表全部登记在 8.0 数据字典里**：每表 5 张公共表 + **每个 FTS 索引** 6 张 INDEX 表。N 个索引 ≈ 5+6N 张表 ⇒ 建表/删表要逐张拿 exclusive MDL，DD 膨胀、DDL 变慢 | `dict0dd.cc:6463`、`fts0fts.cc:1663`（`fts_lock_common_tables` 逐张 acquire） |
+
+> `ER_INNODB_FT_LIMIT` 的语义常被误读：它不是"一张表只能有一个 FTS 索引"，而是**"一条 DDL 只能 ADD 一个"** + **"已有 FTS 的表不能再 inplace rebuild"**。一张表可以有多组 FULLTEXT 索引，分多次 ADD 即可。
+
+**D. 事务可见性 ★**
+
+| 限制 | 说明 |
+|---|---|
+| **未提交的 DML 对 `MATCH` 不可见** | token 直到 `trx_commit_low → fts_commit → fts_add_doc_by_id` 才写入 `fts_cache`（`trx0trx.cc:2211`）；而 `fts_query` 用的是**另一个后台事务**（`fts0que.cc:3636`）、只读 cache + 磁盘，`fts0que.cc` 里 grep `fts_trx` **0 命中**——它完全不看未提交的 op。<br>⇒ **在一个事务里 INSERT 后立即 `MATCH` 查不到刚插入的行**（autocommit 下每条语句都提交，所以看起来"可见"） |
+
+**E. 复制 ★**
+
+| 限制 | 说明 |
+|---|---|
+| **辅助表的修改不记 binlog** | 内部 query graph 不过 server 层（`storage/innobase/fts/` grep `binlog` 0 命中）。从库的 FTS 索引是**重放行级 DML 后自己分词重建**的 |
+| **主从的 stopword 表 / `ngram_token_size` / parser 插件配置若不同，`MATCH` 结果会不同** | 两端各自分词（`fts0fts.cc:220`），变量是 GLOBAL/SESSION 级（`ha_innodb.cc:1088/22101/22512`） |
+| 澄清：`FTS_DOC_ID` **不随行复制也不需要** | 隐藏 doc_id 由本地 `fts_create_doc_id` 生成；aux 表根本不复制，两端 doc_id 是否相同不影响排名（排名只由 tf/idf 决定） |
+
+**F. 空间与运维**
+
+| 限制 | 说明 |
+|---|---|
+| 删除不回收空间（只写墓碑） | 后台自动回收门槛 1000 万个已删文档 + 5 分钟；否则要 `innodb_optimize_fulltext_only=ON` + `OPTIMIZE TABLE` |
+| OPTIMIZE 全局单线程 | `fts_optimize_init` 只允许一个线程 |
+| 结果集内存上限 | 超 `innodb_ft_result_cache_limit`（默认 2GB）报 `HA_ERR_FTS_EXCEED_RESULT_CACHE_LIMIT`（"FTS query exceeds result cache limit"），检查点 `fts0que.cc:1385/3071/3397/3443` |
+
+**★ 几条最容易被误传的限制——逐条给源码证据**：
+
+**① 临时表确实不支持**（`dict0dd.cc:1578` 与 `ha_innodb.cc:13169` 两处独立拦截）：
+
+```cpp
+  /* Check if there are any FTS indexes defined on this table. */
+  for (uint i = 0; i < form->s->keys; i++) {
+    const KEY *key = &form->key_info[i];
+
+    if ((key->flags & HA_FULLTEXT) && is_temporary) {
+      /* We don't support FTS indexes in temporary tables. */
+      my_error(ER_INNODB_NO_FT_TEMP_TABLE, MYF(0));
+      return true;
+    }
+  }
+```
+
+**② 分区表：能力位声明了，但 DDL 路径硬拦**（★ 两处矛盾值得点出）：
+
+```cpp
+/* storage/innobase/handler/ha_innopart.h:55 —— 声明了 HA_CAN_FULLTEXT */
+```
+```cpp
+/* handler0alter.cc:10121 —— ADD_INDEX 时直接拒绝 */
+      if (key->flags & HA_FULLTEXT) {
+        ha_alter_info->unsupported_reason =
+            innobase_get_err_msg(ER_FULLTEXT_NOT_SUPPORTED_WITH_PARTITIONING);
+        return HA_ALTER_INPLACE_NOT_SUPPORTED;
+      }
+```
+> ★ 即"引擎说支持、DDL 路径禁止"——不要只看能力位就下结论。
+
+**③ 列类型四连禁**（`sql_table.cc:4951`）：
+
+```cpp
+  if (key->type == KEYTYPE_FULLTEXT) {
+    if ((sql_field->sql_type != MYSQL_TYPE_STRING &&
+         sql_field->sql_type != MYSQL_TYPE_VARCHAR &&
+         !is_blob(sql_field->sql_type)) ||
+        sql_field->charset == &my_charset_bin ||
+        sql_field->charset->mbminlen > 1 ||  // ucs2 doesn't work yet
+        (*ft_key_charset && sql_field->charset != *ft_key_charset)) {
+      my_error(ER_BAD_FT_COLUMN, MYF(0), column->get_field_name());
+      return true;
+    }
+    *ft_key_charset = sql_field->charset;
+```
+> ★ 四连禁：非 CHAR/VARCHAR/TEXT、binary、`mbminlen > 1`（ucs2/utf16/utf32 全不支持）、同一索引内字符集不一致。
+
+**④ ngram 模式下 `innodb_ft_min_token_size` 被显式忽略**（★ 中文场景必知）：
+
+```cpp
+/* fts0fts.cc:4492 —— fts_check_token */
+  if (!is_ngram) {
+    if (token->f_n_char < fts_min_token_size ||
+        token->f_n_char > fts_max_token_size ||
+        (stopwords != nullptr && rbt_search(stopwords, &parent, token) == 0)) {
+      return (false);
+    } else {
+      return (true);
+    }
+  }
+
+  /* Check token for ngram. */
+  /* We ignore fts_min_token_size when ngram */
+  ut_ad(token->f_n_char > 0 && token->f_n_char <= fts_max_token_size);
+```
+> ★★ 所以中文搜不到单字时**改 `innodb_ft_min_token_size` 完全没用**，要改的是 `ngram_token_size`（默认 2）。
+
+**⑤ ADD FULLTEXT 为什么要锁表**（`handler0alter.cc:1306`，★ 官方注释直说）：
+
+```cpp
+  } else if ((ha_alter_info->handler_flags & Alter_inplace_info::ADD_INDEX)) {
+    /* Building a full-text index requires a lock.
+    We could do without a lock if the table already contains
+    an FTS_DOC_ID column, but in that case we would have
+    to apply the modification log to the full-text indexes. */
+    for (uint i = 0; i < ha_alter_info->index_add_count; i++) {
+      const KEY *key = ...;
+      if (key->flags & HA_FULLTEXT) {
+        ha_alter_info->unsupported_reason =
+            innobase_get_err_msg(ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_FTS);
+        online = false;   /* ★ 退化为 SHARED_LOCK */
+        break;
+      }
+    }
+  }
+```
+
+**⑥ 一条 ALTER 只能加一个**（`handler0alter.cc:4479`）：
+
+```cpp
+  if (num_fts_index > 1) {
+    my_error(ER_INNODB_FT_LIMIT, MYF(0));
+    goto error_handled;
+  }
+```
+
+**⑦ FTS_DOC_ID 与 FTS_DOC_ID_INDEX 不可删改**（`handler0alter.cc:1275`）：
+
+```cpp
+  if (m_prebuilt->table->fts && innobase_fulltext_exist(altered_table)) {
+    /* FULLTEXT indexes are supposed to remain. */
+    /* Disallow DROP INDEX FTS_DOC_ID_INDEX */
+    for (uint i = 0; i < ha_alter_info->index_drop_count; i++) {
+      if (!my_strcasecmp(system_charset_info,
+                         ha_alter_info->index_drop_buffer[i]->name,
+                         FTS_DOC_ID_INDEX_NAME)) {
+        ha_alter_info->unsupported_reason = innobase_get_err_msg(
+            ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_CHANGE_FTS);
+        return HA_ALTER_INPLACE_NOT_SUPPORTED;
+      }
+    }
+```
+
+**⑧ 用户自建 FTS_DOC_ID 的形态约束**（`ha_innodb.cc:14865`，★ 两处）：
+
+```cpp
+    if (fts_doc_id_index) {
+      switch (fts_doc_id_index->type()) {
+        case dd::Index::IT_UNIQUE:
+          ut_ad(fts_doc_id_index->algorithm() == dd::Index::IA_BTREE);
+          if (dd_is_only_column(fts_doc_id_index, fts_doc_id)) {
+            break;                    /* ★ 必须单列 UNIQUE BTREE */
+          }
+          [[fallthrough]];
+        case dd::Index::IT_MULTIPLE:
+        case dd::Index::IT_FULLTEXT:
+        case dd::Index::IT_SPATIAL:
+          my_error(ER_INNODB_FT_WRONG_DOCID_INDEX, MYF(0), ...);
+          ...
+      }
+    }
+
+    if (fts_doc_id) {
+      if (fts_doc_id->type() != dd::enum_column_types::LONGLONG ||
+          fts_doc_id->is_nullable() ||
+          fts_doc_id->name() != FTS_DOC_ID_COL_NAME) {
+        my_error(ER_INNODB_FT_WRONG_DOCID_COLUMN, MYF(0), ...);
+        ...
+      }
+    } else {
+      /* Add hidden FTS_DOC_ID column */
+      dd::Column *col = dd_table->add_column();
+      col->set_hidden(dd::Column::enum_hidden_type::HT_HIDDEN_SE);
+      col->set_name(FTS_DOC_ID_COL_NAME);
+      col->set_type(dd::enum_column_types::LONGLONG);
+      col->set_nullable(false);
+      col->set_unsigned(true);
+    }
+```
+> ★ 用户列必须是 `BIGINT UNSIGNED NOT NULL` 且名字就叫 `FTS_DOC_ID`；否则 InnoDB 自动加一个 `HT_HIDDEN_SE` 隐藏列（**注意是 SE 级隐藏，与 GIPK 的 USER 级不同**）。
+
+**⑨ ROLLUP 列不支持**（`sql_resolver.cc:371`）：
+
+```cpp
+  if (fulltext_uses_rollup_column(this)) {
+    my_error(ER_FULLTEXT_WITH_ROLLUP, MYF(0));
+    return true;
+  }
+```
+
+**⑩ 物化子查询/派生表不能建**（`item_func.cc:7494`）：`ER_NO_FT_MATERIALIZED_SUBQUERY`。
+
+**★ 相关错误码全表**（`share/messages_to_clients.txt`）：
+
+| 错误码名 | 行 | 文案 |
+|---|---|---|
+| `ER_FT_MATCHING_KEY_NOT_FOUND` | 4157 | Can't find FULLTEXT index matching the column list |
+| `ER_TABLE_CANT_HANDLE_FT` | 4488 | The used table type doesn't support FULLTEXT indexes |
+| `ER_BAD_FT_COLUMN` | 5075 | Column '%-.192s' cannot be part of FULLTEXT index |
+| `ER_FULLTEXT_NOT_SUPPORTED_WITH_PARTITIONING` | 6707 | FULLTEXT index is not supported for partitioned tables. |
+| `ER_TABLE_HAS_NO_FT` | 6734 | The table does not have FULLTEXT index to support this query |
+| `ER_INNODB_FT_LIMIT` | 6828 | InnoDB presently supports one FULLTEXT index creation at a time |
+| `ER_INNODB_NO_FT_TEMP_TABLE` | 6831 | Cannot create FULLTEXT index on temporary InnoDB table |
+| `ER_INNODB_FT_WRONG_DOCID_COLUMN` | 6834 | Column '%-.192s' is of wrong type for an InnoDB FULLTEXT index |
+| `ER_INNODB_FT_WRONG_DOCID_INDEX` | 6837 | Index '%-.192s' is of wrong type for an InnoDB FULLTEXT index |
+| `ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_FTS` | 7021 | Fulltext index creation requires a lock |
+| `ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_CHANGE_FTS` | 7018 | Cannot drop or rename FTS_DOC_ID |
+| `ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_HIDDEN_FTS` | 7015 | Cannot replace hidden FTS_DOC_ID with a user-visible one |
+| `ER_NO_FT_MATERIALIZED_SUBQUERY` | 7214 | Cannot create FULLTEXT index on materialized subquery |
+| `ER_BINLOG_UNSAFE_FULLTEXT_PLUGIN` | 7178 | Statement is unsafe because it uses a fulltext parser plugin ... |
+| `ER_FULLTEXT_FUNCTIONAL_INDEX` | 8723 | Fulltext functional index is not supported. |
+| `ER_FULLTEXT_WITH_ROLLUP` | 9693 | MATCH does not support ROLLUP columns. |
+
+> ⚠️ `ER_INNODB_NO_FT_USES_PARSER` 已废弃：现名 **`OBSOLETE_ER_INNODB_NO_FT_USES_PARSER`**（`:7069`），代码中 **0 处引用** ⇒ **8.0.39 的 InnoDB 是支持 `WITH PARSER` 的**（`is_ngram` 由 parser 名判定，`ha_innodb.cc:7596`）。"InnoDB 不支持 WITH PARSER"是过时说法。
+
+**G. 能力缺失**
+
+| 缺失 | 证据 |
+|---|---|
+| **无高亮 / 摘要（snippet）** | 词位置只用于短语匹配（`fts0que.cc:3054`），无对外 API；`storage/innobase` grep `snippet\|highlight` 0 命中 |
+| **无自定义打分插件** | parser 插件接口只有 `init/deinit/parse`（`fts0plugin.h:43-58`），**没有 rank 回调**；打分硬编码在 `fts0que.cc:3405/3431` |
+| 无 facet / 聚合 / 拼写纠错 / 自动补全 | 见 Misc「FTS 没有实现哪些算法」 |
+| 分数不可解释 | 只暴露最终 rank，拿不到 tf、文档长度 ⇒ 也无法在 SQL 层补救长度归一化 |
 
 ---
 
@@ -1562,6 +2780,160 @@ const struct _ft_vft ft_vft_result = {nullptr,                    /* read_next *
 | 并发 | 行级锁 | 表级锁 |
 
 > 注意 `HA_CAN_FULLTEXT_EXT` 是分水岭：SQL 层多处（hints 下推、免排序、覆盖索引、`can_skip_ranking`）都以它为前提，MyISAM 全都走不到。
+
+**★ 能力位的直接 diff**（★ 最硬的证据）：
+
+```cpp
+/* storage/innobase/handler/ha_innodb.cc:2973 —— InnoDB */
+      m_int_table_flags(
+          HA_NULL_IN_KEY | HA_CAN_INDEX_BLOBS | HA_CAN_SQL_HANDLER |
+          HA_PRIMARY_KEY_REQUIRED_FOR_POSITION | HA_PRIMARY_KEY_IN_READ_INDEX |
+          HA_BINLOG_ROW_CAPABLE | HA_CAN_GEOMETRY | HA_PARTIAL_COLUMN_READ |
+          HA_TABLE_SCAN_ON_INDEX | HA_CAN_FULLTEXT | HA_CAN_FULLTEXT_EXT |
+          HA_CAN_FULLTEXT_HINTS | HA_CAN_EXPORT | HA_CAN_RTREEKEYS |
+          ...);
+                    /* ★★ 三个 FULLTEXT 能力位全有 */
+```
+```cpp
+/* storage/myisam/ha_myisam.cc:625 —— MyISAM */
+      int_table_flags(
+          HA_NULL_IN_KEY | HA_CAN_FULLTEXT | HA_CAN_SQL_HANDLER |
+          HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE | HA_DUPLICATE_POS |
+          HA_CAN_INDEX_BLOBS | HA_AUTO_PART_KEY | HA_FILE_BASED |
+          HA_CAN_GEOMETRY | HA_NO_TRANSACTIONS | HA_CAN_BIT_FIELD |
+          HA_CAN_RTREEKEYS | HA_COUNT_ROWS_INSTANT | HA_STATS_RECORDS_IS_EXACT |
+          HA_CAN_REPAIR | HA_GENERATED_COLUMNS | HA_ATTACHABLE_TRX_COMPATIBLE |
+          HA_SUPPORTS_DEFAULT_EXPRESSION),
+                    /* ★★ 只有 HA_CAN_FULLTEXT：无 EXT、无 HINTS，且 HA_NO_TRANSACTIONS */
+```
+```cpp
+/* sql/handler.h:305 / :416 / :441 —— ⚠️ 三者都不在 include/my_base.h */
+#define HA_CAN_FULLTEXT (1 << 21)
+#define HA_CAN_FULLTEXT_EXT (1LL << 39)
+#define HA_CAN_FULLTEXT_HINTS (1LL << 43)
+```
+```cpp
+/* include/my_base.h:106 —— my_base.h 里只有这两个 */
+  HA_KEY_ALG_FULLTEXT = 4 /* FULLTEXT. */
+/* include/my_base.h:497 */
+#define HA_FULLTEXT (1 << 7)
+```
+
+**★ SQL 层按能力位分流**（`sql/item_func.h:3487`，★ 三个判断都以 EXT 为前提）：
+
+```cpp
+  bool ordered_result() {
+    assert(!master);
+    if (hints->get_flags() & FT_SORTED) return true;
+
+    if ((table_ref->table->file->ha_table_flags() & HA_CAN_FULLTEXT_EXT) == 0)
+      return false;        /* ★★ MyISAM → false → 优化器必须自己 filesort */
+
+    assert(ft_handler);
+    return ((FT_INFO_EXT *)ft_handler)->could_you->get_flags() &
+           FTS_ORDERED_RESULT;
+  }
+
+  bool docid_in_result() {
+    if ((table_ref->table->file->ha_table_flags() & HA_CAN_FULLTEXT_EXT) == 0)
+      return false;
+    return ((FT_INFO_EXT *)ft_handler)->could_you->get_flags() &
+           FTS_DOCID_IN_RESULT;
+  }
+```
+
+**★ 非索引列搜索：注释直接点名了两家的差异**（`sql/item_func.h:3651`）：
+
+```cpp
+  bool allows_search_on_non_indexed_columns(const TABLE *tr) {
+    // Only Boolean search may support non_indexed columns
+    if (!(flags & FT_BOOL)) return false;
+
+    // Assume that if extended fulltext API is not supported,
+    // non-indexed columns are allowed.  This will be true for MyISAM.
+    if ((tr->file->ha_table_flags() & HA_CAN_FULLTEXT_EXT) == 0) return true;
+
+    return false;          /* ★★ InnoDB → false */
+  }
+```
+> ★ 上游注释（`item_func.h:3638`）也承认这是"hack"：*"The current hack is to assume that search on non-indexed columns are supported for engines that does not support the extended fulltext API (e.g., MyISAM), while it is not supported for other engines (e.g., InnoDB)"*。
+
+**★ MyISAM 的 50% 阈值从哪来**（★ InnoDB 没有，这是两家的实质差异）：
+
+```cpp
+/* storage/myisam/ftdefs.h:88 —— GWS_IN_USE 用的是 GWS_PROB */
+#define GWS_PROB                                                        \
+  ((aio->info->state->records > doc_cnt)                                \
+       ? log(((double)(aio->info->state->records - doc_cnt)) / doc_cnt) \
+       : 0)
+                    /* ★ df > N/2 时 (N-df)/df < 1 ⇒ log 为负 */
+```
+```cpp
+/* storage/myisam/ft_nlq_search.cc:163 —— 负权重直接归零 */
+    gweight = word->weight * GWS_IN_USE;
+    if (gweight < 0 || doc_cnt > 2000000) gweight = 0;
+```
+> ★★ 这就是 MyISAM"50% 阈值"的**全部实现**：不是一个显式规则，而是 `GWS_PROB` 对数的副作用。**InnoDB 完全没有对应代码**（`fts0que.cc` 里 idf 恒 ≥ 0）。
+> ★ 布尔模式两家都无此阈值 —— MyISAM 布尔用静态权重表 `wghts`/`nwghts`（`ft_boolean_search.cc:176`，clamp 到 ±5），与 df/N 无关。
+
+**★ MyISAM 的索引就是 `.MYI` 里的 key，无辅助表**：
+
+```cpp
+/* storage/myisam/ftdefs.h:124 */
+uint _ft_make_key(MI_INFO *, uint, uchar *, FT_WORD *, my_off_t);
+uchar ft_get_word(const CHARSET_INFO *, uchar **, uchar *, FT_WORD *,
+                  MYSQL_FTPARSER_BOOLEAN_INFO *);
+FT_INFO *ft_init_nlq_search(MI_INFO *, uint, uchar *, uint, uint, uchar *);
+FT_INFO *ft_init_boolean_search(MI_INFO *, uint, uchar *, uint,
+                                const CHARSET_INFO *);
+```
+> ★ MyISAM 也有 `ft_nlq_get_docid` 挂在 `_ft_vft` 上，但**不属于 `FT_INFO_EXT` 扩展 API**。
+
+**★★ 历史继承的硬证据**（★ MyISAM → InnoDB 的接口复用）：
+
+```cpp
+/* include/ft_global.h:27 —— ft_global.h 是 MyISAM 时代的产物 */
+/* Written by Sergei A. Golubchik, who has a shared copyright to this code */
+```
+```cpp
+/* storage/innobase/include/fts0fts.h:42 —— InnoDB 直接 include 它 */
+#include "ft_global.h"
+```
+```cpp
+/* storage/innobase/include/fts0fts.h:91 —— 并逐字镜像常量 */
+/** Defines for FTS query mode, they have the same values as
+those defined in mysql file ft_global.h */
+#define FTS_NL 0
+#define FTS_BOOL 1
+...
+```
+> ★★ 结论：`ft_global.h` 里 `_ft_vft` 这套"函数指针虚表"（含那个 `INTERCAL style :-)` 的梗）是 **MyISAM FTS 定下的 SE 接口契约**，InnoDB FTS **没有另起炉灶，而是实现同一套接口**。
+
+```cpp
+/* include/ft_global.h:42 —— 接口本体 */
+#define HA_FT_MAXBYTELEN 336
+#define HA_FT_MAXCHARLEN (HA_FT_MAXBYTELEN / 4)
+#define DEFAULT_FTB_SYNTAX "+ -><()~*:\"\"&|"
+
+struct FT_INFO;
+struct _ft_vft {
+  int (*read_next)(FT_INFO *, char *);
+  float (*find_relevance)(FT_INFO *, uchar *, uint);
+  void (*close_search)(FT_INFO *);
+  float (*get_relevance)(FT_INFO *);
+  void (*reinit_search)(FT_INFO *);
+};
+
+/* Flags for extended FT API */
+#define FTS_ORDERED_RESULT (1LL << 1)
+#define FTS_DOCID_IN_RESULT (1LL << 2)
+#define FTS_DOC_ID_COL_NAME "FTS_DOC_ID"
+#define FTS_NGRAM_PARSER_NAME "ngram"
+
+struct FT_INFO {
+  struct _ft_vft *please; /* INTERCAL style :-) */
+};
+```
 
 ---
 
@@ -1662,6 +3034,124 @@ ha_innobase::optimize（innodb_optimize_fulltext_only=ON）  ha_innodb.cc:18142
 | `ft_stopword_file` | NULL | 停用词文件 |
 | `ft_boolean_syntax` | `"+ -><()~*:\"\"&|"` | **对 InnoDB 不生效**——InnoDB 用 `fts0tokenize.h:43` 的静态常量 |
 
+**★★ 真名核查（★ 三条容易写错的）**：
+
+1. **`innodb_ft_*` 不在 `sql/sys_vars.cc`** —— 它们定义在 **`storage/innobase/handler/ha_innodb.cc`**，声明名是 `ft_xxx`，`innodb_` 前缀由**插件自动加**。
+2. **`ngram_token_size` 不在 `sys_vars.cc` 也不在 `ha_innodb.cc`** —— 它是 **ngram 插件**的 sysvar（`plugin/fulltext/ngram_parser/plugin_ngram.cc:250`）。
+3. **`ft_min_word_len` 在 8.0.39 仍然存在**（`sys_vars.cc:2290`，默认 4，READ_ONLY）—— "8.0 已删除"是错的。
+
+**★ InnoDB 侧变量的注册原文**（`ha_innodb.cc:22481` 起）：
+
+```cpp
+static MYSQL_SYSVAR_BOOL(
+    ft_enable_diag_print, fts_enable_diag_print, PLUGIN_VAR_OPCMDARG,
+    "Whether to enable additional FTS diagnostic printout ", nullptr, nullptr,
+    false);
+
+static MYSQL_SYSVAR_STR(ft_aux_table, fts_internal_tbl_name,
+                        PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "FTS internal auxiliary table to be checked",
+                        innodb_internal_table_validate, nullptr, nullptr);
+
+static MYSQL_SYSVAR_ULONG(ft_cache_size, fts_max_cache_size,
+                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                          "InnoDB Fulltext search cache size in bytes", nullptr,
+                          nullptr, 8000000, 1600000, 80000000, 0);
+                          /* ★ 默认 8,000,000；范围 [1600000, 80000000]；只读 */
+
+static MYSQL_SYSVAR_ULONG(
+    ft_total_cache_size, fts_max_total_cache_size,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "Total memory allocated for InnoDB Fulltext Search cache", nullptr, nullptr,
+    640000000, 32000000, 1600000000, 0);
+
+static MYSQL_SYSVAR_ULONG(
+    ft_result_cache_limit, fts_result_cache_limit, PLUGIN_VAR_RQCMDARG,
+    "InnoDB Fulltext search query result cache limit in bytes", nullptr,
+    nullptr, 2000000000L, 1000000L, 4294967295UL, 0);
+
+static MYSQL_SYSVAR_ULONG(
+    ft_min_token_size, fts_min_token_size,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "InnoDB Fulltext search minimum token size in characters", nullptr, nullptr,
+    3, 0, 16, 0);                       /* ★ 默认 3，范围 [0,16]，只读 */
+
+static MYSQL_SYSVAR_ULONG(
+    ft_max_token_size, fts_max_token_size,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "InnoDB Fulltext search maximum token size in characters", nullptr, nullptr,
+    FTS_MAX_WORD_LEN_IN_CHAR, 10, FTS_MAX_WORD_LEN_IN_CHAR, 0);
+
+static MYSQL_SYSVAR_ULONG(ft_num_word_optimize, fts_num_word_optimize,
+                          PLUGIN_VAR_OPCMDARG,
+                          "InnoDB Fulltext search number of words to optimize "
+                          "for each optimize table call ",
+                          nullptr, nullptr, 2000, 1000, 10000, 0);
+
+static MYSQL_SYSVAR_ULONG(ft_sort_pll_degree, ddl::fts_parser_threads,
+                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                          "InnoDB Fulltext search parallel sort degree, will "
+                          "round up to nearest power of 2 number",
+                          nullptr, nullptr, 2, 1, 16, 0);
+
+static MYSQL_SYSVAR_BOOL(optimize_fulltext_only, innodb_optimize_fulltext_only,
+                         PLUGIN_VAR_NOCMDARG,
+                         "Only optimize the Fulltext index of the table",
+                         nullptr, nullptr, false);
+```
+> ★ `ft_sort_pll_degree` 绑的是 **`ddl::fts_parser_threads`**（建索引时的分词线程数），不是 OPTIMIZE 线程数。
+
+**★ 两个会话级变量是 `THDVAR`**（`ha_innodb.cc:1088`，★ 作用域是 SESSION）：
+
+```cpp
+static MYSQL_THDVAR_BOOL(ft_enable_stopword, PLUGIN_VAR_OPCMDARG,
+                         "Create FTS index with stopword.", nullptr, nullptr,
+                         /* default */ true);
+
+static MYSQL_THDVAR_STR(
+    ft_user_stopword_table, PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
+    "User supplied stopword table name, effective in the session level.",
+    innodb_stopword_table_validate, nullptr, nullptr);
+```
+
+**★ 三个停用词变量的汇合点**（`ha_innodb.cc:12893`）：
+
+```cpp
+bool innobase_fts_load_stopword(
+    dict_table_t *table, /*!< in: Table has the FTS */
+    trx_t *trx,          /*!< in: transaction */
+    THD *thd)            /*!< in: current thread */
+{
+  ut_ad(!dict_sys_mutex_own());
+
+  return (fts_load_stopword(table, trx, innobase_server_stopword_table,
+                            THDVAR(thd, ft_user_stopword_table),
+                            THDVAR(thd, ft_enable_stopword), false));
+}
+```
+> ★ 会话级 `innodb_ft_user_stopword_table` **优先于**全局 `innodb_ft_server_stopword_table`；两者都写在 CONFIG 表持久化，重启可复原。
+
+**★ `ngram_token_size` 的注册**（`plugin/fulltext/ngram_parser/plugin_ngram.cc:246`）：
+
+```cpp
+static struct st_mysql_ftparser ngram_parser_descriptor = {
+    MYSQL_FTPARSER_INTERFACE_VERSION, ngram_parser_parse, nullptr, nullptr};
+
+static MYSQL_SYSVAR_INT(
+    token_size, ngram_token_size, PLUGIN_VAR_READONLY,
+    "InnoDB ngram full text plugin parser token size in characters", nullptr,
+    nullptr, 2, 1, 10, 0);   /* ★ 默认 2，范围 [1,10]，只读 */
+
+static SYS_VAR *ngram_system_variables[] = {MYSQL_SYSVAR(token_size), nullptr};
+
+mysql_declare_plugin(ngram_parser){
+    MYSQL_FTPARSER_PLUGIN,
+    &ngram_parser_descriptor,
+    "ngram",                  /* ★ 插件名 → 前缀 ngram_ */
+    ...
+```
+> ⚠️ **MeCab 没有 token size 变量**，它只有 1 个 sysvar `mecab_rc_file`（`plugin_mecab.cc:346`）。
+
 **ngram 插件**：`ngram_token_size` 默认 **2**，范围 1..10，只读（`plugin_ngram.cc:250`）。
 
 ### 状态变量
@@ -1724,22 +3214,116 @@ FTS 的可观测性靠 **INFORMATION_SCHEMA 表**（都必须先设 `innodb_ft_a
 
 对 `storage/innobase/fts/`、`include/fts0*`、`ddl/ddl0fts.cc`、`plugin/fulltext/` 做精确检索，**以下全部 0 命中**：
 
-| 算法 / 结构 | 替代品（社区版实际用的） |
+**检索模型**
+
+| 算法 | 替代品（社区版实际用的） |
 |---|---|
 | **BM25 / Okapi**、任何带长度归一化的模型 | `tf × idf²`（§11） |
-| **编辑距离 / fuzzy / Levenshtein** | 只有尾部 `%` 前缀匹配，靠红黑树前缀扫描（`fts0que.cc:930`） |
+| **语言模型（LM）/ DFR / LTR** | 无 |
+| **向量检索 / embedding / ANN**（HNSW、IVF、PQ） | 无 |
+
+**文本处理**
+
+| 算法 | 替代品 |
+|---|---|
 | **词干提取**（Porter / Snowball / Krovetz） | 无——`run` 与 `running` 是两个独立词 |
 | **同义词 / 词林 / thesaurus** | 无 |
-| **向量检索 / embedding / ANN**（HNSW、IVF、PQ） | 无 |
+| **编辑距离 / fuzzy / Levenshtein / 拼写纠错** | 只有尾部 `%` 前缀匹配，靠红黑树前缀扫描（`fts0que.cc:930`） |
+
+**数据结构**
+
+| 算法 | 替代品 |
+|---|---|
 | **Trie / 前缀树 / 自动补全** | 红黑树 + `innobase_fts_text_cmp_prefix` 双向扫描 |
 | **跳表（skip list）** | **posting list 只能从头顺序 VLC 解码，无法随机访问中间 doc_id** |
 | **Roaring bitmap** | 朴素 char bitmap（初始 4B，2 倍扩容） |
+| **Bloom filter** | 无（停用词直接红黑树查） |
+
+**★★ 一个必须纠正的说法：InnoDB **是**支持短语查询与邻近（proximity）查询的**。
+
+常见以为"InnoDB FTS 存了位置但不支持短语查询"，**这是错的**。位置信息不仅存了，而且有完整的短语/邻近检索实现：
+
+| 能力 | 源码证据 |
+|---|---|
+| 短语/邻近主入口 | `fts_phrase_or_proximity_search()`（`fts0que.cc:353`、`:4031`） |
+| 位置提取 | `fts_proximity_get_positions()`（`fts0que.cc:364`） |
+| `@N` 距离判定 | `fts_proximity_is_word_in_range()`（`:1541`）、`fts_query_is_in_proximity_range()`（`:2277`） |
+| AST 上的距离属性 | `fts_ast_text_set_distance()`（`fts0ast.cc:381` 注释 "Set the proximity attribute of a text node"） |
+| **语法 `@N`** | `fts0pars.y:151` `text '@' FTS_NUMB { fts_ast_text_set_distance($1, fts_ast_string_to_ul($3, 10)); }`；`:167` 前缀形式 |
+| 位置写入 | `fts_add_token()`（`fts0fts.cc:4585` 注释 "Add the token and its start position to the token's list of positions"） |
+| 词数上限 | `MAX_PROXIMITY_ITEM = 128`（`fts0que.cc:60`） |
+
+```yacc
+# fts0pars.y:151 —— InnoDB 布尔语法里的邻近距离
+        | text '@' FTS_NUMB {
+                fts_ast_text_set_distance($1, fts_ast_string_to_ul($3, 10));
+                fts_ast_string_free($3);
+        }
+```
+> ★★ 所以 `AGAINST('"database tuning" @2' IN BOOLEAN MODE)` 这类查询在 InnoDB 里**是支持的**。
+> ⚠️ 但注意：`&` 和 `|` 虽然在 `ft_boolean_syntax` 里，InnoDB 的 bison 语法**没有对应算子** —— 它们只是被 server 层接受。
+
+**★ 逐条 grep 实证的"没有"清单**（★ 每条都真的 grep 过）：
+
+| IR 特性 | 检索结果 |
+|---|---|
+| stemming（词干提取） | `storage/innobase` grep `stemming\|stemmer` → **0 命中**；`sql/` 也无 FTS 相关命中 |
+| lemmatization（词形还原） | grep `lemmatiz` → **0 命中** |
+| synonym（同义词） | `storage/innobase` grep `synonym` → **0 命中** |
+| highlight / snippet（高亮） | grep `highlight\|snippet` → **0 命中**；没有 `ft_highlight()` 类函数 |
+| facet（分面） | grep `facet` → **0 命中** |
+| fuzzy（编辑距离模糊匹配） | grep `fuzzy` → **0 命中**；只有尾部 `%` 前缀匹配 |
+| spell-correction（拼写纠错） | grep `spell` → **0 命中** |
+| BM25 | 全 innobase grep `bm25` → **0 命中**；且 `k1` / `avgdl` 无命中 |
+| 字段加权（field boost） | `fts_query_calculate_ranking()` 中无任何列权重项 |
+| 自定义 scoring 插件 | `ft_vft_result` 只有 4 个槽（`ha_innodb.cc:607`），无 scoring hook |
+
+**★ 有的（别漏）**：
+
+| 特性 | 证据 |
+|---|---|
+| 短语查询 phrase | `fts_phrase_or_proximity_search()` |
+| 邻近查询 proximity `@N` | 见上表 |
+| 查询扩展 query expansion | `fts_expand_query()`（`fts0que.cc:3904`）+ `ft_query_expansion_limit`（默认 20） |
+| 尾部通配符 `*` | `fts_query_get_token()`（`fts0que.cc:2693`，转成 `xxx%`） |
+| ngram / MeCab 分词 | `plugin/fulltext/{ngram,mecab}_parser/` |
+
+**★ 盲查询扩展的代价**（`fts0que.cc:3904`，★ 源码注释自白）：
+
+```c
+/** This function implements a simple "blind" query expansion search:
+ words in documents found in the first search pass will be used as
+ search arguments to search the document again, thus "expand"
+ the search result set. */
+...
+    /* Fetch the documents with the doc_id from the
+    result of first search pass. Since we do not
+    store document-to-word mapping, we need to
+    fetch the original document and parse them.
+    Future optimization could be done here if we
+    support some forms of document-to-word mapping */
+    fts_doc_fetch_by_doc_id(nullptr, ranking->doc_id, index,
+                            FTS_FETCH_DOC_BY_ID_EQUAL,
+                            fts_query_expansion_fetch_doc, &result_doc);
+```
+> ★★ 注释直说：**没有 doc→word 正排索引**，所以 QE 必须把第一趟命中的每个文档整篇读回来重新分词 —— 这是 QE 慢的根本原因。
+> ★ 二轮检索的新词**全部按 `FTS_NONE`（并集）**加入，同样参与 `Σ tf·idf²`。
+| **Aho-Corasick**（多模式串匹配；KMP / Boyer-Moore 也没有） | 朴素逐 token 顺序匹配 |
+| **MinHash / SimHash / LSH** | 无 |
+
+**压缩编码**
+
+| 算法 | 替代品 |
+|---|---|
 | **PForDelta / FOR / SIMD 批量解码** | 逐字节 7-bit VLC（`fts0vlc.ic:114`） |
 | **前缀压缩 / front coding** | word 完整存储 |
-| **KMP / Boyer-Moore / Aho-Corasick** | 朴素逐 token 顺序匹配 |
-| **k 路归并 / 优先队列 / 败者树** | `N_WAY_MERGE = 2` 的平衡 2 路外部归并 |
+
+**其它**
+
+| 算法 | 替代品 |
+|---|---|
+| **k 路归并 / 优先队列 / 败者树**（外部排序） | `N_WAY_MERGE = 2` 的平衡 2 路外部归并 |
 | **LRU / LFU 淘汰**（FTS cache） | 超阈值全量 flush 后清空，无逐项淘汰 |
-| **MinHash / SimHash / LSH** | 无 |
 
 **三处"看起来有、其实是死代码"**（读 FTS 源码最容易踩的坑）：
 
@@ -1750,6 +3334,14 @@ FTS 的可观测性靠 **INFORMATION_SCHEMA 表**（都必须先设 `innodb_ft_a
 | `fts_query_total_docs_containing_term`（`fts0que.cc:2078`） | 无调用者；`df` 实际只取 INDEX 表的 `doc_count` 列 |
 
 **最该记住的一条**：posting list **没有跳表、没有分块**。单个高频词的 ilist 很长时，即便只要前 N 条结果，也要把整个 ilist **从头顺序 VLC 解码一遍**——唯一的加速是 `fts0que.cc:1148-1163` 的 node 级 `[lower_doc_id, upper_doc_id]` 区间剪枝，粒度是整个 node 而非 block。这是 InnoDB FTS 在大数据集上查询慢的**结构性原因**。
+
+**整体定位：能用、够用——以及为什么"正经搜索场景上 ES"是技术判断而非生态判断。**
+
+综合"已实现"（「理论基础 → 算法与数据结构」的 7 类盘点）与"未实现"（本节清单），这套实现的定位可以概括为：**分词、倒排、布尔、短语、查询扩展、崩溃恢复一应俱全，但压缩编码（只有 VLC+delta）、posting list 加速（无跳表/分块）、打分模型（无长度归一化）三处都停在最朴素的方案上**——每一处都"能用"，没有一处是现代搜索引擎的水准。
+
+⇒ 业界普遍建议"正经搜索场景上 ES"的根因是**技术性的，不是生态或易用性**：这三个短板在大数据量下表现为"查询慢 + 排序差"，而且**不可通过调参修复**——要修就得重写存储格式，而这又被「理论基础①」的根本设计（辅助表必须是普通 InnoDB 表）锁死了。
+
+反过来说，它的优势同样真实：**辅助表就是普通 InnoDB 表 ⇒ 事务、崩溃恢复、备份、复制与主表同一生命周期**——不需要双写、没有同步延迟。选型就按这个定位取舍：数据量不大、要与事务强一致、不想引入外部组件 ⇒ InnoDB FTS；数据量大、要求排序质量与查询性能 ⇒ 外部搜索引擎（与 Lucene / PostgreSQL 的逐项对比见「理论基础 → 类似实现对比」）。
 
 ### FAQ
 
@@ -1773,6 +3365,56 @@ A：社区版不能——全仓库搜 `bm25` / `Okapi` 零命中，没有插件�
 
 **Q：FTS 辅助表能直接 SELECT 吗？**
 A：不能。它们是 `DICT_TF2_AUX` 标记的隐藏表。想看内容只能通过 I_S 的 `INNODB_FT_*` 表（且要先设 `innodb_ft_aux_table`）。
+
+**Q：InnoDB 支持短语查询吗？**
+A：**支持**（这是常见误解的反面）。`fts_phrase_or_proximity_search()` + `@N` 语法都有完整实现，见 [§FTS 没有实现哪些算法](#fts-没有实现哪些算法) 的纠正段。不支持的是 stemming / 同义词 / 高亮 / 模糊匹配。
+
+**Q：InnoDB 支持 `WITH PARSER` 吗？**
+A：**支持**。`ER_INNODB_NO_FT_USES_PARSER` 已改名为 `OBSOLETE_ER_INNODB_NO_FT_USES_PARSER` 且代码中 0 处引用；`is_ngram` 由 parser 名判定（`ha_innodb.cc:7596`）。
+
+**Q：MATCH 的列顺序要和索引一致吗？**
+A：**不用**。`fix_index()` 只统计"MATCH 的列有多少落在该索引的列集合中"，比较的是**数量**而非顺序（`item_func.cc:7694-7726`）。
+
+### ★★★ 真名勘误（本轮新增）
+
+| 常见说法 | 8.0.39 真相 |
+|---|---|
+| `add_ft_key()`（单数） | **不存在**，真名 **`add_ft_keys()`**（复数），`static`，在 `sql/sql_optimizer.cc:7822` |
+| `Item_func_match::get_mm_tree()` | **不存在**（0 命中）。FT **不走 range optimizer**，由 `add_ft_keys()` 直接 push `Key_use` |
+| `fulltext_cond()` | **不存在** |
+| `FT_SELECT` 结构体 | **不存在**，8.0 用 `JOIN_TAB::set_ft_func()` + `JT_FT` |
+| `FT_EXPANSION` | **不存在**，真名 **`FT_EXPAND` = 4**，在 `include/ft_global.h:109`（不是 `sql/sql_lex.h`） |
+| `FT_OPERATOR_*` 枚举 | **不存在**，InnoDB 侧是 `fts_ast_oper_t`，SQL 层是 `ft_boolean_syntax` 字符串 |
+| `fts_ast_type` | 真名 **`fts_ast_type_t`**，**7 个取值**（OPER/NUMB/TERM/TEXT/PARSER_PHRASE_LIST/LIST/SUBEXP_LIST） |
+| `fts_vlc_encode` / `fts_encode_ulint` | **都不存在**。真名 **`fts_encode_int`** / **`fts_decode_vlc`** / **`fts_get_encoded_len`** |
+| `fts_encode_ilist` / `fts_decode_ilist` | **都不存在**（0 命中）。编码内联在 `fts_cache_node_add_positions()`，解码内联在各消费点 |
+| `fts_trx` 在 `trx0fts.cc` | **该文件不存在**。`fts_trx_*` 全部在 `fts0fts.cc` |
+| DELETE 写墓碑用 `fts_add_deleted_doc_id` / `fts_delete_doc_id` | **都不存在**，真名是 **`fts_delete()`**（`static`，`fts0fts.cc:3048`） |
+| 后台线程唤醒用 `fts_optimize_wakeup` | **不存在**。靠 **`ib_wqueue_timedwait(wq, 5s)`** 轮询 + 消息（`FTS_MSG_*`） |
+| `fts_builtin_wordsep` / `fts_default_tokenizer` | **都不存在**。内置 parser 是 **`fts_default_parser`**（`st_mysql_ftparser` 实例，复用 MyISAM 的 `mysql_parse`） |
+| `FTS_STOPWORD_TABLE_NAME` 是一张表名 | 它是 **CONFIG 表里的一个 key** `"stopword_table_name"`（配 `FTS_USE_STOPWORD` = `"use_stopword"`） |
+| `fts_get_synced_doc_id()` | **不存在**。水位线就是字段 **`fts_cache_t::synced_doc_id`**（`fts0types.h:193`），读写函数是 `fts_cmp_set_sync_doc_id()`（`static`） |
+| `fts_init_tables()` / `FTS_Init_tables()` | **不存在**。入口是 **`fts_init_index()`**；恢复回调 `fts_init_recover_doc()` / `fts_init_get_doc_id()` |
+| 崩溃恢复在启动线程扫描重建 | **错**。是**懒**的：首次 FTS 访问时由 `ha_innodb.cc:11008` 检查 `ADDED_TABLE_SYNCED` 才触发 |
+| 状态变量 `Innodb_ft_inserted` 等 | **8.0.39 已彻底没有**（`mysqld.cc` grep `Innodb_ft_` → 0 命中）。只剩 I_S 表 |
+| `innodb_ft_*` 定义在 `sql/sys_vars.cc` | **错**。在 **`storage/innobase/handler/ha_innodb.cc`**，声明名 `ft_xxx`，前缀由插件自动加 |
+| `ngram_token_size` 在 `sys_vars.cc` / `ha_innodb.cc` | **都不在**。在 **`plugin/fulltext/ngram_parser/plugin_ngram.cc:250`** |
+| `ft_min_word_len` 在 8.0 被删 | **还在**（`sys_vars.cc:2290`，默认 4，READ_ONLY），只服务 MyISAM |
+| InnoDB 不支持短语/邻近查询 | **错**，完整实现了（`fts_phrase_or_proximity_search()` + `@N`） |
+| InnoDB 不支持 `WITH PARSER` | **错**，错误码已 `OBSOLETE_`，0 引用 |
+| MATCH 列顺序必须与索引一致 | **错**，`fix_index()` 只比数量不比顺序 |
+| 打分函数叫 `fts_rank_doc` | **不存在**，真名 **`fts_query_calculate_ranking()`** |
+| InnoDB rank 被 clamp 到 [0,1] | **错**。打分函数无任何 clamp；clamp 只在布尔算子路径（范围 `[-1,1]`） |
+| idf 用 `pow(log(...), 2)` | **不是 `pow`**，是连续乘两次同一个 `double` |
+| InnoDB 有 50% 阈值 | **没有**。那是 **MyISAM** 的 `GWS_PROB` 副作用（`log((N-df)/df)`，df>N/2 时归零） |
+| 单 term 时"跳过 AST 解析" | **错**，AST 照样解析。快路径真名 **`FTS_OPT_RANKING`**，跳过的是 `doc_ids` 树 + 命中词位图 |
+| `fts0pars.yy` | 真名 **`fts0pars.y`**（另有生成物 `fts0pars.cc`、词法 `fts0blex.l` / `fts0tlex.l`） |
+| `HA_CAN_FULLTEXT` 在 `include/my_base.h` | **不在**，三个 FULLTEXT 能力位都在 **`sql/handler.h`**（`:305/:416/:441`） |
+| MyISAM 也有 `HA_CAN_FULLTEXT_EXT` | **没有**。MyISAM 只有 `HA_CAN_FULLTEXT`，无 EXT、无 HINTS |
+| 辅助表是 6 张 | **6 张 INDEX 分片 + 5 张 COMMON**（`FTS_NUM_AUX_INDEX=6`、`FTS_NUM_AUX_COMMON=5`） |
+| InnoDB FTS 有 WL 编号 | 整个 `storage/innobase/fts` 目录 grep `WL#` **只有 1 条**（`fts0fts.cc:5479`，WL#6608，还在 `#if 0` 里）。**没有**引入 FTS 的 WL 编号 |
+
+> ★ 一个官方未清理的开发残留：`fts0que.cc:756` 注释写 `RANK_DOWNGRADE (-0.5)` / `RANK_UPGRADE (0.5)`，但实际值（`fts0que.cc:56-57`）是 **±1.0F** —— 注释滞后于代码。
 
 ---
 
@@ -1802,5 +3444,5 @@ A：不能。它们是 `DICT_TF2_AUX` 标记的隐藏表。想看内容只能通
 
 - 上层（谁驱动 FTS 查询）：执行器与 filesort 见 [`../server/query/runtime/01_filesort.md`](../server/query/runtime/01_filesort.md)（§1.3 addon vs rowid，本篇 §2.8 是它的一个强制场景）
 - 接口层：handler/handlerton 分层与行定位见 [`../server/handler.md`](../server/handler.md)
-- InnoDB 侧通用机制：B-tree 页结构 [`../innodb/physical/page_structure.md`](../innodb/physical/page_structure.md)、大对象 [`../innodb/physical/lob.md`](../innodb/physical/lob.md)（ilist 是 BLOB）、在线 DDL [`../innodb/ddl.md`](../innodb/ddl.md)
+- InnoDB 侧通用机制：B-tree 页结构 [`../innodb/physical/page_structure.md`](../innodb/physical/page_structure.md)、大对象 [`../innodb/physical/lob.md`](../innodb/physical/lob.md)（ilist 是 BLOB）、在线 DDL [`../feat/ddl/ddl.md`](../feat/ddl/ddl.md)
 - 同类跨层特性：分区表 [`partitioning.md`](partitioning.md)（与 FTS 一样同时改 SQL 层与引擎层，且**分区表不支持 FULLTEXT**）

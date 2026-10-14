@@ -7,16 +7,19 @@
 
 | 文件 | 内容 |
 |---|---|
-| [dd.md](dd.md) | **server 层 8.0 数据字典**：★ 全景图 + DD 表体系（30 张逐张用途）与 `mysql.ibd`、★★ `dd::tables::Tables` vs `dd::Table` + 完整继承多态（双轨/虚继承/多态实例/Collection 所有权）、★★ **Composite 描述树与 attribute/children/store/restore 机制**（加载=依赖序、drop=逆序、叶子用空实现、根 vs 叶子）、★ `options` vs `se_private_data` 与全键名表、★ `Dictionary_client` + RAII + COW + MVCC 私有写集、SDI、★★ **初始化执行链**（create_target_table/execute_direct/dd_properties 先建/Upgrade_status 阶段文件）、★★ **升级三路径**（DD_INITIALIZE/_SERVER/RESTART + 5.7 迁移 + 崩溃可回退）、原子 DDL 中的地位、★ DD 里的 C++ 运用 |
-| [innodb_dict.md](innodb_dict.md) | **InnoDB 内部字典**：DICT_HDR 页（系统表空间页 7）、`SYS_TABLES`/`SYS_COLUMNS`/`SYS_INDEXES`/`SYS_FIELDS` 四张内部表、`dict_table_t`（★ instant 三组计数器 + `dd_table_has_row_versions` 与 ALTER 继承）/ `dict_index_t`（★ instant 三件套、★ `is_usable()`）/ `dict_col_t` 对象模型、dict cache（哈希 + ★ LRU/non_LRU 与"谁不可淘汰" + `dict_sys_mutex` + ★ **intrinsic 会话缓存**）、从 DD 加载链路、★ `mysql.ibd` 硬编码创建与页布局、★★ **动态元数据全链**（三态机 + `MLOG_TABLE_DYNAMIC_META` 压缩 redo + DD Buffer Table 快照与 checkpoint 分工 + recovery 四步）、★ **index corrupt 闭环**、★ `mysql.innodb_ddl_log` 与两种原子性分工、分区表一对多 |
-| [statistics.md](statistics.md) | **InnoDB 统计信息**：★ 四套"统计"辨析（`innodb_*_stats` / DD 的 `table_stats` / 内存统计 / 直方图）、★ 表级 `stats_auto_recalc`+`stats_sample_pages` 存在 `dd::Table::options()`、`dict_stats_update()` 四种模式逐行解析（★ 采前唤醒 purge / ★ 用 dummy clone 承接读取）、采样算法与 `N_SAMPLE_PAGES`、★ **专属线程 `dict_stats_thread`**（★ 周期性唤醒防事件丢失 / `BG_STAT_IN_PROGRESS` / ★ recalc_pool latch 层级的三场景推导）、`ANALYZE TABLE` 链路、参数表 |
+| [dd.md](dd.md) | server 层 8.0 数据字典：DD 表体系、对象模型、升级三路径（**SDI 不在本篇**——见下） |
+| ⭐ [`../../feat/sdi.md`](../../feat/sdi.md) | **SDI（Serialized Dictionary Information）已独立成篇**，放 `feat/` 因为它**横跨 server ↔ InnoDB 两层**且是 8.0 引入的跨层特性（与 `fts.md` 同性质）：server 定序列化格式（`sdi.cc`）、InnoDB 提供存储（`dict0sdi.cc` 的 `SDI_<space_id>` B-tree、`ibd2sdi`）。★ 服务器**只写不读**（`dict_sdi_get`/`_drop` 被 `#if 0`）；★ `.sdi` 文件按 **`hton->sdi_set` 能力**分派而非 `innodb_read_only`；★ `sdi_version` 全等 ⇒ 跨 minor 导入基本不可行 |
+| [innodb_dict.md](innodb_dict.md) | InnoDB 内部字典：内部表、dict cache、动态元数据 |
+| [statistics.md](statistics.md) | InnoDB 统计信息：采样算法、统计线程、ANALYZE |
+| [stored_program_dd.md](stored_program_dd.md) | **存储程序与视图的 DD 侧持久化**：`sp_head`/`Table_ref`/`Event_parse_data`/`::Trigger` → `mysql.routines`/`triggers`/`events`/`tables` 的字段映射。★ 视图**没有** `mysql.views` 表（与表共用 `mysql.tables`）；★ 视图依赖是**名字级**而触发器是 `table_id` 外键；★ 时区 UTC 化不在 `dd_event.cc`；★ `originator` + `SLAVESIDE_DISABLED` 是从库不重复执行的保障；三类写入器（被动填充/主动写入/子对象挂载）与 `dd::create_table` 的分工。与 [`../stored_program.md`](../stored_program.md)（SQL 层语义）是姊妹篇 |
+| [system_views.md](system_views.md) | **I_S 的 DD 半边**：8.0 绝大多数 I_S 表（`COLUMNS`/`TABLES`/`STATISTICS`…）是**真视图**（`CREATE VIEW` 落进 DD），视图定义在 C++ 里用 builder 拼。43 张清单 + `SHOW` 重写 + `Table_statistics`（Cardinality 过期）。★ 与 [`../../feat/i_s.md`](../../infra/observability/i_s.md)（插件机制 + InnoDB 26 张表）是**姊妹篇**，合起来才是完整的 I_S |
 
 ## 与周边文档的边界
 
 | 主题 | 不在本目录，见 |
 |---|---|
 | 表对象的生命周期（`TABLE_SHARE` / `TABLE` / 开表 / 锁表 / 表 DDL 操作） | [`../table.md`](../table.md) |
-| DDL 的三种算法与执行（COPY / INPLACE / INSTANT、row log、DDL log） | [`../../innodb/ddl.md`](../../innodb/ddl.md) |
+| DDL 的三种算法与执行（COPY / INPLACE / INSTANT、row log、DDL log） | [`../../feat/ddl/ddl.md`](../../feat/ddl/ddl.md) |
 | 分区表的 DD 往返与裁剪 | [`partitioning.md`](../../feat/partitioning.md) |
 | 生成列表达式的 DD 文本往返 | [`generated_columns.md`](../../feat/generated_columns.md) |
 | MDL（元数据**锁**，与元数据本身不同） | [`../../lock/transactional/mdl.md`](../../infra/lock/transactional/mdl.md) |

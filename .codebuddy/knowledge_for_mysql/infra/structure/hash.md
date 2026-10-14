@@ -117,6 +117,211 @@ node->hashnr = my_reverse_bits(hashnr) | 1;   /* 普通节点：奇数 */
 dummy->hashnr = my_reverse_bits(bucket) | 0;  /* 哨兵节点：偶数 */
 ```
 
+**★ 上面的两行在源码里的确切位置**（`mysys/lf_hash.cc:830` 与 `:606`）：
+
+```cpp
+  dummy->hashnr = my_reverse_bits(bucket) | 0; /* dummy node */
+  ...
+  node->hashnr = my_reverse_bits(hashnr) | 1; /* normal node */
+```
+
+**★ 节点结构 `LF_SLIST`**（用户数据紧随其后，`LF_HASH_OVERHEAD` 就是它的大小）：
+
+```cpp
+/* An element of the list */
+struct LF_SLIST {
+  std::atomic<LF_SLIST *>
+      link;      /* a pointer to the next element in a listand a flag */
+  uint32 hashnr; /* reversed hash number, for sorting                 */
+  const uchar *key;
+  size_t keylen;
+  /*
+    data is stored here, directly after the keylen.
+    thus the pointer to data is (void*)(slist_element_ptr+1)
+  */
+};
+const int LF_HASH_OVERHEAD = sizeof(LF_SLIST);
+```
+
+> ★ `lf_hash_search()` 返回 `found + 1` —— 就是跳过这个头。MDL 用 `arg + LF_HASH_OVERHEAD` placement-new，同一个技巧。
+
+**★★ DELETED 标志不是 `ULONG_MAX`，是 `link` 指针的 bit 0**：
+
+```cpp
+/*
+  the last bit in LF_SLIST::link is a "deleted" flag.
+  the helper functions below convert it to a pure pointer or a pure flag
+*/
+template <class T> static inline T *PTR(T *ptr) {
+  intptr_t i = reinterpret_cast<intptr_t>(ptr);
+  i &= (intptr_t)~1;        // 清掉 bit0 → 纯指针
+  return reinterpret_cast<T *>(i);
+}
+template <class T> static inline bool DELETED(T *ptr) {
+  const intptr_t i = reinterpret_cast<intptr_t>(ptr);
+  return i & 1;             // ★ DELETED 标志 = 最低位
+}
+template <class T> static inline T *SET_DELETED(T *ptr) {
+  intptr_t i = reinterpret_cast<intptr_t>(ptr);
+  i |= 1;                   // 置 bit0 = 逻辑删除
+  return reinterpret_cast<T *>(i);
+}
+```
+
+**★ `my_reverse_bits()` 不在 `mysys/my_bit.cc`**（那里只有 256 项查表），真身是 `include/my_bit.h:116` 的 inline：
+
+```cpp
+static inline uint32 my_reverse_bits(uint32 key) {
+  return (_my_bits_reverse_table[key & 255] << 24) |
+         (_my_bits_reverse_table[(key >> 8) & 255] << 16) |
+         (_my_bits_reverse_table[(key >> 16) & 255] << 8) |
+         _my_bits_reverse_table[(key >> 24)];
+}
+```
+
+```cpp
+static inline uint32 my_clear_highest_bit(uint32 v) {
+  uint32 w = v >> 1;
+  w |= w >> 1;  w |= w >> 2;  w |= w >> 4;  w |= w >> 8;  w |= w >> 16;
+  return v & w;   // ★ 清掉最高位的 1 → 得到 split-ordered 的 parent
+}
+```
+
+**★ `calc_hash()` 为什么只留 31 位**：
+
+```cpp
+/*
+  Compute the hash key value from the raw key.
+
+  @note, that the hash value is limited to 2^31, because we need one
+  bit to distinguish between normal and dummy nodes.
+*/
+static inline uint calc_hash(LF_HASH *hash, const uchar *key, size_t keylen) {
+  return (hash->hash_function(hash, key, keylen)) & INT_MAX32;
+}
+```
+
+**★★ `initialize_bucket()`——dummy 哨兵的插入（split-ordered 的关键）**：
+
+```cpp
+static int initialize_bucket(LF_HASH *hash, std::atomic<LF_SLIST *> *node,
+                             uint bucket, LF_PINS *pins) {
+  uint parent = my_clear_highest_bit(bucket);      // ① 父桶
+  LF_SLIST *dummy =
+      (LF_SLIST *)my_malloc(key_memory_lf_slist, sizeof(LF_SLIST), MYF(MY_WME));
+  //  ★★ dummy 走裸 my_malloc，不走 lf_alloc —— 因为它永不被回收
+  if (unlikely(!dummy)) return -1;
+
+  LF_SLIST *tmp = nullptr, *cur;
+  std::atomic<LF_SLIST *> *el = static_cast<std::atomic<LF_SLIST *> *>(
+      lf_dynarray_lvalue(&hash->array, parent));
+  if (unlikely(!el)) { my_free(dummy); return -1; }
+
+  if (el->load() == nullptr && bucket &&
+      unlikely(initialize_bucket(hash, el, parent, pins))) {
+    //  ★ 递归：父桶没初始化就先初始化父桶（bucket==0 时靠 bucket&& 防死循环）
+    my_free(dummy); return -1;
+  }
+
+  dummy->hashnr = my_reverse_bits(bucket) | 0; /* dummy node */
+  dummy->key = dummy_key;                       // 恒为空串
+  dummy->keylen = 0;
+
+  if ((cur = linsert(el, hash->cmp_function, hash->charset, dummy, pins,
+                     LF_HASH_UNIQUE))) {
+    my_free(dummy);
+    dummy = cur;                                // ② 撞见别人已插入的等价 dummy → 直接复用
+  }
+
+  atomic_compare_exchange_strong(node, &tmp, dummy);
+  //  ★ CAS 失败也无需重试、也无需 free —— 源码注释解释了为什么无泄漏
+  return 0;
+}
+```
+
+> ★★ **insert / delete / search / random_match 四条路径全都要先 `initialize_bucket`**——源码注释解释了原因：`"we cannot return 'node not found', because an old bucket of that node may've been split and the node was assigned to a new bucket that was never accessed before"`。这是 split-ordered list 最容易看漏的一条。
+
+**★ `lf_hash_insert()` 与零迁移扩容**：
+
+```cpp
+int lf_hash_insert(LF_HASH *hash, LF_PINS *pins, const void *data) {
+  int csize, bucket, hashnr;
+  LF_SLIST *node;
+  std::atomic<LF_SLIST *> *el;
+
+  node = (LF_SLIST *)lf_alloc_new(pins);
+  if (unlikely(!node)) return -1;
+  uchar *extra_data = (uchar *)(node + 1);   // Stored immediately after the node.
+  if (hash->initialize) {
+    (*hash->initialize)(extra_data, (const uchar *)data);   // ★ initializer 回调优先
+  } else {
+    memcpy(extra_data, data, hash->element_size);           // 否则浅拷贝
+  }
+  node->key = hash_key(hash, (uchar *)(node + 1), &node->keylen);
+  hashnr = calc_hash(hash, node->key, node->keylen);
+  bucket = hashnr % hash->size;
+  el = static_cast<std::atomic<LF_SLIST *> *>(
+      lf_dynarray_lvalue(&hash->array, bucket));   // ★ dynarray 永不 realloc，指针永有效
+  if (unlikely(!el)) { lf_pinbox_free(pins, node); return -1; }
+  if (el->load() == nullptr &&
+      unlikely(initialize_bucket(hash, el, bucket, pins))) {
+    lf_pinbox_free(pins, node); return -1;
+  }
+  node->hashnr = my_reverse_bits(hashnr) | 1; /* normal node */
+  if (linsert(el, hash->cmp_function, hash->charset, node, pins, hash->flags)) {
+    lf_pinbox_free(pins, node);
+    return 1;                                    // LF_HASH_UNIQUE 撞键
+  }
+  csize = hash->size;
+  if ((hash->count.fetch_add(1) + 1.0) / csize > MAX_LOAD) {
+    atomic_compare_exchange_strong(&hash->size, &csize, csize * 2);
+    // ★★ 扩容就这一行：负载 > 1.0 就 CAS 把 size 翻倍；失败说明别人已扩，忽略
+  }
+  return 0;
+}
+```
+
+```cpp
+#define MAX_LOAD 1.0 /* average number of elements in a bucket */
+```
+
+> ★★ **扩容不搬任何数据**——只改 `size` 这个整数。因为 bit-reversed 序下，bucket i 拆成 i 与 i+size 后，**新区间天然是旧区间的二分裂，链表顺序完全不变**。这就是"零迁移"的全部含义。
+> ⚠️ `hash->count` 在 delete 里是非原子 `--hash->count;`（允许近似值）——MDL 里有注释承认这一点。
+
+**★ `LF_DYNARRAY` 是递归数组，永不 realloc**——这是它能被无锁使用的根本原因：
+
+```cpp
+/*
+  wait-free dynamic array, see lf_dynarray.c
+
+  4 levels of 256 elements each mean 4311810304 elements in an array - it
+  should be enough for a while
+*/
+#define LF_DYNARRAY_LEVEL_LENGTH 256
+#define LF_DYNARRAY_LEVELS 4
+
+struct LF_DYNARRAY {
+  std::atomic<void *> level[LF_DYNARRAY_LEVELS];
+  uint size_of_element;
+};
+```
+
+```cpp
+  /* reserve the space for free() address */
+  data = alloc + sizeof(void *);     // ★ 预留 8 字节放原始 malloc 地址
+  { /* alignment */
+    intptr mod = ((intptr)data) % array->size_of_element;
+    if (mod) data += array->size_of_element - mod;
+  }
+  ((void **)data)[-1] = alloc;       // free() will need the original pointer
+  ...
+  return ((uchar *)ptr) + array->size_of_element * idx;
+  // ★★ 返回的指针永不失效 —— dynarray 从不 realloc
+```
+
+> ★ 对齐后指针不能直接 free，所以叶子层在 `[-1]` 存了原始 malloc 地址；`recursive_free()` 里 `my_free(alloc[-1])` 就是取回它。
+> ⚠️ **`_lf_dynarray_allocate()` 不存在**——分配逻辑内联在 `lf_dynarray_lvalue()`。
+
 整条链按 reversed hash 排序。于是**扩容 = `size *= 2`**：旧 bucket i 拆成 i 和 i+size，但 reversed 序下新区间天然是旧区间的二分裂——**链表顺序完全不变，不需要搬任何数据**（详见「插入与扩容」）。代价：哈希值浪费 1 位（31 位有效）+ 全局一条链，random_match 注释承认有"随机 dive 落到链尾"的尾部扫描风险。
 
 算法与数据结构：
@@ -789,6 +994,172 @@ class ut_lock_free_cnt_t {
 | 读者代价 | 显式 pin/unpin + 4 pin 上限 | 拿 handle（自动析构） | 零（锁外无指针） |
 | 内存 | 池复用，不还 OS | 空壳延迟销毁 | 用户管理 |
 
+**★ LF_HASH 的两步删除 + helping**（维持"置标志 == 摘链"不变量）：
+
+```cpp
+static int ldelete(std::atomic<LF_SLIST *> *head, lf_cmp_func *cmp_func,
+                   CHARSET_INFO *cs, uint32 hashnr, const uchar *key,
+                   uint keylen, LF_PINS *pins) {
+  CURSOR cursor;
+  int res;
+  for (;;) {
+    if (!my_lfind(head, cmp_func, cs, hashnr, key, keylen, &cursor, pins)) {
+      res = 1; /* not found */
+      break;
+    } else {
+      /* mark the node deleted */
+      if (atomic_compare_exchange_strong(&cursor.curr->link, &cursor.next,
+                                         SET_DELETED(cursor.next))) {
+        //  ★ 第 1 步：把 next 指针 bit0 置 1（逻辑删除）
+        /* and remove it from the list */
+        if (atomic_compare_exchange_strong(cursor.prev, &cursor.curr,
+                                           cursor.next)) {
+          //  ★ 第 2 步：CAS 摘链
+          lf_pinbox_free(pins, cursor.curr);      // 投入 purgatory 延迟回收
+        } else {
+          /*
+            somebody already "helped" us and removed the node ?
+            Let's check if we need to help that someone too!
+            (to ensure the number of "set DELETED flag" actions
+            is equal to the number of "remove from the list" actions)
+          */
+          my_lfind(head, cmp_func, cs, hashnr, key, keylen, &cursor, pins);
+        }
+        res = 0;
+        break;
+      }
+    }
+  }
+  lf_unpin(pins, 0); lf_unpin(pins, 1); lf_unpin(pins, 2);
+  return res;
+}
+```
+
+> ★★ **helping 的对称性要求**："置 DELETED 标志"的次数必须**等于**"从链上摘除"的次数。任何线程看见 DELETED 节点都有义务帮忙摘链（`my_lfind` 里的那段）——所以第 2 步 CAS 失败时要重跑 `my_lfind` 去帮别人。
+
+**★★ hazard pointer 的 purgatory（延迟回收）**——⚠️ `LF_PINS::purgatory` **不是数组**，是单个 `void*` 链表头，next 指针**借**对象内部的 8 字节：
+
+```cpp
+// hazard pointer
+struct LF_PINS {
+  std::atomic<void *> pin[LF_PINBOX_PINS];  // 4 个 hazard pointer 槽
+  LF_PINBOX *pinbox;
+  void *purgatory;             // ★ 单链表头（非数组）
+  uint32 purgatory_count;
+  std::atomic<uint32> link;    // 双用途：已分配=自己下标；空闲=空闲栈 next
+  /* we want sizeof(LF_PINS) to be 64 to avoid false sharing */
+#if SIZEOF_INT * 2 + SIZEOF_CHARP * (LF_PINBOX_PINS + 2) != 64
+  char pad[64 - sizeof(uint32) * 2 - sizeof(void *) * (LF_PINBOX_PINS + 2)];
+#endif
+};
+```
+
+```cpp
+#define LF_PINBOX_PINS 4      // ★ 每线程最多 4 个 hazard pointer 槽
+#define LF_PURGATORY_SIZE 10  // ★ 攒够 10 个才真正扫一次
+```
+
+```cpp
+#define pnext_node(P, X) (*((void **)(((char *)(X)) + (P)->free_ptr_offset)))
+//  ★★ purgatory 的 next 指针"借"对象内部 free_ptr_offset 处的 8 字节
+//     LF_HASH 借的是 offsetof(LF_SLIST, key) —— 待回收节点已无人使用，可放心覆写
+
+static inline void add_to_purgatory(LF_PINS *pins, void *addr) {
+  pnext_node(pins->pinbox, addr) = pins->purgatory;
+  pins->purgatory = addr;       // 头插法
+  pins->purgatory_count++;
+}
+
+void lf_pinbox_free(LF_PINS *pins, void *addr) {
+  add_to_purgatory(pins, addr);
+  if (pins->purgatory_count % LF_PURGATORY_SIZE == 0) {
+    lf_pinbox_real_free(pins);  // ★ 每攒满 10 个才扫一遍所有线程的 pins
+  }
+}
+```
+
+```cpp
+/* Scan the purgatory and free everything that can be freed */
+static void lf_pinbox_real_free(LF_PINS *pins) {
+  LF_PINBOX *pinbox = pins->pinbox;
+  struct st_match_and_save_arg arg = {pins, pinbox, pins->purgatory};
+  pins->purgatory = nullptr;
+  pins->purgatory_count = 0;
+
+  lf_dynarray_iterate(&pinbox->pinarray, match_and_save, &arg);
+  //  ★ 扫所有线程的所有 pin，"仍被 pin 住"的挑回新 purgatory
+
+  if (arg.old_purgatory) {
+    /* Some objects in the old purgatory were not pinned, free them. */
+    void *last = arg.old_purgatory;
+    while (pnext_node(pinbox, last)) last = pnext_node(pinbox, last);
+    pinbox->free_func(arg.old_purgatory, last, pinbox->free_func_arg);
+    //  ★ 剩下的整段无人 pin → 批量交给 free_func
+  }
+}
+```
+
+> ⚠️ **`_lf_pinbox_real_free()` 不存在**（无下划线前缀）。
+> ★ `free_func` 就是 `alloc_free()`——**回收到 free-list 复用，不是真 free**：
+
+```cpp
+static void alloc_free(void *v_first, void *v_last, void *v_allocator) {
+  uchar *first = static_cast<uchar *>(v_first);
+  uchar *last = static_cast<uchar *>(v_last);
+  LF_ALLOCATOR *allocator = static_cast<LF_ALLOCATOR *>(v_allocator);
+  uchar *node = allocator->top;
+  do {
+    anext_node(last) = node;                    // last 接到当前栈顶之后
+  } while (!atomic_compare_exchange_strong(&allocator->top, &node, first) &&
+           LF_BACKOFF);
+}
+```
+
+**★ 归还 pins 时会死循环清空 purgatory**（源码里有一条死锁警告）：
+
+```cpp
+void lf_pinbox_put_pins(LF_PINS *pins) {
+  ...
+  /* This thread should not hold any pin. */
+  for (int i = 0; i < LF_PINBOX_PINS; i++) assert(pins->pin[i] == nullptr);
+
+  /*
+    XXX this will deadlock if other threads will wait for
+    the caller to do something after _lf_pinbox_put_pins(),
+    and they would have pinned addresses that the caller wants to free.
+    Thus: only free pins when all work is done and nobody can wait for you!!!
+  */
+  while (pins->purgatory_count) {
+    lf_pinbox_real_free(pins);
+    if (pins->purgatory_count) my_thread_yield();   // 还空不了就让出 CPU 再试
+  }
+  ...
+}
+```
+
+**★ `lf_hash_destroy()` 里 dummy 与 normal 的释放路径不同**（dummy 是裸 my_malloc 来的）：
+
+```cpp
+void lf_hash_destroy(LF_HASH *hash) {
+  LF_SLIST *el, **head = (LF_SLIST **)lf_dynarray_value(&hash->array, 0);
+  if (unlikely(!head)) { lf_alloc_destroy(&hash->alloc); return; }
+  el = *head;
+  while (el) {
+    LF_SLIST *next = el->link;
+    if (el->hashnr & 1) {
+      lf_alloc_direct_free(&hash->alloc, el); /* normal node */
+    } else {
+      my_free(el);                            /* dummy node */
+    }
+    el = (LF_SLIST *)next;
+  }
+  lf_alloc_destroy(&hash->alloc);
+  lf_dynarray_destroy(&hash->array);
+}
+```
+
+> ⚠️ **`lf_hash_free()` 不存在**，真名 `lf_hash_destroy()`。**`lf_alloc_free()` / `lf_alloc_direct()` 也不存在**，真名 `lf_alloc_direct_free()`。
+
 ---
 
 ## 并发正确性协议
@@ -811,6 +1182,208 @@ class ut_lock_free_cnt_t {
 
 key 合法转移：`UNUSED → 真实key`、`UNUSED → AVOID`（其余禁止）；val 合法转移：`NOT_FOUND → 真实值/DELETED`、`真实值 → 另一真实值/DELETED/GOTO_NEXT_ARRAY`、`DELETED → 真实值/GOTO_NEXT_ARRAY`。**代价**：真实 key 不能用 `UINT64_MAX`/`-1`，真实 val 不能用 `INT64_MAX` 附近三个值。
 
+**★ 五个魔法值的确切定义**（⚠️ 传说中的 `RESERVED` **不存在**，真名是 **`AVOID`**）：
+
+```cpp
+ private:
+  /** A key == UNUSED designates that this cell in the array is empty. */
+  static const uint64_t UNUSED = UINT64_MAX;
+
+  /** A key == AVOID designates an unusable cell. This cell of the array
+  has been empty (key == UNUSED), but was then marked as AVOID in order
+  to prevent new inserts into it. Searches should treat this like
+  UNUSED (ie if they encounter it before the key they are searching for
+  then stop the search and declare 'not found'). */
+  static const uint64_t AVOID = UNUSED - 1;        // ★ 不是 RESERVED
+
+  /** A val == DELETED designates that this cell in the array has been
+  used in the past, but it was deleted later. ... */
+  static const int64_t DELETED = NOT_FOUND - 1;
+
+  /** A val == GOTO_NEXT_ARRAY designates that this tuple (key, whatever)
+  has been moved to the next array. The search for it should continue there. */
+  static const int64_t GOTO_NEXT_ARRAY = DELETED - 1;
+```
+
+> ⚠️ **`NOT_FOUND` 不在 `ut_lock_free_hash_t` 里定义**，它继承自基类 `ut_hash_interface_t`（`= INT64_MAX`），是 **public** 的——所以 `buf0stats.h` 才能直接写 `ut_lock_free_hash_t::NOT_FOUND`。
+> ★ 数值关系：`NOT_FOUND = INT64_MAX`；`DELETED = NOT_FOUND-1`；`GOTO_NEXT_ARRAY = NOT_FOUND-2`。`UNUSED = UINT64_MAX`；`AVOID = UINT64_MAX-1`。
+
+**★ `del_when_zero` 语义的唯一起效点**（全文件仅此一处）：
+
+```cpp
+  bool update_tuple(key_val_t *t, int64_t val_to_set, bool is_delta) {
+    int64_t cur_val = t->m_val.load(std::memory_order_relaxed);
+    for (;;) {
+      if (cur_val == GOTO_NEXT_ARRAY) return (false);   // 上层转去下一个数组
+      int64_t new_val;
+      if (is_delta && cur_val != NOT_FOUND && cur_val != DELETED) {
+        if (m_del_when_zero && cur_val + val_to_set == 0) {
+          new_val = DELETED;      // ★★ 减到 0 直接变 DELETED，不是留一个 0
+        } else {
+          new_val = cur_val + val_to_set;
+        }
+      } else {
+        new_val = val_to_set;
+      }
+      if (t->m_val.compare_exchange_strong(cur_val, new_val)) return (true);
+    }
+  }
+```
+
+**★ 无锁扩容 `grow()`——"输家线程"直接释放自己分配的数组**：
+
+```cpp
+  next_t grow(int64_t deleted_val, bool *grown_by_this_thread) {
+    size_t new_size;
+    if (m_n_base_elements > 1024 &&
+        n_deleted(deleted_val) > m_n_base_elements * 3 / 4) {
+      /* If there are too many deleted elements (more than
+      75%), then do not double the size. */
+      new_size = m_n_base_elements;      // ★ 删除项 >75% 且数组 >1024 → 只重建不扩容
+    } else {
+      new_size = m_n_base_elements * 2;  // ★ 否则翻倍
+    }
+    next_t new_arr = alloc(new_size);
+    next_t expected = nullptr;
+    if (!m_next.compare_exchange_strong(expected, new_arr)) {
+      dealloc(new_arr);                  // ★★ 输家直接释放，赢家只有一个
+      *grown_by_this_thread = false;
+      return (expected);
+    } else {
+      *grown_by_this_thread = true;
+      return (new_arr);
+    }
+  }
+```
+
+> ★★ **只有"亲手扩容"的线程才负责 `optimize()`**——`insert_or_update()` 里 `if (grown_by_this_thread) call_optimize = true;`。这是避免所有线程都去抢那把 mutex 的关键设计。
+> ⚠️ **`check_size()` / `suggest_size()` 都不存在**——容量决策就内联在 `grow()` 这几行里。
+
+**★★ `optimize()`——全流程用 mutex 串行化的"迁移 + 摘链 + 掏空"**：
+
+```cpp
+  void optimize() {
+    mutex_enter(&m_optimize_latch);       // ★★ 全文件唯一的 mutex_enter
+    for (;;) {
+      arr_node_t *arr = m_data.load();
+      arr_node_t *next = arr->m_next.load();
+      if (next == nullptr) break;         // 只剩一个数组 → 已是最优
+
+      copy_to_another_array(arr, next);   // ① 迁移
+
+      arr->m_pending_free.store(true);    // ② 立"即将释放"牌 → begin_access() 一律返回空句柄
+
+      arr_node_t *expected = arr;
+      ut_a(m_data.compare_exchange_strong(expected, next));  // ③ 摘链：表头前移
+
+      arr->await_release_of_old_references();   // ④ 忙等 256 个分片引用计数归零
+
+      arr->m_base.reset();                      // ⑤ 只掏空元素数组，不销毁 node
+
+      m_hollow_objects->push_back(arr);         // ⑥ 壳子进"待销毁清单"，析构时才 dealloc
+    }
+    mutex_exit(&m_optimize_latch);
+  }
+```
+
+官方自述为什么敢用 mutex（`m_optimize_latch` 的注释原文）：
+
+```cpp
+  /** Concurrent copy-all-elements-to-the-next-array, removal of the
+  head of the list and freeing of its m_base member are serialized with
+  this latch. Those operations could be implemented without serialization,
+  but this immensely increases the complexity of the code. Growing of the
+  hash table is not too hot operation and thus we chose simplicity and
+  maintainability instead of top performance in this case. "Get"
+  operations and "insert/update" ones that do not cause grow still
+  run concurrently even if this latch is locked. */
+  ib_mutex_t m_optimize_latch;
+```
+
+**★★ 迁移时防"删除丢失"的细节**（`copy_to_another_array`）：
+
+```cpp
+      /* Prevent further inserts into empty cells. */
+      if (k == UNUSED && t->m_key.compare_exchange_strong(k, AVOID)) {
+        continue;                       // ★ 空槽就地封死为 AVOID
+      }
+      ...
+      /* If we copied the tuple to dst_arr once then we must
+      keep trying to transfer its most recent value to
+      dst_arr, even if its value becomes DELETED. Otherwise
+      a delete operation on this tuple which executes
+      concurrently with the loop below may be lost. */
+      bool copied = false;
+      for (;;) {
+        if (v != DELETED || copied) {
+          insert_or_update(k, v, false, dst_arr, false);   // ★ optimize_allowed=false 防递归
+          copied = true;
+        }
+        if (t->m_val.compare_exchange_strong(v, GOTO_NEXT_ARRAY)) break;
+      }
+```
+
+**★ 读者侧是 RAII handle，不是 enter()/exit()**（⚠️ 后两者**不存在**）：
+
+```cpp
+  class handle_t {
+   public:
+    handle_t(std::atomic<uint64_t> *counter) : m_counter{counter} {
+      m_counter->fetch_add(1);                    // 构造即 +1
+    }
+    handle_t(handle_t &&other) noexcept : m_counter{other.m_counter} {
+      other.m_counter = nullptr;                  // 移动后源失效，防 double-dec
+    }
+    explicit operator bool() const noexcept { return m_counter != nullptr; }
+    ~handle_t() {
+      if (m_counter != nullptr) m_counter->fetch_sub(1);   // 析构即 -1
+    }
+   private:
+    std::atomic<uint64_t> *m_counter;
+  };
+```
+
+```cpp
+  void await_release_of_old_references() const {
+    for (size_t i = 0; i < m_cnt.size(); i++) {
+      while (m_cnt[i].load()) {
+        std::this_thread::yield();      // ★★ 忙等真身：yield 自旋，逐分片等到 0
+      }
+    }
+  }
+```
+
+```cpp
+  /** The shards of the counter. ... and that the
+  size (256 * 64B = 16 KiB) is not too large.
+  We pad the atomics to avoid false sharing. ...*/
+  std::array<ut::Cacheline_aligned<std::atomic<uint64_t>>, 256> m_cnt;
+```
+
+**★ `begin_access()` 被拒时怎么回退**（两条路径不同！）：
+
+```cpp
+// get_tuple()：被拒就回到表头重来
+      auto handle = (*arr)->begin_access();
+      if (!handle) {
+        /* The array has been garbaged, restart the search from the beginning.*/
+        *arr = m_data.load();
+        continue;
+      }
+
+// insert_or_update()：被拒就直接走下一个数组（不回头）
+      auto handle = arr->begin_access();
+      if (!handle) {
+        /* The array has been garbaged, try the next one. */
+        arr = arr->m_next.load();
+        continue;
+      }
+```
+
+> ★★ **这个差异有实际后果**：读路径遇到被掏空的数组会从头找（能找到已迁移的条目）；写路径直接往后走（不会往回找）。
+> ⚠️ **`get_no_lock()` / `dec_by()` / `insert()` / `search()` / `n_cells()` / `clear()` / `destroy()` 全都不存在**。真名分别是 `get()`（本来就无锁）、`dec()`、`insert_or_update()`、`get_tuple_from_array()`，销毁只有析构函数。
+> ⚠️ **`ut_lock_free_hash_t` 不在 `ut` 命名空间**（全文件无 `namespace ut {`），4 个类都在全局命名空间——它只是**消费** `ut::hash_uint64` / `ut::Cacheline_aligned` / `ut::this_thread_hash`。
+
 ### hash_table_t：分片锁 + confirm 两段式（可选内建锁）
 
 两种模式：
@@ -819,6 +1392,212 @@ key 合法转移：`UNUSED → 真实key`、`UNUSED → AVOID`（其余禁止）
 - **SYNC_RW_LOCK**：**唯一用户是 buf_pool 的 page_hash**（见「查找」），配合"无锁 peek + 锁后 confirm"。
 
 **锁序约定**：`hash_lock_x_all` 按数组**升序**获取全部分片 X 锁（防死锁），用于 resize/清空；`hash_unlock_x_all_but` 保留一把释放其余；`hash_lock_has_all_x` 仅 debug，作为 `set_n_cells` 的前置断言。
+
+**★ 分片规则：`cell_id & (n_sync_obj - 1)`**（相邻 cell 属于不同 shard）：
+
+```cpp
+static inline uint64_t hash_get_sync_obj_index(hash_table_t *table,
+                                               uint64_t hash_value) {
+  ut_ad(table->type != HASH_TABLE_SYNC_NONE);
+  ut_ad(ut_is_2pow(table->n_sync_obj));
+  return ut_2pow_remainder(hash_calc_cell_id(hash_value, table),
+                           table->n_sync_obj);
+}
+```
+
+> ★ `ut_2pow_remainder(n, m) == (n) & ((m) - 1)`。所以 **cell i → shard i % n_sync_obj**，不是"前 k 个 cell 归 shard 0"。
+
+**★★ confirm 两段式协议的完整形态**（这是本机制最精巧的一段）：
+
+```cpp
+static inline rw_lock_t *hash_lock_s_confirm(rw_lock_t *hash_lock,
+                                             hash_table_t *table,
+                                             uint64_t hash_value) {
+  ut_ad(rw_lock_own(hash_lock, RW_LOCK_S));
+
+  rw_lock_t *hash_lock_tmp = hash_get_lock(table, hash_value);
+
+  while (hash_lock_tmp != hash_lock) {
+    rw_lock_s_unlock(hash_lock);
+    hash_lock = hash_lock_tmp;
+    rw_lock_s_lock(hash_lock, UT_LOCATION_HERE);
+    hash_lock_tmp = hash_get_lock(table, hash_value);
+  }
+
+  return hash_lock;
+}
+```
+
+> ★★ **为什么要 while 循环**：解锁 → 加锁之间 `n_cells` 可能又被改了，`hash_get_lock` 结果又变了，所以要转圈直到"手中锁"与"当前算出的锁"一致。
+> ★ **循环必然收敛**的前提：`hash_lock_x_all` 保证"改 n_cells 必须持有全部 X 锁"——一旦你持有任一把锁，改表者就被挡住。
+> ★ 协议三步：① **无锁读** `n_cells`（`memory_order_relaxed`）→ 算出"猜测的" cell_id → `hash_get_lock` 拿"猜测的"锁；② 加锁；③ **持锁后再算一次**，不一致就换锁重来。
+> ⚠️ **X 版 `hash_lock_x_confirm()` 结构完全相同**，只是 S→X。
+
+```cpp
+// buf0buf.cc:3084 的真实调用点
+  rw_lock_s_lock(hash_lock, UT_LOCATION_HERE);
+  /* If not own buf_pool_mutex, page_hash can be changed. */
+  hash_lock = buf_page_hash_lock_s_confirm(hash_lock, buf_pool, page_id);
+```
+
+> ⚠️ **`hash_table_t` 没有任何锁成员方法**——`get_lock()` / `lock()` / `unlock()` / `lock_shared()` **都不存在**。锁 API 全是**自由函数**：
+> `hash_get_lock()` / `hash_get_nth_lock()` / `hash_get_sync_obj_index()` / `hash_lock_s_confirm()` / `hash_lock_x_confirm()` / `hash_lock_x_all()` / `hash_unlock_x_all()` / `hash_unlock_x_all_but()` / `hash_lock_has_all_x()`（仅 debug）。
+
+**★ 只有 page_hash 是 RW_LOCK 模式**——其余全部 NONE：
+
+```cpp
+enum hash_table_sync_t {
+  HASH_TABLE_SYNC_NONE = 0,  /*!< Don't use any internal synchronization ... */
+  HASH_TABLE_SYNC_RW_LOCK    /*!< Use rw_locks to control access ... */
+};
+// ★ 只有两个值！不存在 HASH_TABLE_SYNC_MUTEX（8.0 已删除 mutex 版）
+```
+
+```cpp
+void hash_create_sync_obj(hash_table_t *table, latch_id_t id,
+                          size_t n_sync_obj) {
+  ut_a(n_sync_obj > 0);
+  ut_a(ut_is_2pow(n_sync_obj));
+  table->type = HASH_TABLE_SYNC_RW_LOCK;
+  ut_a(sync_latch_get_level(id) != SYNC_UNKNOWN);
+  table->rw_locks = static_cast<rw_lock_t *>(ut::malloc_withkey(
+      UT_NEW_THIS_FILE_PSI_KEY, n_sync_obj * sizeof(rw_lock_t)));
+  for (size_t i = 0; i < n_sync_obj; i++) {
+    rw_lock_create(hash_table_locks_key, table->rw_locks + i, id);
+  }
+  table->n_sync_obj = n_sync_obj;
+}
+```
+
+> ⚠️ **没有 `cell_calc` / `get_sync_obj` 回调**——签名只有 3 个参数，分片规则硬编码。
+> ⚠️ **`hash_create()` 不存在**——创建走构造函数 + AHI/page_hash 用的工厂 `ib_create()`。`hash_create_sync_obj()` 是**唯一**把 `type` 改成 RW_LOCK 的地方。
+
+**★ `ib_create()` 的分叉：要么有 heap，要么有 rw_locks，不会都有**：
+
+```cpp
+hash_table_t *ib_create(size_t n, latch_id_t id, size_t n_sync_obj,
+                        uint32_t type) {
+  ut_a(type == MEM_HEAP_FOR_BTR_SEARCH || type == MEM_HEAP_FOR_PAGE_HASH);
+  ut_ad(ut_is_2pow(n_sync_obj));
+  table = ut::new_<hash_table_t>(n);
+  ut_ad(table->heap == nullptr);
+
+  if (n_sync_obj == 0) {                       // ★ AHI 路径
+    table->heap = mem_heap_create(std::min(uint64_t{4096}, ...),
+                                  UT_LOCATION_HERE, type);
+    ut_a(table->heap);
+    return table;
+  }
+  ut_ad(type == MEM_HEAP_FOR_PAGE_HASH);       // ★ page_hash 路径
+  /* We create a hash table protected by rw_locks for buf_pool->page_hash. */
+  hash_create_sync_obj(table, id, n_sync_obj);
+  return table;
+}
+```
+
+```cpp
+static inline mem_heap_t *hash_get_heap(hash_table_t *table) {
+  ut_ad(table->n_sync_obj == 0);
+  ut_ad(table->type == HASH_TABLE_SYNC_NONE);   // ★ 有 heap 的表一定没有分片锁
+  ut_ad(table->heap != nullptr);
+  return table->heap;
+}
+```
+
+**★ 四大哈希表的桶数怎么算**：
+
+```cpp
+// ① buf_pool->page_hash —— 唯一 RW_LOCK 模式，桶数 = 2 * curr_size
+    buf_pool->page_hash =
+        ib_create(2 * buf_pool->curr_size, LATCH_ID_HASH_TABLE_RW_LOCK,
+                  srv_n_page_hash_locks, MEM_HEAP_FOR_PAGE_HASH);
+    buf_pool->zip_hash = ut::new_<hash_table_t>(2 * buf_pool->curr_size);
+    //  ★ zip_hash 是 SYNC_NONE，靠 buf_pool->zip_hash_mutex 保护
+
+// ② lock_sys 三表 —— 桶数 = srv_lock_table_size，全 SYNC_NONE
+  lock_sys->rec_hash = ut::new_<hash_table_t>(n_cells);
+  lock_sys->prdt_hash = ut::new_<hash_table_t>(n_cells);
+  lock_sys->prdt_page_hash = ut::new_<hash_table_t>(n_cells);
+
+// ③ dict_sys 两表 —— 桶数 = BP字节数 / (512 * sizeof(void*))
+  dict_sys->table_hash = ut::new_<hash_table_t>(
+      buf_pool_get_curr_size() / (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+  dict_sys->table_id_hash = ut::new_<hash_table_t>(
+      buf_pool_get_curr_size() / (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+
+// ④ AHI —— 桶数 = hash_size / btr_ahi_parts，n_sync_obj=0（SYNC_NONE）
+  hash_table = ib_create((hash_size / btr_ahi_parts), LATCH_ID_HASH_TABLE_MUTEX,
+                         0, MEM_HEAP_FOR_BTR_SEARCH);
+```
+
+> ★ 桶数经 `ut::find_prime()` 抬成质数后，**装载因子约 0.5**（每页最多一个 entry）。这就是"敢不扩容"的底气——创建时就按数据量上限算好了。
+
+**★ `mt_fast_modulo_t`：质数为何不再昂贵**。⚠️ 真名方法不是 `modulo()` / `set()`，而是 **`load()`** / **`store()`**：
+
+```cpp
+/** Allows to execute x % mod for a specified mod in a fast way, without using a
+slow operation of division. The additional cost is hidden in constructor to
+preprocess the mod constant. */
+class fast_modulo_t {
+ public:
+  /** Computes the value of x % mod. */
+  uint64_t compute(uint64_t x) const {
+    uint64_t hi;
+    (void)multiply_uint64(x, m_inv, hi);       // 128 位乘法取高位
+    const uint64_t guess = hi * m_mod;
+    const uint64_t rest = x - guess;
+    return rest - (m_mod <= rest) * m_mod;     // ★ 无分支写法
+  }
+  static uint64_t precompute_inv(uint64_t mod) {
+    if (mod == 1) return ~uint64_t{0};
+    return divide_128(1, 0, mod);              // floor(2^64 / mod)
+  }
+ private:
+  uint64_t m_mod{0};
+  uint64_t m_inv{0};
+};
+
+static inline uint64_t operator%(uint64_t x, const ut::fast_modulo_t &fm) {
+  return fm.compute(x);
+}
+```
+
+> ★★ 核心：预计算 `m_inv = floor(2^64 / mod)`，取模退化成 **1 次 128 位乘法 + 1 次乘法 + 2 次减法**，**完全无除法指令**。这就是 n_cells 敢用质数（非 2 的幂）的原因——质数桶分布好，快速取模把代价抹平。
+> ★ `hash_calc_cell_id()` 里的 `%` 就是被重载的那个 `operator%`：
+> ```cpp
+> static inline uint64_t hash_calc_cell_id(uint64_t hash_value, hash_table_t *table) {
+>   return hash_value % table->get_n_cells_fast_modulo();
+> }
+> ```
+> ⚠️ **`hash_calc_cell()` / `hash_calc_hash()` 都不存在**，真名带 `_id` 后缀。
+
+**★ 为什么 `mt_fast_modulo_t` 需要 Seq_lock**——`m_mod` 与 `m_inv` 是**两个独立的 atomic**，读者可能读到"新 mod + 旧 inv"（撕裂），算出的 cell_id 会越界：
+
+```cpp
+class mt_fast_modulo_t : private Non_copyable {
+ public:
+  fast_modulo_t load() {
+    return m_data.read([](const data_t &stored_data) {
+      return fast_modulo_t{stored_data.m_mod.load(std::memory_order_relaxed),
+                           stored_data.m_inv.load(std::memory_order_relaxed)};
+    });
+  }
+  void store(uint64_t new_mod) {
+    const fast_modulo_t new_fast_modulo{new_mod};
+    const auto inv = new_fast_modulo.get_inverse();
+    m_data.write([&](data_t &data) {
+      data.m_mod.store(new_mod, std::memory_order_relaxed);
+      data.m_inv.store(inv, std::memory_order_relaxed);
+    });
+  }
+ private:
+  struct data_t {
+    std::atomic<uint64_t> m_mod;
+    std::atomic<uint64_t> m_inv;
+  };
+  Seq_lock<data_t> m_data;     // ★ 保证两个字段成对一致，且读者无锁
+};
+```
 
 ### 对照：并发协议
 
@@ -1025,6 +1804,78 @@ ut_lock_free_hash_t 用三个特殊 key + 三个特殊 val 把"空/删除/迁移
 - **`hash_calc_hash` / `hash_table_find` 在 8.0.39 均不存在**——hash 值由调用者算，勿引用这两个符号（旧资料常见错误）。
 - **`hash_get_heap` 的 heap ≠ 元素内存**：只存 AHI 的 ha_node_t 索引节点，元素本体在缓冲池。
 - **`buf0stats.h` 的 `buf_stat_per_index`（全局单例）≠ `buf_pool->stat`（`buf_pool_stat_t`）**：前者按索引统计页数（用无锁 hash），后者按 pool 统计 gets/reads 等计数（用 `Counter`）。
+
+**★ 真名勘误全表**（这一节最容易写错名字，全部经全仓 grep 验证）：
+
+| 常见写法 | 8.0.39 真相 |
+|---|---|
+| `lf_hash_init()` 是函数 | 是**宏**：`lf_hash_init2(A,B,C,D,E,F,G, NULL,NULL,NULL,NULL)`。实现体叫 `lf_hash_init_impl()` |
+| `lf_hash_new()` / `lf_hash_get()` | **都不存在**。真名 `lf_alloc_new()` / `lf_hash_get_pins()` |
+| `lf_hash_iterate()` | **不存在**。遍历入口是 `lf_hash_random_match()` + `lf_dynarray_iterate()` |
+| `lf_hash_size()` / `lf_hash_count()` | **不是函数**，是 `LF_HASH` 的 public `std::atomic<int32>` 字段，调用方直接读 |
+| `lf_hash_search_using_adaptive()` | **不存在** |
+| `lf_hash_free()` | **不存在**，真名 `lf_hash_destroy()` |
+| `_lf_pinbox_real_free()` | **不存在**（无下划线），真名 `lf_pinbox_real_free()`（static） |
+| `_lf_dynarray_allocate()` | **不存在**，分配逻辑内联在 `lf_dynarray_lvalue()` |
+| `lf_alloc_free()` / `lf_alloc_direct()` | **都不存在**，真名 `lf_alloc_direct_free()`（`lf.h` 的 static inline） |
+| LF_HASH 的 DELETED 标志是 `ULONG_MAX` | **错**。是 `LF_SLIST::link` 指针的 **bit 0**，靠 `PTR()/DELETED()/SET_DELETED()` 三个模板函数存取 |
+| `my_reverse_bits()` 在 `mysys/my_bit.cc` | **错**。是 `include/my_bit.h:116` 的 inline；`my_bit.cc` 只有 256 项查表 |
+| `include/my_sys.h` 声明了 lf_hash | **错**。`my_sys.h` 中 0 命中，全套声明只在 `include/lf.h` |
+| LF_HASH 是每 bucket 一条链 | **错**。全局只有**一条** split-ordered 链表，dummy 节点把它切成若干 bucket |
+| `LF_PINS::purgatory` 是数组 | **错**。是单个 `void*` 链表头，next 借对象内部 `free_ptr_offset` 处的 8 字节 |
+| `lf_pin()` / `lf_unpin()` 在 .cc 里 | 是 `include/lf.h:115-127` 的 static inline，本质就是一次 `atomic::store` |
+| dummy 节点也走 lf_alloc | **错**。dummy 用裸 `my_malloc()`，释放也裸 `my_free()`；只有 normal 走 `lf_alloc_direct_free()` |
+| `hash0hash.cc` 在 `storage/innobase/hash/` | **错**。真路径 **`storage/innobase/ha/hash0hash.cc`** |
+| `ut_find_prime()` | **不存在**。真名 **`ut::find_prime()`**，在 `ut0math.h:70` / `ut/ut0math.cc:36`（**不在 `ut0rnd.h`**） |
+| `mt_fast_modulo_t` 在 `ut0seq_lock.h` | **错**。在 **`ut0math.h:237`**；`ut0seq_lock.h` 只有 `ut::Seq_lock<T>` |
+| `ut_hash_ulint` / `ut_fold_ulint_pair` / `ut_fold_binary` / `ut_fold_string` | **全都不存在**。8.0 已迁到 `ut0rnd.h` 的 `ut::hash_uint64` / `hash_uint64_pair` / `hash_binary` / `hash_string` |
+| `hash_table_sync_t` 有 `_MUTEX` | **错**。只有 **2 个值**：`NONE=0` / `RW_LOCK`。mutex 版 8.0 已删 |
+| `hash_create()` | **不存在**。改为构造函数 + 工厂 `ib_create()` |
+| `hash_table_free()` | **不存在**。销毁用 `ut::delete_(table)`，清空用 `hash_table_clear()` |
+| `hash_calc_cell()` / `hash_calc_hash()` | **不存在**。真名 **`hash_calc_cell_id()`**（带 `_id`） |
+| `hash_insert()` / `hash_delete()` / `hash_search()` 函数版 | **不存在**。只有宏 `HASH_INSERT` / `HASH_DELETE` / `HASH_SEARCH` |
+| `hash_table_t::calc_hash()` | **不存在**。类只有 3 个方法；**哈希值一律由调用方算好后传入** |
+| `hash_table_t::get_lock()/lock()/unlock()/lock_shared()` | **都不是成员**。锁 API 全是**自由函数** |
+| `mt_fast_modulo_t::modulo()` / `set()` | 真名 **`load()`** / **`store()`**；真正的取模是 `fast_modulo_t::compute()` + `operator%` |
+| `hash_create_sync_obj` 带 `cell_calc`/`get_sync_obj` 回调 | **不存在回调**。签名 `(hash_table_t*, latch_id_t, size_t)`，分片规则硬编码 |
+| `HASH_GET_FIRST` 是宏 | **不是宏**。是 inline 函数 **`hash_get_first()`**，返回 `void *&`（**引用**，可直接赋值） |
+| `ut_lock_free_hash_t` 在 `ut` 命名空间 | **不在**。4 个类全在全局命名空间，只是**消费** `ut::` 的工具 |
+| `get_no_lock()` / `dec_by()` / `insert()` / `search()` | **都不存在**。真名 `get()` / `dec()` / `insert_or_update()` / `get_tuple_from_array()` |
+| `busy_wait()` / `wait_readers()` / `enter()` / `exit()` | **4 个全不存在**。真身是 `await_release_of_old_references()`（yield 自旋）与 RAII `handle_t` |
+| `check_size()` / `suggest_size()` / `n_cells()` / `empty()` | **都不存在**。容量决策内联在 `grow()`；销毁只有析构函数 |
+| 魔法值 `RESERVED` | **不存在**。真名 **`AVOID`**（key 侧） |
+| `buf0stats.cc` | **该文件不存在**。`buf_stat_per_index_t` 是 header-only，全局对象在 `buf0buf.cc:1543` 创建 |
+
+**★ 三个"只有一条/只有一个"的事实**：
+
+1. **LF_HASH 只有一条全局链表**——dummy 把它切成 bucket，扩容只改 `size` 整数，零迁移。
+2. **`hash_create_sync_obj()` 是唯一把 `type` 改成 RW_LOCK 的地方；`buf_pool->page_hash` 是唯一走它的用户**——其余（zip_hash / lock_sys 三表 / dict 两表 / AHI）**全部是 `HASH_TABLE_SYNC_NONE**`，各自靠外部 mutex/latch 保护。
+3. **`optimize()` 的 `mutex_enter` 是全 `ut0lock_free_hash.h` 唯一一处上锁**（`mutex_exit` 在 928 行）。官方注释承认是"拿简单性换性能"。
+
+**★ 遍历能力：LF_HASH 没有 `iterate`**——只有 `lf_hash_random_match()`：
+
+```cpp
+void *lf_hash_random_match(LF_HASH *hash, LF_PINS *pins,
+                           lf_hash_match_func *match, uint rand_val,
+                           void *match_arg) {
+  uint hashnr = (rand_val & INT_MAX32);
+  uint bucket = hashnr % hash->size;
+  uint32 rev_hashnr = my_reverse_bits(hashnr);   // ★ 用 bit-reversed 值在有序链上定位
+  ...
+  res = my_lfind_match(el, rev_hashnr | 1, UINT_MAX32, match, &cursor, pins, match_arg);
+  if (!res && hashnr != 0) {
+    /*
+      We have not found matching element - probably we were too close to
+      the tail of our split-ordered list. To avoid bias against elements
+      at the head of the list we restart our search from its head. ...
+    */
+    el = ...lf_dynarray_lvalue(&hash->array, 0);
+    res = my_lfind_match(el, 1, rev_hashnr, match, &cursor, pins, match_arg);
+  }
+```
+
+> ★★ **MDL 的锁驱逐就是靠它**：先随机落在某 bucket，找不到就回绕到 bucket 0 再找一遍——避免偏向链表尾部。这也是"一条有序链"结构带来的必然：**没有 O(1) 的全量遍历方式**，只能随机采样。
+> ★ `my_lfind_match()` 里 dummy 节点被当作"安全的重启动锚点"（`head = &cursor->curr->link`）——因为 dummy **永不释放**。
 
 ---
 

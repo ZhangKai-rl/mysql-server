@@ -2,7 +2,7 @@
 
 > 基于 MySQL 8.0.39 源码。剖析 InnoDB 索引 B-tree 的全套结构操作：游标搜索（`btr0cur`）、页面分裂/合并/根页管理（`btr0btr`）、持久游标（`btr0pcur`）、自适应哈希索引 AHI（`btr0sea`）、排序批量构建（`btr0load`）。
 >
-> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](../innodb/row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](../innodb/physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](../innodb/physical/record.md)；latch 体系与行锁见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](../innodb/redo_log.md)；undo 与 purge 见 [`undo_log.md`](../innodb/undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](../innodb/physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](../innodb/ddl.md)。
+> **边界**：本篇讲 **B-tree 结构与索引记录**这一层；SQL 层如何用游标逐行取数据（`row_search_mvcc` 主链、行缓冲转换）见 [`row_search.md`](../innodb/row_search.md)；页物理格式与页内目录槽二分定位见 [`physical/page_structure.md`](../innodb/physical/page_structure.md)；记录物理格式与 offsets 解析见 [`physical/record.md`](../innodb/physical/record.md)；latch 体系与行锁见 [`../infra/lock/transactional/innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)；mtr（mini-transaction）与 redo 见 [`redo_log.md`](../innodb/redo_log.md)；undo 与 purge 见 [`undo_log.md`](../innodb/undo_log.md)；LOB 外存字段在 btr 中的交互见 [`physical/lob.md`](../innodb/physical/lob.md)；online DDL 与并行索引构建上下文见 [`ddl.md`](../feat/ddl/ddl.md)。
 
 ## 目录
 
@@ -17,9 +17,10 @@
     - [搜索：`btr_cur_search_to_nth_level`（逐行解析）](#搜索btr_cur_search_to_nth_level逐行解析)
     - [页内二分：`page_cur_search_with_match`](#页内二分page_cur_search_with_matchpage0curcc-逐行解析)
     - [行数估算：BTR_ESTIMATE 与 `btr_estimate_n_rows_in_range`](#行数估算btr_estimate-与-btr_estimate_n_rows_in_range)
-    - [自适应哈希索引（AHI）：搜索的加速捷径](#自适应哈希索引ahi)
+    - [自适应哈希索引（AHI）：搜索的加速捷径](#自适应哈希索引ahi与-btr-搜索的集成点)
   - 写路径：DML 与 SMO
     - [索引锁：完整锁语义（intention / 叶子三兄弟 / SMO 预测）](#索引锁完整锁语义intention--叶子三兄弟--smo-预测)
+    - [压缩页（page_zip）上的 B-tree 操作](#压缩页page_zip上的-b-tree-操作)
     - [插入与分裂](#插入与分裂)
     - [删除与合并](#删除与合并)
     - [更新：三条路径](#更新三条路径)
@@ -102,7 +103,7 @@ B-link 树（Lehman & Yao, 1981）的核心思想是：每个节点额外保存�
 
 - 默认取**记录数中点**（`page_get_middle_rec`）对半分；
 - **顺序插入感知**：若 `PAGE_LAST_INSERT` 显示上次插入就在本次插入点之前（持续右追加，自增主键场景），`btr_page_get_split_rec_to_right` 直接把"几乎所有记录"分走（新页只装新 tuple），给顺序流留满整页；倒序同理（`to_left`）。理由：50/50 分裂对单调插入是灾难——每次分裂只写一半页，页利用率 ~50%，分裂频率翻倍；
-- 二次迭代（压缩页分裂后仍放不下）用 `btr_page_get_split_rec` 按**字节空间 50%** 分割（累计数据量过半即分裂点）。
+- 二次迭代（压缩页分裂后仍放不下）用 `btr_page_get_split_rec` 按**字节空间 50%** 分割（累计数据量过半即分裂点）——压缩页完整模型见 [压缩页专节](#压缩页page_zip上的-b-tree-操作)。
 
 **代价**：顺序插入优化的副作用是——页几乎全空时就开始"预留"分裂（乐观插入提前失败），以及分裂后旧页利用率极低（可能 < 50%）。而 bulk load 100% 打包的页，构建完成后**任意一条插入立即触发分裂**（bitmap free bits 被清零，声明"此页已满"，连 change buffer 都无法缓冲）。三种填充策略并存，是"写放大"与"空间浪费"之间摇摆的历史结果。
 
@@ -583,6 +584,269 @@ void btr_pcur_t::copy_stored_position(btr_pcur_t *dst, const btr_pcur_t *src) {
 
 逐行解释：`copy_stored_position` 服务于需要**克隆游标位置**的场景（如扫描的 savepoint、子游标）；`m_old_rec` 指向 `m_old_rec_buf` 内偏移，深拷贝后要用**偏移量**重定位指针而不是原指针值。`open_on_user_rec` 的 `ut_error` 说明 LE/L 模式天然不会停在 supremum 后（LE 停在 ≤ key 的最后一条用户记录或 infimum），只有 GE/G 可能滚出页尾。
 
+#### `open_no_init` 与 `move_to_next_user_rec`：定位与推进
+
+`row_search_mvcc` 的 PHASE 3（打开/恢复游标）与 PHASE 5（推进）最终都落到这两个方法上。
+
+**定位 `open_no_init`**：
+
+```cpp
+inline void btr_pcur_t::open_no_init(dict_index_t *index, const dtuple_t *tuple,
+                                     page_cur_mode_t mode, ulint latch_mode,
+                                     ulint has_search_latch, mtr_t *mtr,
+                                     ut::Location location) {
+  // 去掉 intention 位（BTR_SEARCH_LEAF / BTR_MODIFY_LEAF 里的意向部分）
+  m_latch_mode = BTR_LATCH_MODE_WITHOUT_INTENTION(latch_mode);
+  m_search_mode = mode;
+
+  auto cur = get_btr_cur();
+
+  // ★ 两条路径：临时表（intrinsic）走无 latch 版本
+  if (index->table->is_intrinsic()) {
+    ut_ad((latch_mode & BTR_MODIFY_LEAF) || (latch_mode & BTR_SEARCH_LEAF));
+    // 临时表是连接私有的 ⇒ 不存在并发，省掉整个加锁路径
+    btr_cur_search_to_nth_level_with_no_latch(
+        index, m_read_level, tuple, mode, cur, location.filename, location.line,
+        mtr, ((latch_mode & BTR_MODIFY_LEAF) ? true : false));
+  } else {
+    btr_cur_search_to_nth_level(index, m_read_level, tuple, mode, latch_mode,
+                                cur, has_search_latch, location.filename,
+                                location.line, mtr);
+  }
+
+  m_pos_state = BTR_PCUR_IS_POSITIONED;
+  m_old_stored = false;      // ★ 之前 store_position 存的位置作废（游标已移动）
+  m_trx_if_known = nullptr;
+}
+```
+
+★ 与 `open_at_side` 的分工：`open_no_init` 是**按搜索元组从 root 下降**定位；`open_at_side(from_left, ...)` 是**定位到 B-tree 最左/最右端**，用于全表扫描的起点。
+
+**推进 `move_to_next_user_rec`**：
+
+```cpp
+inline dberr_t btr_pcur_t::move_to_next_user_rec(mtr_t *mtr) {
+  ut_ad(m_pos_state == BTR_PCUR_IS_POSITIONED);
+  ut_ad(m_latch_mode != BTR_NO_LATCHES);
+
+  for (;;) {
+    m_old_stored = false;
+
+    if (is_after_last_on_page()) {
+      if (is_after_last_in_tree(mtr)) {
+        return (DB_END_OF_INDEX);   // 整棵树都扫完了
+      }
+      move_to_next_page(mtr);       // 跨到下一页
+    } else {
+      move_to_next_on_page();       // 页内下一条
+    }
+
+    if (is_on_user_rec()) {
+      return (DB_SUCCESS);
+    }
+    // ★ 落在 infimum/supremum 上 ⇒ 继续循环，直到停在真正的用户记录
+  }
+}
+```
+
+★ **为什么是 `for(;;)` 而不是 if**：跨页后落到的第一条可能是页边界记录（infimum/supremum），必须继续推进。单步版本 `move_to_next()` 只走一步并返回 bool，**不保证停在用户记录上**——两者不能混用。
+
+⇒ `DB_END_OF_INDEX` 就是 `row_search_mvcc` 里"扫描结束"的来源。
+
+#### 跨页推进时 latch 从树级降到页级
+
+`move_to_next_user_rec` 在页尾时调 `move_to_next_page`，实现里有三个要点：
+
+```cpp
+void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
+  dict_table_t *table = get_btr_cur()->index->table;
+  ut_ad(is_after_last_on_page());     // 调用方保证：确实在页尾
+  m_old_stored = false;
+
+  auto page = get_page();
+  auto next_page_no = btr_page_get_next(page, mtr);   // 叶层的 next 指针
+  ut_ad(next_page_no != FIL_NULL);
+
+  // ★ latch 降级：树级 → 页级
+  //   ⇒ 跨页是沿叶子链表平移，不再从 root 下降 ⇒ 不需要保护树结构
+  auto mode = m_latch_mode;
+  switch (mode) {
+    case BTR_SEARCH_TREE:  mode = BTR_SEARCH_LEAF;  break;
+    case BTR_MODIFY_TREE:  mode = BTR_MODIFY_LEAF;
+  }
+  /* For intrinsic tables we avoid taking any latches as table is
+  accessed by only one thread at any given time. */
+  if (table->is_intrinsic()) {
+    mode = BTR_NO_LATCHES;            // ★ 临时表单线程访问 ⇒ 完全不加 latch
+  }
+
+  auto block = get_block();
+  auto next_block = btr_block_get(
+      page_id_t(block->page.id.space(), next_page_no), block->page.size, mode,
+      UT_LOCATION_HERE, get_btr_cur()->index, mtr);
+  auto next_page = buf_block_get_frame(next_block);
+
+#ifdef UNIV_BTR_DEBUG
+  if (!import_ctx) {
+    // ★ 双向链表一致性校验：next 页的 prev 必须指回当前页
+    ut_a(page_is_comp(next_page) == page_is_comp(page));
+    ut_a(btr_page_get_prev(next_page, mtr) == get_block()->page.id.page_no());
+  } else {
+    // import 场景：不一致只标记损坏，不能 ut_a 直接崩
+    if (page_is_comp(next_page) != page_is_comp(page) ||
+        btr_page_get_prev(next_page, mtr) != get_block()->page.id.page_no()) {
+      /* next page does not contain valid previous page number,
+      next page is corrupted, can't move cursor to the next page */
+      import_ctx->is_error = true;
+    }
+  }
+#endif
+  ...
+}
+```
+
+1. **latch 从树级降到页级**（`BTR_SEARCH_TREE`→`BTR_SEARCH_LEAF`、`BTR_MODIFY_TREE`→`BTR_MODIFY_LEAF`）——沿叶子链表平移不需要保护上层树结构。
+2. **临时表完全无 latch**（`is_intrinsic()` → `BTR_NO_LATCHES`），与 `open_no_init` 里临时表走 `..._with_no_latch` 是同一套理由。
+3. `UNIV_BTR_DEBUG` 下校验 **prev 回指**——这也是"B-tree 叶子层是双向链表"的直接源码证据。
+
+#### 全扫起点 `open_at_side`：从左边为什么用 `PAGE_CUR_G`
+
+与"按元组从 root 下降"的 `open_no_init` 不同，`open_at_side` 是**定位到 B-tree 最左 / 最右端**，用于全表扫描的起点：
+
+```cpp
+inline void btr_pcur_t::open_at_side(bool from_left, dict_index_t *index,
+                                     ulint latch_mode, bool init_pcur,
+                                     ulint level, mtr_t *mtr) {
+  m_latch_mode = BTR_LATCH_MODE_WITHOUT_FLAGS(latch_mode);
+
+  // ★ 从最左边用 PAGE_CUR_G，从最右边用 PAGE_CUR_L
+  //   ⇒ 页内两端各有边界记录 infimum / supremum，它们不是用户记录；
+  //     用 G（> infimum）才落在第一条用户记录，用 L（< supremum）落在最后一条
+  //     ——不能直接"取第一条/最后一条"，那样会停在 infimum/supremum 本身
+  m_search_mode = from_left ? PAGE_CUR_G : PAGE_CUR_L;
+
+  if (init_pcur) {
+    init();
+  }
+
+  // 与 open_no_init / move_to_next_page 一致：临时表走无 latch 版本
+  if (index->table->is_intrinsic()) {
+    btr_cur_open_at_index_side_with_no_latch(from_left, index, get_btr_cur(),
+                                             level, UT_LOCATION_HERE, mtr);
+  } else {
+    btr_cur_open_at_index_side(from_left, index, latch_mode, get_btr_cur(),
+                               level, UT_LOCATION_HERE, mtr);
+  }
+
+  m_pos_state = BTR_PCUR_IS_POSITIONED;
+  m_old_stored = false;
+  m_trx_if_known = nullptr;
+}
+```
+
+⇒ `level` 指定降到第几层——全扫只需降到叶子层。
+
+`open_at_side` 只是设状态 + 转调，真正的下降在 `btr_cur_open_at_index_side`（303 行）。三个要点：
+
+**（1）索引锁按 latch_mode 分档**
+
+```cpp
+  switch (latch_mode) {
+    case BTR_CONT_MODIFY_TREE:
+    case BTR_CONT_SEARCH_TREE:
+      upper_rw_latch = RW_NO_LATCH;    // continuation：上层 latch 调用方已持有
+      break;
+    case BTR_MODIFY_TREE:
+      /* Free blocks and read IO bandwidth should be prior for them,
+      when the history list is glowing huge. */
+      // ★ history list 很长且已有 pending read IO 时，索引锁从 SX 升级到 X
+      //   ⇒ 让 purge / IO 优先，避免删除进一步堆积
+      if (lock_intention == BTR_INTENTION_DELETE &&
+          trx_sys->rseg_history_len.load() > BTR_CUR_FINE_HISTORY_LENGTH &&
+          buf_get_n_pending_read_ios()) {
+        mtr_x_lock(dict_index_get_lock(index), mtr, UT_LOCATION_HERE);
+      } else {
+        mtr_sx_lock(dict_index_get_lock(index), mtr, UT_LOCATION_HERE);
+      }
+      upper_rw_latch = RW_X_LATCH;
+      break;
+    default:
+      mtr_s_lock(dict_index_get_lock(index), mtr, UT_LOCATION_HERE);   // 只读：S 锁
+      upper_rw_latch = RW_S_LATCH;
+  }
+```
+
+**（2）逐层下降**：每层先 `page_cur_set_before_first` / `set_after_last`（按 `from_left`），再 `move_to_next` / `move_to_prev` 取到第一条 / 最后一条 node pointer，直到 `height == level` 停住。路径记在 `tree_blocks[]` / `tree_savepoints[]`（配 `mtr_set_savepoint`）里，便于回退与释放。
+
+**（3）★ 中途发现 intention 不够，要释放全部块、改 intention、重来**
+
+```cpp
+    // pessimistic delete 可能导致上层也要插入 node_ptr
+    // ⇒ 原本的"单向" intention 不够，必须升级成 BTR_INTENTION_BOTH 重走一遍
+    if (latch_mode == BTR_MODIFY_TREE &&
+        btr_cur_need_opposite_intention(page, lock_intention, node_ptr)) {
+      ut_ad(upper_rw_latch == RW_X_LATCH);
+      for (; n_releases <= n_blocks; n_releases++) {
+        mtr_release_block_at_savepoint(mtr, tree_savepoints[n_releases],
+                                       tree_blocks[n_releases]);
+      }
+      lock_intention = BTR_INTENTION_BOTH;
+      page_id.set_page_no(dict_index_get_page(index));
+      height = ULINT_UNDEFINED;
+      n_blocks = 0;
+      n_releases = 0;
+      continue;                        // ★ 从头重新下降
+    }
+```
+
+反之若 `btr_cur_will_modify_tree()` 判断**不会**改到树结构，就走乐观路径**提前释放**上层块 latch（注意 `n_releases == 0` 时 `continue`——root 块要 pin 住不放）；而到达目标层且是 `BTR_MODIFY_TREE` 时，再把路径上的块**升级成 X 锁**：
+
+```cpp
+    if (height == level && latch_mode == BTR_MODIFY_TREE) {
+      for (ulint i = n_releases; i <= n_blocks; i++) {
+        mtr_block_x_latch_at_savepoint(mtr, tree_savepoints[i], tree_blocks[i]);
+      }
+    }
+```
+
+⇒ 这套"先按乐观假设持 SX 下降、中途发现不够就释放重来、确认要改才升级 X"是 `BTR_MODIFY_TREE` 的核心开销控制手段——**尽量晚地拿排他锁**。
+
+> ★ `btr_cur_will_modify_tree`（SMO 预测）与 `btr_cur_need_opposite_intention`（意图升级判定）是**两条下降路径共用的机制**——`btr_cur_search_to_nth_level` 也走同一套。完整算法见「下钻、意图升级重搜、SMO 预测」一节，此处不重复。
+
+#### `move_to_last_on_page`：只在**索引损坏的容错路径**上
+
+```cpp
+inline void btr_pcur_t::move_to_last_on_page(mtr_t *mtr) {
+  UT_NOT_USED(mtr);   // ★ 页内移动不需要新 mtr：页已在当前 mtr 保护下
+  ut_ad(m_latch_mode != BTR_NO_LATCHES);
+
+  page_cur_set_after_last(get_block(), get_page_cur());   // 移到"最后之后"
+
+  m_old_stored = false;
+}
+```
+
+两个容易误解的点：
+
+1. **名字叫 `move_to_last`，实际移到的是"最后之后"（after last，即 supremum）**，不是最后一条用户记录。
+2. **它不在正常扫描路径上**。唯一调用点（`row0sel.cc:5129`）是**索引损坏时的容错**：
+
+```cpp
+      /* The user may be dumping a corrupt table. Jump
+      over the corruption to recover as much as possible. */
+      ib::info(ER_IB_MSG_1034)
+          << "Index corruption: rec offs " << page_offset(rec) << " next offs "
+          << next_offs << ", page no " << page_get_page_no(page_align(rec))
+          << ", index " << index->name << " of table " << index->table->name
+          << ". We try to skip the rest of the page.";
+
+      pcur->move_to_last_on_page(&mtr);
+      prev_rec = nullptr;
+      goto next_rec;   // 跳到下一页继续
+```
+
+⇒ 当校验发现记录偏移不对（页损坏）时，**放弃这一页剩下的部分**、跳到下一页继续扫，目的是**尽可能多地抢救数据**（用户可能正在 dump 一个已损坏的表）。这是"宁可少读、不要崩"的取舍。
+
 ### 中间页与 node pointer：构建、解析、最小记录标记
 
 非叶层（中间页）只存 **node pointer**——一条记录 = "子页首条记录 key 的前缀 + 4 字节 child page no"。它既是"路由"（搜索时据此下钻），也是"下界标记"（指向 `[key, 下一 node_ptr 的 key)` 区间）。node pointer 不是用户数据：不加行锁、不写 undo、不更新 trx_id（对应 `btr_insert_on_non_leaf_level` 的三个 flag）。
@@ -1055,8 +1319,40 @@ retry_page_get:
         (up_match >= rec_offs_n_fields(offsets) - 1 ||
          low_match >= rec_offs_n_fields(offsets) - 1)) {
       // 比较 node_ptr 与页首/页尾记录，若 key 相同 → detected_same_key_root = true
-      ...
+      const rec_t *first_rec =
+          page_rec_get_next_const(page_get_infimum_rec(page));
+
+      if (node_ptr == first_rec || page_rec_is_last(node_ptr, page)) {
+        detected_same_key_root = true;
+      } else {
+        ulint matched_fields = 0;
+
+        // ★ 只比"页内第一条"：matched_fields >= n_fields-1 表示键完全相同
+        cmp_rec_rec_with_match(node_ptr, first_rec, offsets, offsets2, index,
+                               false, &matched_fields);
+
+        if (matched_fields >= rec_offs_n_fields(offsets) - 1) {
+          detected_same_key_root = true;      // 首条同键 ⇒ 整页都是这个键
+        } else {
+          const rec_t *last_rec;
+          last_rec = page_rec_get_prev_const(page_get_supremum_rec(page));
+
+          matched_fields = 0;
+          cmp_rec_rec_with_match(node_ptr, last_rec, offsets, offsets2, index,
+                                 false, &matched_fields);
+          if (matched_fields >= rec_offs_n_fields(offsets) - 1) {
+            detected_same_key_root = true;    // 末条同键 ⇒ 同样整页同键
+          }
+        }
+      }
     }
+```
+
+**两个细节**（`matched_fields` 第五种用法，参数定义见 [`data_repr.md`](../infra/structure/data_repr.md)「核心实现」第七节）：
+
+- **★ 为什么只比首条和末条就够了**：页内记录**按键有序** ⇒ 首条与末条都与 `node_ptr` 同键，则中间所有记录被夹逼、必然同键。**两次比较判定整页**，不必遍历。
+- **★ `-1` 扣的是什么**：node pointer 的最后一个字段是 **child page no**，不是键的一部分（`dict_index_build_node_ptr` 里 `n_fields_cmp = n_unique` 明确"绝不比较页号字段"——因为同一键可能跨多页，比页号会让等值搜索定位错乱）。⇒ 键字段数 = `n_fields - 1`，所以 `matched >= n_fields-1` 才叫"键完全相同"（只剩页号可能不同）。
+```cpp
 
     // ★ SMO 预测裁剪：不会触发 SMO 就提前释放上层页锁
     if (!detected_same_key_root && latch_mode == BTR_MODIFY_TREE &&
@@ -1156,9 +1452,47 @@ void page_cur_search_with_match(const buf_block_t *block, const dict_index_t *in
   const rec_t *up_rec, *low_rec, *mid_rec;
   ulint up_matched_fields, low_matched_fields, cur_matched_fields;
   int cmp = 0;
-  ...
+  ...（变量声明与断言群，略）
+
+  // ★ 前置分支一：顺序插入捷径（PAGE_CUR_ADAPT）——命中就 return，下面的两级二分根本不执行
+  //   条件：叶子页 + LE 模式 + 页正在"向右顺序插入"（PAGE_DIRECTION==PAGE_RIGHT 且连续 > 3 次）
+  //   ⇒ 自增主键批量插入时命中率极高：从上次插入位置（PAGE_LAST_INSERT）附近找，不必二分
+  if (page_is_leaf(page) && (mode == PAGE_CUR_LE) &&
+      !dict_index_is_spatial(index) &&
+      (page_header_get_field(page, PAGE_N_DIRECTION) > 3) &&
+      (page_header_get_ptr(page, PAGE_LAST_INSERT)) &&
+      (page_header_get_field(page, PAGE_DIRECTION) == PAGE_RIGHT)) {
+    if (page_cur_try_search_shortcut(block, index, tuple, iup_matched_fields,
+                                     ilow_matched_fields, cursor)) {
+      return;
+    }
+  }
+
+  // 前置分支二：空间索引（R-tree）走完全不同的路径——MBR 之间不是线性序，无法二分
+  if (dict_index_is_spatial(index) && mode > PAGE_CUR_LE) {
+    if (mode == PAGE_CUR_RTREE_INSERT && page_is_leaf(page)) {
+      mode = PAGE_CUR_LE;                  // 叶子层插入仍走传统比较
+    } else {
+      rtr_cur_search_with_match(block, index, tuple, mode, cursor, rtr_info);
+      return;
+    }
+  }
+
   up_matched_fields = *iup_matched_fields;   // 从上层下钻带来的公共前缀（跨层复用！）
   low_matched_fields = *ilow_matched_fields;
+
+  // ★ offsets 的两种来源（每次比较都要取一次，是搜索热点）
+  //   索引若"全定长 + 无 NULL + 无 instant 列"，所有记录共享 index->rec_cache.offsets
+  //   ⇒ 直接返回共享数组，跳过 rec_get_offsets 的逐条解析
+  //   （固定 offsets 缓存的机制见 data_repr.md「核心实现」第四节，这里是使用现场）
+  const ulint *const cached_offsets{index->rec_cache.offsets};
+  auto get_mid_rec_offsets = [&]() -> const auto * {
+    if (cached_offsets && !page_cur_has_null(mid_rec, index)) {
+      return cached_offsets;
+    }
+    return rec_get_offsets(mid_rec, index, offsets_,
+                           dtuple_get_n_fields_cmp(tuple), UT_LOCATION_HERE, &heap);
+  };
 
   // 第一级：对 page directory 槽二分，直到上下槽距离为 1
   low = 0;
@@ -1170,6 +1504,7 @@ void page_cur_search_with_match(const buf_block_t *block, const dict_index_t *in
     mid_rec = page_dir_slot_get_rec(slot);    // 槽主记录（每个槽"拥有"若干条记录的代表）
 
     cur_matched_fields = std::min(low_matched_fields, up_matched_fields);  // ★ 公共前缀起点
+    auto offsets = get_mid_rec_offsets();   // ← 固定 offsets 缓存 or 逐条解析，见上
     cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
 
     if (cmp > 0) {                  // tuple > mid_rec：目标在右半
@@ -1197,6 +1532,7 @@ void page_cur_search_with_match(const buf_block_t *block, const dict_index_t *in
     mid_rec = page_rec_get_next_const(low_rec);
 
     cur_matched_fields = std::min(low_matched_fields, up_matched_fields);
+    auto offsets = get_mid_rec_offsets();
     cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
 
     if (cmp > 0) { low_rec = mid_rec; low_matched_fields = cur_matched_fields; }
@@ -1227,6 +1563,8 @@ void page_cur_search_with_match(const buf_block_t *block, const dict_index_t *in
 
 逐行解释：
 
+- **★ 三个前置分支先于二分**：`PAGE_CUR_ADAPT` 捷径命中就 `return`（顺序插入场景省掉整个二分）；R-tree 走 `rtr_cur_search_with_match`（MBR 之间非线性序，无法二分）。⇒ **别把"两级二分"当成入口**——它只是三个分支都未命中后的默认路径。
+- **★ `get_mid_rec_offsets()` 才是 `offsets` 的来源**：搜索热路径每次比较都要取 offsets。命中"全定长 + 无 NULL + 无 instant 列"的索引时返回共享的 `index->rec_cache.offsets`，**跳过 `rec_get_offsets` 的逐条解析**（机制见 [`data_repr.md`](../infra/structure/data_repr.md)「核心实现」第四节，这里是使用现场）；否则才逐条算。
 - **两级查找的结构原因**：页目录槽是**稀疏索引**（每个槽"拥有"最多 `PAGE_DIR_SLOT_MAX_N_OWNED` 条记录），先在槽数组上二分（O(log slots)），再在目标槽内线性扫（最多 8 条）。槽数远小于记录数，所以比纯线性快，又比维护完整有序数组省空间。
 - **`cur_matched_fields = min(low, up)` 是跨层公共前缀复用**：从上一次比较（可能是父层下钻）带进来的 `up_matched_fields/low_matched_fields`，是"已知 tuple 与上界/下界记录的公共前缀长度"。用它做比较起点，跳过了已经确定的相等前缀字段——这是 B-tree 搜索省比较次数的核心技巧。
 - **相等时的方向**（`cmp == 0`）：`PAGE_CUR_G/LE` 是"找下界"（找最后一个 ≤/第一个 ≥ 的位置要向右），归左继续；`PAGE_CUR_L/GE` 是"找上界"，归右。这决定了等值键重复时游标停在等值组的哪一端。
@@ -1545,7 +1883,7 @@ static bool btr_cur_will_modify_tree(dict_index_t *index, const page_t *page,
     if (max_size < BTR_CUR_PAGE_REORGANIZE_LIMIT + rec_size || max_size < rec_size * 2) {
       return true;
     }
-    // 压缩页：按最差压缩率估算
+    // 压缩页：按最差压缩率估算（page_zip_empty_size 语义见压缩页专节）
     if (page_size.is_compressed() &&
         page_zip_empty_size(index->n_fields, page_size.physical()) <
             rec_size * 2 + page_get_data_size(page) +
@@ -1599,10 +1937,41 @@ static bool btr_cur_need_opposite_intention(const page_t *page,
 | `BTR_MODIFY_TREE` | **SX**（purge 高压/spatial 删除意图例外 X） | 只 pin → `will_modify_tree` 裁剪 → 目标层升级 X（root SX） | X | **左/右均 X（左→右）** | 悲观写/SMO |
 | `BTR_CONT_MODIFY_TREE` | 复用 mtr 已有 X/SX | 复用 | 补 X | 无（spatial 例外） | SMO 中找父页 |
 | `BTR_CONT_SEARCH_TREE` | 复用 mtr 已有 X/SX | 复用 | 补 SX | 无 | 校验/只读父页搜索 |
+
+#### "先放父、再锁子"为什么安全（BTR_MODIFY_TREE 的正确性论证）
+
+`BTR_MODIFY_TREE` 下钻的执行顺序是：`btr_cur_will_modify_tree` 预测"子页修改不波及本页" → **先释放上层页锁**（保留 root pin）→ 下一轮再 X 锁子页——表面上违反经典蟹行协议"先锁子再放父"。**它安全的原因与经典协议不同**：经典蟹行防的是"父页被并发分裂、下行指针失效"，而 InnoDB 中该竞态被 **`index->lock` 的 SX 锁整体排除**——SX 与 SX/X 互斥（`sync0rw` 兼容矩阵：S 与 SX 兼容、SX/SX 与 SX/X 冲突），释放掉的父页**不会被任何其他 SMO 触碰**（分裂/合并都需要 index SX/X），父页指针与 prev/next 稳定。`btr_cur_will_modify_tree` 决定"是否保留父页锁"的真实理由是：**子页分裂/合并要在父页插删 node_ptr，必须届时持有父页 X 锁**——不是防父页消失。这也是 8.0 相对 5.7 的核心演进：5.7 的 SMO 对 `index->lock` 加 **X**（阻塞一切读者），8.0 改 **SX**（SMO 之间仍串行、普通读者 S 可与 SMO 并发）。
+
+**叶子 S 锁下记录指针安全的三层论证**（为什么普通搜索到叶后可以放掉全部父页锁）：① 页内任何记录增删都要页 X 锁，与读者 S 互斥 → 读者看到的记录布局冻结；② 分裂/合并都要 index SX/X，而普通搜索**全程持 index S**（到叶才放），S 与 SX/X 互斥 → 搜索期间不可能发生任何 SMO，页链表稳定；③ `buf_fix` 保证块不被 LRU 换出，X 锁互斥保证读不到半修改页。
 | `BTR_SEARCH_PREV` / `BTR_MODIFY_PREV` | S（到叶即放） | 逐层 + **每层锁左兄弟**（回溯两遍） | S/X | 左兄弟 S/X | 倒序扫描 |
 | `BTR_NO_LATCHES` | 无 | 只 pin | 只 pin | 无 | intrinsic 临时表 |
 
 **不变量**：① 加锁顺序自顶向下、自左向右（跨页拿锁永远先左后右）；② 所有页面修改在持有对应 X-latch 的 mtr 内完成；③ index->lock 的 SX 与 S 兼容（并发读不阻塞 SMO）、与 SX/X 互斥（SMO 之间串行）；④ root 页锁一般不提前放（fseg header 在其上）。
+
+### 压缩页（page_zip）上的 B-tree 操作
+
+`ROW_FORMAT=COMPRESSED` 的每个 B-tree 页有**双份结构**（frame + `page_zip`），本节只讲**B-tree 操作对压缩页的特殊处理**；压缩特性自身（双份结构完整模型、物理布局、zip_pad 自适应闭环、redo 差异、现状定位）→ [`../feat/compression.md`](../feat/compression.md) 页压缩节。核心事实就一条：**frame 上有空间 ≠ 压缩镜像放得下**——所有 btr 层的 zip 分支都源自"插入/分裂后可能压不进去"。
+
+#### zip 插入变体：`page_cur_insert_rec_zip` 会返回 NULL
+
+与 `page_cur_insert_rec` 的本质差异（`page0cur.cc:1608-1860`）：普通版保证成功（空间由调用方预判），zip 版**可能因"压缩后放不进压缩页"失败**——frame 明明有空间。内部策略链：空间不足时先试 `btr_page_reorganize_low` 再插；还不行则**先插 frame 再整页 `page_zip_compress`**（8.0 是"先插后压"，不是边插边写修改日志）；压缩失败 → `page_zip_decompress` 回退 → 返回 NULL。恢复期间（`recv_recovery_is_on()`）只插 frame，靠下一条 `MLOG_ZIP_PAGE_COMPRESS_NO_DATA` 重压。
+
+调用方 `btr_cur_optimistic_insert`（`btr0cur.cc:3015-3025`）收到 NULL **不再 reorg 重试**（zip 版内部已试过），直接 `goto fail` → 悲观插入 → 分裂。乐观路径还有一道前置闸（2916-2922）：`page_get_data_size + rec_size >= dict_index_zip_pad_optimal_page_size` 直接放弃乐观——`optimal_page_size` 的完整自适应闭环见 [`compression.md`](../feat/compression.md) 的 zip_pad 节。
+
+#### 分裂：无独立 zip 版函数，三级 fallback + 二次分裂无上限
+
+zip 逻辑内联在 `btr_page_split_and_insert`（`btr0btr.cc:2279-2656`）：
+
+1. **`insert_will_fit` 恒为 false**（2456-2469：`insert_will_fit = !new_page_zip && ...`）→ 压缩页分裂**全程持有 index X-lock**（不提前放）；
+2. **两半各自压缩的三级 fallback**（2524-2558）：`page_move_rec_list_end` → `page_copy_rec_list_end` 内 zip 分支（`page0page.cc:602-630`）：关 mtr 日志复制记录 → `page_zip_compress` 新页 → 失败 `page_zip_reorganize` → 再失败 `page_zip_decompress` 并返回 false → btr 层 fallback `page_zip_copy_recs` **整页字节拷贝** + 双侧 `page_delete_rec_list_*` 逐条删除（删除总会成功——只追加修改日志）；旧页那一半靠修改日志自然变小；
+3. **插入失败 → 二次分裂**（2587-2637）：压缩页 `page_cur_tuple_insert` 失败后**不再 reorg 直接 `goto func_start`**；`ut_ad(n_iterations < 2 || buf_block_get_page_zip(insert_block))`（2634）——**压缩页分裂次数无 2 次上限**；二次分裂若已分裂过且 tuple 要落右半，直接插到空页（2423-2429）；
+4. 二次分裂用 `btr_page_get_split_rec`（`btr0btr.cc:1730-1835`）：空页容量取 `min(page_get_free_space_of_empty, page_zip_empty_size)`，50% 边界按**字节数**（含目录预留）而非记录条数。
+
+#### 合并：判定与未压缩页完全相同，但 merge 目标页有 zip_pad 闸
+
+- `btr_cur_compress_if_useful` → `btr_cur_compress_recommendation`（`btr0cur.ic:107-132`）**无 zip 分支**——只看 frame 的 `page_get_data_size < BTR_CUR_PAGE_COMPRESS_LIMIT`；`btr_cur_merge_compress_pages` **不存在**（全库 0 命中）；
+- merge 目标页的 zip 闸在 `btr_can_merge_with_page`（`btr0btr.cc:4625-4632`）：目标页是压缩叶子且 `data_size + 搬入数据 >= dict_index_zip_pad_optimal_page_size` → 拒绝合并；
+- merge 搬入时同样走 `page_copy_rec_list_end` 的整页重压路径（与分裂相同）。
 
 ### 插入与分裂
 
@@ -1618,6 +1987,7 @@ if (page_zip_rec_needs_ext(rec_size, page_is_comp(page),
   ...
 }
 // 压缩页：插入后 data_size + rec_size >= 最优填充 → 直接放弃乐观
+// （zip_pad 自适应机制与失败后"不 reorg 重试"见压缩页专节）
 if (leaf && page_size.is_compressed() &&
     (page_get_data_size(page) + rec_size >=
      dict_index_zip_pad_optimal_page_size(index))) goto fail;
@@ -1656,6 +2026,91 @@ if (*rec == nullptr && !page_size.is_compressed()) {
 - **二级索引不写 undo**：undo 只在聚簇索引上记录（二级索引靠聚簇索引的 undo 重放）。这是 InnoDB 的重要设计——二级索引变更的"真相"在聚簇索引，二级索引只是投影。
 - 收尾：AHI 更新（`btr_search_update_hash_node_on_insert` O(1) 快路径或整页重建）、`lock_update_insert` 把 infimum 暂存的 gap 锁迁移到新记录、非压缩二级索引页在独立 mtr 递减 change buffer bitmap free bits。
 
+#### `btr_cur_ins_lock_and_undo`：插入前的锁与 undo 编排
+
+乐观/悲观插入共用的编排函数（`btr0cur.cc`），把"插入"拆成四步：**锁检查 → 早退判断 → 写 undo → 回填 roll_ptr**。先逐参数，再逐段。
+
+##### 参数逐一剖析
+
+| 参数 | 语义 |
+|---|---|
+| `flags` | 位标志组合，五种（见下表）；由两个调用点从 row 层透传（`row_ins_clust_index_entry_low` 等） |
+| `cursor` | 已定位的树游标；注释 "on page **after which** to insert"——记录插在 cursor 指向记录**之后**（插入位置 = 后继之前） |
+| `entry` | **in/out**：输入待插记录，输出被回填 `DATA_ROLL_PTR` 隐藏列 |
+| `thr` | query thread；**四种标志组合下可传 NULL**（无需锁/undo/sys 字段时不需要线程上下文）：`flags & (NO_LOCKING \| NO_UNDO_LOG \| CREATE \| KEEP_SYS)` |
+| `mtr` | 整个函数同一个 mtr；调用前提是**叶子页已 X latch**（乐观 leaf X / 悲观三兄弟 X） |
+| `inherit` | out：新记录是否应继承后继记录的 `LOCK_GAP` 锁 |
+
+`flags` 五种标志（`btr0cur.h` 权威定义）：
+
+| 位 | 标志 | 语义 |
+|---|---|---|
+| 1 | `BTR_NO_UNDO_LOG_FLAG` | 不写 undo（内部操作，如 node pointer 插入） |
+| 2 | `BTR_NO_LOCKING_FLAG` | 跳过记录锁检查（临时表/内部索引） |
+| 4 | `BTR_KEEP_SYS_FLAG` | sys 字段已由调用方填好，不回填（copy alter table） |
+| 8 | `BTR_KEEP_POS_FLAG` | 悲观更新移动大字段时保持 cursor 位置（本函数不直接消费） |
+| 16 | `BTR_CREATE_FLAG` | 调用方在建索引 / 绕过 online 创建日志 |
+
+##### 核心逻辑逐段剖析
+
+**① 锁检查**（`BTR_NO_LOCKING_FLAG` 时整体跳过）：
+
+```cpp
+if (!(flags & BTR_NO_LOCKING_FLAG)) {
+  if (dict_index_is_spatial(index)) {
+    lock_prdt_t prdt;
+    rtr_mbr_t mbr;
+    rtr_get_mbr_from_tuple(entry, &mbr);              // 从待插记录提取 MBR
+    lock_init_prdt_from_mbr(&prdt, &mbr, 0, nullptr); // ★ heap=nullptr：栈上先试探
+    err = lock_prdt_insert_check_and_lock(flags, rec, block, index, thr, mtr, &prdt);
+    *inherit = false;
+  } else {
+    err = lock_rec_insert_check_and_lock(flags, rec, block, index, thr, mtr, inherit);
+  }
+}
+```
+
+- **普通索引**：`lock_rec_insert_check_and_lock` 做三件事——**隐含锁物化**（读 `DB_TRX_ID` 发现并发未提交写者时转显式锁）、**拿插入意向锁**、**唯一性冲突检测**。失败返回 `DB_LOCK_WAIT`/`DB_DUPLICATE_KEY`，上层决定等待或转悲观路径。
+- **spatial**：谓词锁分流。`lock_init_prdt_from_mbr(..., heap=nullptr)` 是**栈上试探**——先用栈变量试"这个 MBR 要不要等"，真要等才从 lock heap 分配谓词数据（每次插入省一次堆分配）。spatial 无 gap 语义，`*inherit = false`。
+- **`inherit` 出参**：插入被等待中的 gap 锁盯上时，新记录必须继承锁语义，否则等待者醒来会漏看这条新记录——gap 锁防幻读的关键细节。
+- `ut_ad` 断言：online DDL 的索引要么聚簇、要么带 `BTR_CREATE_FLAG`——online 建索引过程中二级索引不加锁。
+
+**② 早退判断**：
+
+```cpp
+if (err != DB_SUCCESS || !index->is_clustered() || dict_index_is_ibuf(index))
+  return err;
+```
+
+- 锁失败：等锁/冲突，直接返回由上层处理。
+- **非聚簇/ibuf 不写 undo**：二级索引的"真相"在聚簇索引（靠聚簇 undo 重放），ibuf 是内部索引——"undo 只记聚簇"设计的落点。
+
+**③ 写 undo**：
+
+```cpp
+err = trx_undo_report_row_operation(flags, TRX_UNDO_INSERT_OP, thr, index,
+                                    entry, nullptr, 0, nullptr, nullptr, &roll_ptr);
+```
+
+`TRX_UNDO_INSERT_OP` 写聚簇插入 undo，返回 `roll_ptr`。**undo 先于插入**——roll_ptr 要写进记录本身，必须先拿到 undo 记录的地址。
+
+**④ 回填 roll_ptr**：
+
+```cpp
+if (!(flags & BTR_KEEP_SYS_FLAG) && !index->table->is_intrinsic()) {
+  if (index->table->skip_alter_undo) {                    // online alter 复制数据
+    roll_ptr = trx_undo_build_roll_ptr(true, 0, 0, 0);    // 伪造成"刚插入"（1ULL<<55 = insert 位）
+  }
+  row_upd_index_entry_sys_field(entry, index, DATA_ROLL_PTR, roll_ptr);
+}
+```
+
+- `BTR_KEEP_SYS_FLAG`：copy alter table 时 sys 字段已由调用方填好，跳过回填。
+- intrinsic 表：内存临时表无 undo，跳过。
+- **`skip_alter_undo` 特例**：online alter 复制数据时 roll_ptr 为 0，伪造成"刚插入的行"（`1ULL << 55` = roll_ptr 的 insert 标志位），让后续读把它当新插入版本处理。
+
+**总览**：四步在同一 mtr、页 latch 全程持有下原子完成；且本函数是"事务锁（`lock_t`）与 latch 分层"的衔接点——锁检查在已 latch 页的 rec_hash 上做，锁跨 mtr 存活、undo 只在 mtr 内。层次关系见 [`innodb_trx_lock.md`](../infra/lock/transactional/innodb_trx_lock.md)「事务锁与 latch 的分层时序」节。
+
 #### 悲观插入与页分裂：`btr_cur_pessimistic_insert` → `btr_page_split_and_insert`
 
 悲观插入先 `btr_cur_ins_lock_and_undo`（undo 在分裂前写完——undo 是逻辑日志，与页怎么拆无关），再预留 extent，然后分派：
@@ -1672,7 +2127,15 @@ else
 
 `btr_page_split_and_insert` 的完整算法（关键步骤）：
 
-**第 0 步：优先插右兄弟**（8.0 优化，`btr_insert_into_right_sibling`）——游标在页尾且存在右兄弟时，把 tuple 直接插到右兄弟页头，并重建父层 node pointer（删旧的、插新的）。单调递增插入下这替代了反复 50/50 分裂。
+**第 0 步：优先插右兄弟**（8.0 优化，`btr_insert_into_right_sibling`，`btr0btr.cc:2166-2270`）——**这是正常路径不是竞态兜底**（调用点注释 "try to insert to the next page if possible **before split**"，是分裂函数的第一顺位尝试；失败返回 NULL 后走标准分裂，函数内部没有任何异常恢复/竞态检测语义）。
+
+**触发条件**（2180-2183）：页有右兄弟（`next_page_no != FIL_NULL`）**且**游标记录的下一条是 supremum（插入点落在页末）。此时 tuple 本应"属于"右兄弟头部——不分配新页、不搬一半记录，直接插右兄弟页头更廉价。单调递增插入下这替代了反复 50/50 分裂。
+
+**关键步骤**：X-latch 右兄弟 → `lock_update_split_point`（gap 锁延伸到右兄弟）→ `page_cur_tuple_insert` 插到 infimum 之后 → **删掉父层指向右兄弟的旧 node pointer、重建新 node pointer**（`btr_cur_pessimistic_delete(BTR_CREATE_FLAG)` + `dict_index_build_node_ptr` + `btr_insert_on_non_leaf_level`——右兄弟最小键变了）→ 二级索引非临时表更新 ibuf free bits（单页版 `ibuf_update_free_bits_zip`/`ibuf_update_free_bits_if_full`，与分裂的两页版不同）；压缩页重组失败时 `ibuf_reset_free_bits`。
+
+**锁协议联动**：搜索层早为此预留了意图升级——`btr_cur_search_to_nth_level` 里 `BTR_MODIFY_TREE + BTR_INTENTION_INSERT` 且"停在末记录 + 有 next page"时改 `BTR_INTENTION_BOTH` 重新搜索（`btr0cur.cc:1753-1772`，注释原文 "btr_insert_into_right_sibling() might cause deleting node_ptr at upper level"），判定谓词就是 [意图矛盾检测](#意图矛盾检测btr_cur_need_opposite_intention完整源码) 节的 `btr_cur_need_opposite_intention`。
+
+**与 `insert_will_fit` 的分工**：本函数在分裂结构建立**之前**执行、全程持树 X/SX 锁（2173-2175 断言）；`insert_will_fit` 在分裂结构建立**之后**才计算（2456-2469），用于决定可否提前释放树锁——两者是分裂流程里不同阶段的独立优化。
 
 `btr_page_split_and_insert` 完整源码逐行解析（btr0btr.cc 2279~2656，spatial 分支省略）：
 
@@ -2314,6 +2777,55 @@ static buf_block_t *btr_lift_page_up(dict_index_t *index, buf_block_t *block, mt
 
 ### 更新：三条路径
 
+#### 三条路径共用的锁与 undo：`btr_cur_upd_lock_and_undo`（`btr0cur.cc:3247` 完整）
+
+```cpp
+static inline dberr_t btr_cur_upd_lock_and_undo(
+    ulint flags, btr_cur_t *cursor, const ulint *offsets,
+    const upd_t *update, ulint cmpl_info, que_thr_t *thr, mtr_t *mtr,
+    roll_ptr_t *roll_ptr) {
+  rec = btr_cur_get_rec(cursor);
+  index = cursor->index;
+  if (!index->is_clustered()) {
+    ut_ad(dict_index_is_online_ddl(index) == !!(flags & BTR_CREATE_FLAG));
+    /* We do undo logging only when we update a clustered index record */
+    return (lock_sec_rec_modify_check_and_lock(flags, btr_cur_get_block(cursor),
+                                               rec, index, thr, mtr));
+  }
+  if (!(flags & BTR_NO_LOCKING_FLAG)) {
+    err = lock_clust_rec_modify_check_and_lock(flags, ..., offsets, thr);
+    if (err != DB_SUCCESS) return (err);
+  }
+  /* Append the info about the update in the undo log */
+  return (trx_undo_report_row_operation(flags, TRX_UNDO_MODIFY_OP, thr, index,
+                                        nullptr, update, cmpl_info, rec,
+                                        offsets, roll_ptr));
+}
+```
+
+- **二级索引只做锁检查、不写 undo**——旧值由聚簇记录的 undo 重建（`dict_index_is_online_ddl` 断言与 `BTR_CREATE_FLAG` 的对应）；
+- **聚簇**：先 `lock_clust_rec_modify_check_and_lock`（隐式锁冲突则入队，`DB_LOCK_WAIT` 由上层处理锁等待），成功后 `trx_undo_report_row_operation(TRX_UNDO_MODIFY_OP)` 在 **mtr 内**写旧值到回滚段、返回 `roll_ptr` 供新版本携带；
+- **undo 写入时机在页内物理修改之前**（三个调用点都在改页前：`btr0cur.cc:3550/3844/4074`）——保证崩溃/回滚有完整旧值；
+- 配套 flag：`BTR_KEEP_POS_FLAG`（悲观更新搬大字段到 big_rec 后校正 cursor 位置）、`BTR_KEEP_SYS_FLAG`（`BTR_NO_UNDO_LOG_FLAG` 时 sys 字段由调用方放进 update vector，禁止重建）。
+
+#### 更新前的 instant 默认值物化：`materialize_instant_default`
+
+instant 列（ADD COLUMN ... INSTANT）在旧记录里**物理不存**（字段长度标 `UNIV_SQL_ADD_COL_DEFAULT`，读取时 `rec_get_nth_field_instant` 识别后改从 `index->get_nth_default` 取，后者来自 `dict_col_t::instant_default`——DD 列元数据开表时同步）。更新旧行时 `row_rec_to_index_entry` 会把默认值**虚拟填入** new_entry，但物理写回前要决定是否真正物化（`btr0cur.cc:3614-3663`）：
+
+```cpp
+bool materialize_instant_default(const dict_index_t *index, const rec_t *rec) {
+  if (rec_new_is_versioned(rec)) return true;     // 版本化记录：默认值早已物化
+  if (index->has_row_versions()) return true;     // 新实现（row version）行长受控，可安全物化
+  if (index->has_instant_cols()) return false;    // V1 旧实现：不物化
+  return true;                                    // 无 instant 列：正常物化
+}
+```
+
+- **V1 不物化的原因**（3626-3639 注释）：升级表的旧 INSTANT ADD 行物化后，**回滚可能超过 row_size_limit 导致 ROLLBACK 失败**——保持旧行为；
+- 返回 false 时调用方执行 `new_entry->ignore_trailing_default(index)`（`data0data.cc:797`）：从尾部逐列与 `col->instant_default` 比对，把 `n_fields` 收缩到实际存储列数——"更新不涉及该列时，该列保持未物化"，与旧记录表示一致；
+- 调用点：`btr_cur_optimistic_update`（3767）与 `btr_cur_pessimistic_update`（4038）——**物化发生在写新记录前构建 new_entry 阶段**，不是读旧记录时；回滚路径（`row0umod.cc:154`）有断言：产生 big_rec 时必须已物化；
+- 二级索引物理记录只含索引列 + PK、不含 instant 列——该函数对二级索引也被调用但 `ignore_trailing_default` 无字段可裁，物化语义只作用于**聚簇索引**记录。
+
 #### 原地更新 `btr_cur_update_in_place`
 
 前提 `row_upd_changes_field_size_or_external() == false`（所有字段大小不变、无 extern）：锁检查 + undo（`btr_cur_upd_lock_and_undo`，聚簇写 `TRX_UNDO_MODIFY_OP`，二级只做锁检查不写 undo）→ `row_upd_rec_in_place` 覆写字节 → 写 `MLOG_REC_UPDATE_IN_PLACE`（1 字节 flags + sys 字段 + 2 字节页内 offset + 变更字段差异）。若改动了排序字段，先 `btr_search_update_hash_on_delete` 摘 AHI 条目。**压缩页**要先 `btr_cur_update_alloc_zip` 预留 redo 修改空间，失败返回 `DB_ZIP_OVERFLOW`。
@@ -2396,6 +2908,18 @@ dberr_t Btree_load::insert(dtuple_t *tuple, size_t level) noexcept {
 **redo 与持久化**：页数据零 redo，但**页面分配**走单独的 `alloc_mtr`（正常日志模式）——"页被投入使用"这件事由分配日志保证（`MLOG_INIT_FILE_PAGE2` 的语义），页内容靠**刷盘**持久化：每切一个叶子页 `log_free_check`（NO_REDO 页必须落盘才能推进 LSN 水位），`Flush_observer` 跟踪全部 NO_REDO 脏页，DDL 收尾 `Context::cleanup → observer->flush()` 全部刷盘后才允许 redo 记录的操作触碰该索引。崩溃恢复的正确性来自：要么页被刷盘（内容完整），要么分配日志不完整（整页作废重来）——这就是"bulk 页不写 redo"能成立的边界。
 
 **收尾**：`finalize_page_loads` 逐层提交每层最后一页；`load_root_page` 把顶层最后一页**整页拷到真正的 root 页**（root 页号在 `ddl::create_index` 时已预分配），`btr_page_free_low` 释放临时页。调用链：`ha_innobase::inplace_alter_table_impl → ddl::Context::build → ddl::Loader::build_all → Builder::btree_build（Merge_cursor 归并排序输入）→ Btree_load::build`；重建聚簇且键序不变时走 `Builder::insert_direct`（内存 `Key_sort_buffer_cursor`，不落临时文件）。R-tree 和 FTS 不走 btr0load（前者扫描期逐条 `RTree_inserter`，后者 `fts_sort_and_build`）。
+
+#### 五个补充机制（与"零分裂"说法的边界）
+
+**① 唯一例外会"分裂"：压缩表压缩失败**（zip 全链路见 [压缩页专节](#压缩页page_zip上的-b-tree-操作)）。`Page_load::commit` 前若 `is_table_compressed && !compress()` 失败 → `Btree_load::page_split`（`btr0load.cc:895`）：事后二分——按累计大小过半找切点（`get_split_rec`，保证左页至少 1 条）→ 新页 `copy_records` 逐条拷贝 → 旧页 `split_trim` 截断重建 slot → 两页各自 `page_commit(insert_father=true)`（产生**两个** node ptr）。它与在线分裂的本质差异：无需维护父层指针一致性（父页就是当前最右页、尾插即可）、无需锁保护并发读（树未发布）、无需 50/50（fill factor 已预留）、记录由拷贝产生而非原地搬移。
+
+**② 重复键检测不在装载阶段，在排序/归并阶段**。`Page_load::insert` 只做 DEBUG 断言"严格递增"（多值索引允许相等），**不比较键**——正确性完全依赖上游：`Merge_cursor`（`std::priority_queue` 多路归并临时文件）的比较器 `Compare` 里 `cmp_rec_rec_simple(...) == 0` 即报重复（`Load_cursor::duplicates_detected` → `build` 转 `DB_DUPLICATE_KEY`）；**排序相等但含 NULL 字段不报重复**（"null columns are logically inequal, although they are equal in the sorting order"，`Compare_key` 注释）；唯一键只比 `m_n_unique` 个字段、随后继续比全部字段保证与 B-tree 内部序一致。
+
+**③ 并行粒度 = "索引 × 阶段"，单棵树串行**。`ddl0par-scan.cc` 的 `Parallel_cursor` 用 `Parallel_reader` 并行扫聚簇索引，**每线程每 Builder 一个排序缓冲/临时文件**（并行扫描只"取样写文件"，不建树）；`Loader::Task_queue` 多线程消费任务，每个 Builder 独立走 `SORT → BTREE_BUILD → FINISH` 状态机——**多棵二级索引的排序/建树可并行，但单棵索引的 `Btree_load::build` 本身单线程**（`Merge_cursor` 已是全局有序流）。有虚拟列/FTS/重建聚簇（需保序）/spatial 时强制单线程。
+
+**④ 发布衔接：先刷盘 → MLOG_INDEX_LOAD → row_log_apply**。`Builder::finalize`（`ddl0builder.cc:1949`）的顺序：`observer->flush()` 把 NO_REDO 脏页全部刷盘 → `write_redo` 写 `MLOG_INDEX_LOAD(space, root, index->id)` → `row_log_apply` 把 build 期间 DML 线程记在 row_log 里的并发变更**以普通插入（记 redo）**补进新树 → `ONLINE_INDEX_COMPLETE` → `index->set_committed(true)` 发布。恢复侧 `MLOG_INDEX_LOAD` 不携带页数据（树已 flush 落盘），只进热备 list；崩溃兜底靠 DDL log 的 `FREE_TREE_LOG` → `btr_free_if_exists` 释放半成品树。
+
+**⑤ change buffer 收尾**：新索引未发布期间用户 INSERT 不会对它缓冲（ibuf 只对已发布索引生效）；`Page_load::commit` 对二级索引叶页调 `ibuf_set_bitmap_for_bulk_load`——fill factor 100 时把 bitmap free 位置 0（"无空闲"），否则写实际 free 值并清 BUFFERED 位，保证发布后 change buffer 合并不误判。
 
 ### 树的创建、分配、释放与截断（完整生命周期）
 
@@ -2525,6 +3049,70 @@ ulint btr_create(ulint type, space_id_t space, space_index_t index_id,
 - **失败回滚**：leaf 段创建失败要 `btr_free_root` 回收 top 段 + `btr_free_root_invalidate` 把 root 页 `PAGE_INDEX_ID` 置 0，避免残留一个"半成品根页"。
 - **`ut_ad(page_get_max_insert_size(page, 2) > 2 * BTR_PAGE_MAX_REC_SIZE)`**：这是全模块最重要的正确性断言之一——根页必须装得下 2 条 `BTR_PAGE_MAX_REC_SIZE`（`UNIV_PAGE_SIZE/2 - 200`）记录，因为分裂到根时，根抬高后新根只剩 1 条 node pointer、两个子页各需容纳 1 条最大记录，装不下则分裂算法不成立。
 
+#### `btr_create` 的 `type` 参数：哪些 flag 真的影响建页
+
+`type` 是 `DICT_*` 位的或（`dict0mem.h`：`DICT_CLUSTERED=1`、`DICT_UNIQUE=2`、`DICT_IBUF=8`、`DICT_SDI=256`），但**函数体内只判断其中两位**：
+
+```cpp
+if (type & DICT_IBUF) { ... }                                   // ① 建段方式不同（段头不在 root 页）
+if (!(type & DICT_CLUSTERED) && !index->table->is_temporary())  // ② 二级索引才重置 ibuf free bits
+  ibuf_reset_free_bits(block);
+```
+
+| flag | 值 | `btr_create` 内是否消费 | 说明 |
+|---|---|---|---|
+| `DICT_IBUF` | 8 | ✅ 2 处 | ibuf 树：段头在 `IBUF_HEADER_PAGE_NO`，root 页另外分配 + 初始化 free list |
+| `DICT_CLUSTERED` | 1 | ✅ 1 处 | 非聚簇（即二级索引）才 `ibuf_reset_free_bits` |
+| `DICT_UNIQUE` | 2 | ❌ 不消费 | 存进 `index->type`，供其他模块判断唯一性 |
+| `DICT_SDI` | 256 | ❌ 不消费 | 存进 `index->type`，唯一消费者是 `dict_index_is_sdi()`：`return (index->type & DICT_SDI);` |
+
+★ 因此读 `btr_create(DICT_CLUSTERED | DICT_UNIQUE | DICT_SDI, ...)` 这类调用时要清楚：**三个 flag 里只有 `DICT_CLUSTERED` 真的影响建页动作**，另两个是"顺带写入 `index->type` 的类型标记"，不参与 `btr_create` 的任何分支。建页行为本身只由 ibuf / clustered 两位决定。
+
+#### IMPORT TABLESPACE 的 root 调整族：`btr_root_adjust_on_import`
+
+导入 .ibd 后，root 页两个段头（`PAGE_BTR_SEG_LEAF`/`PAGE_BTR_SEG_TOP`）里的旧 space id 失效（.ibd 注册到新 space id），而 fseg header 三字段是 `FSEG_HDR_SPACE`(space id) / `FSEG_HDR_PAGE_NO`(inode 页号) / `FSEG_HDR_OFFSET`(inode 页内偏移)——**页号布局不变，只需重写 space id**。三个函数分工（`btr0btr.cc`）：
+
+| 函数 | 行 | 职责 |
+|---|---|---|
+| `btr_root_fseg_validate` | 138 | **debug 断言**：段头 space id 与当前表空间一致、inode 槽偏移落在页数据区（被 `btr_root_block_get` 对 LEAF/TOP 两段头调用） |
+| `btr_root_fseg_adjust_on_import` | 224 | **单段头改写**：偏移非法返回 false（段头损坏）；合法则只改写 `FSEG_HDR_SPACE`（压缩页走 `page_zip_write_header`，否则 `mlog_write_ulint`） |
+| `btr_root_adjust_on_import` | 248 | **root 页级编排**：`MTR_LOG_NO_REDO` 下 X-latch root → 校验 `page_is_root` → 聚簇索引额外校验 compact 格式一致 + 表空间 flags 一致（`fsp_flags_are_equal`，先剔除 SDI/加密位——它们不是表属性）→ 依次调整 LEAF/TOP 两段头 → 返回错误码 |
+
+调用时序（`row0import.cc:4670-4754`，import 收尾的一致性修正阶段，在 cfg 解析与页转换**之后**）：`ibuf_check_bitmap_on_import` → `btr_root_adjust_on_import`(聚簇) → `IndexPurge` 清聚簇 delete-marked 记录 → `row_import_adjust_root_pages_of_secondary_indexes`（逐个二级索引，失败则 `dict_set_corrupted` 继续，顺带 purge 二级失败记录）→ 最后 SDI 索引。未确认：`MTR_LOG_NO_REDO` 下 root 改动如何保证崩溃可见（推断依赖 import 整体失败即丢弃 .ibd 的语义）。
+
+#### SDI 索引的创建：`btr_sdi_create_index` → `btr_sdi_create`
+
+每张 InnoDB 表在自己表空间里都有一棵 **SDI 索引**（8.0 起，Serialized Dictionary Information 的物理载体，替代 5.7 的 `.frm`；见 [`../feat/sdi.md`](../feat/sdi.md)）。它就是在 `btr_create` 之上包了一层：
+
+```cpp
+dberr_t btr_sdi_create_index(space_id_t space_id, bool dict_locked) {
+  fil_space_t *space = fil_space_acquire(space_id);
+  ...
+  sdi_table = dict_sdi_get_table(space_id, dict_locked, true);  // ① 取/建 SDI "伪表"（内存对象）
+  ut_ad(sdi_table != nullptr);
+
+  mtr_t mtr; mtr.start();
+  const page_size_t page_size = page_size_t(space->flags);
+
+  /* Create B-Tree root page for SDI Indexes */
+  sdi_root_page_num = btr_sdi_create(space_id, &mtr, sdi_table); // ② 建根页
+  ...
+}
+
+static page_no_t btr_sdi_create(space_id_t space_id, mtr_t *mtr, dict_table_t *table) {
+  dict_index_t *index = table->first_index();
+  ut_ad(UT_LIST_GET_LEN(table->indexes) == 1);                  // ★ SDI 表只有一个索引
+
+  index->page = btr_create(DICT_CLUSTERED | DICT_UNIQUE | DICT_SDI, space_id,
+                           index->id, index, mtr);
+  return (index->page);
+}
+```
+
+- **SDI 索引建在表自己的表空间里**（`space_id` 就是该表的 space），不是系统表空间——所以每张表各有自己的 SDI 根页。
+- 传 `DICT_CLUSTERED` 的效果是让它跳过 ibuf bitmap 重置（按聚簇路径走）；`DICT_UNIQUE` 标唯一；`DICT_SDI` 只是"我是 SDI 索引"的标记，后续由 `dict_index_is_sdi()` 消费。
+- 调用点覆盖"任何需要新建/重建表空间的场合"：`dict0crea.cc`（建表）、`ha_innodb.cc`（建表空间）、`row0import.cc`（`IMPORT TABLESPACE`）、`srv0start.cc`（启动时为系统表空间建）、`api0api.cc`（InnoDB API）。
+
 #### 页释放：`btr_page_free_low` / `btr_page_free`
 
 ```cpp
@@ -2596,20 +3184,54 @@ static void btr_free_root(buf_block_t *block, mtr_t *mtr) {
   while (!fseg_free_step(header, true, mtr)) { /* Free the entire segment in small steps */ }
 }
 
-// 根页作废：PAGE_INDEX_ID 置 0（BTR_FREED_INDEX_ID）
+// 根页作废：PAGE_INDEX_ID 置 BTR_FREED_INDEX_ID（= 0，btr0btr.cc:789）
 static void btr_free_root_invalidate(buf_block_t *block, mtr_t *mtr) {
+  ut_ad(page_is_root(block->frame));            // ★ 断言：操作对象必须是 root 页
   btr_page_set_index_id(buf_block_get_frame(block), buf_block_get_page_zip(block),
                         BTR_FREED_INDEX_ID, mtr);
 }
 
 // 取 root 前的防误删校验
 static buf_block_t *btr_free_root_check(page_id, page_size, index_id, mtr) {
+  ut_ad(!fsp_is_system_temporary(page_id.space()));
+  ut_ad(index_id != BTR_FREED_INDEX_ID);        // ★ 期待的 index_id 不能是"已作废"值
+
   block = buf_page_get(page_id, page_size, RW_X_LATCH, ..., mtr);
-  if (fil_page_index_page_check(block->frame) && index_id == btr_page_get_index_id(block->frame))
+  buf_block_dbg_add_level(block, SYNC_TREE_NODE);
+  // buf_page_get = buf_page_get_gen 的包装宏（指定 latch 与 Page_fetch 模式），
+  // 页面读取的完整剖析见 ../innodb/buffer_pool.md 的「页面读取：buf_page_get_gen」
+
+  if (fil_page_index_page_check(block->frame) && index_id == btr_page_get_index_id(block->frame)) {
+    /* This should be a root page.
+    It should not be possible to reassign the same
+    index_id for some other index in the tablespace. */
+    ut_ad(page_is_root(block->frame));
     return block;      // 是索引页且 index_id 匹配 → 真是这个索引的根
+  }
   return nullptr;      // 页已被复用/重建 → 拒绝释放
 }
 ```
+
+**`btr_page_set_index_id` 本身有两条路径**（`btr0btr.ic:69`），这是 invalidate 能生效的前提：
+
+```cpp
+static inline void btr_page_set_index_id(page_t *page, page_zip_des_t *page_zip,
+                                         space_index_t id, mtr_t *mtr) {
+  if (page_zip) {
+    mach_write_to_8(page + (PAGE_HEADER + PAGE_INDEX_ID), id);
+    page_zip_write_header(page_zip, page + (PAGE_HEADER + PAGE_INDEX_ID), 8, mtr);  // ★ 压缩页
+  } else {
+    mlog_write_ull(page + (PAGE_HEADER + PAGE_INDEX_ID), id, mtr);                  // ★ 普通页走 redo
+  }
+}
+```
+
+- 普通页用 `mlog_write_ull`——**走 redo**，所以"作废"这个动作是持久且可恢复的；崩溃恢复时不会残留一个"看起来仍是某索引根页"的页。
+- ★ 压缩页要**多写一次 `page_zip_write_header`**——因为压缩页的头部同时存在于解压页与 zip 压缩镜像里，两处必须同步；漏掉就会出现"解压后看到的 index_id 与压缩镜像不一致"。
+
+★ **`invalidate` 的意义**：把 `PAGE_INDEX_ID` 写成 0 之后，这个页就不再可能通过 `btr_free_root_check` 的 `index_id == btr_page_get_index_id()` 比对——**它在释放链路上"自我注销"了**。这是崩溃安全的收尾：即使后面还有其他 DDL log 重放同一 `page_id`（例如崩溃恢复重放），也会因为 index_id 不匹配而 `return nullptr` 跳过，**不会二次释放**。同理 `btr_free_root_check` 里 `ut_ad(index_id != BTR_FREED_INDEX_ID)` 保证调用方不会拿着"已作废"的 id 来查。
+
+（配套地，`btr_create` 开头也有 `ut_ad(index_id != BTR_FREED_INDEX_ID)`——建树用的 id 绝不可能是 0。）
 
 逐行解释：
 
@@ -2708,7 +3330,102 @@ ulint btr_get_size(dict_index_t *index, ulint flag, mtr_t *mtr) {
 
 #### 校验族与 redo 解析端
 
-- **校验族**（诊断/`CHECK TABLE`）：`btr_validate_index` → `btr_validate_level`（逐层校验 node pointer 指向正确子页、兄弟链双向一致、记录有序）→ `btr_index_page_validate`/`btr_index_rec_validate`；`btr_check_node_ptr` 单点校验父 node pointer。`btr_sdi_create`/`btr_sdi_create_index` 建 SDI 索引（8.0 新特性，见 [`ddl.md`](../innodb/ddl.md)）。
+- **校验族**（诊断/`CHECK TABLE`）：`btr_validate_index` → `btr_validate_level`（逐层校验 node pointer 指向正确子页、兄弟链双向一致、记录有序）→ `btr_index_page_validate`/`btr_index_rec_validate`；`btr_check_node_ptr` 单点校验父 node pointer。`btr_sdi_create`/`btr_sdi_create_index` 建 SDI 索引（8.0 新特性，见 [`ddl.md`](../feat/ddl/ddl.md)）。
+- **打印族**（`btr_print_size` / `btr_print_recursive` / `btr_print_index`，`btr0btr.cc:3646/3681/3733`）——见下方深挖小节。
+
+#### 树校验 `btr_validate_index` / `btr_validate_level`：算法详写已迁至 check_table.md
+
+树校验算法（`btr_validate_index`/`btr_validate_level` 逐项校验表、锁协议、CHECK TABLE 调用链与四个细节、五个调用点）是 **CHECK TABLE 诊断主题**，详写在 [`../feat/check_table.md`](../feat/check_table.md)「B-tree 结构校验算法」节。btr 视角只保留两条与树结构直接相关的要点：① `btr_validate_level` 沿最左 node pointer 下钻（spatial 因页链序≠键序需沿 `FIL_PAGE_PREV` 回溯到最左页）；② 页级锁一律 `RW_SX_LATCH`（阻止结构修改但允许普通读），release 下错误是运行时行为（warning + `ret=false`），debug 下 `ut_a` 直接 abort。
+
+#### 打印族深挖：`btr_print_size` / `btr_print_recursive` / `btr_print_index`
+
+**先立两个前提**（决定这个函数族的真实性质）：① 三个函数整体包在 `#ifdef UNIV_BTR_PRINT ... #endif` 内（`btr0btr.cc:3731` 的 `#endif /* UNIV_BTR_PRINT */`）——**默认构建不定义该宏，函数不存在于二进制**（grep 全库只有 `#ifdef` 使用处、无 `#define`）；② `btr_print_index`/`btr_print_size` **全库零运行时调用点**（只有 `btr0btr.h:542/544` 的头文件声明）——纯开发者调试工具，供 gdb 手动调用。输出全走 `stderr`/`ib::info`，非 SQL 可见。
+
+**`btr_print_size`**（:3646，打两个段的存储概览）：
+
+```cpp
+void btr_print_size(dict_index_t *index) {
+  if (dict_index_is_ibuf(index)) {
+    fputs("Sorry, cannot print info of an ibuf tree: use ibuf functions\n", stderr);
+    return;                                 // ① ibuf 树拒绝：段结构在 ibuf 体系里，走 ibuf 自己的打印
+  }
+  mtr_start(&mtr);
+  root = btr_root_get(index, &mtr);         // ② 只拿 root 页（S latch 即可，只读段头）
+  seg = root + PAGE_HEADER + PAGE_BTR_SEG_TOP;
+  fputs("INFO OF THE NON-LEAF PAGE SEGMENT\n", stderr);
+  fseg_print(seg, &mtr);                    // ③ 非叶段：fseg 的 inode/保留页统计
+  if (!dict_index_is_ibuf(index)) {         // ★ 死代码：① 已拒绝过 ibuf，此判断恒真（历史遗留）
+    seg = root + PAGE_HEADER + PAGE_BTR_SEG_LEAF;
+    fputs("INFO OF THE LEAF PAGE SEGMENT\n", stderr);
+    fseg_print(seg, &mtr);
+  }
+  mtr_commit(&mtr);
+}
+```
+
+**`btr_print_recursive`**（:3681，static，递归打印树页）：
+
+```cpp
+static void btr_print_recursive(dict_index_t *index, buf_block_t *block,
+                                ulint width, mem_heap_t **heap,
+                                ulint **offsets, mtr_t *mtr) {
+  const page_t *page = buf_block_get_frame(block);
+  page_cur_t cursor;
+  mtr_t mtr2;                               // ★ 每个子树一个独立 mtr
+
+  ut_ad(mtr_is_block_fix(mtr, block, MTR_MEMO_PAGE_SX_FIX, index->table));
+  ib::info(ER_IB_MSG_34) << "NODE ON LEVEL " << btr_page_get_level(page)
+                         << " page " << block->page.id;
+  page_print(block, index, width, width);   // ① 页内首尾各 width 条记录（page0page.cc:1660，同为 UNIV_BTR_PRINT）
+  n_recs = page_get_n_recs(page);
+  page_cur_set_before_first(block, &cursor);
+  page_cur_move_to_next(&cursor);
+  while (!page_cur_is_after_last(&cursor)) {
+    if (page_is_leaf(page)) {
+      /* leaf level: do nothing */         // ② 叶层不下钻
+    } else if ((i <= width) || (i >= n_recs - width)) {
+      mtr_start(&mtr2);                    // ★ 每棵子树独立 mtr：
+      node_ptr = page_cur_get_rec(&cursor);//   递归子调用会 commit mtr2，
+      *offsets = rec_get_offsets(...);     //   父页的 latch 随父 mtr 存活期间
+      btr_print_recursive(index,           //   子页用自己的 mtr——不累积深层 latch
+          btr_node_ptr_get_child(node_ptr, index, *offsets, &mtr2),
+          width, heap, offsets, &mtr2);
+      mtr_commit(&mtr2);
+    }                                     // ③ 只下钻"前 width + 后 width"条 node ptr，
+    page_cur_move_to_next(&cursor);        //   中间子树跳过——宽度剪枝，防止全树打印失控
+    i++;
+  }
+}
+```
+
+两个值得注意的设计：**宽度剪枝**（`(i <= width) || (i >= n_recs - width)`——只打印最左/最右各 `width` 棵子树，默认避免整棵树刷屏，也天然覆盖了"顺序扫描边界"最常看的区域）；**mtr2 独立 mini-transaction**（递归下钻每棵子树开新 mtr，`btr_node_ptr_get_child` 拿到的子页块在子 mtr 里 X-latch，父页 latch 不跨层累积——与搜索路径的 latch coupling 相反，这里是"打印完一层放一层"）。
+
+**`btr_print_index`**（:3733，编排入口）：
+
+```cpp
+void btr_print_index(dict_index_t *index, ulint width) {
+  fputs("--------------------------\nINDEX TREE PRINT\n", stderr);
+  mtr_start(&mtr);
+  root = btr_root_block_get(index, RW_SX_LATCH, &mtr);   // SX：打印期间阻止 SMO，允许读
+  btr_print_recursive(index, root, width, &heap, &offsets, &mtr);
+  if (heap) mem_heap_free(heap);
+  mtr_commit(&mtr);
+  ut_ad(btr_validate_index(index, 0, false));   // ★ 打印后跑完整树校验（debug 断言）
+}
+```
+
+`RW_SX_LATCH` 选择的原因：打印要稳定树结构（SX 阻止分裂/合并/降高），又不必独占写（SX 与 S 兼容，并发读不受影响）——与校验族 `btr_validate_index` 的 `lockout=false` 路径同款。末尾 `btr_validate_index` 让"打印"自带一致性验证：开发者 gdb 调完打印，立即得到"这棵树是否完好"的断言结论。`page_print`（`page0page.cc:1660`）则是页内视图：首尾各 `pr_n` 条记录的完整字段 + 页头字段（`PAGE_LEVEL/N_RECS/MAX_TRX_ID` 等）。
+
+**与校验族的对比**：校验族是**规则驱动的对错判断**（每项校验返回 bool），打印族是**人类可读的结构视图**（树形/页形输出 + 附赠一次校验）——一个回答"树坏没坏"，一个回答"树长什么样"。
+
+#### 页摘除的两个边界
+
+- **`btr_discard_page`**（删掉页上最后一条记录后整页摘除，删除节已述）：选**左兄弟优先**为锁继承页 → drop AHI → 最左内节点给右兄弟首记录补 `MIN_REC` 标记 → 删父 node pointer → 摘页链 → `lock_update_discard` 迁移锁 → `btr_page_free` 归还段。
+- **`btr_discard_only_page_on_level`**（该层只剩一页——正常被 `btr_compress` 先处理，理论不该到达）：循环"drop AHI → 找父页 → 锁迁移 → 释放页"**向上逐层丢弃**直到根；根页 `btr_page_empty` 清空为叶页（保留 `PAGE_MAX_TRX_ID`，二级索引 `ibuf_reset_free_bits`）。
+
+#### 页数与行数估算的树侧入口
+
+`btr_get_size`（`btr0btr.cc:466`）**不遍历页、不数记录**——直接读 root 页上两个 FSEG header 的 `fseg_n_reserved_pages`（段 inode 的保留页计数，含 free 状态段内页），O(1)，供 `stat_index_size`/`stat_n_leaf_pages`。transient 统计的采样定位走 `btr_cur_open_at_rnd_pos`（`btr0cur.cc:2426`）：从 root 起每层 `page_cur_open_on_rnd_user_rec`（`page_cur_lcg_prng() % n_recs` 均匀随机选一条记录，不按 key 二分）沿随机 node_ptr 下钻——每层独立均匀 ⇒ 叶子样本均匀。
 - **redo 解析端**（崩溃恢复重放，与写端一一对应）：`btr_parse_page_reorganize`（MLOG_PAGE_REORGANIZE）、`btr_parse_set_min_rec_mark`（MLOG_REC_MIN_MARK）、`btr_cur_parse_update_in_place`（MLOG_REC_UPDATE_IN_PLACE）、`btr_cur_parse_del_mark_set_clust_rec`/`btr_cur_parse_del_mark_set_sec_rec`（delete-mark）。列表级搬移日志的解析在 page 层 `page_parse_delete_rec_list`。
 
 ---
@@ -2800,7 +3517,7 @@ ulint btr_get_size(dict_index_t *index, ulint flag, mtr_t *mtr) {
 - mtr 与 redo 日志（`MLOG_LIST_*` 重放、`mtr_set_log_mode`）见 [`redo_log.md`](../innodb/redo_log.md)
 - undo 与 purge（物理删除入口、delete-mark）见 [`undo_log.md`](../innodb/undo_log.md)
 - LOB 外存字段（`lob::BtrContext`、extern 引用前缀）见 [`physical/lob.md`](../innodb/physical/lob.md)
-- online DDL 与并行构建（`ddl::Loader`/`Builder` 驱动 `Btree_load` 的上下文）见 [`ddl.md`](../innodb/ddl.md)
+- online DDL 与并行构建（`ddl::Loader`/`Builder` 驱动 `Btree_load` 的上下文）见 [`ddl.md`](../feat/ddl/ddl.md)
 - 可见性判断（`up_match/low_match` 供重复键检测、PAGE_MAX_TRX_ID）见 [`mvcc.md`](../innodb/mvcc.md)
 
 

@@ -8,11 +8,7 @@
 
 **想查某个具体机制** → 用下面的目录索引
 
-**★ 要新增或修改一篇文档** → **动笔前必读**（它们是本库的准入规范，不读会返工）：
-① 本文[「如何新增文档」](#如何新增文档)——放哪、拆不拆、归位 vs 并存、编号、收尾清单
-② 本文[「准入标准」](#准入标准)——三条硬门槛、难点怎么讲、六类事实错误、不该进什么
-③ [`_template.md`](_template.md)——单篇骨架 + 13 条动笔自检
-④ **先整体看一遍知识库现状**——本文「目录索引」扫全库有哪些篇 + 与候选主题相关的篇读它们的「边界」行（见「第一步」前置），**避免重复造轮子**
+**★ 要新增或修改一篇文档** → 动笔前必读：① 本文「如何新增文档」（放哪、拆不拆、编号）② 本文「准入标准」③ [`_template.md`](_template.md)（单篇骨架 + 动笔自检）④ 先扫目录索引 + 读相关篇「边界」行，避免重复。
 
 ---
 
@@ -44,6 +40,8 @@
 ## 目录索引
 
 > **顶层分类轴**：`server/`、`innodb/`、`feat/` 是**源码知识**（按代码位置 / 跨层特性）；`infra/`、`index/` 是**横切主题**（基础设施 = 数据结构+锁；索引 = 横跨 SQL 语法/优化器/引擎存储）；`cloud/`、`papers/` 是**外部知识**（部署环境 / 论文剖析），以源码库之外的材料为事实来源。
+>
+> 条目风格：**文件名 + 一句话定位**。机制细节在正文里，不进索引（见「收尾检查清单」第 1 条）。
 
 ### server/ —— Server 层
 
@@ -51,17 +49,19 @@
 
 | 文件 / 目录 | 内容 |
 |---|---|
-| [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、三个表缓存分工、表的通用操作（open/lock/CREATE/ALTER/TRUNCATE/DROP/FLUSH） |
-| [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层、prebuilt、行定位 |
-| [lifecycle/](server/lifecycle/) | **服务器生命周期（3 篇）**：[01_initialize](server/lifecycle/01_initialize.md)（`--initialize` 数据目录初始化：bootstrap 自举、DD 硬编码建表、InnoDB 建库、root 口令与证书）、[02_startup](server/lifecycle/02_startup.md)（启动主链路：两阶段选项解析、★ 两阶段插件注册、DD 加载与升级判定、崩溃恢复的位置、网络监听与 ready 宣告）、[03_shutdown](server/lifecycle/03_shutdown.md)（三入口关闭、两阶段 kill、★ InnoDB 九态关闭状态机与 `pre_dd_shutdown` 屏障、`innodb_fast_shutdown` 三档、退出码） |
-| [auth/](server/auth/) | 认证与授权：security_context（认证上下文）、mfa（多因素认证）、definer（definer 与 SQL SECURITY） |
-| [replication/](server/replication/) | 复制：binlog（物理结构/组提交/2PC 与崩溃裁决/GTID 持久化/读侧 dump）、binlog_event（事件三层类体系/序列化/checksum/各事件字节布局）、binlog_sbr（语句级复制/unsafe 判定/MIXED 降级）、binlog_encryption（两级密钥/keyring 轮换/reencrypt）、mysqlbinlog（工具架构/打印/DECODE-ROWS/过滤/收尾）、semisync（半同步插件/active_tranxs 等待/ACK receiver/降级恢复）、gtid、replication（复制拓扑与故障转移：协议/双定位/拓扑/过滤/延迟复制/GTID_ONLY/failover）、prpl（并行复制）、preserve_commit_order（从库提交保序：FIFO 队列/MDL 复用/缺陷档案）、replica（从库侧 IO/SQL 线程与 relay log 读写、三组位点体系、relay log recovery、线程生命周期）
-| [xa.md](server/xa.md) | **外部 XA 事务（分布式事务）**：X/Open DTP 与 RM 定位、状态机与 `xa_detach_on_prepare`、`XA_prepare_log_event` 与"文本词法提取 XID"、★ 恢复态六态 `enum_ha_recover_xa_state`、GTID 在 PREPARE 即分配
-| [datatype/](server/datatype/) | 数据类型：json（二进制/部分更新/索引）、gis（空间/R-tree） |
-| [dd/](server/dd/) | 数据字典（两套并存）：dd.md（8.0 权威 DD）、innodb_dict.md（引擎侧 `dict_sys`）、statistics（统计） |
-| [infra/](server/infra/) | 通用机制：dbug（DBUG 宏族）、pfs + pfs_statement（Performance Schema 埋点与语句级）、memory（内存分配与 PSI 记账）、vio（虚拟 I/O 与网络）、variables（系统变量体系）、encoding、charset（字符集与 collation，★ UCA 900 权重算法 + InnoDB 比较回调）、io_cache（`IO_CACHE` 与 server 层 I/O 继承体系）、mtr（mysql-test 框架）、build（编译构建体系）、reading_guide（★ 源码阅读知识地图） |
-| [plugin/](server/plugin/) | 可扩展框架：plugin（插件体系）、component（组件）、service（服务）、abi（C++ ABI 横切专题） |
-| [logging/](server/logging/) | 服务器日志：error_log、general_log、slow_log |
+| [table.md](server/table.md) | 表：DD → `TABLE_SHARE` → `TABLE` → `Table_ref` 四层表示、表缓存与通用操作 |
+| [handler.md](server/handler.md) | server ↔ 存储引擎分界面：handler/handlerton 分层 |
+| [lifecycle/](server/lifecycle/) | 服务器生命周期 3 篇：initialize / startup / shutdown |
+| [auth/](server/auth/) | 认证与授权：authentication / authorization / account_management（导航见 [`auth/README.md`](server/auth/README.md)） |
+| [replication/](server/replication/) | 复制：binlog 格式与组提交、GTID、MTS 并行复制、从库线程与 relay log、半同步 |
+| [xa.md](server/xa.md) | 外部 XA 事务：X/Open DTP、状态机、恢复态与 GTID 分配 |
+| [stored_program.md](server/stored_program.md) | 存储程序（占位篇）：存储过程/函数/触发器/事件 |
+| [view.md](server/view.md) | 视图（占位篇）：dd::View、可更新判定、WITH CHECK OPTION |
+| [datatype/](server/datatype/) | 数据类型：json、gis |
+| [dd/](server/dd/) | 数据字典（两套并存）：8.0 权威 DD 与引擎侧 `dict_sys` |
+| [infra/](server/infra/) | 通用机制：dbug、pfs、vio、variables、encoding、charset、io_cache、mtr、build、reading_guide |
+| [plugin/](server/plugin/) | 插件/组件/服务框架（入口 [`architecture.md`](server/plugin/architecture.md)）+ 具体插件：clone、mysqlx、keyring、validate_password |
+| ~~[logging/](server/logging/)~~ | ⚠️ 已整体迁入 [`infra/observability/logging/`](infra/observability/logging/)（general_log / error_log / slow_log 均为观测手段） |
 
 ### [innodb/](innodb/) —— 存储引擎
 
@@ -69,124 +69,152 @@
 
 | 文件 | 内容 |
 |------|------|
-| [buffer_pool.md](innodb/buffer_pool.md) | **Buffer Pool**：页状态机与 fix 体系、★ 完整缺页读路径（同步 `pread`、`buf_wait_for_read` 等 S 锁技巧）、★ 完整脏页刷盘（三路径/批次 single-flight/邻接刷/自适应刷脏）、LRU 中点替换、预读、压缩页三态 |
-| [dblwr.md](innodb/dblwr.md) | **doublewrite**：为什么必须有（torn page 与 redo 的能力边界）、文件布局（批量区 + SYNC 槽位、奇偶文件功能切分）、批量/单页写流程、崩溃恢复时序与 torn page 判定 |
-| [mvcc.md](innodb/mvcc.md) | **MVCC**：ReadView 结构与三层漏斗判定、二级索引 `PAGE_MAX_TRX_ID` 页级粗筛、undo 版本链回溯、半一致性读、purge 与最老 ReadView 的水位闭环 |
-| [row_search.md](innodb/row_search.md) | `row_search_mvcc`：取行主链与游标推进（承接 handler.md） |
-| [physical/tablespace.md](innodb/physical/tablespace.md) | 表空间物理结构与空间管理：FSP/XDES/inode 逐字节布局、fseg 分配与释放、`FSP_FLAGS`、碎片度量 |
-| [physical/page_structure.md](innodb/physical/page_structure.md) | 页物理结构与全页类型清单：页头/infimum/supremum/heap/目录槽、12 类常见页逐字节 layout |
-| [physical/record.md](innodb/physical/record.md) | 行记录格式：record header、变长编码、NULL 位图、offsets 数组协议、instant 行版本状态机 |
-| [physical/lob.md](innodb/physical/lob.md) | 大对象存储（JSON 部分更新的物理基础） |
-| [redo_log.md](innodb/redo_log.md) | **redo**：三层格式、LSN、mtr 与 log mode、★ redo 的 I/O 路径（五个后台线程、环形写、redo 与数据文件 I/O 方式差异表）、组提交、checkpoint、文件管理与 resize |
-| [recovery.md](innodb/recovery.md) | **崩溃恢复**：两阶段模型（redo 前滚/undo 回滚）、扫描与解析状态机、hash 聚合与按页应用 |
-| [undo_log.md](innodb/undo_log.md) | undo 表空间、purge |
+| [buffer_pool.md](innodb/buffer_pool.md) | Buffer Pool：页状态机、读路径、脏页刷盘、LRU 替换、预读 |
+| [dblwr.md](innodb/dblwr.md) | doublewrite：文件布局、写流程、崩溃恢复与 torn page |
+| [mvcc.md](innodb/mvcc.md) | MVCC：ReadView、undo 版本链、半一致性读、purge 闭环 |
+| [row_search.md](innodb/row_search.md) | 取行主链 `row_search_mvcc` 与游标推进（承接 handler.md） |
+| [row_ops.md](innodb/row_ops.md) | **行操作层状态机**：que 驱动协议、INSERT/UPDATE 状态序列、乐观→悲观 mode 升级、锁等待断点续传、undo 先于改页与回滚逆状态机 |
+| [physical/tablespace.md](innodb/physical/tablespace.md) | 表空间物理结构与空间管理 |
+| [physical/page_structure.md](innodb/physical/page_structure.md) | 页物理结构与全页类型清单 |
+| [physical/record.md](innodb/physical/record.md) | 行记录格式与 offsets 协议 |
+| [physical/lob.md](innodb/physical/lob.md) | 大对象存储 |
+| [redo_log.md](innodb/redo_log.md) | redo：格式、LSN、mtr、I/O 路径、组提交、checkpoint |
+| [recovery.md](innodb/recovery.md) | 崩溃恢复：redo 前滚 / undo 回滚两阶段 |
+| [undo_log.md](innodb/undo_log.md) | undo 表空间与 purge |
 | [query_graph.md](innodb/query_graph.md) | InnoDB 内部执行模型（fork/thr/node） |
-| [ddl.md](innodb/ddl.md) | online DDL |
-| [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`）：B+ 树按子树切分算法；★ 社区版为什么没有 SQL 层并行查询 |
-| [fil.md](innodb/fil.md) | 表空间与文件层（fil）：`Fil_shard`×68 分片、`fil_io` 主链路、★ AIO 模式三选一判定链（含"缺页读为何是同步 `pread`"） |
-| [io.md](innodb/io.md) | **MySQL I/O 全景（从 SQL 到系统调用）**：七层分层、AIO 子系统（三套实现、无 io_uring）、server 层 I/O 全景、★ 云盘上的 MySQL I/O 与隐含假设；详写内容多已归位各专篇（读路径/刷脏/dblwr/redo I/O），本篇保留总览与归位表 |
-| [monitor.md](innodb/monitor.md) | **可观测基础设施**（全局，非锁专属）：InnoDB Monitor 输出体系与三个 monitor 类后台线程、临时文件中转机制、monitor counter / `INNODB_METRICS`（位图开关 + 无锁累加 + `MONITOR_EXISTING` 复用）；与 server 层 status var / PFS 的分工 |
+| [parallel_scan.md](innodb/parallel_scan.md) | InnoDB 内部并行扫描（`Parallel_reader`） |
+| [fil.md](innodb/fil.md) | 表空间与文件层（fil） |
+| [io.md](innodb/io.md) | MySQL I/O 全景（从 SQL 到系统调用，详写已归位各专篇） |
 | [trx.md](innodb/trx.md) | InnoDB 事务（`trx_t`） |
 
-### [feat/](feat/) —— 跨层端到端特性
+### [feat/](feat/) —— 跨层主题（server ↔ InnoDB）深度剖析
 
-> 这些主题**同时改动多个层**（语法 → 优化器 → 引擎存储），按"特性"归位，不按层拆开。判据见下面「第一步：决定放哪」与「边界归属」两节；**篇内怎么组织见 [`feat/README.md`](feat/README.md)**。
+> 同时需要 server 与引擎两边源码才能讲清的主题归这里，**一篇写完两层**。判据见「第一步」与「边界归属」；篇内骨架见 [`feat/README.md`](feat/README.md)。
 
 | 文件 | 内容 |
 |---|---|
-| [partitioning.md](feat/partitioning.md) | **分区表**（全链路单篇）：元数据模型、分区裁剪、DML 路由、分区 DDL、能力边界 |
-| [fts.md](feat/fts.md) | **全文检索**（全链路单篇）：语法→优化器→辅助表与编码→打分→崩溃恢复 |
-| [auto_increment.md](feat/auto_increment.md) | **自增列**（全链路单篇）：AUTOINC 锁三模式、handler 区间分配、★ 计数器持久化（8.0 重启不回退） |
-| [generated_columns.md](feat/generated_columns.md) | **生成列**（全链路单篇）：求值链路、虚拟列二级索引、隐藏生成列家族（功能索引/多值索引/GIPK） |
+| [partitioning.md](feat/partitioning.md) | 分区表（全链路单篇） |
+| [fts.md](feat/fts.md) | 全文检索（全链路单篇） |
+| [auto_increment.md](feat/auto_increment.md) | 自增列（全链路单篇） |
+| [generated_columns.md](feat/generated_columns.md) | 生成列（全链路单篇） |
+| [ddl/](feat/ddl/) | **DDL 主题目录（9 篇）**：[ddl.md](feat/ddl/ddl.md) 主篇＝两层公共骨架（三种算法选择策略 + MDL 三段式 + DROP/TRUNCATE/RENAME + 行为速查 + 观测）；[create_table.md](feat/ddl/create_table.md) ＝ CREATE TABLE 全链路（server 编排 + 引擎侧建 .ibd / `btr_create` 建根页 / 统计置空）；[alter_table.md](feat/ddl/alter_table.md) ＝ ALTER TABLE 编排主线（★ 含 `mysql_alter_table` 剩余四段全剖析：外键 MDL 大集合 / 新表定义落地 / `mysql_inplace_alter_table` 18 步全流程 / 收尾与失败清理；三种算法各自分篇）；[atomic_ddl.md](feat/ddl/atomic_ddl.md) ＝ ★★ 原子 DDL（server 编排 + 引擎 DDL log + 崩溃恢复闭环，所有 DDL 共用的横切保障）；[copy_ddl.md](feat/ddl/copy_ddl.md)、[inplace_ddl.md](feat/ddl/inplace_ddl.md)、[instant_ddl.md](feat/ddl/instant_ddl.md) 三种算法各一篇（**每篇均写完两层**）；[ddl_engine.md](feat/ddl/ddl_engine.md) ＝ 8.0 新版 DDL 引擎与并行构建（并行不另立篇）；[online_ddl_tools.md](feat/ddl/online_ddl_tools.md) ＝ gh-ost / pt-osc 在线变更工具（外部知识） |
+| [sdi.md](feat/sdi.md) | **SDI 序列化字典信息**：紧凑 JSON + 伪装内存表；★ server 只写不读，读靠 `IMPORT`/`ibd2sdi` |
+| [compression.md](feat/compression.md) | **压缩全景地图**：9 机制 × 3 算法库总表、算法接入清单、Percona/MariaDB 特性不存在清单、常见误解；深度落各归属文档 |
+| [check_table.md](feat/check_table.md) | **CHECK TABLE 全链路**：ADMIN 语句家族与四档语义、`ha_innobase::check` 三段流程、行级扫描与重复键检测、Msg_type 聚合、REPAIR 边界（InnoDB 无 repair） |
 
-### [infra/](infra/) —— 跨层基础设施（数据结构 + 锁）
+### [infra/](infra/) —— 跨层基础设施（数据结构 + 锁 + 线程 + 内存）
 
-> 横跨 `include/`、`mysys/`、`sql/`、`innodb/` 的基础设施之家，含两大子域。**数据结构**（`structure/`）：按**类型**一篇一主题、**不分层**，跨层同主题在一篇里对比写清（如两个无锁哈希合成 `hash.md`）——它们不是锁，也不属 `lock/`；**锁与同步**（`lock/`）：按主题分**同步原语**（`primitives/`）与**事务锁**（`transactional/`）。导航见 [`infra/README.md`](infra/README.md) 与 [`infra/lock/README.md`](infra/lock/README.md)。
+> 横跨 `include/`、`mysys/`、`sql/`、`innodb/` 的基础设施之家，五大子域：**数据结构**（`structure/`，按类型一篇一主题、跨层同主题一篇对比）、**锁与同步**（`lock/`，同步原语 `primitives/` + 事务锁 `transactional/`）、**线程模型**（`threading/`）、**内存**（`memory/`）、**观测体系**（`observability/`，按「观测手段」组织）。导航见 [`infra/README.md`](infra/README.md)、[`infra/lock/README.md`](infra/lock/README.md) 与 [`infra/observability/README.md`](infra/observability/README.md)。
 
-**数据结构（structure/，按类型一篇一主题，全量盘点）**
+**数据结构（structure/）**
 
 | 文件 | 类别 | 内容 |
 |------|------|------|
-| [list.md](infra/structure/list.md) | 链表 | **链表全盘点（五实现）**：InnoDB `ut_list_base`（侵入式双向 + **成员指针偏移编译期固化**）、server `SQL_I_List`（侵入式单向 + `T **next` 二级指针）、`base_list`/`List`（非侵入式 + `end_of_list` 哨兵）、`I_List`/`ilink`（侵入式双向 + sentinel 伪装 + unlink 自解链）、C `LIST`——寻址协议是第一分野 |
-| [hash.md](infra/structure/hash.md) | 哈希 | **哈希全盘点（三实现一张光谱）**：无锁 `LF_HASH`（split-ordered list + dummy 哨兵 + 零迁移扩容 + hazard pointer 4 pin + purgatory）、无锁 `ut_lock_free_hash_t`（开放寻址 + 链表数组扩容 + 256 分片引用计数）、**有锁** `hash_table_t`（链地址 + 分片 rw_lock + 无锁 peek/锁后 confirm）——含"通用性越强、理论原型越重"结论与 my_hash 已删除澄清 |
-| [queue.md](infra/structure/queue.md) | 队列 | **有界 MPMC 队列（一个算法两种裁剪）**：server `Integrals_lockfree_queue`（仅整型，虚拟索引 + MSB 占用位 + `Null`/`Erased` 哨兵，全套 API）vs InnoDB `mpmc_bq`（任意类型，槽 seq 判空满，最小 MPMC）——需求半径决定 API 半径 |
-| [counter.md](infra/structure/counter.md) | 计数器 | 分片计数器两代：`ib_counter_t`（RDTSC 散槽 + 非原子 `+=`，读 fuzzy）vs `Counter::Shards`（真原子 + Pad，读精确）；cache 乒乓解法与 fuzzy 误差量级分析 |
-| [link_buf.md](infra/structure/link_buf.md) | 链缓冲 | `Link_buf` 无锁环形"链缓冲"：乱序 `add_link` + tail 沿链推进（槽级锁 + 二次确认）；redo `recent_written`/`recent_closed` 两条串行链的解耦 |
-| [data_repr.md](infra/structure/data_repr.md) | 行数据表示（跨层） | "一行数据在各层怎么表示"的完整链路：server `Field`(68 子类)/`TABLE::record[2]` → handler 边界（只传 `uchar*`）→ InnoDB `dtype_t`(prtype 位域打包)/`dfield_t`/`dtuple_t` → `rec_t` 字节流；★ 三种行表示对照、`n_fields_cmp`、`mbminmaxlen` 5 位打包、转换桥梁（`rec_convert_dtuple_to_rec` / `cmp_dtuple_rec_with_match_low`） |
+| [list.md](infra/structure/list.md) | 链表 | 链表五实现全盘点（侵入式 / 非侵入式 / C LIST） |
+| [hash.md](infra/structure/hash.md) | 哈希 | 哈希三实现光谱：无锁 LF_HASH、无锁开放寻址、有锁分片 |
+| [queue.md](infra/structure/queue.md) | 队列 | 有界 MPMC 队列两种裁剪（server vs InnoDB） |
+| [counter.md](infra/structure/counter.md) | 计数器 | 分片计数器两代（`ib_counter_t` vs `Counter::Shards`） |
+| [link_buf.md](infra/structure/link_buf.md) | 链缓冲 | `Link_buf` 无锁环形链缓冲 |
+| [data_repr.md](infra/structure/data_repr.md) | 行数据表示 | 一行数据在 server → handler → InnoDB 各层的表示链路 |
 
 **锁与同步（lock/）**
 
 | 文件 | 锁类别 | 内容 |
 |------|--------|------|
-| [mysys_primitives.md](infra/lock/primitives/mysys_primitives.md) | 同步原语 | server 侧同步原语族：native/my/mysql **三层封装**、PFS 埋点宏链（`m_psi` 无条件内嵌换 ABI 零分支）、SAFE_MUTEX（CMake Debug 注入，**与 PFS 正交可同开**）、**prlock 为 MDL 手搓**（强读者优先 + "unlocked 即可 destroy" 两条硬保证）、instrument 注册全流程 |
-| [innodb_sync.md](infra/lock/primitives/innodb_sync.md) | 同步原语 | InnoDB 自研原语族：`os_event`（manual-reset + signal_count 防丢信号）、sync0arr（event 已嵌入被等对象）、PolicyMutex 模板族（TTAS 自旋 + futex 三态，含 Theorem 1 正确性证明注释）、**`rw_lock_t` lock_word 单字三态编码**（S/SX/X + 递归 + 读者 XOR）、LatchDebug / Stateful_latching_rules / LOCK ORDER 三套锁序校验 |
-| [rcu.md](infra/lock/primitives/rcu.md) | 同步原语 | RCU 锁模式：`MyRcuLock<T>` 逐行剖析（读计数等零 + 写者等读者退出）、SSL acceptor context 场景、受限之处 |
-| [seq_lock.md](infra/lock/primitives/seq_lock.md) | 同步原语 | `Seq_lock` 回调式 seqlock：读者零写（与内核版差异）、引 HPL-2012-68、唯一实例 `mt_fast_modulo_t`（hash 表快速取模） |
-| [global_lock.md](infra/lock/transactional/global_lock.md) | 事务锁 | 全局锁二件套：**FTWRL**（`Global_read_lock` = GLOBAL S + COMMIT S **两段式**，含"为什么必须两段"的三线程死锁反例）、**备份锁**（`BACKUP_LOCK` namespace，**语义 X = MDL S 的命名反转**推导、`Shared_backup_lock_guard` 同会话不免）；`SET GLOBAL read_only` 为何复用 GRL；两把锁阻塞范围对比（**备份锁不挡 DML**） |
-| [mdl.md](infra/lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：**18 namespace 与两套策略**（scoped/object）、**fast path 与 obtrusive/unobtrusive 的延迟精算**（`m_fast_path_state` 单字位布局 + 单向物化）、双兼容矩阵（granted + **4 张 waiting 优先级矩阵**）、`can_grant_lock` 三级短路、`reschedule_waiters` 公平调度、wait-for graph 死锁检测（BFS+DFS、静态权重 victim、**深度 32 即判死锁**）、锁升级 SU→SNW→X 与 online/instant DDL、用户级锁 GET_LOCK |
-| [innodb_trx_lock.md](infra/lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁（`lock_t` 一统表锁/行锁）：**表锁机制**（意向锁、`count_by_mode` 快路径、AUTOINC）、**行锁四形态深入剖析**（源码判定版冲突矩阵、supremum 归一化）、隐含锁物化、等待与唤醒（slot 1:1:1、授予的公平性调度）、wait-for graph 死锁检测（DFS 着色 + victim 权重 + 假阳性双校验）、锁与 MVCC/半一致性读边界；**谓词锁**（R-tree 第四种锁语义：MBR 谓词挂锁尾、三张 hash 表、只有插入意向会等待）、**AUTOINC**（三档模式、语句级释放、持久化与 gap 成因）；含 41 个核心函数完整代码剖析（加锁决策主链 `lock_rec_lock` 三兄弟、冲突判定、授予、入队、挂起） |
-| [thr_lock.md](infra/lock/transactional/thr_lock.md) | 事务锁 | server 层表锁 THR_LOCK：两级结构（`THR_LOCK` + `THR_LOCK_DATA`）、13 种 `thr_lock_type` **优先级编码进枚举值**、**排序代替死锁检测**（`sort_locks` 的 `LOCK_CMP` 全序）、写优先与防饥饿（`max_write_lock_count` 默认关闭）、MyISAM 并发插入 4 处锁升级；**InnoDB `lock_count()==0` 空壳**但 `thr_lock_type` 仍是跨层意图协议 |
+| [mysys_primitives.md](infra/lock/primitives/mysys_primitives.md) | 同步原语 | server 侧原语族：三层封装、PFS 埋点、SAFE_MUTEX、prlock |
+| [innodb_sync.md](infra/lock/primitives/innodb_sync.md) | 同步原语 | InnoDB 自研原语族：os_event、PolicyMutex、`rw_lock_t` 三态、锁序校验 |
+| [rcu.md](infra/lock/primitives/rcu.md) | 同步原语 | RCU：`MyRcuLock<T>` 逐行剖析与 SSL context 场景 |
+| [seq_lock.md](infra/lock/primitives/seq_lock.md) | 同步原语 | `Seq_lock` 回调式 seqlock |
+| [global_lock.md](infra/lock/transactional/global_lock.md) | 事务锁 | 全局锁二件套：FTWRL 与备份锁 |
+| [mdl.md](infra/lock/transactional/mdl.md) | 事务锁 | MDL 元数据锁：锁类型、双兼容矩阵、死锁检测 |
+| [innodb_trx_lock.md](infra/lock/transactional/innodb_trx_lock.md) | 事务锁 | InnoDB 事务锁：表锁/行锁/谓词锁/AUTOINC、死锁检测 |
+| [thr_lock.md](infra/lock/transactional/thr_lock.md) | 事务锁 | server 层表锁 THR_LOCK：排序代替死锁检测 |
 
-### [index/](index/) —— 索引（横切主题）
-
-> 索引横跨 SQL 层（语法/优化器）→ handler 接口 → 存储引擎（B-tree 存储与维护），以"索引"为第一主语的篇进本目录；索引只是一部分的特性篇留在原处（全文检索 feat/fts、空间 R-tree server/datatype/gis、功能/多值索引 feat/generated_columns），由知识地图导航。**地图与阅读路径见 [`index/README.md`](index/README.md)**（六层：概念 → SQL → 优化器 → handler → 存储结构 → 辅助与治理）。
+**线程模型（threading/）**
 
 | 文件 | 内容 |
 |------|------|
-| [btr.md](index/btr.md) | **B-tree 结构与操作（btr 模块全套）**：游标体系与 store/restore 逐行、`btr_cur_search_to_nth_level` 逐行解析、页内二分、中间页与 node pointer、乐观/悲观插入与页分裂、删除与合并、更新三路径、索引锁完整语义（SMO 预测裁剪）、`Btree_load` 批量构建、树生命周期 |
-| [rtree.md](index/rtree.md) | **R-tree 索引结构全套**：MBR 编码与记录布局、两阶段子树选择、二次分裂、MBR 上溯两条路、谓词锁与 SSN；操作 × B-tree/R-tree 对照表 |
-| [inverted.md](index/inverted.md) | **倒排索引存储与编码**：ilist 字节级布局（VLC 终止位 + delta + 0x00 哨兵）、6 档分档、删除旁路表示与 optimize 重编码、cache/辅助表"只追加"边界 |
-| [metadata.md](index/metadata.md) | **索引元数据对象模型**：`dd::Index` ↔ `dict_index_t` ↔ SDI 三层分工、`se_private_data` 五键桥、`n_uniq` 三种情况、原子 DDL 时序 |
-| [physical_storage.md](index/physical_storage.md) | **索引物理存储与持久化**：root page 恒定、每索引两段、MLOG 统一型 redo 体系、bulk load 豁免 + DDL log、空间回收与崩溃恢复 |
-| [transaction.md](index/transaction.md) | **索引 × MVCC/purge/唯一性**：delete-mark 两阶段、`row_vers_old_has_index_entry` 版本链回溯、purge 定位与删除、唯一性必须加锁 |
-| [construction.md](index/construction.md) | **KEY 类与索引构造**：KEY/KEY_PART_INFO 全成员与两级 flags、DDL → KEY → dd::Index → dict_index_t 三条链路、构造期/开表期不对称表 |
-| [record_format.md](index/record_format.md) | **索引记录存储格式**：三种记录字段组成、trx_id_offset 快速通道、BLOB 768 前缀规则、info bits、instant 只影响聚簇 |
-| [partitioning.md](index/partitioning.md) | **索引 × 分区**：本地索引与 `dd::Partition_index`、唯一键含分区键约束、逐分区 DDL、先裁剪后逐分区搜索、统计基数只取最大分区 |
-| [secondary.md](index/secondary.md) | **二级索引整合专篇**：生命周期闭环（插入五步/更新删旧插新/两阶段删除/purge）、change buffer 决策点、读路径分支全景、`row_sel_sec_rec_is_for_clust_rec` 双向校验 |
-| [types.md](index/types.md) | **索引类型总览**：语义 vs 实现的分离、`dict_index_t::type` 十位标志体系、`n_uniq` 粒度；聚簇（主键/GEN_CLUST_INDEX/GIPK）、二级、唯一、降序、前缀、功能、多值、全文倒排、空间 R-tree、不可见 全谱系 |
-| [access.md](index/access.md) | **回表与三类访问优化**：回表完整链路（版本回溯 + 一致性复核）、覆盖索引两层判定、ICP 三层链路（`row_search_idx_cond_check` 逐行）、MRR/DS-MRR（双 handler + rowid 排序）、Skip Scan |
-| [constraint.md](index/constraint.md) | **索引承载的约束**：唯一性检查两条链路（聚簇/二级）、NULL 语义、与 change buffer 的逻辑互斥；外键双索引指针、必须有索引的原因、检查与加锁、级联与 `FK_MAX_CASCADE_DEL=15` |
-| [stats.md](index/stats.md) | **索引统计**：persistent 分层采样（LA 层 + 分段随机 + REF01 外推）vs transient 随机页采样、`n_diff_pfxNN` 持久化、10% 重算判据、`rec_per_key` 传递链、**基数漂移 16 条根因** |
-| [operations.md](index/operations.md) | **索引的生老病死与观测**：`ADD INDEX` 完整链路、三种算法与 online 例外、row log 超限后果；`DROP INDEX` 三段式延迟释放；`SHOW INDEX`/`I_S`/PFS/sys schema 观测 |
-| [ahi.md](index/ahi.md) | **自适应哈希索引**：B-tree 之上的可丢弃缓存、8.0.30 分片、★ 哈希键前缀长度自适应算法、构建双门槛与全 nowait 哲学、锁按 (space_id, index_id) 路由的局限 |
-| [ibuf.md](index/ibuf.md) | **change buffer（insert buffer）**：为什么只缓存非唯一二级索引 INSERT、物理布局、插入 14 条否决条件与合并 8 条触发条件、merge 可能触发页分裂 |
+| [thd.md](infra/threading/thd.md) | THD 对象深度剖析（连接/线程/会话三合一载体） |
+| [internal_thd.md](infra/threading/internal_thd.md) | 内部 THD（后台线程持有的降级会话） |
+| [stack_depth.md](infra/threading/stack_depth.md) | 栈深度治理：`thread_stack`、软件栈检查、检查点地图、栈 vs MEM_ROOT |
+| [thread_lifecycle.md](infra/threading/thread_lifecycle.md) | 线程生命周期：创建·注册·停止·回收 |
+| [threading_architecture.md](infra/threading/threading_architecture.md) | 全栈线程模型：server 连接线程 + InnoDB 后台线程全景 |
+| [connection_threading.md](infra/threading/connection_threading.md) | 连接线程模型（Per_thread）：线程缓存与接纳循环 |
+| [thread_pool.md](infra/threading/thread_pool.md) | 线程池（MySQL 26.7 源码级） |
+| [thread_wait.md](infra/threading/thread_wait.md) | 线程等待登记与唤醒协议：`current_cond`/`current_mutex` 双字段、漏杀窗口、PFS stage 上报 |
+| [thread_pool_mariadb_percona.md](infra/threading/thread_pool_mariadb_percona.md) | MariaDB/Percona 线程池源码级对比 |
+
+**观测体系（observability/）** —— 按「观测手段」组织（不是按"XX 怎么观测"；后者留在各主题篇）。地图与选型决策树见 [`infra/observability/README.md`](infra/observability/README.md)
+
+| 文件 | 内容 |
+|------|------|
+| [i_s.md](infra/observability/i_s.md) | **INFORMATION_SCHEMA 虚拟表**：server `ST_SCHEMA_TABLE` 插件框架 + InnoDB 26 张表；I_S / PFS / SHOW 三分天下 |
+| [pfs/](infra/observability/pfs/) | **Performance Schema（多篇，故独立子目录）**：[`pfs.md`](infra/observability/pfs/pfs.md) 框架（PSI 接口、零开销探针、设计模式）· [`pfs_statement.md`](infra/observability/pfs/pfs_statement.md) 语句统计 · [`pfs_events.md`](infra/observability/pfs/pfs_events.md) 事件表族（waits/stages/transactions/**errors** + 两级开关）· [`thread_pfs.md`](infra/observability/pfs/thread_pfs.md) 线程插桩 |
+| [slow_log.md](infra/observability/logging/slow_log.md) | **慢查询日志**：判定链 + ★ `log_slow_extra` **20 字段全集** + `log_slow_admin_statements` 真实机制 + 与 digest 对比 |
+| [error_log.md](infra/observability/logging/error_log.md) | **错误日志**：组件架构（filter/sink）+ ★ `log_sink_json` 字段全集 + `ib::` 宏族 + ★ `innodb_print_ddl_logs` 需配 `verbosity=3` 的陷阱 + 暴涨根因 |
+| [innodb_monitor.md](infra/observability/innodb_monitor.md) | InnoDB 可观测基础设施：Monitor 体系、`SHOW ENGINE INNODB STATUS` |
+| [explain_trace.md](infra/observability/explain_trace.md) | 调试与可观测性：EXPLAIN（TRADITIONAL/TREE/JSON/ANALYZE）、optimizer trace |
+| [sys_schema.md](infra/observability/sys_schema.md) | **sys schema**：102 视图 / 22 函数 / 26 过程；★ `x$` 数值视图族与"格式化不可排序"的取舍；安装与权限模型 |
+| [processlist.md](infra/observability/processlist.md) | **会话观测四种入口**：`SHOW PROCESSLIST` / `I_S.PROCESSLIST`(已废弃) / `PFS.threads`(推荐) / `sys.session`；★ 锁代价、`THREAD_OS_ID` 联动 OS 层、State 体系 |
+| [show_commands.md](infra/observability/show_commands.md) | **SHOW 命令族**：★ 多数改写成 SELECT；`SHOW ENGINE INNODB STATUS` 全段判读 + **`LATEST DETECTED DEADLOCK` 逐字段** + 受害者选择算法 |
+| [status_variables.md](infra/observability/status_variables.md) | **状态 / 系统变量**：三作用域（默认 SESSION）、PFS 六表、代价；★ **counter vs gauge 与采样套路**；`SET PERSIST` / `variables_info` |
+| [system_tools.md](infra/observability/system_tools.md) | **系统层 / 外部工具**：★ `THREAD_OS_ID` 桥梁；`pstack`/`pt-pmp` **会暂停进程** vs `perf`/eBPF 不暂停；代价对照与决策树 |
+
+### [index/](index/) —— 索引（横切主题）
+
+> 以"索引"为第一主语的篇进本目录；索引只是一部分的特性篇留在原处（全文检索 feat/fts、空间 R-tree server/datatype/gis、生成列 feat/generated_columns）。**地图与阅读路径见 [`index/README.md`](index/README.md)**。
+
+| 文件 | 内容 |
+|------|------|
+| [btr.md](index/btr.md) | B-tree 结构与操作（btr 模块全套，含压缩页 page_zip 双份结构专节） |
+| [rtree.md](index/rtree.md) | R-tree 索引结构全套 |
+| [inverted.md](index/inverted.md) | 倒排索引存储与编码 |
+| [metadata.md](index/metadata.md) | 索引元数据对象模型（dd::Index ↔ dict_index_t ↔ SDI） |
+| [physical_storage.md](index/physical_storage.md) | 索引物理存储与持久化 |
+| [transaction.md](index/transaction.md) | 索引 × MVCC/purge/唯一性 |
+| [construction.md](index/construction.md) | KEY 类与索引构造 |
+| [record_format.md](index/record_format.md) | 索引记录存储格式 |
+| [partitioning.md](index/partitioning.md) | 索引 × 分区 |
+| [secondary.md](index/secondary.md) | 二级索引整合专篇 |
+| [types.md](index/types.md) | 索引类型总览（全谱系） |
+| [access.md](index/access.md) | 回表与三类访问优化（覆盖索引/ICP/MRR） |
+| [constraint.md](index/constraint.md) | 索引承载的约束（唯一性/外键） |
+| [stats.md](index/stats.md) | 索引统计 |
+| [operations.md](index/operations.md) | 索引的生老病死与观测 |
+| [ahi.md](index/ahi.md) | 自适应哈希索引 |
+| [ibuf.md](index/ibuf.md) | change buffer（insert buffer） |
 
 ### [cloud/](cloud/) —— 云环境（外部知识）
 
 | 文件 | 内容 |
 |---|---|
-| [cloud_storage.md](cloud/cloud_storage.md) | 云存储（EBS/云盘）：设计权衡、attach/detach ≠ mount/umount、快照语义、★ MySQL 对云盘无感知的证据与隐含假设 |
-| [cloud_db.md](cloud/cloud_db.md) | 云数据库架构：数据面/支撑环境分层、存算分离、HA 切换、透明切换 L0-L6 |
+| [cloud_storage.md](cloud/cloud_storage.md) | 云存储（EBS/云盘）：设计权衡、attach/detach ≠ mount/umount、快照语义 |
+| [cloud_db.md](cloud/cloud_db.md) | 云数据库架构：数据面/支撑环境分层、存算分离、HA 切换 |
 | [cloud_networking.md](cloud/cloud_networking.md) | 云上网络：VPC、L3-L4-L7、网关体系、安全组、PrivateLink、K8s 网络 |
 
 ### [papers/](papers/) —— 外部论文剖析
 
-> **与源码文档的区别**：源码文档以**本仓库 8.0.39 源码**为事实来源；论文剖析以**论文**为事实来源，并在「对 MySQL 与云数据库的启示」一节与源码文档对接。两者通过文首「边界」行双向互指。
+> 源码文档以**本仓库源码**为事实来源；论文剖析以**论文**为事实来源，并在「对 MySQL 与云数据库的启示」一节与源码文档互指。
 
 | 文件 | 内容 |
 |---|---|
-| [btrlog.md](papers/btrlog.md) | **BtrLog（VLDB 2026）云上 WAL 日志服务**：单写者假设省掉排序层、SSD 日志节点 Quorum + 对象存储异步归档、微秒级工程与全量评估；附"对象存储为什么成本低延迟高"分析 |
+| [btrlog.md](papers/btrlog.md) | BtrLog（VLDB 2026）云上 WAL 日志服务：单写者假设、SSD 日志节点 Quorum、微秒级工程 |
 
 ---
 
 ## 如何新增文档
 
-> 单篇的写法（章节骨架、必填项）见 [`_template.md`](_template.md)。本节讲**文档之间**的组织规则：放哪、怎么编号、边界怎么划。
+> 单篇写法（章节骨架、必填项）见 [`_template.md`](_template.md)。本节讲**文档之间**的组织规则。
 
 ### 第一步：决定放哪
 
-> **前置（必做，2026-09-22 用户拍板）：动笔前先整体看知识库现状**。
-> ① 扫一遍本文「目录索引」——全库现在有哪些篇、各目录的主题边界是什么；
-> ② 找出与候选主题相关的篇（同目录 + 相邻目录），**读它们文首的「> 边界」行或「概述」**——
->    确认新主题的每一块内容是否已被覆盖、边界在哪；
-> ③ 做完 ①② 再走下面的决策树。目的：**避免重复**——最常见的返工是"新篇讲的内容已有宿主篇讲透"或"边界与既有篇重叠打架"。
+> **前置（必做）**：先扫本文「目录索引」+ 读相关篇文首「边界」行，确认没被覆盖再动手——最常见的返工是新篇讲的内容已有宿主篇讲透。
 
 ```
 新主题
   │
   ├─ ★ 是"跨层端到端特性"吗？（同时改 SQL 层与引擎层：分区、全文索引、GIS…）
-  │     是 → feat/，一篇讲完整条链路；引擎差异写进篇内小节，
-  │          不为每个引擎单独开篇（详见「边界归属」）
+  │     是 → feat/，一篇讲完整条链路；引擎差异写进篇内小节，不为每个引擎单独开篇
   │
   ├─ 是"一条 SQL 必经的一步"吗？
   │     是 → server/query/ 下加数字编号（如 09_dml.md）
@@ -207,67 +235,45 @@
   │     是 → infra/lock/（同步原语进 primitives/，事务锁进 transactional/）
   │
   ├─ 是"索引"主题吗？（横跨 SQL 语法/优化器/引擎存储，以索引为第一主语）
-  │     是 → index/（索引只是一部分的特性篇——全文/空间/生成列——留在 feat|datatype，由 index/README 导航）
+  │     是 → index/（索引只是一部分的特性篇留在 feat|datatype，由 index/README 导航）
   │
   ├─ 是外部论文的深度剖析吗？（事实来源是论文，不是本仓库源码）
-  │     是 → papers/，一篇论文一个文件；文首「边界」行必须与相关源码文档互指
+  │     是 → papers/，一篇论文一个文件；文首「边界」行与相关源码文档互指
   │
   └─ 其他 server 层主题
         ├─ 数据类型（JSON/GIS/时间类型…）  → server/datatype/
         ├─ binlog 与复制                    → server/replication/
         ├─ 被全局复用的通用机制             → server/infra/
         ├─ 插件/组件/服务（可扩展框架）     → server/plugin/
-        └─ 服务器日志（error/general/slow） → server/logging/
+        └─ 服务器日志（error/general/slow） → infra/observability/logging/
 ```
+
+> ★ 主题的天然归属优先于"它是插件/组件"这个事实：`plugin/` 收录具体插件是**兜底**；功能主体天然属于别的目录就留在那详写，`plugin/` 只写框架视角并互指（例：认证算法在 [`server/auth/authentication.md`](server/auth/authentication.md)，不在 `plugin/`）。
 
 ### 第二步：判断该独立成篇，还是并入现有篇
 
-这是最容易做错的一步。两个方向都要考虑：
+**该独立成篇**（满足任一）：有自己的一整套数据结构（如 range 优化的 `SEL_TREE`/`SEL_ARG`）；是另一条并行的主链（如 DML）；是通用子系统被多个上层复用（如 LOB）。
 
-**该独立成篇** —— 满足任一条：
+**该并入现有篇**（满足任一）：拆开会让主链断头；内容是同一件事的两半；篇幅撑不起一篇且无独立数据结构。
 
-- 有**自己的一整套数据结构**，讲不透就会拖累宿主篇
-  （例：range 优化有 `SEL_TREE`/`SEL_ARG` 区间森林 + 六种访问方法，从"访问方法选择"里独立出来成 `08_range_optimizer.md`）
-- 是**另一条并行的主链**，而非现有链的分支
-  （例：DML 与 SELECT 共用前段但执行完全不同，独立为 `09_dml.md`，没有塞进 `runtime/`）
-- 是**通用子系统**，被多个上层复用
-  （例：LOB 是 InnoDB 通用机制，从 `json.md` 拆出为 `innodb/physical/lob.md`）
-
-**该并入现有篇** —— 满足任一条：
-
-- 拆开会让**主链断头**，读者走到边界就掉出目录
-  （例：协议层收包原为 `server/net.md`，并入 `query/01`——否则主链第一步"SQL 文本从哪来"在目录外）
-- 内容是**同一件事的两半**，分开必有一半无处安放
-  （例：收包与回包是协议层的两个方向，独立成文会让回包没地方写）
-- 篇幅撑不起一篇，且没有独立的数据结构
-
-**★ 已确定独立成篇后，还要决定：原篇那份内容是"迁走"还是"两处都留"？**
-
-判据是新篇与宿主篇的**关系**——这两种在本库里都发生过，处理方向**相反**：
+**★ 已决定独立成篇后，原篇内容是"迁走"还是"两处都留"？** 按新篇与宿主篇的关系定：
 
 | 关系 | 判据 | 处理 | 实例 |
 |---|---|---|---|
-| **另一个子系统** | 第一主语不同（新篇有自己独立的数据结构与生命周期） | **归位**：完整实现迁到新篇；宿主篇只留**概要 / 归位表 + 属于它自己视角的结论**，两边互指 | `dblwr` / `刷脏` / `读路径` / `AHI` / `change buffer` / `redo I/O` 从 `io.md` 拆出 |
-| **另一个视角** | 同一机制换个角度讲（恢复视角看 redo、优化器视角看索引） | **并存**：宿主篇**保留完整版**，新篇写自己的视角并互指，**不要**搬走原篇内容 | `recovery.md` 里的 redo（`redo_log.md` 的完整版保留不动） |
+| **另一个子系统** | 第一主语不同（独立的数据结构与生命周期） | **归位**：完整实现迁到新篇，宿主篇只留边界说明 + 归位表 + 本篇视角的结论 | `dblwr`/`刷脏`/`读路径`/`AHI`/`change buffer` 从 `io.md` 拆出 |
+| **另一个视角** | 同一机制换个角度讲 | **并存**：宿主篇保留完整版，新篇写自己的视角并互指 | `recovery.md` 里的 redo（`redo_log.md` 完整版不动） |
 
-✗ 两种常见错法（都返工过）：
-
-- 把"另一个视角"当成"另一个子系统"，**搬空宿主篇** → 读者在原位置找不到内容
-- 把"另一个子系统"既在新篇写、又在宿主篇留完整副本 → 两处必然漂移
-
-> 归位时宿主篇**必须留的**是：① 一句边界说明 ② 一张归位表（写明每条去哪篇找）③ 属于本篇视角的那几条结论（不是复制正文）。
+✗ 两种错法：把"另一个视角"当"另一个子系统"搬空宿主篇；两处都留完整副本（必然漂移）。
 
 ### 第三步：够不够建子目录
 
-- **同一阶段 ≥ 3~4 篇** → 建子目录
-  （例：逻辑优化 4 篇 → `logical/`，物理优化 4 篇 → `physical/`）
-- **只有 1 篇** → 留在上级目录，**不建单文件目录**
-  （例：`10_plan_refinement.md` 是计划改进阶段的唯一一篇，留在 `07_optimize/` 根）
-- 建了子目录后，上级 README 必须**按阶段分组**展示，否则读者看不出层次
+- 同一阶段 ≥ 3~4 篇 → 建子目录（如逻辑优化 4 篇 → `logical/`）
+- 只有 1 篇 → 留上级目录，不建单文件目录
+- 建了子目录后，上级 README 必须按阶段分组展示
 
 ### 边界归属：第一主语原则
 
-跨层主题（一件事横跨 SQL 层、接口层、引擎层）按**"第一主语是谁"**归位，而不是按"涉及谁"：
+跨层主题按**"第一主语是谁"**归位，而不是按"涉及谁"；一份内容只在一处详写，其他篇交叉引用：
 
 | 内容 | 第一主语 | 归属 |
 |---|---|---|
@@ -276,236 +282,107 @@
 | `row_search_mvcc`、游标推进 | InnoDB | `innodb/row_search.md` |
 | DML 的 buffer row id 两阶段读 | SQL 层 DML | `query/09_dml.md` |
 
-一份内容只在**一处**详写，其他篇用交叉引用指向它——不要因为"这里也相关"就复制一遍。跨层主题在文首加一行"边界"说明谁讲什么。
+**例外：跨层端到端特性进 `feat/`**，判据（满足任一）：① 同时改动多个层 ② 可能被多个引擎实现（一篇 + 引擎差异小节，避免 N 个引擎 N 篇）③ 读者需要一次读完闭环。不属于此类的按层归位；**锁与同步**横跨四层，按主题进 `lock/`。
 
-**例外：跨层端到端特性不走按层归位，进 `feat/`。** 判据（满足任一）：
-
-1. **同时改动多个层**：分区表同时改 SQL 层（语法、元数据、优化器、MDL）与引擎层（存储、分区 DDL）；全文索引、GIS 同理。
-2. **可能被多个引擎实现**：按引擎拆篇会让 N 个引擎变成 N 篇，且每篇都要复述一遍 server 层。正确做法是一篇 + "引擎差异"小节（例：分区表只 InnoDB/NDB 两家，NDB 走 `HA_USE_AUTO_PARTITION` 自动分区并保留 `nodegroup_id`，未声明 native 分区能力的引擎直接被拒）。
-3. **读者需要一次读完闭环**：分区表的 DML 路径横跨 `ph_write_row`（SQL 层算分区号）与 `set_partition`（引擎换 `dict_table_t`），中间只隔一层虚调用，拆开则两篇都断头。
-
-不属于此类的仍按层归位：纯引擎内部机制（buffer pool、redo）→ `innodb/`；纯 SQL 层机制（优化器）→ `server/`；**两层接口本身** → `server/handler.md`（它属于"接口"而非"特性"）。**锁与同步是例外**：横跨 include/mysys/sql/innodb，按主题进 `lock/`（见第一步决策树）。
-
-> **★ `feat/` 篇的骨架另有要求**（两种形态，按"两层耦合方式"选），见 [`feat/README.md`](feat/README.md)「篇内骨架」。
-> 这是全库**唯一**的目录级骨架规范；除它之外，单篇骨架一律以 [`_template.md`](_template.md) 为准。
+> `feat/` 篇的骨架另有要求（两种形态），见 [`feat/README.md`](feat/README.md)「篇内骨架」——这是全库唯一的目录级骨架规范，其余一律以 [`_template.md`](_template.md) 为准。
 
 ### 编号规则
 
 - 主链用数字前缀表示**时间顺序**（`01_` → `09_`）
-- 子目录内**编号全局连续、不重置**：`07_optimize/logical/02_` 一直排到 `physical/09_`，再往后是 `15_`~`22_`（15 之后分「专项 / 横切 / ②续」三组，见 `07_optimize/README.md`）
-  - 这样跨篇引用"见 03 篇"**永远有效**，移动文件不必改引用
-  - 用**路径**区分命名空间（写 `07_optimize/01_cost_model`），不靠"移出去平级"来避免编号冲突
+- 子目录内**编号全局连续、不重置**（`07_optimize/logical/02_` 一直排到 `physical/09_`）——跨篇引用"见 03 篇"永远有效；用**路径**区分命名空间，不靠移出去平级避免冲突
 - 横切内容（`runtime/`、EXPLAIN）不参与主链编号语义，README 里单独分组
 
 ### 命名
 
-- 全库**英文文件名**、小写、下划线分隔
-- 名字要能看出**内容归属**：`04_logical_join.md` / `06_join_order.md` 一眼能分清逻辑优化和物理优化；反例是曾经的 `06_join_order_access.md`，把 greedy + range + const 全挤在一起，看不出是物理优化
+全库英文文件名、小写、下划线；名字要能看出**内容归属**（如 `04_logical_join.md` / `06_join_order.md` 一眼分清逻辑与物理优化）。
 
 ### 收尾检查清单
 
-新增或移动文档后，这四件必做：
-
-1. **改上级 README** 的文件索引（含新篇的一句话内容摘要）
-2. **改被影响篇的交叉引用**（尤其是拆分/合并时，原篇的指向会失效）
-3. **跑链接校验**——相对路径层级最易错（`../` 还是 `../../`）：
+1. **改上级 README 的文件索引**。条目风格：**文件名 + 一句话定位**——机制细节（函数名/★ 堆砌/算法清单）进索引就是抄一遍且必然漂移
+2. **改被影响篇的交叉引用**（拆分/合并时原篇指向会失效）。★ **链接写法约定**：**同目录互指只写文件名**（链接目标形如 `(ddl.md)`，不加 `./`、不写目录路径）——这样目录整体搬迁时同目录内的链接零改动；跨目录引用必须写相对路径（Markdown 限制，无解），因此**跨目录引用尽量收敛到各 README 的导航**，压掉目录变动时的改动面
+3. **跑链接校验**——相对路径层级最易错：
    ```bash
    cd .codebuddy/knowledge_for_mysql
    for f in $(find . -name "*.md"); do d=$(dirname "$f"); \
      for l in $(grep -o "](\([^)#]*\.md\)[^)]*)" "$f" | sed 's/](//;s/)$//;s/#.*//'); do \
        [ -e "$d/$l" ] || echo "BROKEN: $f -> $l"; done; done
    ```
-4. **写好本篇的「参考」章节**（论文 / 官方文档 / 内核月报，按相关性取舍）
-
-   > **四类资料源都要查**（2026-09-20 用户拍板）：**① WorkLog**（dev.mysql.com/worklog，演进动机一手来源）、**② bug 论坛**（bugs.mysql.com，坑与已知缺陷的权威出处）、**③ Reference Manual**（官方手册，语义与行为基准）、**④ 内核月报**（腾讯云数据库内核月报等，视角与理论脉络）。动笔前先查这四处有没有相关内容，有就引用核实；bug 号 / WL 号要在正文或参考里给出。
+4. **写好本篇「参考」章节**（四类资料源都要查，见 [`_template.md`](_template.md) 自检 ⑰ 与参考章说明）
 
 ---
 
 ## 准入标准
 
-> 上一章讲**放哪**（组织），本章讲**够不够格进、要写成什么样**（质量）。
->
-> 本章每一条都来自真实返工——不是假想的规范。
+> 上一章讲**放哪**，本章讲**够不够格进**。完整规则在 [`_template.md`](_template.md) 自检 ⑤~⑰，此处只留骨架。
 
-### 零、先明确：什么是好文档
-
-**目标是内核月报式的深度剖析**——讲透设计思想与核心算法，**不是**教科书式的"是什么 / 有哪些 / 怎么配置"罗列。
-
-读者是"想真正理解 MySQL 设计的人"，不是"想查某个函数在第几行的人"。
-
-一篇合格的文档要能回答三个问题，按重要性排序：
+**内核月报式深度剖析**，一篇合格文档回答三问：
 
 | # | 问题 | 落在哪一章 |
 |---|---|---|
-| **1** | **怎么设计的？为什么这么设计？用了什么思想理论？**（权衡取舍、被否决的方案、论文溯源、他库对比） | 「理论基础」——本章是文档价值的核心 |
-| **2** | **重点难点是什么，怎么讲清？**（反直觉处、隐含假设、复杂状态机） | 「核心实现」——**贴关键代码 + 逐段解释算法**，只给结论等于没写透 |
-| **3** | **怎么演进到今天的？**（**5.7 → 8.0 → 最新 MySQL 的大演进**，各版本变了什么、为什么变） | 「概述·版本演进」记变化清单；「理论基础」记为什么变 |
+| 1 | **怎么设计的？为什么？**（权衡、被否决方案、论文溯源、他库对比） | 「理论基础」——价值核心 |
+| 2 | **重点难点是什么？**（反直觉处、隐含假设、复杂状态机） | 「核心实现」——**边贴代码边剖析**（写法见下方专节） |
+| 3 | **怎么演进到今天的？** | 「版本演进」记变化 + **能查到的标 `WL#xxxx`**（见下方专节），「理论基础」记为什么 |
 
-**加一条结构要求：模块要闭环。** 读者读完这一篇（或这个子目录），对该模块应形成完整认知，不留"讲了一半"的断口——上游谁调它、下游它调谁、边界在哪，都要交代（哪怕只一句交叉引用）。
+三条硬门槛：有理论基础 / 讲透实现 / 模块闭环。篇幅与可测指标基线见 `_template.md` ⑥⑮。基线版本 8.0.39，之后版本（8.4 / 9.x）也要跟踪。
 
-> **不写源码位置索引。** 读者会自己看代码，不需要文档告诉他"在哪个文件第几行"。函数名/结构名照常出现——它们是**指称用的术语**（讨论 `choose_table_order` 做了什么），不是坐标。也不要专门列"源码位置速查表"。
->
-> **执行细则**（完整版见 [`_template.md` ⑧](_template.md)，两处重复时以 template 为准）：① **行号一律不写**——版本一变就失效，而且会把注意力从"为什么"拉到"在哪"；② 文件名最多在首次交代"这个函数属于哪个模块"时提一次，之后只用函数名；③ 参考章只列论文/文档/月报/相关文档，**不列源码清单**；④ **不列"关键函数速查"表**（函数 ↔ 一句话职责）——那是把正文抄一遍，且必然漂移，函数名在讲到它的地方就地交代。
->
-> **存量（早期文档）里的行号与「关键源码位置速查」章保持现状，不作回溯清理**；新写和重写的篇按上面四条从严。
+★ **不写「勘误 / 纠错」章**——写错就地改对、不留痕迹；"某符号不存在"直述事实，不立纠错表（见 `_template.md` ⑫；存量不回头清理）。
 
-### 一、三条硬门槛
+### ★ 源码剖析的统一写法：在原代码里就近注释
 
-| 门槛 | 含义 | 不满足的表现 |
-|---|---|---|
-| **有理论基础** | 讲清设计思想、权衡、理论溯源 | 只有"代码这么写的"，没有"为什么这么写" |
-| **讲透实现** | 关键代码贴出来并逐段解释算法 | 只列结论、只给函数名清单 |
-| **闭环** | 该模块认知完整，边界与上下游交代清楚 | 读完不知道这一步之后发生什么 |
+**贴完整原代码，在关键行附近直接用注释剖析**。**禁止**"整段贴完再在末尾集中写『**逐段解释**：①…②…』"。
 
-**篇幅要撑得起。** 同族篇的基线：`redo_log` 2151 / `io` 1660 / `dblwr` 1126 / `ahi` 975 / `buffer_pool` 869 行。
-新篇若只有三四百行，通常意味着"核心实现"没展开——**写了骨架没写血肉**。判据：关键函数贴全了吗、
-每个分支都解释了吗、"为什么"都答了吗。（不是凑字数，是别在讲透之前收尾。）
+**为什么**：解释要**紧贴对应代码行**。末尾集中解释会让读者看代码时还没拿到解释、要来回翻，且解释脱离了对应行的上下文，退化成"对一段话的复述"而不是"对这段代码的说明"。
 
-**说的东西必须真实存在**——函数名、结构成员、默认值都经本仓库源码核实（见「三、事实核验」）。
+**四条要点**
 
-**基线版本是本仓库的 MySQL 8.0.39。** **版本演进是重点**：5.7 → 8.0 → **最新 MySQL** 的大演进必须讲清——不是贴"版本号 + 一句话"清单，而是讲"为什么在这个版本做这件事、机制怎么变的"；8.0.39 之后的最新变化（8.4 / 9.x，或更高 8.0 小版本）也要跟踪交代。
+1. **注释紧贴对应行**——行上方或行尾，让读者看代码时注释就在旁边
+2. **只注释核心与难点**——**不必逐行注释**；把"为什么必须这样"讲清楚即可
+3. **注释讲"为什么"**——做了什么 + 为什么这么写 / 边界怎么处理；**不复述**代码字面意思
+4. **★ 保持代码完整**——**不要**为了插解释把函数切碎成多个代码块（打断阅读流、也不便复制）。⚠️ "完整"指**函数不分家**；无关行仍按既有规范**骨架化**（砍变量声明 / Doxygen 注释 / 无关分支，用 `...` 压缩），二者不冲突；代码占比基线仍按 `_template.md` ⑮ 执行
+5. **★ 贴代码之前，先用一句话交代"这个函数整体在做什么"**——说清它的输入 / 输出 / 在调用链里的位置，再贴代码。⇒ 读者先有整体框架，看代码时才知道每行服务于什么；**直接从函数签名进代码，容易"每行都看得懂、但不知道整体在干什么"**。这也是自查"有没有停在包装函数上"的前提——先把被调者的职责讲清，才判断得出要不要继续往下挖
+5. **★★ 不要停在包装函数**——若一个函数的主体是"准备参数 + 转调另一个函数"（通常只有十几到几十行），**它不是剖析对象**，必须**顺着调用链往下挖到真正有逻辑的那一层**。⚠️ 判据：写完后通篇都是"它调用了 X"、却没有"X 内部怎么做" ⇒ 就是停在包装层了。实例：`row_sel_build_committed_vers_for_mysql` 只有 26 行且主体是转调，真正逻辑在 `row_vers_build_for_semi_consistent_read`（109 行）——只剖前者等于没剖
+6. **★ 小标题不要用纯函数名**——标题写**结论 / 语义**（读者扫目录就知道这节讲透了什么），函数名在正文首句交代即可；**同一件事的多个函数（入口 + 实现）放在同一标题下**，不要每个函数一节。⚠️ 反例：`#### row_vers_build_for_semi_consistent_read`（只有函数名，看不出讲什么）；正例：`#### 半一致读要的是「最新已提交版本」，不是「视图可见版本」`
 
-### 二、重点难点怎么讲
+**正反对照**
 
-一篇里通常只有**一两个真正的难点**，把它们讲透比均匀铺开更有价值。哪些算难点：
+❌ 整段贴完 30 行，再在末尾写：
 
-- **反直觉**：排序/物化/聚合发生在 `Init()` 而非 `Read()`；迭代器不拥有行缓冲
-- **易混淆的命名**：handler 的 `ref`（行位置）与 EXPLAIN 的 `ref` 列（访问类型）毫无关系；PSI batch mode 是**监控**批量不是计算批量
-- **有隐含假设**：ROR-intersection 的选择率乘数把不同列当独立相乘——这既是设计简化，也是 bad case 的根因
-- **状态机复杂**：NLJ 的 NULL 补全为什么必须区分"第一条内层行"
+> **逐段解释**：- 短路在最前面… - `LOG_BUFF_MAX` 定长栈缓冲… - audit 的位置…
 
-讲透的标准：**解释清"为什么不得不这样"**，而不只是"它是这样"。
+✅ 完整代码 + 关键行就近注释：
 
-> 设计里的简化假设带来的**失效场景**、以及**阈值下的退化行为**（如 `eq_range_index_dive_limit` 只缓解 index dive、不缓解 SEL_ARG 树构造），写在「理论基础 → 设计思想与权衡」里——它们是权衡的另一半，跟产生它们的设计决策放在一起才讲得通。
+```cpp
+  // ★ 短路在最前面：这类命令要不要记 / 总开关 / handler 链是否非空，三者缺一即走这里
+  //   ⇒ general_log=OFF 时开销只是一次布尔判断——零开销探针思路
+  if (!log_command(thd, command) || !opt_general_log ||
+      !(*general_log_handler_list))
+    return false;
 
-### 二·补：讲清复杂性的三种手段
+  char message_buff[LOG_BUFF_MAX];   // 定长栈缓冲 ⇒ 消息超长会被截断
+```
 
-难点只靠文字往往讲不透。以下三件是本库反复验证有效的手段：
+完整范例见 [`infra/observability/logging/general_log.md`](infra/observability/logging/general_log.md)「核心实现」。
 
-> **本节是摘要，执行细则见 [`_template.md` ⑪⑫⑬](_template.md)**——两处重复时以 template 为完整版。
+> ⚠️ **存量说明**：既有篇目里仍有"整段代码 + 末尾『逐段解释』"的旧写法（2026-10-02 盘点约 27 篇）。**存量不批量整改**——本规范只对**新增 / 重写的篇目**生效；看到旧写法**不需要**回头改写（改了会造成同一篇内新旧混用）。
 
-**① 复杂处必须配图**（文字说不清的一律画图）
+### ★ 版本演进要标 WorkLog 编号
 
-| 类型 | 用什么 |
-|---|---|
-| 结构关系（继承树、结构体嵌套、内存/文件布局） | ASCII 树 / 分块图 |
-| 状态与流转（状态机、生命周期、调用链） | ASCII 缩进链，或 mermaid `stateDiagram` |
-| 并发与时序（多线程协作、加锁顺序、事件唤醒） | mermaid `sequenceDiagram` |
-| 分层与数据流（跨层路径、缓冲区读写） | ASCII 分层框图 |
+「版本演进」里**能对应 MySQL Worklog 的变化，要标 `[WL#xxxx](https://dev.mysql.com/worklog/task/?id=xxxx)`**——这是演进最权威的一手设计依据，比 Release Notes 更深一层（含 Scope / HLS / 兼容性影响）。
 
-> **ASCII 优先**：纯文本、diff 友好、任何环境可读；mermaid 只在"节点多、连线复杂"时用。
-> ✗ 常见错法：用大段文字描述树状继承关系；用列表罗列状态转移。
+**形式二选一**：写进"变化"列（多数篇这样做，如 `引入 MDL（设计见 WL#3726 / WL#4284）…`）；或独立成 `WL` 列（演进多且重要时更清晰）。
 
-**② 涉及 C++ 类体系就加一章「★ 本机制里的 C++ 运用」**
+**查不到编号的如实注明**（如"早于 MySQL Worklog 体系，无编号"），**不要留空**——留空会让人以为漏了。
 
-判据：有继承体系 / 模板 / 所有权转移 / RAII / C 与 C++ 边界。写法是"为什么用、代价是什么"，
-**不是语法教学**。参考 [`server/infra/io_cache.md`](server/infra/io_cache.md) 与 [`server/dd/dd.md`](server/dd/dd.md) 的同名章。
-（C 结构如何被安全地包进 C++ 类——这条最能体现工程权衡，有就必写。）
-
-> **★ C++ 难点讲透是硬要求**（2026-09-20 用户拍板）：**复杂的 C++ 语法、高级用法、复杂继承结构、内存布局**——凡是对 C++ 功力要求较深、读者难以看懂的地方，都要**讲透搞清楚**（配继承树/内存布局图 + 逐段解释），不能一句带过。判据：一个没读过该模块的读者照着文档能否读懂代码——读不懂就是没讲透。
-
-**③ 面向二次开发：Misc 里给"动手改"需要的信息**
-
-- **扩展点**：加一种新类型/新分支要改哪几处
-- **坑与已知缺陷**：源码 TODO/FIXME 注释、**社区边界澄清**（"社区版没有 X"）
-- **怎么观测**：status 变量、PFS instrument、`SHOW ENGINE` 段落、debug 开关
-
-### 三、事实核验：六类高频错误
-
-**这六类是本知识库真实踩过的坑**（虽然定位精度要求降低了，但"说的东西必须真实存在"这条不放松）：
-
-#### A. 函数名不存在（最高频）
-
-来源：注释里的**伪代码**、**历史版本**名字、**其他分支**（MariaDB/Percona）名字。
-
-| 写错的名字 | 8.0.39 实际 | 错因 |
-|---|---|---|
-| `find_min_ror_intersection_scan` | `get_best_ror_intersect` + `find_intersect_order` | 只是伪代码注释 |
-| `Optimize_table_order::best()` | `choose_table_order()` | 5.x 历史名字 |
-| `prepare_unique` | 已内联进 `IndexMergeIterator::Init()` | **头注释里的方法名**，代码已重构 |
-| `MRR_HANDLER_BUFFER` | `HANDLER_BUFFER` | MariaDB 的名字 |
-| `ha_autocommit_or_rollback` | `trans_commit_stmt` | 已删除 |
-
-> ★ **注释里出现的函数名不算存在**——头注释常年不更新，`index_merge.h` 至今写着"implemented in `prepare_unique`"，而那个方法早就没了。每个函数名都要 grep 确认。
-
-#### B. 结构成员已删除或从不存在
-
-`POSITION::sjmat_lookup_tables`（8.0.39 已删）、`IndexMergeIterator::m_dedup`（不存在，是优化器侧局部变量）、`TableRowIterator::m_expected_rows`（在各子类上，不在基类）。
-
-> 贴结构体时打开头文件逐字段对照，不凭记忆列字段。
-
-#### C. 默认值凭印象
-
-`subquery_to_derived` 默认 **OFF**（常被误认为 ON）；`KEY_COMPARE_COST` 是 **0.05**（不是 0.1）。
-
-> 必须从 `sys_vars.cc` / `opt_costconstants.cc` 的定义处读出。
-
-#### D. 实现机制的版本前提变了
-
-8.0.39 的**多表** UPDATE 延迟缓冲用**临时表**，`open_cached_file + position()` 只用于**单表** UPDATE 改扫描键的快路径。旧资料混为一谈。
-
-> 写"X 用 Y 实现"时，确认这条路径在 8.0.39 真的还走 Y。
-
-#### E. 把别家特性当社区特性
-
-| 特性 | 实际归属 |
-|---|---|
-| `inlist2join` | Percona Server |
-| table elimination | MariaDB |
-| 列相关性 / dependency 统计 | PolarDB 在做，社区**无** |
-| 向量执行、列式加速 | HeatWave（商业闭源），社区**无** |
-| SQL 层并行查询 | 社区**无**（只有 InnoDB 内部 `Parallel_reader`） |
-
-> 读商业版/其他分支资料时逐个 grep 确认。**社区没有的，宁可写"没有"也不能含糊带过。**
-
-#### F. 把注释/文档当实现
-
-头注释描述的算法可能已被重构（见 A 的 `prepare_unique`）。**以实际代码为准，注释只作线索。**
-
-### 四、外部材料（月报 / 论文 / 博客）怎么消化
-
-**外部材料提供视角与理论，源码提供事实。**
-
-这几轮的经验：**月报的函数名和行号几乎全部对不上 8.0.39**（多基于 5.7 或某分支）。流程固定三步：
-
-1. **读材料，提取"问题视角"与"理论脉络"**：它关注什么问题、指出什么 bad case、背后是哪篇论文的思路
-2. **回源码核实机制与函数名**
-3. **写文档时以源码为准，并显式记录纠正**
-
-案例：月报《Index-Merge 代价估算原理》给了极好的问题视角（为什么 index merge 常选错），但它的 4 个函数名在 8.0.39 全不存在。最终文档保留了**算法思路和 bad case 根因**，函数名全部换成源码实际的。
-
-> **禁止**照抄外部材料的函数名/公式而不核实。这是本知识库返工最多的原因。
-
-### 五、什么不该进
-
-| 不该进 | 处理 |
-|---|---|
-| 无法落到源码的传闻、性能玄学 | 不写 |
-| 别家分支/商业版的私有实现细节 | 只在「理论基础 → 他库对比」里提及，明确标注归属 |
-| 从外部材料抄来但没核实的内容 | 核实后再写 |
-| 已被本版本删除的机制 | 只进"版本演进"作为沿革 |
-| 同一内容在第二处重写 | 交叉引用指向唯一详写处 |
-
-### 六、"社区没有 X" 这类澄清怎么处理
-
-读者常问相邻概念（向量执行？并行查询？IN list 转 join？）。这类澄清**有价值**，但要：
-
-1. **给证据**（"全库搜 `inlist2join` 返回 0 匹配"），不是断言
-2. **说清替代品**——社区用什么解决同类问题
-3. **说清谁有**——哪个分支/商业版的特性
-4. **不为"没有"单独造一篇**——挂在最相关的篇里
-
-> 例外：`innodb/parallel_scan.md` 单独成篇，因为有真实的 `Parallel_reader` 可讲，"社区无 SQL 层并行查询"只是其中一节。
-
-### 七、提交前自检
-
-**内容五条**（组织四条见上一章「收尾检查清单」）：
+### 提交前自检（内容九条；组织四条见上一章）
 
 1. **「理论基础」写了吗**——设计思想、权衡、理论溯源、演进动机
-2. **关键代码贴了并逐段解释了吗**——只给结论等于没写透
+2. **关键代码贴了吗**——只给结论等于没写透
 3. **模块闭环吗**——上下游、边界都交代了吗
-4. **难点讲透了吗**——能解释"为什么不得不这样"，不只是"它是这样"
-5. **函数名/成员/默认值核实过吗**——不照抄外部材料、不信注释里的函数名
+4. **难点讲透了吗**——能解释"为什么不得不这样"
+5. **跑过可测指标吗**——代码占比、符号覆盖 grep、链接校验；被问"X 剖析了吗"先实测再答
+6. **归属对吗**——专职机制归模块文档，全景篇只留「清单 + 通用机制」
+7. **★ 是「边贴边剖析」吗**——在**完整原代码的关键行附近就近注释**；**不是**整段贴完末尾集中「逐段解释」；核心与难点注释清楚即可，**不必逐行**（见上方专节）
+8. **★★ 挖到实质了吗 + 标题写对了吗**——① 有没有停在包装函数上？逐个检查本篇被剖的函数：主体是不是"准备参数 + 转调"？若是**继续往下挖被调者**，直到那一层有真正的逻辑；② 小标题是不是纯函数名？若是改成**结论 / 语义**，且同一件事的多个函数（入口 + 实现）要归到**同一标题下**（判据见要点 5、6）
+9. **★ 版本演进标 `WL#` 了吗**——能对应 MySQL Worklog 的标 `[WL#xxxx](...)`（见上方专节）；**查不到的注明原因**，不留空
 
-> 单篇文档模板见 [`_template.md`](_template.md)；参考资料（论文 / 官方文档 / 内核月报 / 书籍）
-> 在**每篇文档末尾的「参考」章节**，不在全局维护索引。
+> 单篇模板见 [`_template.md`](_template.md)；参考资料在**每篇末尾的「参考」章节**，不全局维护索引。

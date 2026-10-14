@@ -3,6 +3,8 @@
 > 基于 MySQL 8.0.39 源码，涵盖插件的 ABI 契约、类型系统、加载/安装/卸载全链路、引用计数与延迟收割、插件系统变量。
 >
 > **边界**：本篇讲插件体系（老一代扩展机制）；组件基础设施（Component）见 [`component.md`](component.md)，服务（Service，含 registry 内部实现与老版 plugin service）见 [`service.md`](service.md)。
+>
+> ★ **认证插件不在这里单独成篇**：`caching_sha2_password` / `mysql_native_password` 的算法与握手协议属认证主题，详写于 [`../auth/authentication.md`](../auth/authentication.md)；本篇只在[「认证插件：从框架视角看这个元老类型」](#认证插件从框架视角看这个元老类型)讲它们的**框架事实**。
 
 ## 目录
 
@@ -44,6 +46,25 @@
 ## 理论基础
 
 ### 设计思想与权衡
+
+**第零条（第一性原理）：插件解决的是"服务器在固定位置需要一段可替换的代码"。**
+
+一句话概括设计原点：**调用点驱动，而非能力驱动**。服务器写代码时就知道"打开表要解析存储引擎、认证要调认证插件、写 binlog 前要通知审计"——这些**调用点是服务器内生的、固定的**，插件要做的只是"把自己填进这个坑位"。因此契约形态必然是"类型化角色"（我是什么 → 我能被谁调），而不是"能力注册"（我提供什么 → 谁都可以来查）。
+
+三条替代路线，插件体系为什么没走：
+
+| 路线 | 为什么插件体系没选 | 后来怎样 |
+|---|---|---|
+| 通用服务注册（能力市场） | 5.1 时代服务器尚未服务化；调用点若走注册表查找会有额外开销 | 8.0 由组件体系补上（WL#4102），见 [`component.md`](component.md) |
+| 进程外插件 + IPC | 引擎接口每行调用，跨进程不可接受 | 从未采用，见 [`abi.md` 设计思想 ②](abi.md) |
+| 依赖声明 + 自动排序 | 插件不声明依赖，服务器无从排序 | 于是顺序只能硬编码成三段（early / builtin / dynamic），见「主链路：启动加载」 |
+
+代价与收益是同一枚硬币：
+
+- **代价**：类型集合封闭（12 个，第三方无法新增）、初始化顺序硬编码、插件之间互不可见（`RTLD_LOCAL`，见 [`abi.md` 实验 5](abi.md)）、支持新扩展场景必须改服务器；
+- **收益**：调用点拿到强类型 vtable 直接调用——**零查找、零 acquire/release、零注册表**；部署极简（一个 `.so` + `mysql.plugin` 一行）。
+
+这也解释了 8.0 的整体格局：**插件没有"错"，它只是为"调用点固定且高频"的场景优化到了极致**；"调用点不固定、需要互相组合"的场景只能由组件体系解。两代机制并存不是历史包袱，而是**两种调用形态各得其所**（见 [`abi.md` 设计思想 ⑦](abi.md) 的调用形态三分层）。
 
 **1. 类型化 vtable = "角色契约"，而非能力市场。**
 
@@ -190,7 +211,7 @@ struct st_mysql_plugin {
 | STORAGE ENGINE | `st_mysql_storage_engine` | `ha_initialize_handlerton` / `ha_finalize_handlerton` |
 | INFORMATION_SCHEMA | `st_mysql_information_schema` | `initialize_schema_table` / `finalize_schema_table` |
 | AUDIT | `st_mysql_audit` | `initialize_audit_plugin` / `finalize_audit_plugin` |
-| AUTHENTICATION | `st_mysql_auth` | 无包装，直调 `plugin->init` |
+| AUTHENTICATION（类型号 `7`） | `st_mysql_auth` | 无包装，直调 `plugin->init`；vtable 七成员与 `CR_*` 返回码全表见 [`../auth/authentication.md`](../auth/authentication.md) §7.1 |
 | KEYRING | `st_mysql_keyring` | 无包装 |
 | CLONE | `Mysql_clone` | 无包装 |
 | 其余（UDF/FTPARSER/DAEMON/REPLICATION/VALIDATE_PASSWORD/GROUP_REPLICATION） | 各 vtable | 无包装 |
@@ -223,6 +244,70 @@ struct st_plugin_dl {
 
 全局：`plugin_array`（顺序数组）、`plugin_dl_array`、`plugin_hash[12]`、`reap_needed`、`plugin_array_version`（每次 add/del 递增，`plugin_foreach_with_mask` 用它检测遍历期间数组被改），全部由 `LOCK_plugin` 保护。
 
+### 插件状态机：七态与转换（难点）
+
+`st_plugin_int::state` 是**单 bit** 状态机，七个本征态（`sql/sql_plugin.h`）：`UNINITIALIZED`(4)、`DISABLED`(32)、`READY`(8)、`DYING`(16)、`DELETED`(2)、`FREED`(1)、`WAITING_FOR_UPGRADE`(64)。用 bitmap 而非枚举，源码注释说得很清楚——方便"是否属于某几个状态之一"的判断（`intern_plugin_lock` 就靠 `state & (READY|UNINITIALIZED)` 一行判断能否加锁）。
+
+```
+              plugin_add / register_builtin
+                        │
+        test_plugin_options 失败 ──► DISABLED   ← 终态：被 --skip-xxx 关闭，只能重启恢复
+                        │成功
+                        ▼
+     UNINITIALIZED ──(DD 升级期)──► WAITING_FOR_UPGRADE ──(升级完成)──► 回到 UNINITIALIZED
+                        │ plugin_initialize() 成功
+                        ▼
+                      READY
+                        │ UNINSTALL / shutdown
+                        ▼
+          DYING ──(check_uninstall 失败)──► 回到 READY，报 ER_PLUGIN_CANNOT_BE_UNINSTALLED
+            │成功
+            ▼
+         DELETED ──(ref_count 归零后的某次 unlock 触发 reap)──► DYING ──► FREED
+                                                                          │
+                                                              槽位可被 plugin_insert_or_reuse 复用
+```
+
+关键转换的源码落点（已逐条核实）：
+
+- `plugin_add()`：成功置 `UNINITIALIZED`，`test_plugin_options()` 失败置 `DISABLED`，中途失败置 `FREED`；
+- `plugin_initialize()`：断言进入时是 `UNINITIALIZED`，init 成功后置 `READY`；
+- `mysql_uninstall_plugin()`：`READY → DYING`（**放锁后**才调 `check_uninstall`，因为它可能拿 MDL）→ 失败回 `READY` → 成功置 `DELETED`；
+- `reap_plugins()`：`DELETED && ref_count == 0` → 置 `DYING`（防并发重复收割）→ 锁外 deinit → `plugin_del()` 置 `FREED`；
+- `plugin_shutdown()`：`READY → DELETED`（binlog 最后一轮才标），残留者强制阶段改 `DYING` 后强行 deinit。
+
+**为什么"删除 + 收割"必须拆成 DELETED → DYING → FREED 三步？** 三个状态各管一件事，缺一不可：
+
+1. `DELETED` 是**对外承诺**——从此 `intern_plugin_lock()` 对新请求返回 `nullptr`，插件不再接受新引用（这是"卸载安全"的一半）；
+2. `DYING` 是**内部互斥**——收割是由"最后一个 `plugin_unlock`"触发的，任意线程都可能执行，必须有状态防止两个线程收割同一插件；
+3. `FREED` 是**资源状态**——槽位可复用，但 `plugin_array` **不缩容**（保证遍历中的指针稳定，`plugin_foreach` 依赖这一点）。
+
+把"不再接受新引用"与"物理回收"解耦，是延迟收割能成立的前提——这一点与组件体系的"引用未归零就拒绝卸载"恰好是同一问题的两种解法（见 [`component.md`](component.md) 的卸载链）。
+
+### `plugin_foreach` 的 mask 语义（反直觉点）
+
+`plugin_foreach_with_mask()` 的 mask 语义与直觉相反——源码第一行就把它取反了：
+
+```c
+state_mask = ~state_mask;  // do it only once
+...
+plugins[idx] = !(plugin->state & state_mask) ? plugin : nullptr;
+```
+
+因为 `state` 同一时刻只有一个 bit，两次取反后等价于"**只选出 state 恰好等于 mask 的那些插件**"：
+
+| 调用 | 传入 mask | 实际选出 |
+|---|---|---|
+| `plugin_foreach(...)`（宏展开为 `PLUGIN_IS_READY`） | READY | 只有 READY |
+| `fill_plugins()` 传 `~PLUGIN_IS_FREED` | FREED | **除 FREED 外全部**（含 DISABLED、DELETING） |
+
+`plugin_foreach()` 默认只看"就绪"的插件；`SHOW PLUGINS` 要看"除已释放槽位外的一切"（所以传取反值）。搞反会得到两类 bug：插件明明存在却遍历不到；把正在删除的插件当可用。
+
+另外两个易忽略的细节：
+
+- **存储引擎类型下 binlog 强制最先调用**：注释说明"GTID 需要先由 binlog 生成"——加载器先找到 binlog 的槽位单独调一次，再遍历其余；
+- **回调期间不持锁**，靠 `plugin_array_version` 检测数组被改动：版本变了就在锁内把"状态已不匹配的槽位"剔除。这是"快照 + 版本校验"而非全程持锁的折中——回调可能很慢，甚至会反向拿 `LOCK_plugin`（这正是 INSTALL PLUGIN 要预取 audit 句柄的原因，见 Misc）。
+
 ### 加载一个 .so：`plugin_dl_add` 七道关
 
 ```
@@ -249,6 +334,62 @@ plugin_load_list / plugin_add
 `register_builtin()` 只做三件事：`ref_count = 0`、**`plugin_dl = nullptr`**、入数组入哈希。
 
 `plugin_insert_or_reuse()` 的细节：**bootstrap 期间不复用空槽**（`get_server_state() != SERVER_BOOTING`）——注释解释：若早期插件（如 keyring）加载失败留下空槽，用户插件可能抢占该槽，导致之后 mandatory 插件（如 PFS）装载时数组序混乱。
+
+### `plugin_initialize()`：为什么 init 在锁外执行
+
+登记（`plugin_add` / `register_builtin`）只是把插件放进哈希表、建好系统变量；真正的初始化由 `plugin_initialize()` 完成。这段代码短，但每一行的取舍都很硬：
+
+```c
+mysql_mutex_assert_owner(&LOCK_plugin);
+uint state = plugin->state;
+assert(state == PLUGIN_IS_UNINITIALIZED);
+
+mysql_mutex_unlock(&LOCK_plugin);                        /* ① 放锁 */
+mysql_rwlock_unlock(&LOCK_system_variables_hash);        /* ② 也放 sysvar 锁 */
+
+if (plugin_type_initialize[plugin->plugin->type]) {      /* ③ 类型包装优先 */
+  if ((*plugin_type_initialize[plugin->plugin->type])(plugin)) { ... goto err; }
+  /* FIXME: Need better solution to transfer the callback function
+     array to memcached */
+  if (strcmp(plugin->name.str, "InnoDB") == 0) {
+    innodb_callback_data = ((handlerton *)plugin->data)->data;   /* ④ 隐藏耦合 */
+  }
+} else if (plugin->plugin->init) {
+  if (strcmp(plugin->name.str, "daemon_memcached") == 0) {
+    plugin->data = innodb_callback_data;                  /* ④ 接过来 */
+  }
+  if (plugin->plugin->init(plugin)) { ... goto err; }     /* ⑤ 直调插件 init */
+}
+state = PLUGIN_IS_READY;                                  /* ⑥ 先标 READY */
+
+if (plugin->plugin->status_vars) {
+  if (add_status_vars(plugin->plugin->status_vars)) goto err;   /* ⑦ 状态变量 */
+}
+
+/* set the plugin attribute of plugin's sys vars so they are pointing
+   to the active plugin */
+if (plugin->system_vars) {                                /* ⑧ sysvar 回填 */
+  sys_var_pluginvar *var = plugin->system_vars->cast_pluginvar();
+  for (;;) { var->plugin = plugin; if (!var->next) break; var = var->next->cast_pluginvar(); }
+}
+ret = 0;
+err:
+mysql_rwlock_wrlock(&LOCK_system_variables_hash);
+mysql_mutex_lock(&LOCK_plugin);
+plugin->state = state;                                    /* ⑨ 重新加锁写回 */
+```
+
+逐条解释其中的"为什么"：
+
+**①② init 必须在锁外执行。** 插件的 init 可能很长（InnoDB 启动要恢复 redo、初始化 buffer pool），更关键的是它可能**反向获取这两把锁**——例如插件自己调 `plugin_lock_by_name()`（拿 `LOCK_plugin`）或注册系统变量（拿 `LOCK_system_variables_hash`）。若持锁调用就是自死锁。代价：init 期间别的线程能观察到 `UNINITIALIZED` 状态（所以 `intern_plugin_lock` 允许锁 `UNINITIALIZED` 状态的插件，见状态机一节）。
+
+**③ 类型包装优先。** 只有 SE / I_S / AUDIT 三类有内核包装函数（要先分配 `handlerton`、注册 schema table、并入全局 audit mask），其余类型直接调 `plugin->init`。
+
+**⑥→⑦ 顺序**：先置 `READY` 再注册状态变量——因为 `add_status_vars` 可能触发 `SHOW STATUS`，而调用方期望插件已就绪；失败则 `goto err`，此时 `state` 仍是 `READY`（局部变量），会被写回，上层看到的是"初始化失败但状态是 READY"，由调用者决定后续（启动阶段 mandatory 插件失败则拒绝启动）。
+
+**⑧ sysvar 回填的意义**：系统变量在更早的 `test_plugin_options()` 阶段就已注册（那时插件还没 init），此时才把 `sys_var_pluginvar::plugin` 指向这个活跃实例——`SHOW VARIABLES`、`SET`、以及卸载时的 `plugin_del` 都靠这个指针定位"这个变量属于哪个插件"。
+
+**④ 一个活标本：`innodb_callback_data` 的名字特判。** 这是全篇最能说明"插件只能对服务器说话"代价的例子：`daemon_memcached` 插件需要 InnoDB 的回调函数数组才能直接访问 InnoDB 行，但**插件之间没有通道**（没有服务、没有 registry），于是只能由服务器在 `plugin_initialize()` 里硬编码两个 `strcmp` 特判——先记住 InnoDB 的 `handlerton::data`，等 memcached 插件初始化时再塞给它。源码自己贴了 `FIXME: Need better solution`。这类"按名字特判"的胶水，正是 WL#4102 缺陷 1（插件只能与服务器对话）在真实代码里的样子；组件体系出现后，同类需求直接走服务，不再需要这种耦合。
 
 ### `INSTALL PLUGIN` 全链路
 
@@ -318,12 +459,79 @@ static void reap_plugins() {
 
 注册入口**不在** `plugin_initialize()` 而在 `test_plugin_options()`：遍历 `plugin->system_vars`，为每个变量 `new sys_var_pluginvar(...)` 并 `add_dynamic_system_variable_chain()`。`sys_var_pluginvar` 的关键成员 `orig_pluginvar_name`：变量名会被改成带插件前缀的**动态分配**名字（`plugin_name + "-" + var_name`，破折号转下划线、转小写），插件可反复装卸而 .so 不重载，卸载时必须把 `plugin_var->name` 恢复成硬编码原名——`restore_pluginvar_names()` 干这件事。
 
-THD 变量（`PLUGIN_VAR_THDLOCAL`）的 per-session 存储是这套机制里最精巧的部分：
+THD 变量（`PLUGIN_VAR_THDLOCAL`）的 per-session 存储是这套机制里最精巧的部分——**插件变量的个数与类型在编译期未知，而每个会话都要有自己的一份拷贝**，且插件可以在运行期装卸。MySQL 的解法是把所有 THDVAR 打包进一块 per-session 的"动态变量区"，用 **offset + 版本号**管理。
 
-1. **bookmark**（`st_bookmark`，存 `plugin_mem_root`，**永不删除**）：key 格式 = `1 字节类型码 + "plugin_var" + '\0'`。查得到就复用 offset，查不到才分配新 offset。
-2. **offset 分配**（`register_var()`）：按类型 size（bool/int/long/longlong/char*/double）**2 的幂对齐**，追加到 `global_system_variables.dynamic_variables_ptr` 尾部，总大小 64 字节向上取整（`(offset + size + 63) & ~63`），global 与 max 两份同步 realloc。
-3. **会话懒拷贝**（`alloc_and_copy_thd_dynamic_variables()`）：会话首次访问某个 THDVAR 时（`intern_sys_var_ptr()` 发现 `offset > thd->variables.dynamic_variables_head`），把 `dynamic_variables_ptr` realloc 到全局大小，**只 memcpy 新增区间**；`PLUGIN_VAR_MEMALLOC` 的字符串变量还要 per-session `strdup`（挂在 `dynamic_variables_allocs` 链表）。
-4. **取址**：`THDVAR(thd, name)` 展开为 `resolve(thd, offset)`——每种类型一个 `mysql_sys_var_XXX(thd, offset)` 函数，`construct_options()` 第一遍赋给 vtable 里的 resolve 指针；offset 初始为 -1，第二遍回填。
+**第一步：bookmark 分配 offset（`register_var()` 核心片段）**
+
+```c
+if (!(result = find_bookmark(nullptr, varname + 1, flags))) {
+  result = (st_bookmark *)plugin_mem_root.Alloc(sizeof(st_bookmark) + length - 1);
+  varname[0] = flags & PLUGIN_VAR_TYPEMASK;      /* key 首字节 = 类型码 */
+  memcpy(result->key, varname, length);
+  result->offset = -1;
+
+  assert(size && !(size & (size - 1)));          /* size 必须是 2 的幂 */
+
+  offset = global_system_variables.dynamic_variables_size;
+  offset = (offset + size - 1) & ~(size - 1);    /* 按自身 size 对齐 */
+  result->offset = (int)offset;
+
+  new_size = (offset + size + 63) & ~63;         /* 总量 64 字节向上取整 */
+
+  if (new_size > global_variables_dynamic_size) {
+    global_system_variables.dynamic_variables_ptr = (char *)my_realloc(..., new_size, ...);
+    max_system_variables.dynamic_variables_ptr    = (char *)my_realloc(..., new_size, ...);
+    /* 只把新增区间清零——字符串变量必须保证初值为 NULL */
+    memset(global_system_variables.dynamic_variables_ptr + global_variables_dynamic_size,
+           0, new_size - global_variables_dynamic_size);
+    memset(max_system_variables.dynamic_variables_ptr + global_variables_dynamic_size,
+           0, new_size - global_variables_dynamic_size);
+    global_variables_dynamic_size = new_size;
+  }
+
+  global_system_variables.dynamic_variables_head = offset;
+  global_system_variables.dynamic_variables_size = offset + size;
+  global_system_variables.dynamic_variables_version++;   /* 版本号 +1 */
+  result->version = global_system_variables.dynamic_variables_version;
+}
+```
+
+逐段拆解其中的设计决策：
+
+- **bookmark 永不删除**（`st_bookmark` 分配在 `plugin_mem_root`，注释明说 "this structure is never removed from the hash"）：offset 一旦分配就永久保留给"插件名 + 变量名"这个 key。理由在本文开头的设计权衡里——**会话的生命周期可能长于插件**：若卸载重装时重新分配 offset，老会话的 `dynamic_variables_ptr` 里那个位置的含义就变了，直接越界读写。
+- **两次对齐**：先按变量自身 size 做 2 的幂对齐（保证 `int`/`double`/指针落在自然边界），再把总大小按 64 字节向上取整（减少 realloc 次数、对齐 cache line）。
+- **只清零新增区间**，而不是整块：因为现有变量的值必须保留（可能已有会话在用）。
+- **版本递增**（`dynamic_variables_version`）：会话侧用它判断"我这块内存落后了几个时代"，决定要不要补拷贝。
+
+**第二步：会话懒拷贝（`alloc_and_copy_thd_dynamic_variables()`）**
+
+```c
+thd->variables.dynamic_variables_ptr = (char *)my_realloc(
+    key_memory_THD_variables, thd->variables.dynamic_variables_ptr,
+    global_variables_dynamic_size, MYF(MY_WME | MY_FAE | MY_ALLOW_ZERO_PTR));
+
+/* 只拷新增部分：从 thd 已有的 size 到 global 的 size */
+memcpy(thd->variables.dynamic_variables_ptr + thd->variables.dynamic_variables_size,
+       global_system_variables.dynamic_variables_ptr + thd->variables.dynamic_variables_size,
+       global_system_variables.dynamic_variables_size - thd->variables.dynamic_variables_size);
+
+/* 新增的 string+MEMALLOC 变量要 per-session strdup 一份 */
+for (const auto &key_and_value : *malloced_string_type_sysvars_bookmark_hash) {
+  ...
+  thdvar = (char **)(thd->variables.dynamic_variables_ptr + varoff);
+  *thdvar = nullptr;
+  plugin_var_memalloc_session_update(thd, nullptr, thdvar, *sysvar);
+}
+thd->variables.dynamic_variables_version = global_system_variables.dynamic_variables_version;
+```
+
+**"懒"体现在触发时机**：`intern_sys_var_ptr(thd, offset)` 发现 `offset > thd->variables.dynamic_variables_head` 才触发拷贝（且 `current_thd != thd` 时不触发，避免跨线程改别人的内存——直接返回全局值）。绝大多数会话从不访问插件变量，就永远不用付这份内存。
+
+**第三步：取址（为什么 `THDVAR()` 是个宏 + 函数指针）**
+
+`THDVAR(thd, name)` 展开为 `MYSQL_SYSVAR_NAME(name).resolve(thd, offset)`——每种类型一个 `mysql_sys_var_XXX(thd, offset)` 函数，`construct_options()` 第一遍遍历时赋给 vtable 的 `resolve` 指针（offset 初值是 -1，第二遍回填）。用函数指针而非直接算地址，是为了让"取址"这一步能顺带完成**懒拷贝**——`resolve` 内部调的就是 `intern_sys_var_ptr()`。
+
+一个容易忽略的对称设计：`PLUGIN_VAR_MEMALLOC` 的字符串变量在会话里要 `strdup`，这些堆块挂在 `System_variables::dynamic_variables_allocs` 链表上，会话结束时由 `plugin_var_memalloc_free()` 统一释放——**per-session 内存的生命周期由 THD 管理，而 offset 布局由全局 bookmark 管理**，两套生命周期解耦才能支撑插件反复装卸。
 
 状态变量（`SHOW_VAR[]`）：`plugin_initialize()` 成功后 `add_status_vars()` 挂进全局 `all_status_vars`；`plugin_deinitialize()` 里 `remove_status_vars()` 摘除。
 
@@ -340,7 +548,60 @@ open_table → ha_resolve_by_name(thd, &name)
 
 ### 使用方之二：审计
 
-`initialize_audit_plugin()`：校验 `class_mask` 与 `event_notify`，把插件的 mask 并入全局 `mysql_global_audit_mask`。分发靠 `plugin_foreach(current_thd, plugins_dispatch, MYSQL_AUDIT_PLUGIN, ...)`：对每个 READY 的审计插件调 `event_notify`。8.0.39 中审计**仍是插件接口、未迁移组件**（`include/mysql/components/services/` 下无 `event_tracking_*`；只有 `components/audit_api_message_emit` 这个供审计插件发消息的组件）。
+`initialize_audit_plugin()`：校验 `class_mask` 与 `event_notify`，把插件的 mask 并入全局 `mysql_global_audit_mask`（卸载时 `finalize_audit_plugin` 再用 `plugin_foreach` **重算**一遍全局 mask——不是做减法，因为多个插件的 mask 可能重叠）。
+
+真正的分发函数很短，但每个字节都有用意（`sql/sql_audit.cc`）：
+
+```c
+static int plugins_dispatch(THD *thd, plugin_ref plugin, void *arg) {
+  const struct st_mysql_event_generic *event_generic =
+      (const struct st_mysql_event_generic *)arg;
+  unsigned long subclass = static_cast<unsigned long>(
+      *static_cast<const int *>(event_generic->event));
+  st_mysql_audit *data = plugin_data<st_mysql_audit *>(plugin);
+
+  /* Check to see if the plugin is interested in this event */
+  if (check_audit_mask(data->class_mask[event_generic->event_class], subclass))
+    return 0;
+
+  /* Actually notify the plugin */
+  return data->event_notify(thd, event_generic->event_class,
+                            event_generic->event);
+}
+```
+
+三点设计：
+
+- **两级过滤**：全局 `mysql_global_audit_mask` 先挡掉"没有任何插件关心"的事件（省掉一次遍历），再在每个插件上用 `class_mask[event_class]` + subclass 位图精筛——审计事件在热路径上（每条语句、每次连接），两级过滤是必要的性能设计。
+- **`plugin_data<st_mysql_audit *>(plugin)`**：从 `plugin_ref` 直接取 `st_plugin_int::data`（初始化时 `plugin->data = plugin->plugin->info`），**无哈希查找**——又一处"热路径不走查找"。
+- **遍历用 `plugin_foreach`**：只遍历 READY 插件，且遍历期间不持 `LOCK_plugin`（见 `plugin_foreach` 小节）——所以审计回调里可以做慢操作，但这也是 INSTALL PLUGIN 必须预取 audit 句柄的原因。
+
+8.0.39 中审计**仍是插件接口、未迁移组件**（`include/mysql/components/services/` 下无 `event_tracking_*`；只有 `components/audit_api_message_emit` 这个供审计插件发消息的组件）。
+
+### `SHOW PLUGINS` / `I_S.PLUGINS`：状态如何变成字符串
+
+两者共用 `fill_plugins()` → `plugin_foreach_with_mask(~PLUGIN_IS_FREED)` → `show_plugins()`。后者把内部状态机映射成用户可见的 `PLUGIN_STATUS`（`sql/sql_show.cc`，原文）：
+
+```c
+switch (plugin_state(plugin)) {
+  /* case PLUGIN_IS_FREED: does not happen */
+  case PLUGIN_IS_DELETED:                                  → "DELETED"
+  case PLUGIN_IS_UNINITIALIZED:
+  case PLUGIN_IS_WAITING_FOR_UPGRADE:                      → "INACTIVE"
+  case PLUGIN_IS_READY:                                    → "ACTIVE"
+  case PLUGIN_IS_DYING:                                    → "DELETING"
+  case PLUGIN_IS_DISABLED:                                 → "DISABLED"
+}
+table->field[3]->store(plugin_type_names[plug->type].str, ...);              /* 类型名 */
+table->field[4]->store(make_version_string(version_buf, sizeof(version_buf),
+                                           *(uint *)plug->info), ...);        /* 类型 ABI 版本 */
+```
+
+两个细节：
+
+- **`FREED` 永远不会出现**——源码注释直说 "does not happen"：`FREED` 的槽位已被 `~PLUGIN_IS_FREED` 这个 mask 排除在遍历之外（见 `plugin_foreach` 小节的 mask 语义）。
+- **`WAITING_FOR_UPGRADE` 与 `UNINITIALIZED` 都显示 `INACTIVE`**——所以升级期间"延迟插件"看起来就是没初始化，运维侧看不出区别，这正是"升级场景延迟插件"那条 Misc 的由来。
+- 第 5 列 `PLUGIN_TYPE_VERSION` 打印的是 `*(uint *)plug->info`，即**类型 vtable 首字段**——又一次印证"首字段即版本号"这条 ABI 约定（详见 [`abi.md`](abi.md)）。
 
 ### 关闭：`plugin_shutdown` 多轮收敛
 
@@ -349,6 +610,117 @@ open_table → ha_resolve_by_name(thd, &name)
 `plugin_shutdown()` 是 **while 循环而非两遍**：每轮把上一轮标 DELETED 的收割掉，再把所有 READY 的标 DELETED——**binlog 例外，最后一轮才标**（其它引擎提交时还要写 binlog）；若某轮无进展（剩下都因 ref_count 不归零），则 `unlock_variables()` 释放 `global_system_variables` 持有的默认引擎句柄再试。仍收敛不了时进入**强制关停**：`ref_check=false` 直接 deinit，结束后统一查 ref_count 并报 `ER_PLUGIN_HAS_NONZERO_REFCOUNT_AFTER_SHUTDOWN`。最后 `free_plugin_mem()` 逐个 `dlclose`。
 
 ---
+
+### 8.0.39 的 builtin 插件全清单
+
+`sql/sql_builtin.cc.in` 是模板，cmake 生成 `sql/sql_builtin.cc`（本分支的生成物见 `build_vscode_8039/sql/sql_builtin.cc`）。它产出两个数组，**数组身份决定命运**：
+
+```c
+struct st_mysql_plugin *mysql_mandatory_plugins[] = {
+  builtin_binlog_plugin, builtin_mysql_password_plugin,
+  builtin_caching_sha2_password_plugin, builtin_daemon_keyring_proxy_plugin,
+  builtin_csv_plugin, builtin_heap_plugin, builtin_innobase_plugin,
+  builtin_myisam_plugin, builtin_myisammrg_plugin, builtin_perfschema_plugin,
+  builtin_temptable_plugin, 0};
+
+struct st_mysql_plugin *mysql_optional_plugins[] = {
+  builtin_archive_plugin, builtin_blackhole_plugin, builtin_federated_plugin,
+  builtin_ndbcluster_plugin, builtin_ngram_parser_plugin, builtin_mysqlx_plugin, 0};
+```
+
+| 分组 | 插件 | 说明 |
+|---|---|---|
+| **mandatory** | `binlog` | 伪存储引擎（代表 binlog 参与事务） |
+| | `mysql_native_password` **+** `sha256_password`（同属一个 `mysql_declare_plugin(mysql_password)` 块，在数组里表现为**单个指针** `builtin_mysql_password_plugin`）、`caching_sha2_password` | 认证插件——注意是 **3 个插件、2 个数组条目**；契约与 `CR_*` 返回码见 [`../auth/authentication.md`](../auth/authentication.md) §7.1 |
+| | `daemon_keyring_proxy` | 把 keyring 插件包装成组件服务的代理（见 [`keyring.md`](keyring.md)） |
+| | `csv`、`heap`、`innobase`、`myisam`、`myisammrg`、`temptable` | 存储引擎，其中 MyISAM/InnoDB/CSV 在 `plugin_register_builtin_and_init_core_se` 阶段就被提前初始化 |
+| | `perfschema` | PFS（源码里还额外把它硬编码成 `PLUGIN_FORCE`） |
+| **optional** | `archive`、`blackhole`、`federated`、`ndbcluster` | 可选存储引擎 |
+| | `ngram_parser` | 全文解析器插件（中日文分词） |
+| | **`mysqlx`** | X Plugin——注意它是 **builtin**，不是 `.so`（见 [`mysqlx.md`](mysqlx.md)） |
+
+三个要点：
+
+- **mandatory ≠ "不能被关"**，而是"**初始化失败就拒绝启动**"（`reaped_mandatory_plugin` → 服务器退出）；它们同时也**不生成 `--plugin-<name>` 开关**（`construct_options()` 对 `PLUGIN_FORCE` 不生成），所以用户关不掉。
+- **optional 可以被关**：`--skip-archive`、`--skip-mysqlx` 这类开关由 `test_plugin_options()` 为每个插件生成；关掉的插件状态是 `PLUGIN_IS_DISABLED`（状态机里的终态，只能重启恢复）。
+- **builtin 插件一律不参与引用计数**（`plugin_dl == nullptr`），也**不能 `UNINSTALL PLUGIN`**（报 `ER_PLUGIN_DELETE_BUILTIN`）——这是 builtin 与 dynamic 最关键的行为差异。
+
+### 认证插件：从框架视角看这个元老类型
+
+认证插件的算法、握手协议与凭据校验**不在本篇**——那是认证主题，见 [`../auth/authentication.md`](../auth/authentication.md)（§3 逐个插件深剖、§7.1 契约）。本节只讲**从插件框架角度才能看清的 5 个事实**，它们是框架的通用特性，用认证插件作例子最直观。
+
+**① 类型号 7：`MYSQL_AUTHENTICATION_PLUGIN` 是 MySQL 第一个"非引擎"插件类型。**
+
+5.5 的可插拔认证（pluggable authentication）是插件体系从"只给存储引擎用"走向通用的起点（见 [概述·版本演进](#概述)）。在 12 个类型里它排第 7，夹在 `MYSQL_REPLICATION_PLUGIN`(6) 与 `MYSQL_VALIDATE_PASSWORD_PLUGIN`(8) 之间。
+
+**② 一个 `mysql_declare_plugin` 块可以含**多个**描述符——不是一块一插件。**
+
+这是最容易想错的地方。宏展开后就是一个 `st_mysql_plugin[]` 数组，长度不限：
+
+```c
+/* sql/auth/sql_authentication.cc */
+mysql_declare_plugin(mysql_password){
+    { MYSQL_AUTHENTICATION_PLUGIN, &mysql_native_password_handler, "mysql_native_password", ... },
+    { MYSQL_AUTHENTICATION_PLUGIN, &sha256_password_handler,       "sha256_password",       ... },
+    ...
+} mysql_declare_plugin_end;
+```
+
+后果直接落到 builtin 数组上：上面这**一个块**在 `sql_builtin.cc` 里只对应**一个指针** `builtin_mysql_password_plugin`，却注册了 **2 个插件**。所以"3 个内置认证插件"与"强制数组里 2 个认证条目"是同一件事的两种数法（见上表）。
+
+**③ 一个 decl 块里可以混装**不同类型**的插件。**
+
+```c
+/* sql/auth/sha2_password.cc —— 同一个块：一个认证插件 + 一个审计插件 */
+mysql_declare_plugin(caching_sha2_password){
+    { MYSQL_AUTHENTICATION_PLUGIN, &caching_sha2_auth_handler, "caching_sha2_password", ... },
+    { MYSQL_AUDIT_PLUGIN,          &sha2_cache_cleaner,        "sha2_cache_cleaner",    ... },
+} mysql_declare_plugin_end;
+```
+
+`sha2_cache_cleaner` 的唯一职责是**监听认证类审计事件去失效密码缓存**（见 [`mysqlx.md`](mysqlx.md) 里 X Plugin 的 `mysqlx_cache_cleaner` 同款套路）。两个插件被**捆在同一个库、同一个块**里，因为：
+
+- 它们必须**同生共死**——只有认证插件在工作时，缓存才需要被清理；
+- 而插件之间**没有依赖声明机制**（那是组件 `requires` 的能力），只能靠"塞进同一个块 + 声明顺序"来保证初始化次序。
+
+★ 这是"**插件模型的表达能力不足以描述插件间关系**"的实证——组件用 `REQUIRES_SERVICE` 一行说清的事，插件只能用"物理打包在一起"来近似。
+
+**④ 认证插件是唯一在"每条连接热路径"上走引用计数的类型。**
+
+```c
+static int do_auth_once(THD *thd, const LEX_CSTRING &auth_plugin_name, MPVIO_EXT *mpvio) {
+  bool unlock_plugin = false;
+  plugin_ref plugin =
+      g_cached_authentication_plugins->get_cached_plugin_ref(&auth_plugin_name);   /* ① 先查缓存 */
+
+  if (!plugin) {                                                                  /* ② 未命中才 lock */
+    if ((plugin = my_plugin_lock_by_name(thd, auth_plugin_name,
+                                         MYSQL_AUTHENTICATION_PLUGIN)))
+      unlock_plugin = true;                                                       /* ③ 记住"这次是我锁的" */
+  }
+  ...
+  res = auth->authenticate_user(mpvio, &mpvio->auth_info);
+  if (unlock_plugin) plugin_unlock(thd, plugin);                                  /* ④ 只还自己锁的 */
+}
+```
+
+三条框架语义浓缩在这 15 行里：
+
+- **`unlock_plugin` 这个 bool 就是"借用不归还"原则的代码化**：内置认证插件的 `plugin_ref` 由 `Cached_authentication_plugins` 在 `acl_init()` 里**启动时一次性锁住、整个进程生命周期持有**（`sql_authentication.cc:1039`），`do_auth_once()` 只是**借用**——此时若调 `plugin_unlock` 会破坏计数（详见认证篇对这张缓存表的剖析）；
+- **非内置插件（如 `auth_socket`）每次登录都要真 `lock` + `unlock`**，即每条连接两次 `LOCK_plugin` 竞争。这正是 `Cached_authentication_plugins` 存在的理由——**热路径上能不碰全局锁就不碰**（与 [`abi.md`](abi.md) 设计思想 ⑦「调用形态三分层」是同一条原则）；
+- 认证插件因此成为**引用计数机制压力最大**的使用方：一次连接风暴就是每秒数万次 `plugin_lock`。
+
+**⑤ `st_plugin_int::data`：认证插件**不用**它，SE 全靠它。**
+
+分派表里认证类型"无包装，直调 `plugin->init`"（见[插件类型全集](#插件类型全集与分派表)），对应地它的 `data` 字段**不会被内核填写**：
+
+| 类型 | `st_plugin_int::data` | 为什么 |
+|---|---|---|
+| STORAGE ENGINE | `handlerton *` | **有状态**：每个引擎一个 handlerton，内核要先分配再交给插件填 |
+| AUDIT | `st_mysql_audit *` | 内核要拿着它算全局 audit mask |
+| AUTHENTICATION | **不填** | **vtable 无状态**：`st_mysql_auth` 是纯函数表，插件自己的状态放在自己的全局变量里（如 `SHA256_password_cache`、`g_caching_sha2_rsa_keys`） |
+
+★ 这条差异解释了"为什么 SE 必须有内核包装而认证插件不需要"：**有没有内核需要代管的实例状态**，是包装与否的真正判据，不是类型的重要性。
 
 ## 相关的系统变量/命令行选项
 
@@ -403,6 +775,9 @@ open_table → ha_resolve_by_name(thd, &name)
 - `components/libminchassis/dynamic_loader.cc` 的 `@page page_components_layering_plugins`（插件与组件的关系定位）
 
 **相关文档**
+- 架构总览（双轨制与迁移进度）见 [`architecture.md`](architecture.md)
+- 认证插件的完整剖析（`caching_sha2_password` / `mysql_native_password` / `sha256_password` / `auth_socket` …）见 [`../auth/authentication.md`](../auth/authentication.md)：本篇只讲插件框架，凭据校验与握手协议在那边
 - ABI 契约专题（三层版本校验/旧结构迁移/符号可见性）见 [`abi.md`](abi.md)
 - 组件基础设施见 [`component.md`](component.md)
 - 服务（含老版 plugin service 与 registry 内部）见 [`service.md`](service.md)
+- 具体插件：物理克隆 [`clone.md`](clone.md)、X Plugin [`mysqlx.md`](mysqlx.md)、密钥管理 [`keyring.md`](keyring.md)、口令强度 [`validate_password.md`](validate_password.md)（★ 插件与组件双实现、运行时择优分派）

@@ -615,6 +615,28 @@ parse_error:
 #### Gtid_set 的拷贝 / 赋值 / 清空语义
 
 - ★ **无拷贝构造、无 `operator=`**（从未声明；隐式浅拷贝会复制裸指针与 `mysql_mutex_t`，属 UB，代码规范是**一律指针传递**）
+
+```cpp
+/* rpl_gtid_set.cc:85 —— 只有两个构造 + 析构，sid_map 永远是指针共享 */
+Gtid_set::Gtid_set(Sid_map *_sid_map, Checkable_rwlock *_sid_lock)
+    : sid_lock(_sid_lock),
+      sid_map(_sid_map),                       /* ★ 裸指针，非拥有 */
+      m_intervals(key_memory_Gtid_set_Interval_chunk) {
+  init();
+}
+
+void Gtid_set::init() {
+  has_cached_string_length = false;
+  cached_string_length = 0;
+  chunks = nullptr;
+  free_intervals = nullptr;
+  if (sid_lock)                                /* ★ sid_lock==NULL → 连 free_intervals_mutex 都不建 */
+    mysql_mutex_init(key_gtid_executed_free_intervals_mutex,
+                     &free_intervals_mutex, nullptr);
+}
+```
+> ⚠️ **真名核查**：与 `Gtid_table_persistor` / `Clone_persist_gtid`（显式 `= delete`）不同，`Gtid_set` **没有** `=delete`——只是"从未声明"，靠代码规范约束。
+> ★ 复制语义一律用 `add_gtid_set(other)` 表达，不用赋值。
 - 构造函数对空参数的降级：`sid_map == nullptr` 允许（用于"只要集合运算、不要文本"场景），但 `to_string`/`add_gtid_text` 会 `assert(sid_map != nullptr)`；`sid_lock == nullptr` 时**不初始化 free_intervals_mutex**，走线程局部零锁路径
 - `clear()`：把每个 SIDNO 的区间链表**尾接**回 free list（先走到 free list 尾再 `set(iv)`，保持分配顺序）→ 链头置空——**零释放、零 malloc，全量复用**
 - ★ `clear_set_and_sid_map()` 的注释警告**顺序不可颠倒**：必须先 `clear()` 再 `m_intervals.clear()` 再 `sid_map->clear()`，否则出现 `Gtid_set::get_max_sidno() > Sid_map::get_max_sidno()` 的不变量破坏
@@ -648,6 +670,128 @@ bool Gtid_set::contains_gtid(rpl_sidno sidno, rpl_gno gno) const {
 - **退化场景**：① 单 SIDNO 区间数 k 很大（乱序提交、purge 打洞、clone 恢复碎片）时每事务扫描 O(k)；② `add_gtid_text` 的冒号预分配只在 `chunks == nullptr` 时生效，重复追加退回小 chunk；③ `get_last_gno`/`get_gtid_count`/`contains_gtid` 无缓存
 
 **设计意图总结**：这套实现的一切技艺（link-pointer 迭代器、POD 块分配、懒锁、Prealloced_array）服务于同一个目标——**让热路径（顺序提交事务时的 `executed_gtids` 维护）做到零堆分配、零 mutex、摊还 O(1)**，同时保持 P_S 内存可观测与线程安全断言完备。
+
+**★ 支撑源码：chunk 批发与懒锁**（`sql/rpl_gtid.h:2106`，⚠️ 常量真名纠错）：
+
+```cpp
+  /**
+    Contains a list of intervals allocated by this Gtid_set.  When a
+    method of this class needs a new interval and there are no more
+    free intervals, a new Interval_chunk is allocated and the
+    intervals of it are added to the list of free intervals.
+  */
+  struct Interval_chunk {
+    Interval_chunk *next;
+    Interval intervals[1];        /* ★ struct hack：实际分配 size 个 */
+  };
+  /// The default number of intervals in an Interval_chunk.
+  static const int CHUNK_GROW_SIZE = 8;   /* ⚠️ 真名是 CHUNK_GROW_SIZE=8，不存在 CHUNK_GROW_FACTOR；每次只加 8 个，不是倍增 */
+```
+```cpp
+/* rpl_gtid_set.cc:180 —— free list 空时才 malloc 一个 8 元素的 chunk */
+void Gtid_set::get_free_interval(Interval **out) {
+  Interval_iterator ivit(this);
+  if (ivit.get() == nullptr || simulate_failure)
+    create_new_chunk(CHUNK_GROW_SIZE);
+  *out = ivit.get();                     /* ★ O(1) pop */
+  ivit.set((*out)->next);
+}
+
+void Gtid_set::put_free_interval(Interval *iv) {
+  Interval_iterator ivit(this);
+  iv->next = ivit.get();
+  ivit.set(iv);                          /* ★ O(1) push */
+}
+```
+
+**★★ 懒锁 `Free_intervals_lock`**（`rpl_gtid.h:2189`，★ 这是"零 mutex"热路径的关键）：
+
+```cpp
+  /**
+    Class representing a lock on free_intervals_mutex.
+
+    This is used by the add_* and remove_* functions.  The lock is
+    declared by the top-level function and a pointer to the lock is
+    passed down to low-level functions. If the low-level function
+    decides to access the free intervals list, then it acquires the
+    lock.  The lock is then automatically released by the destructor
+    when the top-level function returns.
+
+    The lock is not taken if Gtid_set->sid_lock == NULL; such
+    Gtid_sets are assumed to be thread-local.
+  */
+  class Free_intervals_lock {
+   public:
+    void lock_if_not_locked() {
+      if (gtid_set->sid_lock && !locked) {          /* ★★ 只有真的要动 free list 才上锁，且一次调用链只上一次 */
+        mysql_mutex_lock(&gtid_set->free_intervals_mutex);
+        locked = true;
+      }
+    }
+    ~Free_intervals_lock() { unlock_if_locked(); }
+```
+> ★★ 所以顺序提交（新 GNO 与末区间合并）**完全不碰 free list ⇒ 完全不上 mutex**。这正是"零 mutex"的成立机制。
+
+**★ `clear()` 零释放**（`rpl_gtid_set.cc:263`，★ 只搬指针）：
+
+```cpp
+void Gtid_set::clear() {
+  has_cached_string_length = false;
+  rpl_sidno max_sidno = get_max_sidno();
+  if (max_sidno == 0) return;
+  Interval_iterator free_ivit(this);
+  for (rpl_sidno sidno = 1; sidno <= max_sidno; sidno++) {
+    Interval_iterator ivit(this, sidno);
+    Interval *iv = ivit.get();
+    if (iv != nullptr) {
+      while (free_ivit.get() != nullptr) free_ivit.next();   /* ★ 走到 free list 尾 */
+      free_ivit.set(iv);                                     /* ★ 整条链表尾接过去 */
+      ivit.set(nullptr);                                     /* 该 sidno 链头置空 */
+    }
+  }
+}
+
+void Gtid_set::clear_set_and_sid_map() {
+  clear();
+  /*
+    Cleaning the SID map without cleaning up the Gtid_set intervals may lead
+    to a condition were the Gtid_set->get_max_sidno() will be greater than the
+    Sid_map->get_max_sidno().
+  */
+  m_intervals.clear();
+  sid_map->clear();          /* ★★ 连共享的 Sid_map 一起清空（RESET MASTER 专用，危险） */
+  assert(get_max_sidno() == sid_map->get_max_sidno());
+}
+```
+> ★ 唯一的内存释放点是**析构**（`rpl_gtid_set.cc:117` 逐个 chunk `my_free`）。
+
+**★ GTID 内存耗尽 = 直接 `_exit`**（`rpl_gtid_set.cc:180`，★ 值得记住的极端行为）：
+
+```cpp
+  if (MAX_NEW_CHUNK_ALLOCATE_TRIES == i || ...) {
+    my_safe_printf_stderr("%s",
+                          "[Fatal] Out of memory while allocating "
+                          "a new chunk of intervals for storing GTIDs.\n");
+    _exit(MYSQLD_FAILURE_EXIT);       /* ★ 不是返回错误，是终止进程 */
+  }
+```
+
+**★ 一次性批发解析优化**（`rpl_gtid_set.cc:449`，★ "数冒号"）：
+
+```cpp
+  // Allocate space for all intervals at once, if nothing is allocated.
+  if (chunks == nullptr) {
+    // compute number of intervals in text: it is equal to the number of colons
+    int n_intervals = 0;
+    text = s;
+    for (; *s; s++)
+      if (*s == ':') n_intervals++;       /* ★ 数冒号 = 数区间 */
+    lock.lock_if_not_locked();
+    create_new_chunk(n_intervals);        /* ★ 一次 malloc 搞定 */
+    lock.unlock_if_locked();
+    s = text;
+  }
+```
 
 ### Owned_gtids
 
@@ -774,6 +918,119 @@ thd->clear_owned_gtids();
 
 `more_trx_with_same_gtid_next`（由 `update_gtids_impl_begin` 得出）控制 `update_gtids_impl_end` 是否结束"GTID 违规事务"计数——**一条语句里包含多个事务时（如 `binlog cache` 里还有内容），同一个 `gtid_next` 会被后续事务继续沿用**，此时不能提前结束违规计数。
 
+**★ 分派主函数原文**（`sql/rpl_gtid_state.cc:218`）：
+
+```cpp
+void Gtid_state::update_gtids_impl(THD *thd, bool is_commit) {
+  if (update_gtids_impl_do_nothing(thd)) return;      /* ★ 分支 0 */
+
+  bool more_trx_with_same_gtid_next = update_gtids_impl_begin(thd);
+
+  global_sid_lock->rdlock();                          /* ★ 外部化只取读锁 */
+  bool gtid_threshold_breach = (thd->owned_gtid.gno > GNO_WARNING_THRESHOLD);
+
+  if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_GTID_SET) {
+    update_gtids_impl_own_gtid_set(thd, is_commit);         /* 分支 1 */
+  } else if (thd->owned_gtid.sidno > 0) {
+    rpl_sidno sidno = thd->owned_gtid.sidno;
+    update_gtids_impl_lock_sidno(sidno);
+    update_gtids_impl_own_gtid(thd, is_commit);             /* 分支 2 ★ 主路径 */
+    update_gtids_impl_broadcast_and_unlock_sidno(sidno);
+  } else if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS) {
+    update_gtids_impl_own_anonymous(thd, &more_trx_with_same_gtid_next);  /* 分支 3 */
+  } else {
+    update_gtids_impl_own_nothing(thd);                     /* 分支 4 */
+  }
+
+  global_sid_lock->unlock();
+  update_gtids_impl_end(thd, more_trx_with_same_gtid_next);
+  if (gtid_threshold_breach) LogErr(WARNING_LEVEL, ER_WARN_GTID_THRESHOLD_BREACH);
+}
+```
+
+**★★★ 分支 2（主路径）的完整代码**（`rpl_gtid_state.cc:856`）：
+
+```cpp
+void Gtid_state::update_gtids_impl_own_gtid(THD *thd, bool is_commit) {
+  assert_sidno_lock_owner(thd->owned_gtid.sidno);
+  /*
+    In Group Replication the GTID may additionally be owned by another
+    thread, and we won't remove that ownership (it will be rolled back later)
+  */
+  assert(owned_gtids.is_owned_by(thd->owned_gtid, thd->thread_id()));
+  owned_gtids.remove_gtid(thd->owned_gtid, thd->thread_id());   /* ★ owned -= */
+
+  if (is_commit) {
+    assert(!executed_gtids.contains_gtid(thd->owned_gtid));
+    /*
+      Any session adds transaction owned GTID into global executed_gtids.
+
+      If binlog is disabled, we report @@GLOBAL.GTID_PURGED from
+      executed_gtids, ... so we did not save gtid into lost_gtids for
+      every transaction for improving performance.
+
+      If binlog is enabled and log_replica_updates is disabled, slave
+      SQL thread or slave worker thread adds transaction owned GTID
+      into global executed_gtids, lost_gtids and gtids_only_in_table.
+    */
+    CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_gtid_externalization");
+    executed_gtids._add_gtid(thd->owned_gtid);                  /* ★ executed += 无条件 */
+    thd->rpl_thd_ctx.session_gtids_ctx().notify_after_gtid_executed_update(thd);
+    if (thd->slave_thread && opt_bin_log && !opt_log_replica_updates) {
+      lost_gtids._add_gtid(thd->owned_gtid);                    /* ★ 仅此条件才进 lost */
+      gtids_only_in_table._add_gtid(thd->owned_gtid);           /* ★ gtids_only_in_table += */
+    }
+  } else {
+    if (thd->owned_gtid.sidno == server_sidno &&
+        next_free_gno > thd->owned_gtid.gno)
+      next_free_gno = thd->owned_gtid.gno;                      /* ★ 回滚填洞 */
+  }
+
+  thd->clear_owned_gtids();
+  if (thd->variables.gtid_next.type == ASSIGNED_GTID) {
+    assert(!thd->is_commit_in_middle_of_statement);
+    thd->variables.gtid_next.set_undefined();                   /* ★★ 提交后变 UNDEFINED 不是 AUTOMATIC */
+  } else { ... }
+}
+```
+
+> ★★ **五个分支对三个集合的影响**（逐个核实）：
+
+| 分支 | 判据 | 场景 | owned_gtids | executed_gtids | gtids_only_in_table |
+|---|---|---|---|---|---|
+| 0 `do_nothing` | own 空 & 无违规 | 绝大多数只读/无 GTID 语句 | 不动 | 不动 | 不动 |
+| 1 `own_gtid_set` | `sidno == OWNED_SIDNO_GTID_SET` | `GTID_NEXT_LIST`（8.0 默认未定义该宏 → `assert(0)`，**实际不可达**） | `-=` 每个 | commit 时 `+=` | 不动 |
+| 2 `own_gtid` | `sidno > 0` | 普通事务、**XA 事务**、复制 applier | `-=` | commit 时 `+=` | **仅** `slave_thread && opt_bin_log && !opt_log_replica_updates` 时 `+=`（同时 `lost_gtids +=`） |
+| 3 `own_anonymous` | `sidno == OWNED_SIDNO_ANONYMOUS` | gtid_mode=OFF/OFF_PERMISSIVE | 释放匿名计数 | 不动 | 不动 |
+| 4 `own_nothing` | 其余 | AUTOMATIC 但一致性违规且不写 binlog | 不动 | 不动 | 不动 |
+
+> ⚠️ **纠正常见说法**：分支判据**不是**"真事务/XA prepare/XA commit/匿名/其它"——**XA 不做区分**，XA 事务走 `sidno>0` 这一支；**XA prepare 阶段根本不外部化**。
+> ★ 分支 2 里 `thd->slave_thread && opt_bin_log && !opt_log_replica_updates` 这个条件，正是 replication.md 里"`log_replica_updates=OFF` 时 GTID 进 `lost_gtids`"的那段代码——两篇在此汇合。
+
+**★ 组提交路径 `update_commit_group()`**（`rpl_gtid_state.cc:155`，★ 与单条路径并行存在）：
+
+```cpp
+  /*
+    We are going to loop in all sessions of the group commit in order to avoid
+    being taking and releasing the global_sid_lock and sidno_lock for each
+    session.
+  */
+  global_sid_lock->rdlock();
+  update_gtids_impl_lock_sidnos(first_thd);      /* ★ 整组一次性加锁（按 sidno 递增，避免死锁） */
+
+  for (THD *thd = first_thd; thd != nullptr; thd = thd->next_to_commit) {
+    bool is_commit = (thd->commit_error != THD::CE_COMMIT_ERROR);
+    if (update_gtids_impl_do_nothing(thd) ||
+        (!is_commit && update_gtids_impl_check_skip_gtid_rollback(thd)))
+      continue;
+    ... /* 同样的四路分派 */
+  }
+
+  update_gtids_impl_broadcast_and_unlock_sidnos();   /* ★ 整组一次性 broadcast + 解锁 */
+  global_sid_lock->unlock();
+```
+> ★ 优化点：一个 commit group 里**每个 sidno 只加一次锁、只 broadcast 一次**（`commit_group_sidnos` 数组去重），而不是每事务一次。
+
 #### 匿名事务的所有权：计数而非登记
 
 `thd->owned_gtid.sidno == -2` 的匿名事务**没有 GTID 可登记**，所以它的"所有权"退化为一个原子计数：
@@ -804,6 +1061,88 @@ gtid_state->wait_for_gtid(thd, spec.gtid);   // 睡在 sidno 的条件变量上�
 相关的禁令：`WAIT_FOR_EXECUTED_GTID_SET()` 函数与 `WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS` **不允许调用者自己持有 owned**（否则报 `ER_CANT_WAIT_FOR_EXECUTED_GTID_SET_WHILE_OWNING_A_GTID`）——自己占着号又等别人提交，可能自锁。
 
 **与复制的关系**：主库 dump 的第一道校验用的是 `executed_gtids ∪ owned_gtids`（见「三道校验」）——因为 owned 里的事务马上就要提交，若从库声称已拥有它，说明从库超前于主库（数据分叉）。反过来，`SHOW MASTER STATUS` / `@@GLOBAL.gtid_executed` **不含** owned。
+
+**★ 完整实现**（`sql/rpl_gtid_state.cc:267`，⚠️ 它自己**不处理超时**）：
+
+```cpp
+bool Gtid_state::wait_for_sidno(THD *thd, rpl_sidno sidno,
+                                struct timespec *abstime,
+                                bool update_thd_status) {
+  PSI_stage_info stage = stage_waiting_for_gtid_to_be_committed;
+  sid_lock->assert_some_lock();
+  sid_locks.assert_owner(sidno);         /* ★ 进入等待时必须已持有 global_sid_lock + 该 sidno mutex */
+  ...
+  sid_locks.enter_cond(thd, sidno, &stage, &old_stage);
+  bool ret = sid_locks.wait(thd, sidno, abstime);   /* ★ cond_timedwait：会释放 sidno mutex */
+  mysql_mutex_unlock(thd->current_mutex);
+  thd->EXIT_COND(&old_stage);
+  return ret;
+}
+
+bool Gtid_state::wait_for_gtid(THD *thd, const Gtid &gtid,
+                               struct timespec *abstime) {
+  assert(!owned_gtids.is_owned_by(gtid, thd->thread_id()));
+  assert(!owned_gtids.is_owned_by(gtid, 0));   /* ★ 前置：确实被"别的"线程 own 着 */
+  bool ret = wait_for_sidno(thd, gtid.sidno, abstime);
+  return ret;                                  /* ★★ 不检查 GNO，只等 sidno 级条件变量 */
+}
+```
+> ⚠️ 两点：① **`abstime` 默认 `nullptr` = 无限等待**（靠 THD killed / STOP SLAVE 退出）；② **只等 sidno 不检查 GNO**——所以被唤醒后要重新走一遍 `set_gtid_next` 的 `while(true)` 循环再判定。
+
+**★ 真正的超时/重验在 `wait_for_gtid_set()`**（`rpl_gtid_state.cc:302`，★ 那段算法注释值得一读）：
+
+```cpp
+  /*
+    Algorithm:
+
+    Let 'todo' contain the GTIDs to wait for. Iterate over SIDNOs in
+    'todo' ... For each SIDNO in 'todo', remove gtid_executed for that
+    SIDNO from 'todo'.  If, after this removal, there is still some
+    interval for this SIDNO in 'todo', then wait for a signal on this
+    SIDNO. ...
+
+    Once the loop over SIDNOs has completed, 'todo' is guaranteed to
+    be empty.  However, it may still be the case that not all GTIDs of
+    wait_for are included in gtid_executed, since RESET MASTER may
+    have been executed while we were waiting.
+
+    RESET MASTER requires global_sid_lock.wrlock. ... the wait
+    operation releases global_sid_lock.rdlock. So if we completed the
+    'for' loop without waiting, we know for sure ... RESET MASTER
+    cannot have executed in the meantime. But if we waited at some
+    point ... Thus, we repeatedly run 'for' loop until it completes
+    without waiting (this is the outermost 'while' loop).
+  */
+  while (!verified) {
+    todo.add_gtid_set(wait_for);
+    verified = true;
+    for (int sidno = 1; sidno <= todo.get_max_sidno(); sidno++) {
+      while (todo.contains_sidno(sidno)) {
+        lock_sidno(sidno);
+        todo.remove_intervals_for_sidno(&executed_gtids, sidno);
+        if (todo.contains_sidno(sidno)) {
+          bool ret = wait_for_sidno(thd, sidno, timeout > 0 ? &abstime : nullptr, ...);
+          global_sid_lock->rdlock();       /* ★ 等待返回后两把锁都没了，必须重新拿 */
+          verified = false;                /* ★★ 等过 → 外层 while 再跑一轮以防 RESET MASTER */
+          if (thd->killed) { ... return true; }
+          if (ret) return true;            /* 超时 */
+        } else { unlock_sidno(sidno); break; }
+      }
+    }
+  }
+```
+> ★ `verified` 标志就是"发生过一次等待就整轮重验"的实现——**防止 `RESET MASTER` 造成的 TOCTOU**。
+> ★ 一个工程细节：栈上预算 100 个 `Interval`（`preallocated_interval_count = 100`），避免等待路径上 malloc。
+
+**★ 调用点**（`wait_for_gtid` 只有 2 处，`wait_for_gtid_set` 才带 timeout）：
+
+| 位置 | 形式 | 超时 |
+|---|---|---|
+| `rpl_gtid_execution.cc:143` | `wait_for_gtid(thd, spec.gtid)`（`GTID_NEXT=<gtid>` 被别人 own） | 无限 |
+| `rpl_gtid_execution.cc:246` | `wait_for_gtid(thd, g)`（`GTID_NEXT_LIST`） | 无限 |
+| `rpl_gtid_state.cc:378` | `wait_for_sidno(..., timeout>0 ? &abstime : nullptr, ...)` | 由 `timeout` 决定 |
+
+> ⚠️ 另有**同名不同类**的 `Relay_log_info::wait_for_gtid_set`（`rpl_rli.cc:772`，`WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS`），最终也走 `Gtid_state::wait_for_gtid_set`。`WAIT_FOR_EXECUTED_GTID_SET()` 函数在 `item_gtid_func.cc:116`。
 
 **观测**：`@@GLOBAL.gtid_owned` 的格式是 `uuid:gno#:thread_id`（多个 owner 时为 `uuid:gno#t1:t2`）。正常空闲实例应为空；长期非空说明有事务卡在"已分配未提交"窗口（大事务或 XA prepared）。
 
@@ -925,6 +1264,146 @@ SESSION-only、`NO_CMD_LINE`、默认 `"AUTOMATIC"`。三种用户可见输入�
 
 **关键语义：提交后 gtid_next 不是重置回 AUTOMATIC，而是进入 `UNDEFINED_GTID`**（`update_gtids_impl_own_gtid` 对 ASSIGNED 类型 `set_undefined()`），下一条语句被 `gtid_pre_statement_checks` 报 `ER_GTID_NEXT_TYPE_UNDEFINED_GTID` 强制"一个显式 GTID 只用于一个事务"；回滚/连接关闭的兜底才 `set_automatic()`（`sql_base.cc`，保证 DROP TEMPORARY TABLE 能生成自己的 GTID）。
 
+**★ 变量注册与类定义**（`sql/sys_vars.cc:6678` / `sys_vars.h:2397`）：
+
+```cpp
+static Sys_var_gtid_next Sys_gtid_next(
+    "gtid_next",
+    "Specifies the Global Transaction Identifier for the following "
+    "transaction.",
+    SESSION_ONLY(gtid_next), NO_CMD_LINE, DEFAULT("AUTOMATIC"), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_gtid_next));
+```
+```cpp
+class Sys_var_gtid_next : public sys_var {
+ public:
+  Sys_var_gtid_next(...) : sys_var(...) {
+    assert(size == sizeof(Gtid_specification));   /* ★ 底层存储就是一个 Gtid_specification */
+  }
+  bool global_update(THD *, set_var *) override {
+    assert(false);                                /* ★★ 没有 global 形式 */
+    return true;
+  }
+  void session_save_default(...) { ... }
+  void global_save_default(THD *, set_var *) override { assert(false); }
+  bool check_update_type(Item_result type) override {
+    return type != STRING_RESULT;                 /* ★ 只接受字符串 */
+  }
+```
+> ⚠️ **真名核查**：`gtid_next` **没有 global 形式**（`global_update` 直接 `assert(false)`）。
+
+**★★ 内部是 6 态不是 3 态**（`sql/rpl_gtid.h:3677`，⚠️ 常见说法的四态名**全都不存在**）：
+
+```cpp
+enum enum_gtid_type {
+  /**
+    Specifies that the GTID has not been generated yet; it will be
+    generated on commit. ... It is important that AUTOMATIC_GTID==0 so
+    that the default value for thd->variables->gtid_next.type is
+    AUTOMATIC_GTID.
+  */
+  AUTOMATIC_GTID = 0,
+  /** Specifies that the transaction has been assigned a GTID (UUID:NUMBER). ...
+      This is the state of GTID-transactions replicated to the slave. */
+  ASSIGNED_GTID,
+  /** Specifies that the transaction is anonymous ... */
+  ANONYMOUS_GTID,
+  /**
+    GTID_NEXT is set to this state after a transaction with
+    GTID_NEXT=='UUID:NUMBER' is committed. ...
+    Problematic case: Consider a transaction, Tx1, that updates two
+    transactional tables on the master, t1 and t2. Then slave (s1) later
+    replays Tx1. However, t2 is a non-transactional table at s1. ...
+    To detect this case on the slave ... we set GTID_NEXT to
+    UNDEFINED_GTID. When the next part of the transaction is being
+    processed, an error is generated ...
+  */
+  UNDEFINED_GTID,
+  /**
+    GTID_NEXT is set to this state by the slave applier thread when it
+    reads a Format_description_log_event that does not originate from
+    this server. ... there is no way for the slave to tell if the binary
+    log is old, until it sees the first transaction ...
+  */
+  NOT_YET_DETERMINED_GTID,
+  /**
+    The applier sets GTID_NEXT this state internally, when it
+    processes an Anonymous_gtid_log_event on a channel having
+    ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS ... It is not user-visible.
+  */
+  PRE_GENERATE_GTID
+};
+```
+> ⚠️ **不存在** `GTID_UNDEFINED` / `GTID_ANONYMOUS` / `GTID_ASSIGNED_AUTOMATIC` / `GTID_ASSIGNED_EXPLICIT`。
+> ★ 上方紧邻（`rpl_gtid.h:3663`）还有一段历史改名说明：
+> ```cpp
+>   BUG# #18089914 - REFACTORING: RENAME GROUP TO GTID
+>   changed AUTOMATIC_GROUP to AUTOMATIC_GTID
+>   ...
+> ```
+> ★ `UNDEFINED_GTID` 那 30 行注释解释了它存在的原因：**防止从库把"源上单事务"拆成两个事务**（源上 t1/t2 都是事务表，但从库 t2 变成非事务表）。
+
+**★ 解析与生效**（`sys_vars.cc:4353` / `rpl_gtid_specification.cc:34`）：
+
+```cpp
+  Gtid_specification spec;
+  if (spec.parse(global_sid_map, res) != RETURN_STATUS_OK) { ... }
+  bool ret = set_gtid_next(thd, spec);      /* ★ 真正生效：获取所有权 */
+```
+```cpp
+enum_return_status Gtid_specification::parse(Sid_map *sid_map, const char *text) {
+  if (my_strcasecmp(&my_charset_latin1, text, "AUTOMATIC") == 0) {
+    type = AUTOMATIC_GTID;  gtid.sidno = 0;  gtid.gno = 0;
+  } else if (my_strcasecmp(&my_charset_latin1, text, "ANONYMOUS") == 0) {
+    type = ANONYMOUS_GTID;  gtid.sidno = 0;  gtid.gno = 0;
+  } else {
+    PROPAGATE_REPORTED_ERROR(gtid.parse(sid_map, text));
+    type = ASSIGNED_GTID;                   /* ★ UUID:NUMBER */
+  }
+  RETURN_OK;
+}
+```
+
+**★ `set_gtid_next()` 里 ASSIGNED 分支的循环**（`rpl_gtid_execution.cc:106`，★ 三个去向）：
+
+```cpp
+      while (true) {
+        if (global_gtid_mode.get() == Gtid_mode::OFF) {
+          my_error(ER_CANT_SET_GTID_NEXT_TO_GTID_WHEN_GTID_MODE_IS_OFF, MYF(0));
+          goto err;
+        }
+        gtid_state->lock_sidno(spec.gtid.sidno);
+
+        // GTID already logged
+        if (gtid_state->is_executed(spec.gtid)) {      /* ① 已执行 → 接受，语句稍后被 SKIP */
+          thd->variables.gtid_next = spec;
+          /* Don't skip the statement here, skip it in gtid_pre_statement_checks. */
+          break;
+        }
+        // GTID not owned by anyone: acquire ownership
+        if (!gtid_state->is_owned(spec.gtid)) {        /* ② 无人持有 → 取得所有权 */
+          if (gtid_state->acquire_ownership(thd, spec.gtid)) goto err;
+          thd->variables.gtid_next = spec;
+          break;
+        }
+        else {                                          /* ③ 被别的线程持有 → 等待 */
+          gtid_state->wait_for_gtid(thd, spec.gtid);
+          ...
+          global_sid_lock->rdlock();
+          lock_count = 1;
+        }
+      }
+```
+> ★ 分支 ① 是**幂等重放**的基础：`is_already_logged_transaction()`（`rpl_gtid_execution.cc:306`）判断 `thd->owned_gtid.sidno == 0` → 跳过该事务。
+
+**★ `gtid_next` 三条错误文本**：
+
+| 错误码 | 文本 |
+|---|---|
+| `ER_CANT_SET_GTID_NEXT_TO_GTID_WHEN_GTID_MODE_IS_OFF` | "@@SESSION.GTID_NEXT cannot be set to UUID:NUMBER when @@GLOBAL.GTID_MODE = OFF." |
+| `ER_CANT_SET_GTID_NEXT_TO_ANONYMOUS_WHEN_GTID_MODE_IS_ON` | "@@SESSION.GTID_NEXT cannot be set to ANONYMOUS when @@GLOBAL.GTID_MODE = ON." |
+| `ER_CANT_SET_GTID_NEXT_WHEN_OWNING_GTID` | "@@SESSION.GTID_NEXT cannot be changed by a client that owns a GTID..." |
+
 ### gtid_purged
 
 **不是 READ_ONLY**——注册 flag 是 `NON_PERSIST GLOBAL_VAR(gtid_purged)`，无 READ_ONLY 位。所以运行时 `SET @@GLOBAL.gtid_purged` 能通过 resolve 的只读检查（权限仍要 SUPER/SYSTEM_VARIABLES_ADMIN），"只读型语义"由业务检查表达：
@@ -974,6 +1453,107 @@ if (!gtid_state->get_lost_gtids()->is_subset(m_exclude_gtid)) {
 | 搭建新从库（备份+binlog 定位） | 恢复备份后手动 `SET GTID_PURGED` | 告诉新从库"备份里已包含这些 GTID 的数据"，之后的复制从 purge 点继续 |
 | 修复 executed 集合 | 手动设置 purged | 当 executed 集合因 binlog 丢失而不完整时，把丢失部分标记为 purged（等价于"我承认这些事务的数据已存在/不需要了"） |
 | 清空复制状态 | `RESET MASTER` | 清空 binlog + gtid_purged + gtid_executed（从库上等价 `RESET REPLICA` 清通道） |
+
+**★★★ `add_lost_gtids()`：gtid_purged 与 exclude 关系的机制根源**（`sql/rpl_gtid_state.cc:618`）：
+
+```cpp
+enum_return_status Gtid_state::add_lost_gtids(Gtid_set *gtid_set,
+                                              bool starts_with_plus) {
+  gtid_set->dbug_print("add_lost_gtids");
+
+  if (!starts_with_plus) {
+    if (!gtid_state->get_lost_gtids()->is_subset(gtid_set)) {
+      my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, MYF(0),
+               "the new value must be a superset of the old value");   /* ★ 约束 1：新值必须是旧值超集 */
+      RETURN_REPORTED_ERROR;
+    }
+    gtid_set->remove_gtid_set(gtid_state->get_lost_gtids());
+  }
+  if (executed_gtids.is_intersection_nonempty(gtid_set)) {
+    my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, MYF(0),
+             "the added gtid set must not overlap with @@GLOBAL.GTID_EXECUTED");  /* ★ 约束 2 */
+    RETURN_REPORTED_ERROR;
+  }
+  if (owned_gtids.is_intersection_nonempty(gtid_set)) {
+    my_error(ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS, MYF(0),
+             "the added gtid set must not overlap with @@GLOBAL.GTID_OWNED");     /* ★ 约束 3 */
+    RETURN_REPORTED_ERROR;
+  }
+
+  if (save(gtid_set)) RETURN_REPORTED_ERROR;                    /* 写 mysql.gtid_executed 表 */
+  PROPAGATE_REPORTED_ERROR(gtids_only_in_table.add_gtid_set(gtid_set));
+  PROPAGATE_REPORTED_ERROR(lost_gtids.add_gtid_set(gtid_set));  /* ★ gtid_purged 的本体 */
+  PROPAGATE_REPORTED_ERROR(executed_gtids.add_gtid_set(gtid_set));  /* ★★ 同时并入 gtid_executed！ */
+  ...
+}
+```
+
+> ★★★ **最后一行是关键**：`SET @@GLOBAL.gtid_purged = X` 会把 X **同时**写进 `lost_gtids` **和** `executed_gtids`。而 `check_start_file()` 校验② 要求 `lost_gtids ⊆ exclude`；从库构造 exclude 时用 `retrieved ∪ executed`——所以只要从库设过 gtid_purged，X 就在它的 `executed_gtids` 里 ⇒ X ⊆ exclude ⇒ **校验② 通过**。
+> ⇒ 反过来说：从备份恢复却**忘了设** `gtid_purged`，而主库已 purge 了那些 binlog ⇒ `lost_gtids ⊄ exclude` ⇒ `ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS`。这就是该错误最常见的成因。
+
+**★ 变量定义**（`sys_vars.cc:6777`，⚠️ 头注释有历史笔误）：
+
+```cpp
+Gtid_set *gtid_purged;
+static Sys_var_gtid_purged Sys_gtid_purged(
+    "gtid_purged",
+    "The set of GTIDs that existed in previous, purged binary logs.",
+    NON_PERSIST GLOBAL_VAR(gtid_purged), NO_CMD_LINE, DEFAULT(nullptr),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_gtid_purged));
+```
+> ⚠️ `sys_vars.h:2638` 的注释写的是 *"Class for @@session.gtid_purged"*——**历史笔误**，实际是 `GLOBAL_VAR`。`session_update` 直接 `assert(false)`。
+> ★ `NON_PERSIST`：**不能 `SET PERSIST`**。
+
+**★ 一个反直觉的读出规则**（`sys_vars.h:2694`）：
+
+```cpp
+  const uchar *global_value_ptr(THD *thd, std::string_view) override {
+    const Gtid_set *gs;
+    global_sid_lock->wrlock();
+    if (opt_bin_log)
+      gs = gtid_state->get_lost_gtids();
+    else
+      /*
+        When binlog is off, report @@GLOBAL.GTID_PURGED from
+        executed_gtids, since @@GLOBAL.GTID_PURGED and
+        @@GLOBAL.GTID_EXECUTED are always same, so we did not
+        save gtid into lost_gtids for every transaction for
+        improving performance.
+      */
+      gs = gtid_state->get_executed_gtids();      /* ★★ 关了 binlog → gtid_purged == gtid_executed */
+    ...
+  }
+```
+> ★ 所以**关掉 binlog 的实例上 `gtid_purged` 恒等于 `gtid_executed`**——这是"为性能不每事务写 lost_gtids"的后果。
+
+**★ 报错文本怎么算出来的**（`sql/binlog.cc:9177`，★ 差集方向）：
+
+```cpp
+void MYSQL_BIN_LOG::report_missing_purged_gtids(
+    const Gtid_set *slave_executed_gtid_set, std::string &errmsg) {
+  Gtid_set gtid_missing(gtid_state->get_lost_gtids()->get_sid_map());
+  gtid_missing.add_gtid_set(gtid_state->get_lost_gtids());      /* missing = lost_gtids */
+  gtid_missing.remove_gtid_set(slave_executed_gtid_set);        /* ★ missing = lost_gtids − exclude */
+  ...
+  gtid_info << "The GTID set sent by the replica is '" << slave_executed_gtids
+            << "', and the missing transactions are '" << missing_gtids << "'";
+  errmsg.assign(ER_THD(thd, ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS));
+  ...
+  if (total_length > MYSQL_ERRMSG_SIZE)      /* ★ 太长就省略，只提示去看 error log */
+    gtid_info.str("The GTID sets and the missing purged transactions are too"
+                  " long to print in this message. ...");
+```
+> ★ 孪生函数 `report_missing_gtids()`（`binlog.cc:9241`）差集方向**相反**：`missing = exclude − previous_gtids`（从库"声称有"但主库最老 Previous_gtids 里没有的）。两个函数对应两道不同的校验。
+
+**★ 搭建从库的标准三步与机制对应**：
+
+```sql
+RESET MASTER;                                    -- 清空（新实例上 GTID_EXECUTED 必须为空才能设）
+SET @@GLOBAL.gtid_purged = '备份时刻的 gtid_executed';
+CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION = 1, ...;
+START REPLICA;
+```
+> 机制链条：第 2 步 → `add_lost_gtids()` → 写 `lost_gtids` + **`executed_gtids`** → 第 4 步 `request_dump()` 构造 exclude 时经 `get_executed_gtids()` 带上 → 主库校验② 通过。
 
 ### GTID 复制协议：exclude 集合（COM_BINLOG_DUMP_GTID）
 
@@ -1040,6 +1620,184 @@ if (command == COM_BINLOG_DUMP_GTID) {
 - **主库算的是"起点文件"，不是"起点 GTID"**。它定位到从哪个 binlog 文件开始读（该文件 `Previous_gtids ⊆ exclude`，即它之前的都被跳过），然后从 `start_position=4` 顺序读，靠事件级 `contains_gtid` 过滤。**第一个不被过滤掉的事务**才是"实际开始发送的事务"——`find_first_log_not_in_gtid_set` 输出参数 `first_gtid` 就是它，用于判断要不要清 FD 的 `created` 字段（`m_gtid_clear_fd_created_flag`）。协议里自始至终没有"起点 GTID"这个输入。
 - **`is_subset_for_sid` 限定 sidno 的理由**：`subset_sidno == 0`（从库集合里根本没有主库 UUID 对应的条目）时直接返回 true——从库一个本主库的事务都没执行过是合法的。而只比主库自己 UUID 那段，是为了忽略从库集合里**其他来源**的 GTID（多源复制、级联上游的其他主库），那些与本通道无关，不该用来判定"从库是否超前于本主库"。
 
+**★★★ `check_start_file()` 完整源码**（`sql/rpl_binlog_sender.cc:854`，★ 四个对比点全在这一个函数里）：
+
+```cpp
+int Binlog_sender::check_start_file() {
+  char index_entry_name[FN_REFLEN];
+  char *name_ptr = nullptr;
+  std::string errmsg;
+
+  if (m_start_file[0] != '\0') {
+    mysql_bin_log.make_log_name(index_entry_name, m_start_file);
+    name_ptr = index_entry_name;          /* ★ file+pos：直接用从库给的文件名，不做任何 GTID 校验 */
+  } else if (m_using_gtid_protocol) {
+    /*
+      In normal scenarios, it is not possible that Slave will
+      contain more gtids than Master with resepctive to Master's
+      UUID. But it could be possible case if Master's binary log
+      is truncated(due to raid failure) or Master's binary log is
+      deleted but GTID_PURGED was not set properly. ...
+    */
+    Sid_map *slave_sid_map = m_exclude_gtid->get_sid_map();
+    global_sid_lock->wrlock();
+    const rpl_sid &server_sid = gtid_state->get_server_sid();
+    rpl_sidno subset_sidno = slave_sid_map->sid_to_sidno(server_sid);   /* ★ 主库 UUID 在"从库视角"的 sidno */
+    Gtid_set gtid_executed_and_owned(gtid_state->get_executed_gtids()->get_sid_map());
+
+    // gtids = executed_gtids & owned_gtids
+    if (gtid_executed_and_owned.add_gtid_set(
+            gtid_state->get_executed_gtids()) != RETURN_STATUS_OK) { assert(0); }
+    gtid_state->get_owned_gtids()->get_gtids(gtid_executed_and_owned);
+
+    if (!m_exclude_gtid->is_subset_for_sid(&gtid_executed_and_owned,
+                                           gtid_state->get_server_sidno(),
+                                           subset_sidno)) {
+      global_sid_lock->unlock();
+      set_fatal_error(ER_THD(m_thd, ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE));  /* ★ 校验① */
+      return 1;
+    }
+    /*
+      Setting GTID_PURGED (when GTID_EXECUTED set is empty ...) will make
+      binlog rotate. That leaves first binary log with empty previous_gtids
+      ... server will always find the first binary log with empty
+      previous_gtids which is subset of any given slave_gtid_executed.
+      Thus Master thinks that it found the first binary log which is
+      actually not correct and unable to catch this error situation.
+      Hence adding below extra if condition to check the situation. ...
+    */
+    if (!gtid_state->get_lost_gtids()->is_subset(m_exclude_gtid)) {      /* ★ 校验② */
+      mysql_bin_log.report_missing_purged_gtids(m_exclude_gtid, errmsg);
+      global_sid_lock->unlock();
+      set_fatal_error(errmsg.c_str());
+      return 1;
+    }
+    global_sid_lock->unlock();
+
+    Gtid first_gtid = {0, 0};
+    if (mysql_bin_log.find_first_log_not_in_gtid_set(                    /* ★ 校验③ / 定位 */
+            index_entry_name, m_exclude_gtid, &first_gtid, errmsg)) {
+      set_fatal_error(errmsg.c_str());
+      return 1;
+    }
+    name_ptr = index_entry_name;
+    /*
+      find_first_log_not_in_gtid_set() guarantees the file it found has
+      Previous_gtids_log_event as all following binlogs. So the variable is
+      set to false which tells not to check the event again ...
+    */
+    m_check_previous_gtid_event = false;
+    /*
+      If we are skipping at least the first transaction of the binlog,
+      we must clear the "created" field of the FD event (set it to 0)
+      to avoid cleaning up temp tables on slave.
+    */
+    m_gtid_clear_fd_created_flag =
+        (first_gtid.sidno >= 1 && first_gtid.gno >= 1 &&
+         m_exclude_gtid->contains_gtid(first_gtid));      /* ★ 对比点 4 */
+  }
+  ...
+```
+
+> ★ 校验① 那段 10 行注释是**最有价值的一段**：它解释了为什么这个"不可能发生"的校验必须存在——主库 binlog 被截断 / `GTID_PURGED` 未正确设置时，从库确实可能拥有主库没有的 GTID。
+
+**★ 校验①的判定实现**（`rpl_gtid_set.cc:1030`，★ 三个短路）：
+
+```cpp
+bool Gtid_set::is_subset_for_sid(const Gtid_set *super,
+                                 rpl_sidno superset_sidno,
+                                 rpl_sidno subset_sidno) const {
+  if (subset_sidno == 0) return true;      /* ★ 从库没听过主库 UUID → 视作子集，放行 */
+  if (superset_sidno == 0) return false;   /* ★ 主库自己没有这个 UUID → 不可能是超集 */
+  Const_interval_iterator subset_ivit(this, subset_sidno);
+  Const_interval_iterator superset_ivit(super, superset_sidno);
+  if (!is_interval_subset(&subset_ivit, &superset_ivit)) return false;
+  return true;
+}
+```
+
+**★★ `find_first_log_not_in_gtid_set()` 是逆序扫描**（`sql/binlog.cc:4565`，★ 单调性论证的源码）：
+
+```cpp
+  /*
+    Iterate over all the binary logs in reverse order, and read only
+    the Previous_gtids_log_event, to find the first one, that is the
+    subset of the given gtid set. Since every binary log begins with
+    a Previous_gtids_log_event, that contains all GTIDs in all
+    previous binary logs.
+    We also ask for the first GTID in the binary log to know if we
+    should send the FD event with the "created" field cleared or not.
+  */
+  rit = filename_list.rbegin();            /* ★★ 从最新往回走 */
+  error = 0;
+  while (rit != filename_list.rend()) {
+    binlog_previous_gtid_set.clear();
+    const char *filename = rit->c_str();
+    switch (read_gtids_from_binlog(filename, nullptr, &binlog_previous_gtid_set,
+                                   first_gtid, ...)) {
+      ...
+      case GOT_GTIDS:
+      case GOT_PREVIOUS_GTIDS:
+        if (binlog_previous_gtid_set.is_subset(gtid_set)) {   /* ★★ 核心判定 */
+          strcpy(binlog_file_name, filename);
+          goto end;                                          /* 第一次命中即答案 */
+        }
+      case TRUNCATED:
+        break;
+    }
+    rit++;                                 /* 往更早的 binlog 走 */
+  }
+
+  if (rit == filename_list.rend()) {       /* 扫到最老都没满足 → 主库缺从库要的 */
+    report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
+    error = -5;
+  }
+```
+
+> ★★ **为什么能逆序扫**：每个 binlog 开头的 `Previous_gtids_log_event` 记录"本文件之前所有 binlog 的全部 GTID"，沿文件序号递增方向**单调递增**。要找"最老的那个还含 exclude 之外内容的文件"⇔ 找**最大的** i 使 `Prev_i ⊆ exclude`。逆序从最新往回，第一次命中即答案，**只读每个文件的头部一个事件**。
+
+**★ 对比点 1：`skip_event()` —— 唯一的跳过判定点**（`rpl_binlog_sender.cc:740`）：
+
+```cpp
+inline bool Binlog_sender::skip_event(const uchar *event_ptr,
+                                      bool in_exclude_group) {
+  uint8 event_type = (Log_event_type)event_ptr[LOG_EVENT_OFFSET];
+  switch (event_type) {
+    case binary_log::GTID_LOG_EVENT: {
+      Gtid_log_event gtid_ev(reinterpret_cast<const char *>(event_ptr), &fd_ev);
+      Gtid gtid;
+      gtid.sidno = gtid_ev.get_sidno(m_exclude_gtid->get_sid_map());  /* ★ 换成从库 sid_map 的 sidno */
+      gtid.gno = gtid_ev.get_gno();
+      return m_exclude_gtid->contains_gtid(gtid);   /* ★★ 该事务在 exclude 里 → 整组跳过 */
+    }
+    case binary_log::ROTATE_EVENT:
+      return false;                                 /* ★ ROTATE 永远发送 */
+  }
+  return in_exclude_group;                          /* 组内非 GTID 事件：延续上一决定 */
+}
+```
+> ⚠️ **真名核查**：跳过判定**只有这一处**。`before_send_hook()` / `after_send_hook()` 里**没有** `contains_gtid()`。
+
+**★ 跳过的事件用 heartbeat 补位**（`rpl_binlog_sender.cc:613`，★ 与 replication.md 呼应）：
+
+```cpp
+    if (m_exclude_gtid &&
+        (in_exclude_group = skip_event(event_ptr, in_exclude_group))) {
+      /*
+        If we have not send any event from past 'heartbeat_period' time
+        period, then it is time to send a packet before skipping this group.
+       */
+      if (m_heartbeat_period > std::chrono::nanoseconds(0) &&
+          (now - m_last_event_sent_ts) >= m_heartbeat_period) {
+        if (send_heartbeat_event(log_pos)) return 1;    /* ★ 让从库推进 master_log_pos */
+        exclude_group_end_pos = 0;
+      } else {
+        exclude_group_end_pos = log_pos;
+      }
+    } else { ... }
+```
+> ★ 这是"被过滤掉的 GTID 也要推进位点"的实现——否则从库会以为卡住了。
+
 #### 报文里有什么：name / pos 字段的真实角色
 
 `COM_BINLOG_DUMP_GTID` 的报文（`com_binlog_dump_gtid`）并不只有 GTID 集合：
@@ -1074,6 +1832,83 @@ if (m_start_file[0] != '\0') {
 
 > 一句话对比：**file+pos 的"起点"是部分状态假设，GTID 的"排除集合"是完整状态声明。** 完整声明天然幂等、可重连、可自愈。
 
+**★ 源码的权威表述**（`sql/rpl_source.h:96`，★ "排除集"命名的出处）：
+
+```cpp
+/**
+  Low-level function where the dump thread iterates over the binary
+  log and sends events to the slave.  This function is common for both
+  COM_BINLOG_DUMP and COM_BINLOG_DUMP_GTID.
+  ...
+  @param gtid_set The gtid_set that the slave sent, or NULL if the
+  protocol is COM_BINLOG_DUMP.
+  ...
+  @note This function will start reading at the given (filename,
+  offset), or from the oldest log if filename[0]==0.  It will send all
+  events from that position; but if gtid_set!=NULL, it will skip all
+  events in that set.          /* ★★ "skip all events in that set" */
+*/
+void mysql_binlog_send(THD *thd, char *log_ident, my_off_t pos,
+                       Gtid_set *gtid_set, uint32 flags);
+```
+```cpp
+/* sql/rpl_source.cc:1054 */
+void mysql_binlog_send(THD *thd, char *log_ident, my_off_t pos,
+                       Gtid_set *slave_gtid_executed, uint32 flags) {
+  Binlog_sender sender(thd, log_ident, pos, slave_gtid_executed, flags);
+  sender.run();
+}
+```
+> ★ 形参见名 `slave_gtid_executed`，赋给成员却是 `m_exclude_gtid`——**一个集合两个视角的名字**，正是"排除集"叫法的由来。
+
+**★★ 从库侧构造 exclude 集合的完整代码**（`sql/rpl_replica.cc:4187`，★ 两步 union）：
+
+```cpp
+  Sid_map sid_map(nullptr); /* No lock needed */
+  Gtid_set gtid_executed(&sid_map);          /* ★ 这个局部变量就是要发给主库的 exclude */
+
+  if (command == COM_BINLOG_DUMP_GTID) {
+    mi->rli->get_sid_lock()->wrlock();
+    if (gtid_executed.add_gtid_set(mi->rli->get_gtid_set()) !=
+        RETURN_STATUS_OK) {                  /* ★ ① 本通道已取回的中继日志 GTID */
+      mi->rli->get_sid_lock()->unlock();
+      return 1;
+    }
+    mi->rli->get_sid_lock()->unlock();
+
+    global_sid_lock->wrlock();
+    if (gtid_executed.add_gtid_set(gtid_state->get_executed_gtids()) !=
+        RETURN_STATUS_OK) {                  /* ★ ② 本实例已执行的 GTID（全局） */
+      global_sid_lock->unlock();
+      return 1;
+    }
+    global_sid_lock->unlock();
+
+    rpl->file_name = nullptr;                /* ★ GTID 模式不发文件名 */
+    rpl->start_position = 4;                 /* ★ 位置恒为 4，协议占位无意义 */
+    rpl->flags |= MYSQL_RPL_GTID;
+    rpl->gtid_set_encoded_size = gtid_executed.get_encoded_length();
+    rpl->fix_gtid_set = fix_gtid_set;
+    rpl->gtid_set_arg = (void *)&gtid_executed;
+  } else {
+    rpl->file_name_length = 0;
+    rpl->file_name = mi->get_master_log_name();      /* ★ file+pos：显式文件名 */
+    rpl->start_position = DBUG_EVALUATE_IF("request_source_log_pos_3", 3,
+                                           mi->get_master_log_pos());
+  }
+```
+```cpp
+/* sql/rpl_replica.cc:4151 —— 编码器：写包时才现算 */
+static void fix_gtid_set(MYSQL_RPL *rpl, uchar *packet_gtid_set) {
+  Gtid_set *gtid_set = (Gtid_set *)rpl->gtid_set_arg;
+  gtid_set->encode(packet_gtid_set);
+}
+```
+> ★ 为什么用**回调**而不是直接拷贝：避免在 `request_dump()` 里先序列化一整份 Gtid_set；写包时才 `encode()`。
+> ★ `sid_map(nullptr)` = 本连接私有的 sid_map，`sidno` 是纯本地编号——**与拓扑位置无关**，这是"GTID 拓扑无关"的又一条硬证据。
+
+**★ 理论小结**：`exclude = retrieved_gtid_set ∪ gtid_executed`。主库算出的起点是**文件级粗粒度**，文件内部仍可能有 exclude 里的 GTID（该文件前半段的事务从库已有）→ 靠 `skip_event()` 事件级细粒度剔除。**起点由主库推，边界由排除集定**。
+
 #### 对照：file+pos 模式确实有显式起点
 
 `COM_BINLOG_DUMP`（file+pos 模式）的起点是**从库指定、主库直接采用**的物理坐标：
@@ -1088,6 +1923,51 @@ if (m_start_file[0] != '\0') {
 | failover | 手工换算坐标 | 自动收敛 |
 
 ★ 一个易忽略的字段差异：`COM_BINLOG_DUMP` 的 pos 是 **4 字节**，GTID 版是 **8 字节**——源码注释自承 "4 bytes is too little ... fixed in the new protocol"。
+
+**★ 两个命令的解码原文对照**（`sql/rpl_source.cc`）：
+
+```cpp
+/* :934 com_binlog_dump() —— file+pos */
+  /*
+    4 bytes is too little, but changing the protocol would break
+    compatibility.  This has been fixed in the new protocol. @see
+    com_binlog_dump_gtid().
+  */
+  READ_INT(pos, 4);                 /* ★ 4 字节 */
+  READ_INT(flags, 2);
+  READ_INT(thd->server_id, 4);
+  ...
+  mysql_binlog_send(thd, thd->mem_strdup(packet + 10), (my_off_t)pos, nullptr,
+                    flags);         /* ★ packet+10 = 文件名（4+2+4 之后）；nullptr = 非 GTID 协议 */
+```
+```cpp
+/* :985 com_binlog_dump_gtid() —— GTID */
+  uint64 pos = 0;                   /* ★ 8 字节，修好了 */
+  Sid_map sid_map(
+      nullptr /*no sid_lock because this is a completely local object*/);
+  Gtid_set slave_gtid_executed(&sid_map);
+  ...
+  READ_INT(flags, 2);
+  READ_INT(thd->server_id, 4);
+  READ_INT(name_size, 4);
+  READ_STRING(name, name_size, sizeof(name));   /* ★ 文件名有长度前缀，不再靠包尾推断 */
+  READ_INT(pos, 8);
+  READ_INT(data_size, 4);
+  CHECK_PACKET_SIZE(data_size);
+  if (slave_gtid_executed.add_gtid_encoding(packet_position, data_size) !=
+      RETURN_STATUS_OK)                          /* ★ 解码 Gtid_set，而不是读一个标量 */
+    return true;
+  ...
+  mysql_binlog_send(thd, name, (my_off_t)pos, &slave_gtid_executed, flags);  /* ★ 非 NULL → GTID 协议 */
+```
+
+| | `COM_BINLOG_DUMP` | `COM_BINLOG_DUMP_GTID` |
+|---|---|---|
+| pos 宽度 | 4 字节（`:962`） | **8 字节**（`:1024`） |
+| 文件名 | `packet + 10`，靠包尾 | **4 字节长度前缀**（`:1022-1023`） |
+| 起点来源 | 从库显式给定 | 主库推算 |
+| 附加 | 无 | `data_size(4)` + Gtid_set 编码 |
+| `mysql_binlog_send` 第 4 参 | `nullptr` | `&slave_gtid_executed` |
 
 **由此产生的最深架构差异是"起点维护责任的转移"**：
 
@@ -1228,6 +2108,75 @@ end:
 
 若跳过的第一个事务正好是某 binlog 文件的第一个事务，FD event 的 `created` 字段要清 0（rpl_binlog_sender.cc:946-953）——避免从库误以为新连接而清理临时表。
 
+**★ 三道校验的报错真名与文本**（★ 逐个核实）：
+
+| 校验 | 触发条件 | 错误符号 | 定义位置 |
+|---|---|---|---|
+| ① | `!m_exclude_gtid->is_subset_for_sid(&gtid_executed_and_owned, server_sidno, subset_sidno)` | **`ER_REPLICA_HAS_MORE_GTIDS_THAN_SOURCE`** | `messages_to_clients.txt:7131` |
+| ② | `!gtid_state->get_lost_gtids()->is_subset(m_exclude_gtid)` | **`ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS`**（由 `report_missing_purged_gtids()` 填 errmsg） | `:6809` |
+| ③ | `find_first_log_not_in_gtid_set()` 返回 true | **`ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS`**（由 `report_missing_gtids()` 填 errmsg） | 同上 |
+| 兜底 | 主库所有 fatal error 传回从库的包装 | **`ER_SOURCE_FATAL_ERROR_READING_BINLOG`** | `:4734` |
+
+> ⚠️ **真名核查**：**`ER_MASTER_FATAL_ERROR_READING_BINLOG` 在 8.0.39 已不存在**（随术语整改重命名）。等价物是 `ER_SOURCE_FATAL_ERROR_READING_BINLOG`，从库侧 `Last_IO_Errno` 显示的是服务端版本 `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG` = **13114**。
+> ⚠️ 文档里写的 `ER_RPL_SOURCE_HAS_PURGED_REQUIRED_GTIDS` 也不准确——真名没有 `RPL_` 前缀。
+
+**★ 校验①的报错原文**（`messages_to_clients.txt:7131`，★ 这段话本身就是运维手册）：
+
+> *"Replica has more GTIDs than the source has, using the source's SERVER_UUID. This may indicate that the the last binary log file was truncated or lost, e.g., after a power failure when sync_binlog != 1. The source may have rolled back transactions that were already replicated to the replica. Replicate any transactions that source has rolled back from replica to source, and/or commit empty transactions on source to account for transactions that have been committed on source but are not included in GTID_EXECUTED."*
+
+**★ 从库侧包装**（`sql/rpl_replica.cc:5586`）：
+
+```cpp
+            case ER_SOURCE_FATAL_ERROR_READING_BINLOG:
+              ... ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                  ER_THD(thd, ER_SOURCE_FATAL_ERROR_READING_BINLOG), ...
+```
+> ★ 主库侧发送点是 `rpl_binlog_sender.h:435` 的 `set_error(ER_SOURCE_FATAL_ERROR_READING_BINLOG, errmsg)`。
+
+**★ 校验②的必要性：源码注释本身就是论证**（`rpl_binlog_sender.cc:899`，★ 这段 25 行注释解释了为什么第 3 步抓不到）：
+
+```cpp
+    /*
+      Setting GTID_PURGED (when GTID_EXECUTED set is empty i.e., when
+      previous_gtids are also empty) will make binlog rotate. That
+      leaves first binary log with empty previous_gtids and second
+      binary log's previous_gtids with the value of gtid_purged.
+      In find_first_log_not_in_gtid_set() while we search for a binary
+      log whose previous_gtid_set is subset of slave_gtid_executed,
+      in this particular case, server will always find the first binary
+      log with empty previous_gtids which is subset of any given
+      slave_gtid_executed. Thus Master thinks that it found the first
+      binary log which is actually not correct and unable to catch
+      this error situation. Hence adding below extra if condition
+      to check the situation. ...
+      The other case, where user deleted binary logs manually
+      (without using 'PURGE BINARY LOGS' command) but gtid_purged
+      is not set by the user, the following if condition cannot catch it.
+      But that is not a problem because in find_first_log_not_in_gtid_set()
+      while checking for subset previous_gtids binary log, the logic
+      will not find one and an error ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS
+      is thrown from there.
+    */
+```
+> ★★ 即：**空集是任何集合的子集**，`SET GTID_PURGED` 造成的"第一个 binlog 的 Previous_gtids 为空"会让第 3 步"假命中"。校验② 就是补这个盲区。
+> ★ 注释还说明了两种"手动删 binlog"场景分别由哪一道抓：设了 gtid_purged 的由 ② 抓，没设的由 ③ 抓。
+
+**★ GTID 模式的前置校验在别处**（`rpl_binlog_sender.cc:284`，★ 校验之前的校验）：
+
+```cpp
+  if (m_using_gtid_protocol) {
+    auto gtid_mode = global_gtid_mode.get();
+    if (gtid_mode != Gtid_mode::ON) {
+      sprintf(buf, "The replication sender thread cannot start in "
+                   "AUTO_POSITION mode: this server has GTID_MODE = %.192s "
+                   "instead of ON.", Gtid_mode::to_string(gtid_mode));
+      set_fatal_error(buf);
+      return;
+    }
+  }
+  if (check_start_file()) return;      /* ★ 三道校验在这之后 */
+```
+
 #### 四个集合的角色对比
 
 | 集合 | 维护方 | 语义 | 与 exclude 的关系 |
@@ -1236,6 +2185,37 @@ end:
 | `owned_gtids` | 主库 | 主库正在执行的（未提交） | 并入 executed 一起校验 |
 | `lost_gtids`（=gtid_purged） | 主库 | 主库已执行但 binlog 已删的 | 必须是 exclude 的子集（校验 2） |
 | **exclude 集合** | **从库** | **从库宣称已执行的** | 主库据此跳过事件、选择发送起点 |
+| `retrieved_gtid_set` | 从库（IO 线程） | 已收进 relay log、可能还没 apply | **exclude 的第 1 项**（`rpl_replica.cc:4193`） |
+
+> ★ 完整关系：`exclude = retrieved_gtid_set ∪ gtid_executed`（从库本实例）。第二步 union 用的是**全局** `gtid_state->get_executed_gtids()`，所以多源/级联下会把整条链上所有 UUID 都带上。
+
+### ★★★ 真名勘误全表（本轮新增）
+
+| 常见说法 / 想当然 | 8.0.39 真相 |
+|---|---|
+| `ER_MASTER_FATAL_ERROR_READING_BINLOG` | **不存在** → `ER_SOURCE_FATAL_ERROR_READING_BINLOG`（从库 `Last_IO_Errno` 显示 13114 = `ER_SERVER_SOURCE_FATAL_ERROR_READING_BINLOG`） |
+| `ER_RPL_SOURCE_HAS_PURGED_REQUIRED_GTIDS` | 真名**没有 `RPL_` 前缀** → `ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS` |
+| `Gtid_specification` 四态 `GTID_UNDEFINED` / `GTID_ANONYMOUS` / `GTID_ASSIGNED_AUTOMATIC` / `GTID_ASSIGNED_EXPLICIT` | **全都不存在** → `enum_gtid_type` 共 **6 态**：`AUTOMATIC_GTID=0` / `ASSIGNED_GTID` / `ANONYMOUS_GTID` / `UNDEFINED_GTID` / `NOT_YET_DETERMINED_GTID` / `PRE_GENERATE_GTID` |
+| `enum_gtid_statement_type` | **不存在** → `enum_gtid_statement_status`（`GTID_STATEMENT_EXECUTE/CANCEL/SKIP`） |
+| `gtid_next` 有 global 形式 | **没有** → `SESSION_ONLY`，`global_update` 直接 `assert(false)` |
+| `gtid_executed` / `gtid_owned` 是普通变量 | **不是** → `Sys_var_charptr_func` 子类，**无后端存储**，每次读实时 `to_string()` |
+| `Sys_var_gtid_purged` 的注释说 "@@session.gtid_purged" | **历史笔误** → 实际是 `GLOBAL_VAR` |
+| `session_track_gtids` 取值 `OWNED_GTID` | 真名字面量是 **`OWN_GTID`** |
+| `gtid_executed_compression_period` 默认 1000 | 8.0.23 起默认 **0**（且 8.0.39 已无代码读取它） |
+| `binlog_gtid_simple_recovery` 已废弃 | **仍存在**，`READ_ONLY`，默认 `true` |
+| GNO 分配是 `max(executed)+1` | **不是** → 以 `next_free_gno` 为 hint 的**最小空洞扫描**，还要跳过被并发 own 的 GNO |
+| 有 `next_free_gno()` / `get_next_available_gno()` 函数 | **不存在** → 只有**成员** `rpl_gno next_free_gno` |
+| `Clone_persist_gtid` 在 `sql/rpl_gtid_persist.h` | **不在** → `storage/innobase/include/clone0repl.h:68`；`rpl_gtid_persist.h` 只有 `Gtid_table_persistor` |
+| 常量 `NUM_VERSIONS` / `BUF_SIZE` | **不存在** → `GTID_VERSION=1` / `GTID_INFO_SIZE=64` |
+| `CHUNK_GROW_FACTOR`（倍增） | **不存在** → `CHUNK_GROW_SIZE=8`，**每次只加 8 个，不是倍增** |
+| `Gtid_set` 有拷贝构造 / `operator=` | **都没有**（也**没有** `=delete`）；复制语义靠 `add_gtid_set()` |
+| `Gtid_set::clear()` 释放内存 | **不释放** → 只把区间链表搬进 `free_intervals`；唯一释放点是析构 |
+| `update_gtids_impl` 五分支 = 真事务/XA prepare/XA commit/匿名/其它 | **错** → 判据是 `thd->owned_gtid.sidno`；**XA 不做区分**（走 `sidno>0` 支，且 prepare 阶段不外部化） |
+| `wait_for_gtid` 自己处理超时 | **不处理** → `abstime` 默认 `nullptr` = 无限等待；超时在 `wait_for_gtid_set()` |
+| `write_to_table()` 有很多调用点 | **只有 1 个**（`flush_gtids()`）；外部入口是 `wait_flush()` 与后台 `periodic_write()` |
+| `read_gtids_from_table()` | **不存在** → `Gtid_state::read_gtid_executed_from_table()` |
+| `find_first_log_not_in_gtid_set` 顺序扫描 | **逆序**（`rbegin()` → `rend()`），利用 Previous_gtids 单调性 |
+| `mysql.gtid_executed` 是静态 DDL | **动态拼接**（`@have_innodb` 决定 InnoDB/MyISAM + 加密属性） |
 
 #### 与 gtid_executed 的区别
 
@@ -1249,6 +2229,64 @@ end:
 真 READ_ONLY（`Sys_var_charptr_func` 构造带 `READ_ONLY NON_PERSIST`），SET 在 resolve 阶段直接被拒。读源：global 读 `Gtid_state::executed_gtids`/`owned_gtids`（持 `global_sid_lock` wrlock 后 to_string）；session 读 `thd->owned_gtid`（`sidno==0` 显示空、`-2` 显示 "ANONYMOUS"、`-1` 读 `thd->owned_gtid_set`）。
 
 **澄清：`gtid_current_pos` 在 MySQL 8.0.39 中不存在**（全仓库 grep 0 匹配）——它是 MariaDB 的变量，别当 MySQL 特性。
+
+**★★ 它们是 computed 变量，不是普通变量**（★ 机制是 `Sys_var_charptr_func` 子类，**没有后端存储**）：
+
+```cpp
+/* sql/sys_vars.h:2543 —— 基类：硬编码 READ_ONLY + off=0（无存储） */
+class Sys_var_charptr_func : public sys_var {
+ public:
+  Sys_var_charptr_func(const char *name_arg, const char *comment,
+                       flag_enum flag_arg)
+      : sys_var(&all_sys_vars, name_arg, comment,
+                READ_ONLY NON_PERSIST flag_arg, 0 /*off*/, NO_CMD_LINE.id,
+                NO_CMD_LINE.arg_type, SHOW_CHAR, (intptr)0 /*def_val*/, ...) {}
+  bool session_update(THD *, set_var *) override { assert(false); return true; }
+  bool global_update(THD *, set_var *) override  { assert(false); return true; }
+  ...
+};
+```
+```cpp
+/* sql/sys_vars.h:2590 —— gtid_executed：每次读都实时序列化 */
+class Sys_var_gtid_executed : Sys_var_charptr_func {
+ public:
+  Sys_var_gtid_executed(const char *name_arg, const char *comment_arg)
+      : Sys_var_charptr_func(name_arg, comment_arg, GLOBAL) {}
+
+  const uchar *global_value_ptr(THD *thd, std::string_view) override {
+    global_sid_lock->wrlock();
+    const Gtid_set *gs = gtid_state->get_executed_gtids();
+    char *buf = (char *)thd->alloc(gs->get_string_length() + 1);
+    if (buf == nullptr) my_error(ER_OUT_OF_RESOURCES, MYF(0));
+    else gs->to_string(buf);            /* ★★ 每次 SHOW 都跑一遍 to_string，无缓存 */
+    global_sid_lock->unlock();
+    return (uchar *)buf;
+  }
+};
+```
+> ⚠️ 真名是 `Sys_var_gtid_executed` / `Sys_var_gtid_owned`（**不是** `..._func`）；机制不是 `SHOW_SIMPLE_FUNC`。
+> ★ **性能提示**：`SELECT @@GLOBAL.gtid_executed` 在 GTID 集合很大时**不便宜**——它是 O(区间数) 的实时字符串序列化，且持 `global_sid_lock` **写锁**。
+
+```cpp
+/* sql/sys_vars.h:2730 —— gtid_owned 的 session 视图：四种显示 */
+  if (target_thd->owned_gtid.sidno == 0)
+    return (uchar *)running_thd->mem_strdup("");                 /* 没持有 → 空串 */
+  else if (target_thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS)
+    return (uchar *)running_thd->mem_strdup("ANONYMOUS");        /* 匿名 */
+  else if (target_thd->owned_gtid.sidno == THD::OWNED_SIDNO_GTID_SET)
+    ... owned_gtid_set.to_string(buf) ...                        /* GTID_NEXT_LIST */
+  else
+    running_thd->owned_gtid.to_string(target_thd->owned_sid, buf);  /* UUID:NUMBER */
+```
+```cpp
+/* 全局视图：遍历 Owned_gtids */
+  const Owned_gtids *owned_gtids = gtid_state->get_owned_gtids();
+  global_sid_lock->wrlock();
+  char *buf = (char *)thd->alloc(owned_gtids->get_max_string_length());
+  if (buf) owned_gtids->to_string(buf);       /* 形如 "uuid:1#3:5#6:10, uuid:2#55" */
+```
+> ★ `gtid_owned` 的全局值格式是 **`uuid:1#线程id1:线程id2`**（`#` 后是 owner 线程 id 列表），与 `gtid_executed` 的 `uuid:1-10:15` 格式不同——因为前者要带 owner 信息。
+> ⚠️ `Sys_var_gtid_executed` 只注册 GLOBAL（构造传 `GLOBAL`），**session 视图由其他机制处理**，本类的 `session_value_ptr` 会 `assert(false)`。
 
 **`SHOW MASTER STATUS` 的 `Executed_Gtid_Set` 就是 `gtid_executed`**（`show_master_status`，rpl_source.cc）：5 列依次是 File / Position / Binlog_Do_DB / Binlog_Ignore_DB / Executed_Gtid_Set，其中 GTID 列在 `global_sid_lock->wrlock()` 下取 `gtid_state->get_executed_gtids()` 并 `to_string()` 序列化。因此它**包含一切已提交事务的 GTID，含 binlog 已被 purge 的那些**（`gtid_purged ⊆ gtid_executed`）。
 
@@ -1265,7 +2303,61 @@ end:
 
 - **`binlog_gtid_simple_recovery` 默认是 true（ON），不是 false**；READ_ONLY（只能命令行/配置文件）。控制 `MYSQL_BIN_LOG::init_gtid_sets` 两处提前终止：反向扫描若最新 binlog 无任何 GTID 事件（`NO_GTIDS`）直接断定 executed/purged 为空；正向扫描只读第一个 binlog 的 `Previous_gtids_log_event` 就确定 purged。代价（注释明说）：旧 5.7.5 前 binlog + 混用 gtid_mode 的场景可能算出错误集合且不会自愈。
 - **`session_track_gtids`**（8.0.26+）：`OFF/OWN_GTID/ALL_GTIDS` 三值，SESSION 作用域，默认 OFF。`on_update` 钩子调 `Session_gtids_tracker::update` 注册/注销 `Session_consistency_gtids_ctx` 监听；OWN_GTID 收集本会话刚提交的 `thd->owned_gtid`，ALL_GTIDS 提交后快照整个 `executed_gtids`；经 OK 包的 `SESSION_TRACK_GTIDS` 类型实体上报客户端。
-- **`gtid_executed_compression_period`**：默认 0（8.0.23 起，之前 1000），控制 mysql.gtid_executed 表压缩线程 `compress_gtid_table` 的触发周期。**8.0.39 实测：该变量除注册/定义外没有任何代码读取**（`m_atomic_count` 无递增点），注释所称"按 period 计数触发"的路径已退化——压缩实际只由 binlog rotate 路径触发。变量仍在纯为向后兼容。
+- **`gtid_executed_compression_period`**：默认 **0**（8.0.23 起，之前 1000），控制 mysql.gtid_executed 表压缩线程 `compress_gtid_table` 的触发周期。**8.0.39 实测：该变量除注册/定义外没有任何代码读取**（`m_atomic_count` 无递增点），注释所称"按 period 计数触发"的路径已退化——压缩实际只由 binlog rotate 路径触发。变量仍在纯为向后兼容。
+
+```cpp
+/* sql/sys_vars.cc:6812 —— ★ 注释本身就讲清了历史与默认值的翻转 */
+static Sys_var_uint Sys_gtid_executed_compression_period(
+    "gtid_executed_compression_period",
+    "Compress the mysql.gtid_executed table whenever this number of "
+    "transactions have been added, by waking up a foreground thread "
+    "(compress_gtid_table). This compression method only operates when "
+    "binary logging is disabled on the replica; if binary logging is "
+    "enabled, the table is compressed every time the binary log is "
+    "rotated, and this value is ignored. Before MySQL 8.0.23, the "
+    "default is 1000, and from MySQL 8.0.23, the default is zero, which "
+    "disables this compression method. This is because in releases from "
+    "MySQL 8.0.17, InnoDB transactions are written to the "
+    "mysql.gtid_executed table by a separate process to non-InnoDB "
+    "transactions. If the server has a mix of InnoDB and non-InnoDB "
+    "transactions, attempting to compress the table with the "
+    "compress_gtid_table thread can slow this process, so from "
+    "MySQL 8.0.17 it is recommended that you set "
+    "gtid_executed_compression_period to 0.",
+    GLOBAL_VAR(gtid_executed_compression_period), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(0), BLOCK_SIZE(1));
+```
+```cpp
+/* sql/sys_vars.cc:1534 —— ⚠️ 真名字面量是 OWN_GTID，不是 OWNED_GTID */
+static const char *session_track_gtids_names[] = {"OFF", "OWN_GTID",
+                                                  "ALL_GTIDS", NullS};
+static Sys_var_enum Sys_session_track_gtids(
+    "session_track_gtids",
+    "Controls the amount of global transaction ids to be "
+    "included in the response packet sent by the server.",
+    SESSION_VAR(session_track_gtids), CMD_LINE(REQUIRED_ARG),
+    session_track_gtids_names, DEFAULT(SESSION_TRACK_GTIDS_OFF), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_outside_trx),
+    ON_UPDATE(on_session_track_gtids_update));
+```
+```cpp
+/* sql/sys_vars.cc:6566 —— 8.0.39 仍存在，READ_ONLY，默认 true */
+static Sys_var_bool Sys_binlog_gtid_simple_recovery(
+    "binlog_gtid_simple_recovery",
+    "If this option is enabled, the server does not open more than "
+    "two binary logs when initializing GTID_PURGED and "
+    "GTID_EXECUTED, either during server restart or when binary "
+    "logs are being purged. ... Note: If this option is enabled,
+    GLOBAL.GTID_EXECUTED and GLOBAL.GTID_PURGED may be initialized
+    wrongly in two cases: (1) All binary logs were generated by
+    MySQL 5.7.5 or older, and GTID_MODE was ON for some binary logs
+    but OFF for the newest binary log. (2) ... If a wrong set is
+    computed in one of case (1) or (2), it will remain wrong even if
+    the server is later restarted with this option disabled.",
+    READ_ONLY GLOBAL_VAR(binlog_gtid_simple_recovery), CMD_LINE(OPT_ARG),
+    DEFAULT(true));
+```
+> ★★ 这段注释很重要：**算错了不会自愈**——即使之后关掉该选项重启，错误的集合也保持错误。这是它唯一的真实风险。
 
 ---
 
@@ -1279,6 +2371,105 @@ GNO 的自动分配由 `get_automatic_gno`（rpl_gtid_state.cc:413）完成。�
 4. 找到第一个空闲的 GNO，分配给当前事务
 
 分配前事务需要获取 GNO 的 ownership（通过 `gtid_state->generate_automatic_gtid`），分配后事务持有该 GTID 的所有权直到 commit 或 rollback。
+
+**★★★ 完整源码**（`sql/rpl_gtid_state.cc:413`，★ 是"带 hint 的最小空洞搜索"，**不是** `max+1`）：
+
+```cpp
+rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const {
+  assert_sidno_lock_owner(sidno);            /* ★ 调用者必须已持有该 sidno 的 mutex */
+  Gtid_set::Const_interval_iterator ivit(&executed_gtids, sidno);
+  /*
+    When assigning new automatic GTIDs, we can optimize the assignment by start
+    searching an available GNO from the "supposed" next free one instead of
+    starting from 1.
+    ...
+    In order to fill the gaps of GTID_EXECUTED when a transaction rolls back
+    releasing the ownership of a GTID, we check if the released GNO is smaller
+    than the next_free_gno ... to set next_free_gno with the "released" GNO.
+  */
+  Gtid next_candidate = {sidno,
+                         sidno == get_server_sidno() ? next_free_gno : 1};
+  /*                     ★ 只有本服务器 UUID 才用 hint；其它 sidno 从 1 开始扫 */
+  while (true) {
+    const Gtid_set::Interval *iv = ivit.get();
+    rpl_gno next_interval_start = iv != nullptr ? iv->start : GNO_END;
+    while (next_candidate.gno < next_interval_start) {
+      if (owned_gtids.is_owned_by(next_candidate, 0)) return next_candidate.gno;
+      /* ★ owner 传 0 == "无人拥有"；成立即该 GNO 空闲 → 立刻返回 */
+      next_candidate.gno++;    /* ★ 已被别的并发事务 own 了 → 往后挪一位继续试 */
+    }
+    if (iv == nullptr) { my_error(ER_GNO_EXHAUSTED, MYF(0)); return -1; }
+    if (next_candidate.gno < iv->end) next_candidate.gno = iv->end;
+    /* ★ 跳到已执行区间的尾后，继续找"洞" */
+    ivit.next();
+  }
+}
+```
+
+> ★★ **三点纠正**：
+> ① **不是 `max(executed)+1`**——会跳过空洞（`next_free_gno` 只是 hint，不是权威值）。
+> ② **不是朴素的"从 1 找最小空洞"**——用 `next_free_gno` 作起点。
+> ③ ⚠️ **不存在** `next_free_gno()` / `get_next_available_gno()` 函数——只有**成员** `rpl_gno next_free_gno`（`rpl_gtid.h:3040`）。
+
+**★ `next_free_gno` 的锁要求**（`rpl_gtid.h:3010`，★ 四种修改场景）：
+
+```cpp
+  /**
+    The next_free_gno variable will be set with the supposed next free GNO
+    every time a new GNO is delivered automatically or when a transaction is
+    rolled back, releasing a GNO smaller than the last one delivered.
+    ...
+    Locking scheme
+
+    This variable can be read and modified in four places:
+    - During server startup, holding global_sid_lock.wrlock;
+    - By a client thread holding global_sid_lock.wrlock (doing a RESET MASTER);
+    - By a client thread calling MYSQL_BIN_LOG::write_transaction function
+    (often the group commit FLUSH stage leader). It will call
+      Gtid_state::generate_automatic_gtid, that will acquire
+      global_sid_lock.rdlock and lock_sidno(get_server_sidno()) ...
+    - By a client thread rolling back, holding global_sid_lock.rdlock
+      and lock_sidno(get_server_sidno()).
+  */
+  rpl_gno next_free_gno;
+```
+
+**★ `generate_automatic_gtid()`**（`rpl_gtid_state.cc:475`，⚠️ **全程只读锁，不升级写锁**）：
+
+```cpp
+  if (locked_sidno_was_passed_null)
+    sid_lock->rdlock();                  /* ★★ global_sid_lock 只取读锁 */
+  ...
+  if (global_gtid_mode.get() >= Gtid_mode::ON_PERMISSIVE) {
+    ...
+    if (automatic_gtid.gno == 0) {
+      automatic_gtid.gno = get_automatic_gno(automatic_gtid.sidno);
+      if (automatic_gtid.sidno == get_server_sidno() && automatic_gtid.gno != -1)
+        next_free_gno = automatic_gtid.gno + 1;   /* ★ hint 只在"分配成功"后前推 */
+    }
+    if (automatic_gtid.gno == -1 || acquire_ownership(thd, automatic_gtid))
+      ret = RETURN_STATUS_REPORTED_ERROR;
+    ...
+  } else {
+    // If GTID_MODE = OFF or OFF_PERMISSIVE, just mark this thread as
+    // using an anonymous transaction.
+    thd->owned_gtid.sidno = THD::OWNED_SIDNO_ANONYMOUS;
+    thd->owned_gtid.gno = 0;
+    acquire_anonymous_ownership();
+  }
+```
+> ★ 真正的互斥粒度是 **per-sidno mutex**（`lock_sidno()`），不是全局写锁。
+> ★ `acquire_ownership()` 里有 `assert(!executed_gtids.contains_gtid(gtid))` —— 已执行的 GTID 不许再被 own。
+
+**★ 回滚时填洞**（`update_gtids_impl_own_gtid`，★ hint 反过来被拉小）：
+
+```cpp
+  } else {                                   /* is_commit == false */
+    if (thd->owned_gtid.sidno == server_sidno &&
+        next_free_gno > thd->owned_gtid.gno)
+      next_free_gno = thd->owned_gtid.gno;   /* ★ 把 hint 拉回被释放的小 GNO，下次优先填这个洞 */
+  }
+```
 
 ---
 
@@ -1644,6 +2835,139 @@ CREATE TABLE IF NOT EXISTS gtid_executed (
 2. ★ **启动时补写 `Previous_gtids_log_event`**：`open_binlog()` 创建启动空 binlog 时只能写空 PREVIOUS_GTIDS；恢复完成后用算出的 `gtids_in_binlog` 重建事件 `write_event_to_binlog_and_sync()`（注释原文："Write the previous set of gtids at this point because during the creation of the binary log this is not done"）——不补写则下一个轮转文件的 PREVIOUS_GTIDS 链会断
 3. `gtid_state->init()`：`server_sid.parse(server_uuid)` → `sid_map->add_sid` → `server_sidno = sidno; next_free_gno = 1`
 
+**★★★ 三个集合的重建公式**（`sql/mysqld.cc:7906`，★ 这是本篇最有价值的一段源码）：
+
+```cpp
+  global_sid_lock->wrlock();
+  int gtid_ret = gtid_state->init();          /* ★ server_uuid → sid_map；next_free_gno = 1 */
+  global_sid_lock->unlock();
+
+  if (!opt_initialize && !opt_initialize_insecure) {
+    // note: Initialize executed_gtids from mysql.gtid_executed table.
+    if (gtid_state->read_gtid_executed_from_table() == -1) unireg_abort(1);   /* ★ A：先读表 */
+  }
+
+  if (opt_bin_log) {
+    if (mysql_bin_log.init_gtid_sets(
+            &gtids_in_binlog, &purged_gtids_from_binlog,
+            opt_source_verify_checksum, true, nullptr, nullptr,
+            true /*is_server_starting*/))                                     /* ★ B：再扫 binlog */
+      unireg_abort(MYSQLD_ABORT_EXIT);
+
+    global_sid_lock->wrlock();
+
+    /* C：binlog 有、表里没有 → 补写表（崩溃恢复的关键） */
+    if (!gtids_in_binlog.is_empty() &&
+        !gtids_in_binlog.is_subset(executed_gtids)) {
+      gtids_in_binlog_not_in_table.add_gtid_set(&gtids_in_binlog);
+      if (!executed_gtids->is_empty())
+        gtids_in_binlog_not_in_table.remove_gtid_set(executed_gtids);
+      /*
+        Save unsaved GTIDs into gtid_executed table, in the following
+        four cases:
+          1. the upgrade case.
+          2. ... slave is provisioned from a backup ... RESET MASTER
+             and RESET SLAVE before this.
+          3. ... no binlog rotation happened from the last RESET MASTER
+             on the server before it crashes.
+          4. The set of GTIDs of the last binlog is not saved into the
+             gtid_executed table if server crashes, so we save it into
+             gtid_executed table and executed_gtids during recovery
+             from the crash.                    ★ 第 4 条就是崩溃恢复本身
+      */
+      if (gtid_state->save(&gtids_in_binlog_not_in_table) == -1) { ... }
+      executed_gtids->add_gtid_set(&gtids_in_binlog_not_in_table);
+    }
+
+    /* D：★ gtids_only_in_table 的重建公式 */
+    /* gtids_only_in_table = executed_gtids - gtids_in_binlog */
+    if (gtids_only_in_table->add_gtid_set(executed_gtids) != RETURN_STATUS_OK) { ... }
+    gtids_only_in_table->remove_gtid_set(&gtids_in_binlog);
+
+    /* E：★ gtid_purged 的重建公式 */
+    /*
+      lost_gtids = executed_gtids -
+                   (gtids_in_binlog - purged_gtids_from_binlog)
+                 = gtids_only_in_table + purged_gtids_from_binlog;
+    */
+    assert(lost_gtids->is_empty());
+    if (lost_gtids->add_gtid_set(gtids_only_in_table) != RETURN_STATUS_OK ||
+        lost_gtids->add_gtid_set(&purged_gtids_from_binlog) != RETURN_STATUS_OK) { ... }
+
+    /* F：给新开的 binlog 补写 PREVIOUS_GTIDS */
+    Previous_gtids_log_event prev_gtids_ev(&gtids_in_binlog);
+```
+
+> ★★ **两个公式值得背下来**：
+> - `gtids_only_in_table = gtid_executed − gtids_in_binlog`（只在表里、不在 binlog 里）
+> - `gtid_purged = gtids_only_in_table + purged_gtids_from_binlog`
+>
+> ★ 第 E 步的 `assert(lost_gtids->is_empty())` 说明：**`lost_gtids` 在恢复前必须为空**，它是纯推导量。
+
+**★ `init_gtid_sets()` 的两种路径**（`sql/binlog.cc:4663`，★ simple_recovery 的快路径）：
+
+```cpp
+  /* 反向扫描：找最后一个含 Previous_gtids 的文件 */
+  rit = filename_list.rbegin();
+  while (!can_stop_reading && !reached_first_file) {
+    switch (read_gtids_from_binlog(filename, all_gtids,
+                                   reached_first_file ? lost_gtids : nullptr, ...)) {
+      case GOT_GTIDS:         can_stop_reading = true; break;
+      case GOT_PREVIOUS_GTIDS:
+        if (!is_relay_log) can_stop_reading = true;   /* ★ binlog 有 PREV 就够 */
+        break;
+      case NO_GTIDS:
+        /*
+          ... This may take very long time if it has many binary logs and
+          almost all of them are out of filesystem cache. So if the
+          binlog_gtid_simple_recovery is enabled, and the last binary log
+          does not contain any GTID event, do not read any more binary
+          logs, GLOBAL.GTID_EXECUTED and GLOBAL.GTID_PURGED should be
+          empty in the case.
+        */
+        if (binlog_gtid_simple_recovery && is_server_starting && !is_relay_log) {
+          assert(all_gtids->is_empty());
+          assert(lost_gtids->is_empty());
+          goto end;                                  /* ★★ 快路径：直接认定都为空 */
+        }
+        [[fallthrough]];
+      case TRUNCATED: break;
+    }
+  }
+```
+```cpp
+  /* 正向扫描（仅 binlog）：找第一个"PREV + GTID"文件 → purged */
+  for (it = filename_list.begin(); it != filename_list.end(); it++) {
+    Gtid first_gtid = {0, 0};
+    switch (read_gtids_from_binlog(
+        filename, nullptr, lost_gtids,
+        binlog_gtid_simple_recovery ? nullptr : &first_gtid, ...)) {
+      case GOT_GTIDS: goto end;
+      case NO_GTIDS:
+      case GOT_PREVIOUS_GTIDS:
+        if (binlog_gtid_simple_recovery) goto end;   /* ★★ 只读第一个就定 purged */
+        [[fallthrough]];
+      ...
+```
+> ★ 注意 `is_server_starting && !is_relay_log && !filename_list.empty()` 时会先 `filename_list.pop_back()`——**启动时新开的空 binlog 不算数**（`binlog.cc:4740` 注释明说）。
+> ⚠️ **真名核查**：从表读的入口是 **`Gtid_state::read_gtid_executed_from_table()`**（`rpl_gtid_state.cc:754`），**不存在** `read_gtids_from_table()`。
+
+**★ rotate 与 shutdown 时的"只写增量"公式**（`rpl_gtid_state.cc:704`）：
+
+```cpp
+  /*
+    logged_gtids_last_binlog= executed_gtids - previous_gtids_logged -
+                              gtids_only_in_table
+  */
+  ret = (logged_gtids_last_binlog.add_gtid_set(&executed_gtids) != RETURN_STATUS_OK);
+  if (!ret) {
+    logged_gtids_last_binlog.remove_gtid_set(&previous_gtids_logged);
+    logged_gtids_last_binlog.remove_gtid_set(&gtids_only_in_table);
+    if (!logged_gtids_last_binlog.is_empty()) {
+      ... save(&logged_gtids_last_binlog) ...        /* ★ 只写差集，不是全表重写 */
+```
+> ★ 同一个公式的第三处复用在 `binlog.cc:5095`（rotate 时 `PREVIOUS_GTIDS = executed − gtids_only_in_table`）。
+
 | 决策 | 实现 | 代价 / 理由 |
 |---|---|---|
 | executed 恢复取并集而非判损坏 | 表 ∪ binlog，差集补表 | 崩溃窗口内落表滞后是常态，不可视为损坏 |
@@ -1711,6 +3035,83 @@ GTID 的持久化有三条路径，各自适用于不同场景：
 | `m_event` / `m_close_thread` / `m_thread_active` / `m_active` | 唤醒 / 退出请求 / 线程存活 / 是否接收 GTID |
 
 常量：`GTID_INFO_SIZE=64`、`s_time_threshold=100ms`、`s_gtid_threshold=1024`、`s_compression_threshold=50`、`s_max_gtid_threshold=1024*1024`。
+
+**★ 完整类定义**（⚠️ **在 `storage/innobase/include/clone0repl.h:68`，不在 `sql/rpl_gtid_persist.h`**）：
+
+```cpp
+/** Serialized GTID information size */
+static const size_t GTID_INFO_SIZE = 64;     /* ⚠️ 真名不是 BUF_SIZE；定长 64 字节 */
+/** GTID format version. */
+static const uint32_t GTID_VERSION = 1;      /* ⚠️ 真名不是 NUM_VERSIONS */
+/** Serialized GTID */
+using Gtid_info = std::array<unsigned char, GTID_INFO_SIZE>;
+/** List of GTIDs */
+using Gitd_info_list = std::vector<Gtid_info>;   /* ★ 上游拼写笔误 "Gitd" */
+
+/** GTID descriptor with version information. */
+struct Gtid_desc {
+  bool m_is_set;
+  Gtid_info m_info;
+  uint32_t m_version;
+};
+
+/** Persist GTID along with transaction commit */
+class Clone_persist_gtid {
+ public:
+  Clone_persist_gtid() {
+    m_event = os_event_create();
+    m_thread_active.store(false);
+    m_gtid_trx_no.store(0);
+    ...
+    /* We accept GTID even before the background service is started. This
+    is needed because we add GTIDs from undo log during recovery. */
+    m_active.store(true);            /* ★★ 构造即 active：恢复期从 undo 捞的 GTID 也要收 */
+  }
+  ...
+  /** Disable copy construction */
+  Clone_persist_gtid(Clone_persist_gtid const &) = delete;
+  /** Disable assignment */
+  Clone_persist_gtid &operator=(Clone_persist_gtid const &) = delete;
+
+ private:
+  /** @return GTID list by number. */
+  Gitd_info_list &get_list(uint64_t list_number) {
+    int list_index = (list_number & static_cast<uint64_t>(1));   /* ★★ 双 buffer 的本质：奇偶取模，只有 2 个槽 */
+    return (m_gtids[list_index]);
+  }
+
+  /** Switch active GTID list. */
+  uint64_t switch_active_list() {
+    ut_ad(trx_sys_serialisation_mutex_own());
+    uint64_t flush_number = m_active_number;
+    ++m_active_number;               /* ★ 切换 = active_number++；奇偶翻位即换另一个 vector */
+    m_compression_gtid_counter += m_num_gtid_mem;
+    m_num_gtid_mem.store(0);
+    return (flush_number);
+  }
+
+ private:
+  /** Time threshold to trigger persisting GTID. Insert GTID once per 1k
+  transactions or every 100 millisecond. */
+  static constexpr std::chrono::milliseconds s_time_threshold{100};
+  /** Threshold for the count for compressing GTID. */
+  const static uint32_t s_compression_threshold = 50;
+  /** Number of transaction/GTID threshold for writing to disk table. */
+  const static int s_gtid_threshold = 1024;
+  /** Maximum Number of transaction/GTID to hold. ... */
+  const static int s_max_gtid_threshold = 1024 * 1024;
+
+  /** Two lists of GTID. One of them is active where running transactions
+  add their GTIDs. Other list is used to persist them to table ... */
+  Gitd_info_list m_gtids[2];        /* ★★ 唯一的容器，无 per-buffer 锁 */
+  std::atomic<uint64_t> m_active_number;
+  std::atomic<uint64_t> m_flush_number;
+  ...
+};
+```
+
+> ★★★ **锁的真相**：`Clone_persist_gtid` 内部**没有任何自己的 mutex**。它复用的锁是 **`trx_sys_serialisation_mutex`**（`get_active_list()` / `switch_active_list()` / `request_immediate_flush()` 都 `ut_ad(trx_sys_serialisation_mutex_own()`），配合 `os_event_t m_event` 唤醒后台线程。**这是它放在 `clone0repl.h` 而不是 `rpl_gtid_persist.h` 的根本原因**——它被绑在 InnoDB 事务串行化路径上。
+> ⚠️ 三点真名纠错：`NUM_VERSIONS` / `BUF_SIZE` / `CHUNK_GROW_FACTOR` **都不存在**。
 
 ### 双 buffer 的精确语义：编号奇偶取模 + 自增
 

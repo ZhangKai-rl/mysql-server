@@ -9979,6 +9979,7 @@ bool fill_record(THD *thd, TABLE *table, Field **ptr,
       set_field_to_null_with_conversions()). So evaluation of this flag can't
       be moved outside of fill_record(), to be done once per statement.
     */
+    // note
     if (value->save_in_field(field, false) ==
             TYPE_ERR_NULL_CONSTRAINT_VIOLATION ||
         thd->is_error())

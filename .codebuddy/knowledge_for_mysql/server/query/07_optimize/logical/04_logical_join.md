@@ -366,6 +366,286 @@ Table_ref *Query_block::end_nested_join() {
 
 核心语义（注释 `:1974-1996`）：**把"后过滤器 cond"与 nest 里每个成员"对质"**。若 cond 对某张内表的 NULL-complemented 行"拒绝 NULL"，该外连接可转内连接。
 
+#### 3.0 `simplify_joins()` 完整源码（`sql/sql_resolver.cc:1951`）
+
+> **勘误**：它是 `Query_block::` 的**成员方法**，在 `sql/sql_resolver.cc`——**不是** `sql_optimizer.cc` 里的自由函数；函数体内**没有** `static` 辅助函数（`check_interleaving_with_nj`/`backout_nj_state` 属于 `Optimize_table_order`，在 `sql/sql_planner.cc`，与 simplify 阶段无关）；也**不存在** `test_if_refutes_null()` / `is_null_rejecting()` / `null_rejecting_row()`。
+
+```cpp
+bool Query_block::simplify_joins(THD *thd,
+                                 mem_root_deque<Table_ref *> *join_list,
+                                 bool top, bool in_sj, Item **cond,
+                                 uint *changelog) {
+  /* Each type of change done by this function, or its recursive calls,
+     is tracked in a bitmap: */
+  enum change {
+    NONE = 0,
+    OUTER_JOIN_TO_INNER = 1 << 0,
+    JOIN_COND_TO_WHERE = 1 << 1,
+    PAREN_REMOVAL = 1 << 2,
+    SEMIJOIN = 1 << 3
+  };
+  uint changes = 0;
+  if (changelog == nullptr)  // This is the top call.
+    changelog = &changes;
+
+  Table_ref *prev_table = nullptr;
+  const bool straight_join = active_options() & SELECT_STRAIGHT_JOIN;
+
+  /*
+    Try to simplify join operations from join_list.
+    The most outer join operation is checked for conversion first.
+    ... (join_list 是"逆序"的：最外层 join 在前)
+  */
+  for (Table_ref *table : *join_list) {
+    table_map used_tables;
+    table_map not_null_tables = table_map(0);
+
+    NESTED_JOIN *nested_join = table->nested_join;
+    if (nested_join != nullptr) {
+      /* If the element of join_list is a nested join apply
+         the procedure to its nested join list first.
+         This confronts the join nest's condition with each member of the nest. */
+      if (table->join_cond() != nullptr) {
+        Item *join_cond = table->join_cond();
+        /* If a join condition JC is attached to the table,
+           check all null rejected predicates in this condition. ... */
+        if (simplify_joins(
+                thd, &nested_join->m_tables,
+                false,  // not 'top' as it's not WHERE.
+                // SJ nests can dissolve into upper SJ or anti SJ nests:
+                in_sj || table->is_sj_or_aj_nest(), &join_cond, changelog))
+          return true;   // ★ 递归 ①：用「本 nest 自己的 ON」confront 内层
+
+        if (join_cond != table->join_cond()) {
+          table->set_join_cond(join_cond);
+          /* For a semi-join or anti-join table nest, if the join condition
+             has been reduced to a constant value, it means that factored out
+             join condition operands can be removed. */
+          if (table->is_sj_or_aj_nest() && join_cond->const_item()) {
+            clear_sj_expressions(nested_join);
+          }
+        }
+      }
+      nested_join->used_tables = table_map(0);
+      nested_join->not_null_tables = table_map(0);
+      // This recursively confronts "cond" with each member of the nest
+      if (simplify_joins(thd, &nested_join->m_tables,
+                         top,  // if it was WHERE it still is
+                         in_sj || table->is_sj_or_aj_nest(), cond, changelog))
+        return true;            // ★ 递归 ②：用「外层 cond」confront 内层
+      used_tables = nested_join->used_tables;
+      not_null_tables = nested_join->not_null_tables;
+    } else {
+      used_tables = table->map();
+      // ★★ 叶子表：null-rejecting 判定就这一行 —— 问 cond 的 not_null_tables()
+      if (*cond != nullptr) not_null_tables = (*cond)->not_null_tables();
+    }
+
+    // ★ 向父 nest 上推位图（"递归上升时计算属性"）
+    if (table->embedding != nullptr) {
+      table->embedding->nested_join->used_tables |= used_tables;
+      table->embedding->nested_join->not_null_tables |= not_null_tables;
+    }
+
+    // ★★★ 核心判定 ★★★
+    if (!table->outer_join || (used_tables & not_null_tables)) {
+      /*
+        For some of the inner tables there are conjunctive predicates
+        that reject nulls => the outer join can be replaced by an inner join.
+      */
+      if (table->outer_join) {
+        *changelog |= OUTER_JOIN_TO_INNER;
+        table->outer_join = false;                 // ★ 真正的"改旗"
+      }
+      if (table->join_cond() != nullptr) {
+        *changelog |= JOIN_COND_TO_WHERE;
+        /* Add join condition to the WHERE or upper-level join condition. */
+        if (*cond != nullptr) {
+          Item *i1 = *cond;
+          Item *i2 = table->join_cond();
+          /* User supplied stored procedures in the query can violate row-level
+             filter enforced by a view. So make sure view's filter conditions
+             precede any other conditions. */
+          if (table->is_view() && i1->has_stored_program()) {
+            std::swap(i1, i2);                     // ★ 坑：视图+存储过程要交换顺序
+          }
+          Item_cond_and *new_cond =
+              down_cast<Item_cond_and *>(and_conds(i1, i2));
+          if (new_cond == nullptr) return true;
+          new_cond->apply_is_true();
+          assert(!new_cond->fixed);
+          Item *cond_after_fix = new_cond;
+          if (new_cond->fix_fields(thd, &cond_after_fix)) return true;
+          *cond = cond_after_fix;
+        } else {
+          *cond = table->join_cond();
+        }
+        table->set_join_cond(nullptr);
+        // ★ ON 被"提走" ⇒ 后续扁平化靠 join_cond()==nullptr 判定
+      }
+    }
+
+    // A table is traversed when 'cond' is WHERE, and when 'cond' is the join
+    // condition of any nest containing the table. Some bitmaps can be set
+    // only after all traversals of this table i.e. when 'cond' is WHERE.
+    if (!top) continue;   // ★★ 只有 top 那趟才记账 dep_tables
+
+    /*
+      Only inner tables of non-convertible outer joins remain with
+      the join condition.
+    */
+    if (table->join_cond() != nullptr) {
+      table->dep_tables |= table->join_cond()->used_tables();
+      // At this point the joined tables always have an embedding join nest:
+      assert(table->embedding != nullptr);
+      // ★ 只保留对 nest 之外表的依赖
+      table->dep_tables &= ~table->embedding->nested_join->used_tables;
+
+      // Embedding table depends on tables used in embedded join conditions.
+      table->embedding->join_cond_dep_tables |=
+          table->join_cond()->used_tables();
+    }
+
+    if (prev_table != nullptr) {
+      /* The order of tables is reverse: prev_table follows table */
+      if (prev_table->straight || straight_join)
+        prev_table->dep_tables |= used_tables;
+      if (prev_table->join_cond() != nullptr) {
+        prev_table->dep_tables |= table->join_cond_dep_tables;
+        table_map prev_used_tables = prev_table->nested_join != nullptr
+                                         ? prev_table->nested_join->used_tables
+                                         : prev_table->map();
+        /*
+          If join condition contains no reference to outer tables
+          we still make the inner tables dependent on the outer tables,
+          as the outer must go before the inner ... Note: PSEUDO_TABLE_BITS
+          mask should not be counted as it prevents update of inner table
+          dependencies (e.g. RAND()/COUNT(*) in JOIN ON clause).
+        */
+        if ((((prev_table->join_cond()->used_tables() & ~PSEUDO_TABLE_BITS) &
+              ~prev_used_tables) &
+             used_tables) == 0) {
+          prev_table->dep_tables |= used_tables;
+        }
+      }
+    }
+    prev_table = table;
+  }
+
+  /* Flatten nested joins that can be flattened.
+     no join condition and not a semi-join => can be flattened. */
+  for (auto li = join_list->begin(); li != join_list->end();) {
+    Table_ref *table = *li;
+    NESTED_JOIN *nested_join = table->nested_join;
+    if (table->is_sj_nest() && !in_sj) {
+      /*
+        If this is a semi-join that is not contained within another semi-join,
+        leave it intact.
+        Otherwise it is flattened, for example
+        A SJ (B SJ (C)) becomes the equivalent A SJ (B JOIN C),
+        A AJ (B SJ (C)) becomes the equivalent A AJ (B JOIN C),
+        While dissolving a SJ nest into an AJ nest is ok ... dissolving an AJ
+        nest into a SJ is not ok:
+        A SJ (B AJ (C)) is not equivalent to A SJ (B JOIN C);
+        that is why the next if() block is guarded by !join_cond() ...
+      */
+      *changelog |= SEMIJOIN;         // ★ 只是记一笔，外层 SJ nest 不动
+    } else if (nested_join != nullptr && table->join_cond() == nullptr) {
+      *changelog |= PAREN_REMOVAL;
+      // ★ 扁平化三件事：改 embedding、改 join_list、继承 dep_tables（|=）
+      for (Table_ref *tbl : nested_join->m_tables) {
+        tbl->embedding = table->embedding;
+        tbl->join_list = table->join_list;
+        tbl->dep_tables |= table->dep_tables;
+      }
+      li = join_list->erase(li);
+      li = join_list->insert(li, nested_join->m_tables.begin(),
+                             nested_join->m_tables.end());
+      // Don't advance li; we want to process the newly added tables.
+      continue;                        // ★★ 不推进迭代器：一趟完成传递闭包
+    }
+    ++li;
+  }
+
+  if (changes) {
+    /* optimizer_trace: transformations_to_nested_joins
+       { "transformations": [ "outer_join_to_inner_join",
+                              "JOIN_condition_to_WHERE",
+                              "parenthesis_removal", "semijoin" ] } */
+    ...
+  }
+  return false;
+}
+```
+
+**配套：`record_join_nest_info()`**（`sql/sql_resolver.cc:2234`）——`Query_block::outer_join` 位图（**所有幸存外连接内表的集合**，不是布尔）在这里被填充：
+
+```cpp
+bool Query_block::record_join_nest_info(mem_root_deque<Table_ref *> *tables) {
+  for (Table_ref *table : *tables) {
+    if (table->nested_join == nullptr) {
+      // 单表外连接
+      if (table->join_cond()) outer_join |= table->map();
+      continue;
+    }
+    if (record_join_nest_info(&table->nested_join->m_tables)) return true;
+
+    /* sj_inner_tables is set properly later in pull_out_semijoin_tables().
+       This assignment is required in case pull_out_semijoin_tables()
+       is not called. */
+    if (table->is_sj_or_aj_nest())
+      table->sj_inner_tables = table->nested_join->used_tables;
+    if (table->is_sj_or_aj_nest()) {
+      sj_nests.push_back(table);
+    }
+    // nest 形态的外连接：整个 nest 的 used_tables 都算"内表"
+    if (table->join_cond()) outer_join |= table->nested_join->used_tables;
+  }
+  return false;
+}
+```
+
+**`build_bitmap_for_nested_joins()`**（`sql/sql_optimizer.cc:5025`）——给每个幸存的外连接 nest 分配 `nj_map` 位：
+
+```cpp
+uint build_bitmap_for_nested_joins(mem_root_deque<Table_ref *> *join_list,
+                                   uint first_unused) {
+  for (Table_ref *table : *join_list) {
+    NESTED_JOIN *nested_join;
+    if ((nested_join = table->nested_join)) {
+      // We should have a join condition or a semi-join condition or both
+      // ★ simplify_joins 跑完后，能扁平的都扁平了，剩下的 nest 必然有 ON 或是 SJ nest
+      assert((table->join_cond() != nullptr) || table->is_sj_nest());
+
+      nested_join->nj_map = 0;
+      nested_join->nj_total = 0;
+      /* We only record nested join information for outer join nests.
+         Tables belonging in semi-join nests are recorded in the
+         embedding outer join nest, if one exists. */
+      if (table->join_cond()) {
+        assert(first_unused < sizeof(nested_join_map) * 8);
+        nested_join->nj_map = (nested_join_map)1 << first_unused++;   // ★ 一 bit 一个 nest（上限 64）
+        nested_join->nj_total = nested_join->m_tables.size();
+      } else if (table->is_sj_nest()) {
+        NESTED_JOIN *const outer_nest =
+            table->embedding ? table->embedding->nested_join : nullptr;
+        /* The semi-join nest has already been counted into the table count
+           for the outer join nest as one table, so subtract 1 ... */
+        if (outer_nest)
+          outer_nest->nj_total += (nested_join->m_tables.size() - 1);
+      } else
+        assert(false);
+
+      first_unused =
+          build_bitmap_for_nested_joins(&nested_join->m_tables, first_unused);
+    }
+  }
+  return first_unused;
+}
+```
+
+**四个"坑"**：① `join_list` 是**逆序**的，`prev_table` 在语法上是"后出现"的表；② 同一张表会被 **confront 多次**（每层嵌套的 ON 一次 + WHERE 一次），所以 `dep_tables` 只在 `top=true` 那趟设置；③ 扁平化用 `dep_tables |=`（继承而非赋值）；④ **SJ/AJ 溶解是不对称的**——`A AJ (B SJ C)` 可溶，但 `A SJ (B AJ C)` 不可溶，靠 `!join_cond()` 挡住（AJ nest 有 ON，进不了扁平化分支）。
+
 ### 3.1 递归结构：两次递归 + 位图上推（`:1997-2056`）
 
 ```cpp
@@ -446,6 +726,92 @@ if (!table->outer_join || (used_tables & not_null_tables)) {
 两个结论对应代码的两件事：`outer_join = false`（LJ⇒⋈）与 `*cond = cond AND join_cond`（JC 从 ON 挪到 post-filter）。**第 2 步是第 1 步的必然推论**，且是必需的——把 JC 移出去才能让 nest 变成"无 ON 的纯括号"，从而被 Pass 2 扁平化。
 
 **`apply_is_true()` 与 `fix_fields` 都是必需的**：前者保证新 AND 走"取并集"而非"取交集"；后者**重算 `not_null_tables_cache`**，这是级联转换的关键。
+
+#### 3.2.2 null-rejecting 的完整机制（`Item::not_null_tables()`）
+
+```cpp
+// sql/item.h:2241 —— 语义定义与**默认实现**
+  /**
+    Return table map of tables that can't be NULL tables (tables that are
+    used in a context where if they would contain a NULL row generated
+    by a LEFT or RIGHT join, the item would not be true).
+    This expression is used on WHERE item to determinate if a LEFT JOIN can be
+    converted to a normal join.
+    Generally this function should return used_tables() if the function
+    would return null if any of the arguments are null ...
+  */
+  virtual table_map not_null_tables() const { return used_tables(); }
+  // ★ 默认"悲观"：只要用到某表就认为它拒绝 NULL —— 保守方向是安全的
+
+// sql/item_func.cc:711 —— 通用函数节点：靠 null_on_null 决定"遇 NULL 即 NULL"
+void Item_func::update_used_tables() {
+  used_tables_cache = get_initial_pseudo_tables();
+  not_null_tables_cache = 0;
+  m_accum_properties = 0;
+
+  for (uint i = 0; i < arg_count; i++) {
+    args[i]->update_used_tables();
+    used_tables_cache |= args[i]->used_tables();
+    // ★★ 核心：t2.b < 5 的 null_on_null=true ⇒ 继承 t2；IS NULL 的 null_on_null=false ⇒ 得 0
+    if (null_on_null) not_null_tables_cache |= args[i]->not_null_tables();
+    add_accum_properties(args[i]);
+  }
+}
+
+// sql/item_cmpfunc.cc:5867 —— AND 取并集，OR/NOT 取交集
+void Item_cond::update_used_tables() {
+  List_iterator_fast<Item> li(list);
+  Item *item;
+
+  used_tables_cache = 0;
+  m_accum_properties = 0;
+
+  if (functype() == COND_AND_FUNC && ignore_unknown())
+    not_null_tables_cache = 0;                    // AND：从 0 开始"或"上去
+  else
+    not_null_tables_cache = ~(table_map)0;        // OR/NOT：从全 1 开始"与"下来
+
+  while ((item = li++)) {
+    item->update_used_tables();
+    used_tables_cache |= item->used_tables();
+    add_accum_properties(item);
+    if (functype() == COND_AND_FUNC && ignore_unknown())
+      not_null_tables_cache |= item->not_null_tables();
+    else
+      not_null_tables_cache &= item->not_null_tables();
+  }
+}
+```
+
+⇒ `WHERE t2.b < 5` 把 `t1 LEFT JOIN t2` 降级为 INNER JOIN 的**完整链路**：`Item_cond_and`（并集）→ `Item_func_lt`（`null_on_null=true`）→ `Item_field` 走默认实现返回 `used_tables()` = t2 的位 → `simplify_joins` 里 `used_tables & not_null_tables` 命中。
+
+**两个反直觉的 override**：
+
+```cpp
+// sql/item_cmpfunc.h:940 —— Item_func_not_all（< ALL / NOT IN 的变换产物）
+  table_map not_null_tables() const override {
+    /*
+      ... An inequality usually rejects NULLs from both operands, so the
+      not_null_tables() of the inequality is the union of the
+      null-rejecting tables of both operands. However, since this is a
+      transformed ALL clause that should return true if the subquery
+      is empty (even if left-expr is NULL), it is not null rejecting
+      for left-expr. ... Therefore, always return 0.
+    */
+    return 0;   // ★ 坑：`t1 LEFT JOIN t2 ... WHERE t1.x < ALL(...)` 不会被降级
+  }
+
+// sql/item.h:5844 —— Item_ref（外层引用）
+  table_map not_null_tables() const override {
+    return depended_from != nullptr ? OUTER_REF_TABLE_BIT
+                                    : ref_item()->not_null_tables();
+    // ★ 返回伪表位，不污染真实表的判定
+  }
+```
+
+另外 `Item_subselect::not_null_tables()`（`sql/item_subselect.h:206`）**恒返回 0**——子查询永远不 null-reject。
+
+> **易混淆**：`Key_use::null_rejecting`（`sql/sql_opt_exec_shared.h:103`）与 `Key_field::null_rejecting`（`sql/sql_optimizer_internal.h:103`）是 **ref 访问路径**上的概念（"该 keypart 的 `=` 比较不存在 NULL 匹配"），与外连接降级**不是同一件事**。
 
 ### 3.3 not_null_tables 的三条规则与判例表
 
@@ -534,6 +900,226 @@ prev_table = table;
 - **2146-2150**：若 ON 完全不引用左邻表（如 `ON RAND()>0.5`、`ON 1=1`），单看 ON 无法产生依赖，但执行器要求外连接内侧至少有一张外表在前——无条件补上。`& ~PSEUDO_TABLE_BITS` 排除 `RAND_TABLE_BIT`，否则 `ON ...RAND()...` 会让掩码非零从而跳过补偿。
 
 ---
+
+### 3.6 从 `dep_tables` 到运行期：`propagate_dependencies()` + `make_outerjoin_info()`
+
+> **勘误**：`propagate_dependencies()` 是 **`JOIN::` 成员，在 `sql/sql_optimizer.cc:5556`**（不是 resolver.cc 的自由函数），它传播的是 **`JOIN_TAB::dependent`**，不是 `Table_ref::dep_tables`；`make_outerjoin_info()` 在 `sql/sql_optimizer.cc:8525`。
+
+`dep_tables` → `JOIN_TAB::dependent` 的搬运发生在 `JOIN::init_planner_arrays()`（`sql/sql_optimizer.cc:5437`）：
+
+```cpp
+  JOIN_TAB **best_ref_p = best_ref;
+  Table_ref *tl = query_block->leaf_tables;
+
+  for (JOIN_TAB *tab = join_tab; tl; tab++, tl = tl->next_leaf, best_ref_p++) {
+    *best_ref_p = tab;
+    TABLE *const table = tl->table;
+    tab->table_ref = tl;
+    tab->set_table(table);
+    ...
+    // ★ simplify_joins 算出来的 dep_tables 在这里落到 JOIN_TAB
+    tab->dependent = tl->dep_tables;  // Initialize table dependencies
+    if (query_block->is_recursive()) {
+      if (query_block->recursive_reference != tl)
+        // Recursive reference must go first
+        tab->dependent |= query_block->recursive_reference->map();
+      else { /* 递归引用不能用索引 */ ... }
+    }
+    ...
+    tab->init_join_cond_ref(tl);   // m_join_cond_ref → tl->join_cond_optim_ref()
+
+    if (tl->outer_join_nest()) {
+      // tab belongs to a nested join, maybe to several embedding joins
+      tab->embedding_map = 0;
+      for (Table_ref *embedding = tl->embedding; embedding;
+           embedding = embedding->embedding) {
+        NESTED_JOIN *const nested_join = embedding->nested_join;
+        tab->embedding_map |= nested_join->nj_map;   // ★ 所有包裹本表的 nest 的 nj_map 并集
+        tab->dependent |= embedding->dep_tables;
+      }
+    } else if (tab->join_cond()) {
+      // tab is the only inner table of an outer join
+      tab->embedding_map = 0;
+      for (Table_ref *embedding = tl->embedding; embedding;
+           embedding = embedding->embedding)
+        tab->embedding_map |= embedding->nested_join->nj_map;
+    }
+    ...
+  }
+```
+
+`JOIN::propagate_dependencies()`（`sql/sql_optimizer.cc:5556`）——Warshall 传递闭包：
+
+```cpp
+/**
+  Propagate dependencies between tables due to outer join relations.
+  ...
+  Build transitive closure for relation 'to be dependent on'.
+  This will speed up the plan search for many cases with outer joins,
+  as well as allow us to catch illegal cross references.
+  Warshall's algorithm is used to build the transitive closure.
+  As we may restart the outer loop up to 'table_count' times, the
+  complexity of the algorithm is O((number of tables)^3).
+  However, most of the iterations will be shortcircuited when
+  there are no dependencies to propagate.
+*/
+bool JOIN::propagate_dependencies() {
+  for (uint i = 0; i < tables; i++) {
+    if (!join_tab[i].dependent) continue;
+
+    // Add my dependencies to other tables depending on me
+    uint j;
+    JOIN_TAB *tab;
+    for (j = 0, tab = join_tab; j < tables; j++, tab++) {
+      if (tab->dependent & join_tab[i].table_ref->map()) {
+        const table_map was_dependent = tab->dependent;
+        tab->dependent |= join_tab[i].dependent;   // ★ 传递：tab 继承 i 的全部依赖
+        /*
+          If we change dependencies for a table we already have
+          processed: Redo dependency propagation from this table.
+        */
+        if (i > j && tab->dependent != was_dependent) {
+          i = j - 1;      // ★ Warshall 的"回退重扫"
+          break;
+        }
+      }
+    }
+  }
+
+  JOIN_TAB *const tab_end = join_tab + tables;
+  // ★ 自依赖（环）→ 报错（典型：递归 CTE + LEFT JOIN 的非法 join 顺序）
+  for (JOIN_TAB *tab = join_tab; tab < tab_end; tab++) {
+    if ((tab->dependent & tab->table_ref->map())) return true;
+  }
+  return false;
+}
+```
+
+**坑**：`propagate_dependencies()` **只在 `query_block->outer_join != 0`（存在幸存外连接）或递归 CTE 时才被调用**（`sql/sql_optimizer.cc:5317`）；纯内连接查询根本不跑。
+
+`JOIN::make_outerjoin_info()`（`sql/sql_optimizer.cc:8525`）——建立 `first_inner/last_inner/first_upper`：
+
+```cpp
+void JOIN::make_outerjoin_info() {
+  assert(query_block->outer_join);
+  ASSERT_BEST_REF_IN_JOIN_ORDER(this);
+
+  query_block->reset_nj_counters();    // ★ 先清零 nj_counter（判定"第一个内表"用）
+
+  for (uint i = const_tables; i < tables; ++i) {
+    JOIN_TAB *const tab = best_ref[i];
+    TABLE *const table = tab->table();
+    if (!table) continue;
+    Table_ref *const tbl = tab->table_ref;
+
+    /*
+      If 'tbl' is inside a SJ/AJ nest served by materialization, we must
+      limit setting first_inner, last_inner and first_upper for join nests
+      inside the materialized table. Indeed it is the SJ-tmp table, and not
+      'tbl', which interacts with the nests outer to the SJ/AJ nest.
+    */
+    const bool sj_mat_inner =
+        sj_is_materialize_strategy(tab->get_sj_strategy());
+
+    if (tbl->outer_join) {
+      /* Table tab is the only one inner table for outer join. */
+      tab->set_last_inner(i);
+      tab->set_first_inner(i);         // ★ 情形 A：单表外连接，first==last==i
+      tab->init_join_cond_ref(tbl);
+      tab->cond_equal = tbl->cond_equal;
+      Table_ref *const outer_join_nest = tbl->outer_join_nest();
+      if (outer_join_nest) {
+        if (!sj_mat_inner ||
+            (tab->emb_sj_nest->sj_inner_tables &
+             best_ref[outer_join_nest->nested_join->first_nested]
+                 ->table_ref->map()))
+          tab->set_first_upper(outer_join_nest->nested_join->first_nested);
+      }
+    }
+    // ★ 情形 B：沿 embedding 链向上爬
+    for (Table_ref *embedding = tbl->embedding; embedding;
+         embedding = embedding->embedding) {
+      if (sj_mat_inner && embedding == tab->emb_sj_nest) break;
+      // Ignore join nests that are not outer join nests:
+      if (!embedding->join_cond_optim()) continue;
+      NESTED_JOIN *const nested_join = embedding->nested_join;
+      if (!nested_join->nj_counter) {
+        /* Table tab is the first inner table for nested_join. */
+        nested_join->first_nested = i;
+        tab->init_join_cond_ref(embedding);
+        tab->cond_equal = tbl->cond_equal;
+        Table_ref *const outer_join_nest = embedding->outer_join_nest();
+        if (outer_join_nest) { ... tab->set_first_upper(...); }
+      }
+      if (tab->first_inner() == NO_PLAN_IDX)
+        tab->set_first_inner(nested_join->first_nested);
+      // ★ 一个"物化临时表"在 plan 里算多个逻辑表
+      nested_join->nj_counter +=
+          tab->sj_mat_exec() ? tab->sj_mat_exec()->table_count : 1;
+      if (nested_join->nj_counter < nested_join->nj_total) break;
+      // Table tab is the last inner table for nested join.
+      // ★★ last_inner 记在 **first_inner 那个 tab** 上，不是最后一个内表
+      best_ref[nested_join->first_nested]->set_last_inner(i);
+    }
+  }
+}
+```
+
+运行期的判据（`sql/sql_opt_exec_shared.h:236`）：
+
+```cpp
+  bool is_first_inner_for_outer_join() const { return m_first_inner == m_idx; }
+  bool is_inner_table_of_outer_join() const {
+    return m_first_inner != NO_PLAN_IDX;   // ★ 判据就是 first_inner 被设过
+  }
+  bool is_single_inner_of_outer_join() const {
+    return m_first_inner == m_idx && m_last_inner == m_idx;
+  }
+```
+
+`Table_ref` 侧（rewrite/优化期，`sql/table.h:3398` / `:3413`）：
+
+```cpp
+  /**
+    ... Note: This function assumes that simplify_joins() has been performed.
+  */
+  Table_ref *outer_join_nest() const {
+    if (!embedding) return nullptr;
+    // ★ SJ nest 不是外连接 nest → 跳过它返回祖父；AJ nest（有 ON）**不**跳过
+    if (embedding->is_sj_nest()) return embedding->embedding;
+    return embedding;
+  }
+
+  bool is_inner_table_of_outer_join() const {
+    if (outer_join) return true;
+    // ★ 沿 embedding 链向上，任一层 outer_join 就算；AJ nest 也在此列
+    for (Table_ref *emb = embedding; emb; emb = emb->embedding) {
+      if (emb->outer_join) return true;
+    }
+    return false;
+  }
+```
+
+**附：antijoin 的 `IS NULL` 条件在哪补**（`sql/sql_optimizer.cc:8830`，也是 EXPLAIN 里 `Not exists` 的来源之一）：
+
+```cpp
+  /* See if 'last_tab' is the first inner of an antijoin nest,
+     then add a IS NULL condition on it. ... */
+  if (lt->table_ref->embedding && lt->table_ref->embedding->is_aj_nest() &&
+      last_tab == lt->first_inner() && !lt->table_ref->join_cond()) {
+    Item *cond = new Item_func_false();
+    cond->item_name.set(antijoin_null_cond);   // 给 create_access_paths 的信号
+    /* ... 必须等 B 的 match status 定下来才测 ⇒ 用 FOUND_MATCH trig cond 包住 ... */
+    cond = add_found_match_trig_cond(this, last_tab, cond, lt->first_upper());
+    cond = new Item_func_trig_cond(cond, nullptr, this, last_tab,
+                                   Item_func_trig_cond::IS_NOT_NULL_COMPL);
+    if (cond->fix_fields(thd, nullptr)) return true;
+    if (lt->and_with_condition(cond)) return true;
+    lt->table()->reginfo.not_exists_optimize = true;   // ★ EXPLAIN 的 "Not exists"
+  }
+```
+
+> **坑**：`reginfo.not_exists_optimize` 有**两个完全不同的来源**（antijoin 转换 vs 经典 `LEFT JOIN + IS NULL`），都映射同一个标志、都显示为 `Not exists`。
 
 ## 四、simplify_joins Pass 2：嵌套 join 扁平化
 

@@ -23,7 +23,7 @@
   - 特殊分支
     - [文件级 redo 与 DDL 在恢复期的处理](#文件级-redo-与-ddl-在恢复期的处理)
     - [clone / MEB 数据目录的恢复分支](#clone--meb-数据目录的恢复分支)
-- [相关的系统变量/状态变量](#相关的系统变量/状态变量)
+- [相关的系统变量/状态变量](#相关的系统变量状态变量)
 - [Misc](#Misc)
 - [参考](#参考)
 
@@ -597,6 +597,20 @@ static bool recv_multi_rec(byte *ptr, byte *end_ptr) {
 3. **`MLOG_FILE_*` 与 `MLOG_TABLE_DYNAMIC_META` 不入 hash**：它们在解析阶段（`recv_parse_or_apply_log_rec_body`）就已执行完毕，这里跳过
 4. **表空间存在性过滤**：`space_id == TRX_SYS_SPACE || fil_tablespace_lookup_for_recovery(space_id)` —— 表空间已不存在的 redo 直接丢弃（对应 `recv_sys->missing_ids`）
 
+#### 索引 redo 的自描述：`mlog_parse_index` 的 dummy index
+
+> 与 [`redo_log.md`](redo_log.md#解析侧如何把-redo-变回页面) 的分工：本节只深挖 **dummy index 的三处特判**；写侧的**完整字节布局表**（11 字段逐项）与读侧的"四件事"见 redo_log.md 的对应小节。
+
+**每条索引页 redo 自带重建 `dict_index_t` 所需的全部元数据**——写侧 `mlog_open_and_write_index`（`mtr0log.cc:795`）写：1B version + 1B flag（`IS_COMPACT/IS_VERSIONED/IS_INSTANT`）+ 2B n +（instant 时 2B inst_cols）+（comp 时 2B n_uniq）+ 逐列 2B len。**注意 v1 格式只写每列 2 字节 len（高位置 NOT NULL 标志），不写 mtype/prtype**——mtype 在解析侧由 len 推导（`DATA_BINARY`/`DATA_FIXBINARY`）；排序方向不记录（恢复只解析记录、不比较，"The is_ascending flag does not matter during redo log apply"）。
+
+恢复侧 `mlog_parse_index`（`mtr0log.cc:1215`）用 `dict_mem_table_create(RECOVERY_INDEX_TABLE_NAME, ...)` + `dict_mem_index_create(...)` 构造**临时 dummy index**（表名/索引名均为 `"LOG_DUMMY"`），每条记录解析/应用完立即 `dict_mem_index_free`。**为什么必须是 dummy**：
+
+1. **DD 不可用/可能不一致**：恢复发生在 `srv_start` 早期，`dict_sys` 尚未从 DD 加载；即使部分表存在，其索引对象也未必与 redo 记录时刻一致（DDL 可能刚发生且其 redo 就在这批日志里）——恢复期唯一可信的元数据来源就是 redo 自己；
+2. **`"LOG_DUMMY"` 有全局特判**：`rec_get_n_fields_old`（"In recovery, index is not completely built. Skip validation."）、`dict_mem_fill_index_struct`（字段无名字跳过校验）、若干 debug 断言按名字豁免；
+3. **`ind->cached = true` 是"伪装已缓存"**（`mtr0log.cc:1370` 注释）：`dict_index_get_n_unique_in_tree` 等有 `ut_ad(index->cached)`，dummy index 不在 dictionary cache 里，置位让断言不误伤——写侧 n_uniq 取的就是 `n_unique_in_tree` 的值，读写必须一致。
+
+代价与收益：每条索引 redo 重复携带完整元数据（字段数 × 2B + versioned 6B/列），大字段数表开销可观；换来**恢复期完全解耦 DD**。空间索引非叶页只记 2 字段（MBR + page no）是显式省日志优化。`INDEX_LOG_VERSION_0`（8.0.29/30 旧格式）`ut_error`（其 redo 逻辑为空）；未来版本直接 `ib::fatal(ER_IB_INDEX_LOG_VERSION_MISMATCH)`。
+
 ### recv_sys_t：恢复上下文的完整结构
 
 恢复全程的**唯一全局状态**是单例 `recv_sys`。它既是"扫描器状态机"，又是"待应用 redo 的容器"。
@@ -837,6 +851,24 @@ dberr_t recv_apply_hashed_log_recs(log_t &log, bool allow_ibuf) {
 
 应用完后 `recv_max_page_lsn` 记录见到的最大页 LSN，`recv_recovery_from_checkpoint_start` 收尾时与 `m_scanned_lsn` 对账——若扫描到的 LSN 还小于已见过的页 LSN，说明**扫描漏了数据**，报错。
 
+#### 正确性兜底的两层 + SMO 列表级 redo 的短形式
+
+**① physiological 依赖：先读页是硬前提。** 索引 redo 的 payload 是"cursor 偏移 + 记录尾段 + mismatch 前缀长度"——完整记录 = **页上 cursor 记录的前缀** ⊕ **redo 尾段**。没有页现状就无法重建记录，所以 `recv_apply_log_rec` 必须 `buf_page_get(RW_X_LATCH)` 先把页读进来。**redo 救不了 torn page** 正是这个依赖的推论：撕裂页 = 错误基底，连前缀都取不出；必须先由 dblwr 恢复整页（`fil_tablespace_open_for_recovery → dblwr::recover`），`DB_CORRUPTION`（dblwr 也救不回）时 `recv_apply_hashed_log_recs` 直接返回错误中止启动，**绝不在坏页上打补丁**（`log0recv.cc:1164-1171` 注释原文 "we cannot proceed with recovery. Skip applying redos and abort the startup"）。
+
+**② 两条"允许页状态不符"的例外**：
+
+- **"全新页"判定**（`recv_page_is_brand_new`）：rec_list 第一条是 `MLOG_INIT_FILE_PAGE2`（或整页无 redo）→ 该页即将被整体重建，恢复期读入时 checksum 坏/页号错都**允许 memset 清零**再让后续 redo 重放（`buf0buf.cc:5712-5716`）；
+- **"创建型" redo 不校验页类型**：`MLOG_PAGE_CREATE*`/`MLOG_UNDO_INIT`/`MLOG_IBUF_BITMAP_INIT` 等注释 "Allow anything in page_type when creating a page"——页内容即将被整体重建；普通索引 redo 则有 `ut_ad(fil_page_type_is_index(page_type))`。
+
+**③ 两层兜底的分工**：
+
+| 错误类别 | 判定方式 | 后果 |
+|---|---|---|
+| 日志流可判定坏（未知类型/头损坏/越界偏移） | 显式 `recv_sys->found_corrupt_log = true` | 停止解析 + 定位报错；`innodb_force_recovery==0` 时启动失败，可被 force_recovery 容忍 |
+| 恢复逻辑不变量被破坏（`page_is_comp == dict_table_is_comp` 不符、`ut_a(ptr == rec_end)`、`n_uniq + DATA_ROLL_PTR <= n`） | `ut_a` | **无条件 abort**（`ut_a` 非 debug-only，`ut_ad` 才是）——"redo 与页状态矛盾 = 解析或应用路径有 bug"，继续重放只会写出更坏的数据 |
+
+**④ SMO 列表级 redo 的恢复应用**：`MLOG_LIST_END_COPY_CREATED`（分裂搬记录）= 头部 4B 总长 + N 条 `MTR_LOG_SHORT_INSERTS` 短插入。**短形式的关键语义**（`page_cur_parse_insert_rec(is_short=true)`）：cursor **隐含 = supremum 的前一条记录**（新页上的拷贝本来就是顺序追加到 supremum 前，无需页内 offset）；`ut_a(ptr == rec_end)` 校验整段被精确消费；收尾重置 `PAGE_LAST_INSERT`/方向计数使恢复结果与运行时"逐字节一致"（写侧注释 "imitate exactly"）。跨页 apply 顺序是 **hash 桶序（非 LSN 序）**——正确性靠每页 `rec_list` 链内 LSN 序保证，分裂的几条 redo 落在不同页、各页链内自洽。
+
 ### redo 与 undo 的协同
 
 为什么必须先 redo 后 undo？三层递进：
@@ -876,7 +908,7 @@ dberr_t recv_apply_hashed_log_recs(log_t &log, bool allow_ibuf) {
 
 顺序上的天然安全性：扫描期只处理文件操作，扫完才统一应用页级 redo —— 避免了"先删了文件、后面又要读页"。
 
-`recv_sys->deleted` 记下被显式删除的表空间，`missing_ids` 记下 redo 提到但文件已不存在的表空间；应用时按这两张表决定跳过哪些页。DDL 侧细节见 [`ddl.md`](ddl.md)。
+`recv_sys->deleted` 记下被显式删除的表空间，`missing_ids` 记下 redo 提到但文件已不存在的表空间；应用时按这两张表决定跳过哪些页。DDL 侧细节见 [`ddl.md`](../feat/ddl/ddl.md)。
 
 ### clone / MEB 数据目录的恢复分支
 
@@ -967,6 +999,6 @@ checkpoint_lsn  ──►  scanned_lsn  ──►  recovered_lsn  ──►  应
 - undo 的管理与 purge（下游）见 [`undo_log.md`](undo_log.md)
 - prepared 事务的提交/回滚裁决见 [`trx.md`](trx.md)，binlog 侧见 [`../server/replication/binlog.md`](../server/replication/binlog.md)
 - 脏页刷盘、doublewrite（半页写防护）见 [`buffer_pool.md`](buffer_pool.md)
-- DDL 的文件级操作见 [`ddl.md`](ddl.md)
+- DDL 的文件级操作见 [`ddl.md`](../feat/ddl/ddl.md)
 
 > ⚠️ 月报/博客的函数名与行号多基于 5.7 或 8.0 早期版本，与 8.0.39 对不上——只取问题视角，机制一律以本篇源码为准。

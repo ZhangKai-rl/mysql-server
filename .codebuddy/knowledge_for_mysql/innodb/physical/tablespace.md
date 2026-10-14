@@ -9,6 +9,7 @@
 - [概述](#概述)
 - [理论基础](#理论基础)
 - [核心实现](#核心实现)
+  - [**★ 物理层级总览：record → page → extent → fseg → tablespace → file**](#物理层级总览record--page--extent--fseg--tablespace--file)
   - [Fil 层内存对象 / 表空间分类与 space_id](#内存中的表空间fil-层的四级对象)
   - [FSP_SIZE / FSP_FREE_LIMIT / FSP_FREE 三边界](#fsp_size--fsp_free_limit--fsp_free三个边界的辨析)
   - [AUTOEXTEND_SIZE](#autoextend_size8-0-的表空间增量扩展单位)
@@ -23,6 +24,8 @@
   - [FSP_FLAGS 位域](#fsp_flags-位域一个-32-位承载表空间所有属性)
   - [系统表空间与 undo 表空间页布局](#系统表空间与-undo-表空间的页布局)
   - [碎片度量](#碎片度量fsp_get_available_space_in_free_extents)
+  - [**★ B+ 树索引与两个段：链路的最终收口**](#b-树索引与两个段链路的最终收口)
+  - [**★ 真名勘误全表**](#真名勘误全表)
 - [相关的系统变量/状态变量](#相关的系统变量状态变量)
 - [Misc](#misc)
 - [参考](#参考)
@@ -95,6 +98,139 @@ mlog_write_ulint(header + FSP_FREE_LIMIT, i + FSP_EXTENT_SIZE, MLOG_4BYTES, mtr)
 ```
 
 启动时由 `fsp_header_init`/`fsp_load` 从页 0 读回填充内存态；这也是为什么 `FSP_FREE_LIMIT` 的推进必须记 redo——恢复后内存态要靠它重建。
+
+**★★ `fil_node_t` 完整定义**（★ 一个 .ibd 文件在内存里的样子，`fil0fil.h:154`）：
+
+```cpp
+struct fil_node_t {
+  /** tablespace containing this file */
+  fil_space_t *space;         // a tablespace may correspond to multiple files.
+
+  /** file name; protected by Fil_shard::m_mutex and log_sys->mutex. */
+  char *name;
+
+  /** whether this file is open. Note: We set the is_open flag after
+  we increase the write the MLOG_FILE_OPEN record to redo log. Therefore
+  we increment the in_use reference count before setting the OPEN flag. */
+  bool is_open;
+
+  /** file handle (valid if is_open) */
+  pfs_os_file_t handle;
+
+  /** size of the file in database pages (0 if not known yet);
+  the possible last incomplete megabyte may be ignored if space->id == 0 */
+  page_no_t size;             /* ★ 该 node 自己的页数 —— 跨 node 路由的基准 */
+
+  /** Size of the file when last flushed, used to force the flush when file
+  grows to keep the filesystem metadata synced when using O_DIRECT_NO_FSYNC */
+  page_no_t flush_size;
+
+  page_no_t init_size;        /* FIL_IBD_FILE_INITIAL_SIZE by default */
+  page_no_t max_size;
+
+  size_t n_pending_ios;       /* ★ is_open must be true if nonzero */
+  size_t n_pending_flushes;
+
+  /** Set to true when a file is being extended. */
+  bool is_being_extended;     /* ★ 扩展串行化标志，见 space_extend 的 for(;;) 自旋 */
+
+  int64_t modification_counter;   /* 自启动以来的写次数 */
+  int64_t flush_counter;          /* 最近一次 flush 时的值 → is_flushed() 比较二者 */
+
+  bool punch_hole;            /* 文件系统是否支持 PUNCH HOLE（页压缩依赖） */
+  size_t block_size;          /* punch hole 的块大小，来自 stat */
+  bool atomic_write;
+  bool is_raw_disk;
+  os_event_t sync_event;      /* 串行化 fsync 的 event */
+  List_node LRU;              /* fil_system->LRU */
+  size_t magic_n;             /* FIL_NODE_MAGIC_N = 89389 */
+};
+```
+
+**★★ `fil_space_t` 的关键成员**（`fil0fil.h:236/347`，★ 与磁盘 FSP header 一对一镜像的那些）：
+
+```cpp
+struct fil_space_t {
+  using Files = std::vector<fil_node_t, ut::allocator<fil_node_t>>;  /* ★ 是 vector 不是链表 */
+
+  char *name{};
+  space_id_t id;
+
+  /** Files attached to this tablespace. Note: Only the system tablespace
+  can have multiple files, this is a legacy issue. */
+  Files files{};
+
+  page_no_t size{};             /* ★ 物理页数 = 各 node.size 之和 */
+  page_no_t size_in_header{};   /* ★ FSP_SIZE 的内存镜像（向下对齐整 MB） */
+  uint64_t autoextend_size_in_bytes{};
+  uint32_t free_len{};          /* ★ FSP_FREE 链表长度的内存缓存 */
+  page_no_t free_limit{};       /* ★ FSP_FREE_LIMIT 的内存缓存 */
+  uint32_t flags{};             /* 页大小/压缩/加密等，见 FSP_FLAGS 位域 */
+  uint32_t n_reserved_extents{};/* 预留给 B-tree split 等 */
+  uint32_t n_pending_flushes{};
+  uint32_t n_pending_ops{};     /* ★ space_acquire/space_release 加减它 */
+
+  rw_lock_t latch;              /* ★ 每个表空间一把 rw_lock，fsp 层 X/S latch */
+  fil_type_t purpose;
+  bool stop_new_ops{};          /* ★ "stop_ios" 的真身：禁新 read IO / ibuf merge / flush */
+  bool prevent_file_open{};     /* ★ rename 期间禁止 open_file */
+
+  Compression::Type compression_type;      /* ★ 页压缩属性（不是 CRC） */
+  Encryption_metadata m_encryption_metadata;
+
+  std::atomic<uint32_t> m_version{};   /* ★ truncate/delete 时 bump，让 BP 旧页变 stale */
+  std::atomic_size_t m_n_ref_count{};  /* ★ 引用计数；inc_ref/dec_ref */
+
+  fil_node_t *get_file_node(page_no_t *page_no) noexcept;   /* ★★ 跨 node 路由入口 */
+};
+```
+
+> ★★ **`size` vs `size_in_header` 是两个不同的数**：前者是物理页数（fil 层），后者是 FSP_SIZE 的镜像且**向下对齐到整 MB**（`fil0fil.cc:1374`）。**两者的差就是"文件比 header 大"**——`DATA_FREE` 的计算正依赖于这个差。
+> ⚠️ **`fil_space_t` 里没有 `full_crc32`**（全库 0 匹配）。8.0 的 full_crc32 是**全局**的（redo / `innodb_checksum_algorithm`），不按表空间存储。"每页属性"只有 `compression_type` 与 `flags` 的 ENCRYPTION 位。
+
+**★★ `get_file_node()`：跨 node 路由**（★ 多文件表空间的页号换算就在这里）：
+
+```cpp
+fil_node_t *fil_space_t::get_file_node(page_no_t *page_no) noexcept {
+  if (files.size() > 1) {
+    ut_a(id == TRX_SYS_SPACE || purpose == FIL_TYPE_TEMPORARY);   /* ★ 只有系统/临时可多文件 */
+
+    for (auto &f : files) {
+      if (f.size > *page_no) {
+        return &f;                    /* ★ 命中：*page_no 已就地改写成「node 内相对页号」 */
+      }
+      *page_no -= f.size;             /* ★★ 逐 node 减去前序文件页数 */
+    }
+  } else if (!files.empty()) {
+    fil_node_t &f = files.front();
+    if ((fsp_is_ibd_tablespace(id) && f.size == 0) || f.size > *page_no) {
+      return &f;                      /* 单文件：页号不变 */
+    }
+    /* The page is outside the current bounds of the file. We should not assert
+    here as we could be loading pages in buffer pool from dump file having pages
+    from dropped tablespaces. ... */
+  }
+  return nullptr;
+}
+```
+
+**★ `space_id` 从哪来**（⚠️ 不存在 `fil_space_get_next_id()`）：
+
+```cpp
+bool Fil_system::assign_new_space_id(space_id_t *space_id) {
+  mutex_acquire_all();
+  space_id_t id = *space_id;
+  if (id < m_max_assigned_id) id = m_max_assigned_id;   /* 从「已分配最大值」起步 */
+  ++id;                                                  /* ★★ 真相：纯全局自增计数器 */
+  ...
+  bool success = !dict_sys_t::is_reserved(id);
+  if (success) *space_id = m_max_assigned_id = id;
+  mutex_release_all();
+  return success;
+}
+```
+
+> ★ 外层 `fil_assign_new_space_id()` 只是一层壳。且注意 `fil_space_create()` 拿的是 **`mutex_acquire_all()`（所有 shard 的锁）**，不是单个分片——创建是稀有操作，简单起见全局串行。
 
 ### 表空间分类与 space_id 分配
 
@@ -256,6 +392,137 @@ information_schema.FILES.FREE_EXTENTS
 ```
 
 > 关键命名陷阱：InnoDB 填的是 `ha_statistics::delete_length`（头文件注释即 "Free bytes"），server 层用 `set_data_free(stats.delete_length)` 映射成 `DATA_FREE`。**引擎的 `delete_length` 就是外部看到的 `DATA_FREE`**，一个东西两个名字。
+
+---
+
+## ★★ 物理层级总览：record → page → extent → fseg → tablespace → file
+
+这一节把整条链路**一次性串起来**。后面各章是它的逐层展开。
+
+### 六级层次与各自的"名字"
+
+| 层 | 寻址单位 | 谁管理 | 元数据存储位置 | 关键换算 |
+|---|---|---|---|---|
+| **file** | 字节偏移 | OS / `fil_node_t` | 无（文件系统） | `offset = node内页号 × physical page size + byte_offset` |
+| **tablespace** | `page_no`（逻辑页号） | `fil_space_t` + FSP header | **page 0**（FSP_HDR，112B header） | 1 个 space = 1..N 个 file；`space->size` = 各 node.size 之和 |
+| **segment (fseg)** | inode entry（192B） | `fseg_inode_t` | **INODE 页**（通常 page 2） | 10B segment header → (space_id, page_no, offset) |
+| **extent** | XDES entry（40B） | `xdes_t` | **XDES 页**（page 0 / 16384 / 32768 …） | 1 extent = 64 页（16K 页）；1 XDES 页管 256 个 extent |
+| **page** | `page_no` | buf_pool / `page_t` | 页自身 38B FIL header + 8B trailer | `page_no % 16384 == 0` ⇒ XDES 页；`== 1` ⇒ IBUF bitmap 页 |
+| **record** | 页内偏移 | `rec_t` + `offsets[]` | 记录头 5B + NULL 位图 + 变长长度 | `rec_get_offsets()` 返回**索引列数**，缺列靠 `REC_OFFS_DEFAULT` 补 |
+
+### ★★ 一次"分配一个 B+ 树新页"的完整下沉路径
+
+```
+btr_page_alloc()                                    ← B+ 树插入/分裂触发
+  │
+  ├─ ① [fseg 层] fseg_alloc_free_page_general(seg_header, hint, dir, mtr)
+  │     └─ fseg_inode_get(seg_header)              10B header → inode 定位
+  │     └─ fseg_alloc_free_page_low()              七分支（见 §分配算法一）
+  │           └─ fseg_alloc_free_extent()          段没有余量 → 要整 extent
+  │                ├─ FSEG_FREE 链表有货 → 取头
+  │                ├─ fsp_alloc_xdes_free_frag()   8.0「租借」路径
+  │                └─ fsp_alloc_free_extent()      向表空间要
+  │                     └─ ② [tablespace 层] FSP_FREE 链表空？
+  │                          └─ fsp_fill_free_list()   从 FSP_FREE_LIMIT 之上初始化新 extent
+  │                               └─ ③ [file 层] fsp_try_extend_data_file()
+  │                                    └─ fil_space_extend()
+  │                                         └─ Fil_shard::space_extend()
+  │                                              └─ posix_fallocate() / fil_write_zeros()
+  │
+  └─ fseg_mark_page_used()                         置 XDES_FREE_BIT=0 + 链表迁移
+        └─ fsp_page_create()  →  buf_page_create() → 最终 fil_io() 落盘
+                                  └─ ④ [file 层] fil_io()
+                                       ├─ Fil_system::shard_by_id(space_id)   space_id % 64
+                                       ├─ Fil_shard::get_space_by_id()        unordered_map
+                                       ├─ fil_space_t::get_file_node(&page_no) 跨 node 路由
+                                       └─ offset = page_no * page_size.physical() + byte_offset
+```
+
+### ★★★ 三处最容易搞混的"定位换算"
+
+**① 页号 → XDES entry（extent 描述符）**：
+
+```cpp
+  page_no
+    ├─ xdes_calc_descriptor_page()  → XDES 页号  = page_no 向下取整到 16384 的倍数
+    ├─ xdes_calc_descriptor_index() → 页内下标   = (page_no % 16384) / 64
+    └─ XDES 地址 = 帧 + XDES_ARR_OFFSET(150) + XDES_SIZE(40) × 下标
+```
+
+**② 10 字节 segment header → inode**：
+
+```cpp
+  inode_addr.page    = mach_read_from_4(header + FSEG_HDR_PAGE_NO);   // +4，4B
+  inode_addr.boffset = mach_read_from_2(header + FSEG_HDR_OFFSET);    // +8，2B
+  ut_ad(space == mach_read_from_4(header + FSEG_HDR_SPACE));          // +0，4B（只做断言）
+  inode = fut_get_ptr(space, page_size, inode_addr, RW_SX_LATCH, mtr, block);
+```
+
+**③ 逻辑页号 → 文件字节偏移**：
+
+```cpp
+  /* Fil_shard::do_io() 的五跳 */
+  auto shard = fil_system->shard_by_id(page_id.space());            // 跳 1：space_id % 64
+  auto space = shard->get_space_by_id(page_id.space());             // 跳 2：unordered_map
+  auto page_no = page_id.page_no();
+  get_file_for_io(space, &page_no, file);                           // 跳 3：page_no 就地改写成 node 内相对页号
+  prepare_file_for_io(file);                                        // 跳 4：懒打开 + pending IO 计数
+  auto offset = (os_offset_t)page_no * page_size.physical();        // 跳 5：★ 最终换算
+  offset += byte_offset;
+```
+
+> ★★★ 第 3 跳是"多文件表空间"的关键：`fil_space_t::get_file_node()` 会**就地改写**传入的 `page_no`，逐 node 减去前序文件的页数。所以后面所有地方用的 `page_no` 都已变成"该 node 内的相对页号"。
+
+### ★ 一个 .ibd 文件的典型固定页布局（16K 页）
+
+```
+page 0    FSP_HDR    —— FIL header(38) + FSP header(112) + XDES Arr[0..255]
+page 1    IBUF_BITMAP
+page 2    INODE      —— 85 个 inode entry（50 + 192*i）
+page 3    SDI        —— 序列化字典信息（8.0 新增）
+page 4    INDEX      —— ★ 第一个索引的根页（PAGE_BTR_SEG_LEAF@74 / TOP@84）
+page 5..  数据页 / 索引页
+page 16384  XDES     —— 第二个描述页（每 16384 页一个）
+```
+
+> ★★ **"每 16384 页一组"这个魔数的来源**：一个 XDES 页能描述 `16384 / 64 = 256` 个 extent，而每个 extent 64 页 → 一组正好 16384 页。所以 `page_no % 16384 == 0` 的页必然是描述页，`== 1` 的必然是 IBUF bitmap 页。这就是 `fsp_fill_free_list()` 里 `init_xdes` 判据的物理含义。
+> ⚠️ **page 0 的 FIL_PAGE_TYPE 是 `FIL_PAGE_TYPE_FSP_HDR`(8)，不是 `FIL_PAGE_TYPE_XDES`(9)**——只有 page 0 之外的描述页才是 9。
+
+### ★ 层次间的"归属"关系一图流
+
+```
+                    ┌─────────── file（.ibd）───────────┐
+                    │  fil_node_t: size / handle / is_open │
+                    └──────────────┬──────────────────────┘
+                                   │ 1..N（一般 N==1，仅系统/临时表空间可多文件）
+                    ┌──────────────▼──────────────────────┐
+                    │ fil_space_t: id / size / free_len / free_limit
+                    │   FSP header (page 0): FSP_SIZE / FSP_FREE_LIMIT
+                    │   FSP_FREE / FSP_FREE_FRAG / FSP_FULL_FRAG 三条链
+                    └──────────────┬──────────────────────┘
+                                   │ 空间以 extent 为单位批发出去
+        ┌──────────────────────────▼──────────────────────────┐
+        │ extent (64 页) ← XDES entry (40B, 存于 XDES 页)      │
+        │   state: FREE / FREE_FRAG / FULL_FRAG / FSEG / FSEG_FRAG │
+        │   bitmap: 64 页 × 2 bit (FREE_BIT, CLEAN_BIT)        │
+        └──────────────┬───────────────────────────────────────┘
+                       │ 整块归段（XDES_FSEG）或单页借出（碎片页）
+        ┌──────────────▼───────────────────────────────────────┐
+        │ segment (fseg) ← inode entry (192B, 存于 INODE 页)   │
+        │   FSEG_FREE / FSEG_NOT_FULL / FSEG_FULL 三条链        │
+        │   FSEG_FRAG_ARR[32]  ← 段早期借的零散页              │
+        └──────────────┬───────────────────────────────────────┘
+                       │ 一个 B+ 树索引 = 两个段（leaf + top）
+        ┌──────────────▼───────────────────────────────────────┐
+        │ page（16K）← 从段里分出来                             │
+        │   FIL_PAGE_TYPE: INDEX / INODE / XDES / SDI / ...     │
+        └──────────────┬───────────────────────────────────────┘
+                       │ 页内
+        ┌──────────────▼───────────────────────────────────────┐
+        │ record（rec_t）← 5B 头 + NULL 位图 + 变长长度 + 列数据 │
+        │   缺的列靠 offsets[] 的 REC_OFFS_DEFAULT/DROP 虚拟补齐 │
+        └──────────────────────────────────────────────────────┘
+```
 
 ### FLST 侵入式链表：八大链表的统一底座
 
@@ -581,6 +848,121 @@ static inline uint32_t FSP_SEG_INODES_PER_PAGE(page_size_t page_size) {
 ★ **为什么 XDES 能算、INODE 不能**：XDES 描述的是"第 n 个 extent"，n 与页号之间存在**固定的算术关系**（每 256 个 extent 一组、组首页即 XDES 页），所以 `xdes_calc_descriptor_page` 一个 `ut_2pow_round` 就能定位；而 inode 描述的是"第 n 个**段**"——段随 CREATE/DROP INDEX 动态生灭，没有任何算术规律可循，只能把"有空槽的 inode 页"串成链表按需取用。
 
 这个差异进一步解释了两个细节：XDES 数组**不需要**空闲位图（无空洞），inode 页却需要 `FSEG_ID == 0` 判空 + 整页满时在 FREE/FULL 链表间迁移——**inode 的空闲度有两个层级**（页内槽位 + 页级链表），XDES 只有一个。
+
+**★★ INODE 页的完整布局与分配**（`fsp0fsp.cc:2001`）：
+
+```cpp
+static bool fsp_alloc_seg_inode_page(fsp_header_t *space_header, mtr_t *mtr) {
+  block = fsp_alloc_free_page(space, page_size, 0, RW_SX_LATCH, mtr, mtr);
+                                              /* ★ 向 FSP 借「单个碎片页」当新 INODE 页 */
+  page = buf_block_get_frame(block);
+  mlog_write_ulint(page + FIL_PAGE_TYPE, FIL_PAGE_INODE, MLOG_2BYTES, mtr);
+                                              /* ★ 页类型 = FIL_PAGE_INODE */
+
+  for (page_no_t i = 0; i < FSP_SEG_INODES_PER_PAGE(page_size); i++) {
+    inode = fsp_seg_inode_page_get_nth_inode(page, i, page_size, mtr);
+    mlog_write_ull(inode + FSEG_ID, 0, mtr);  /* ★ 85 个 entry 的 FSEG_ID 全清 0 = 全空闲 */
+  }
+  flst_add_last(space_header + FSP_SEG_INODES_FREE, page + FSEG_INODE_PAGE_NODE, mtr);
+                                              /* ★ 挂到 FSP_SEG_INODES_FREE 链表尾（节点在页内偏移 38） */
+  return true;
+}
+
+static fseg_inode_t *fsp_alloc_seg_inode(fsp_header_t *space_header, mtr_t *mtr) {
+  if (flst_get_len(space_header + FSP_SEG_INODES_FREE) == 0 &&
+      !fsp_alloc_seg_inode_page(space_header, mtr)) {
+    return nullptr;                           /* 没空闲 INODE 页 → 新开一页 */
+  }
+  /* 取 FSP_SEG_INODES_FREE 链表第一个 INODE 页 */
+  const page_id_t page_id(page_get_space_id(page_align(space_header)),
+                          flst_get_first(space_header + FSP_SEG_INODES_FREE, mtr).page);
+  block = buf_page_get(page_id, page_size, RW_SX_LATCH, UT_LOCATION_HERE, mtr);
+  page = buf_block_get_frame(block);
+  n = fsp_seg_inode_page_find_free(page, 0, page_size, mtr);
+  ut_a(n != FIL_NULL);
+  inode = fsp_seg_inode_page_get_nth_inode(page, n, page_size, mtr);
+                                              /* ★ inode 地址 = page + 50 + 192*n */
+
+  if (FIL_NULL == fsp_seg_inode_page_find_free(page, n + 1, page_size, mtr)) {
+    /* There are no other unused headers left on the page: move it to another list */
+    flst_remove(space_header + FSP_SEG_INODES_FREE, page + FSEG_INODE_PAGE_NODE, mtr);
+    flst_add_last(space_header + FSP_SEG_INODES_FULL, page + FSEG_INODE_PAGE_NODE, mtr);
+                                              /* ★ 该页用完 → FREE 链表迁到 FULL 链表 */
+  }
+  return (inode);
+}
+
+/* 定位：定长数组，不是链表 */
+static inline fseg_inode_t *fsp_seg_inode_page_get_nth_inode(
+    page_t *page, page_no_t i, const page_size_t &page_size, mtr_t *mtr) {
+  return (page + FSEG_ARR_OFFSET + FSEG_INODE_SIZE * i);   /* ★ = page + 50 + 192*i */
+}
+```
+
+```cpp
+/* inode entry 的字段布局（192 字节，16K 页） */
+constexpr uint32_t FSEG_ID               = 0;   // 8B  段 ID，0 = 未使用
+constexpr uint32_t FSEG_NOT_FULL_N_USED  = 8;   // 4B  NOT_FULL 链表中的已用页数
+constexpr uint32_t FSEG_FREE             = 12;  // 16B 空闲 extent 链表
+constexpr uint32_t FSEG_NOT_FULL         = 28;  // 16B 部分使用 extent 链表
+constexpr uint32_t FSEG_FULL             = 44;  // 16B 满 extent 链表
+constexpr uint32_t FSEG_MAGIC_N          = 60;  // 4B  魔数 97937874
+constexpr uint32_t FSEG_FRAG_ARR         = 64;  // 32 × 4B = 128B，段早期借的零散页
+#define FSEG_INODE_SIZE (16 + 3*FLST_BASE_NODE_SIZE + 32*4)   // = 192
+constexpr uint32_t FSEG_MAGIC_N_VALUE = 97937874;
+
+/* ★ INODE 页自身也是链表节点：偏移 38 处是 12B 的 FLST node */
+constexpr uint32_t FSEG_INODE_PAGE_NODE = FSEG_PAGE_DATA;      // = 38
+constexpr uint32_t FSEG_ARR_OFFSET      = FSEG_PAGE_DATA + FLST_NODE_SIZE;  // = 50
+
+/* 一个 INODE 页能放几个 entry —— 是函数不是常量！ */
+static inline uint32_t FSP_SEG_INODES_PER_PAGE(page_size_t page_size) {
+  return (page_size.physical() - FSEG_ARR_OFFSET - 10) / FSEG_INODE_SIZE;
+}
+```
+
+> ★★ **"85 个 inode"只对 16K 页成立**——`FSP_SEG_INODES_PER_PAGE()` 是**函数**不是常量：4K→21、8K→42、16K→**85**、32K→170、64K→341。
+> ★ **INODE 页的回收是"墓碑 + 整页归还"两级**：`fsp_free_seg_inode()` 先把 `FSEG_ID` 写 0、魔数改写成 `0xfa051ce3`（墓碑值），再判断整页是否还有在用 entry——没有才 `fsp_free_page()` 把整页还给表空间。
+
+**★★ `fseg_create_general()`：创建一个段的完整流程**（`fsp0fsp.cc:2277`）：
+
+```cpp
+  if (!has_done_reservation) {
+    /* ★ 预留 2 个 extent：1 个给 inode 页，1 个给段自己 */
+    if (!fsp_reserve_free_extents(&n_reserved, space_id, 2, alloc_type, mtr)) return nullptr;
+  }
+
+  inode = fsp_alloc_seg_inode(space_header, mtr);          /* ① 分配/复用一个 inode entry */
+  if (inode == nullptr) goto funct_exit;
+
+  seg_id = mach_read_from_8(space_header + FSP_SEG_ID);    /* ② 段 ID 从 FSP_SEG_ID(+72) 单调分配 */
+  mlog_write_ull(space_header + FSP_SEG_ID, seg_id + 1, mtr);
+  mlog_write_ull(inode + FSEG_ID, seg_id, mtr);            /* ③ 写 FSEG_ID —— 这一写即"占用"该 slot */
+
+  fseg_inode.write_not_full_n_used(0);                     /* ④ */
+  flst_init(inode + FSEG_FREE, mtr);                       /* ⑤ 三条 extent 链表全部清空 */
+  flst_init(inode + FSEG_NOT_FULL, mtr);
+  flst_init(inode + FSEG_FULL, mtr);
+  mlog_write_ulint(inode + FSEG_MAGIC_N, FSEG_MAGIC_N_VALUE, MLOG_4BYTES, mtr);  /* ⑥ */
+  for (i = 0; i < FSEG_FRAG_ARR_N_SLOTS; i++) {
+    fseg_set_nth_frag_page_no(inode, i, FIL_NULL, mtr);    /* ⑦ 32 个碎片页 slot 全填 FIL_NULL */
+  }
+
+  if (page == 0) {
+    /* ★ 情形 B：page==0 ⇒ 段自己先申请一页，segment header 就写在自己这一页上 */
+    block = fseg_alloc_free_page_low(space, page_size, inode, 0, FSP_UP,
+                                     RW_SX_LATCH, mtr, mtr ...);
+    header = byte_offset + buf_block_get_frame(block);
+    mlog_write_ulint(frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_SYS, MLOG_2BYTES, mtr);
+  }
+
+  mlog_write_ulint(header + FSEG_HDR_OFFSET,  page_offset(inode), MLOG_2BYTES, mtr);  /* ⑧ +8，2B */
+  mlog_write_ulint(header + FSEG_HDR_PAGE_NO, page_get_page_no(page_align(inode)), MLOG_4BYTES, mtr); /* ⑨ +4，4B */
+  mlog_write_ulint(header + FSEG_HDR_SPACE,   space_id, MLOG_4BYTES, mtr);            /* ⑩ +0，4B */
+```
+
+> ★★★ **`page == 0` 这个参数决定段的第一页是谁**：传 0 时段自己申请一页并把 header 写在上面——**B+ 树的根页就是这么来的**（`btr_create()` 建 TOP 段时传 `space, 0, PAGE_HEADER + PAGE_BTR_SEG_TOP`）。传非 0 时（如建 LEAF 段）把 header 写在**已存在的**根页上。
+> ⚠️ 真名是 `FSEG_HDR_SPACE`（不是 `FSEG_HDR_SPACE_ID`）。
 
 ### segment header → inode → fseg：10 字节指针的完整解析链
 
@@ -1480,6 +1862,265 @@ if ((tbsp_extend_and_initialize && !file->atomic_write) || err == DB_IO_ERROR) {
 
 ★ **为什么要在扩展之前先记 redo**（`fil0fil.cc:6660-6676` 的注释详述）：`posix_fallocate()` 存在原子性缺陷——可能"空间已预留、但文件元数据未更新"时就崩溃。此时无法从文件大小反推旧大小，也就不知道哪段需要补 0。所以 redo 里记下 `(offset, len)`，恢复时对比物理文件大小，**只补写不足的那段**（`fil0fil.cc:10529-10544` 注释："Write out the 0's in the extended space only if the physical size of the file is less than the expected size"）。
 
+**★★ `Fil_shard::space_extend()` 的完整关键段**（★ 落盘三步 + 内存更新）：
+
+```cpp
+bool Fil_shard::space_extend(fil_space_t *space, page_no_t size) {
+  for (;;) {
+    mutex_acquire();
+    space = get_space_by_id(space->id);
+    if (size < space->size) { mutex_release(); return true; }   /* 已够大 */
+    file = &space->files.back();                                /* ★ 永远只扩「最后一个」node */
+    if (!file->is_being_extended) {
+      file->is_being_extended = true;                           /* ★ 标志位 + 轮询做互斥 */
+      break;
+    }
+    mutex_release();
+    /* Another thread is currently using the file. Wait for it to finish.
+    It'd have been better to use an event driven mechanism but the entire
+    module is peppered with polling code. */
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+
+  if (!prepare_file_for_io(file)) { file->is_being_extended = false; ... return false; }
+
+  const size_t phy_page_size = page_size.physical();   /* ★ 换算基准是 physical（压缩表用 ZIP 大小） */
+  mutex_release();                                     /* ★ 拿着 n_pending_ios 就能放 mutex 做慢 IO */
+
+  os_offset_t node_start = os_file_get_size(file->handle);      /* 以文件当前字节数为起点 */
+  page_no_t node_first_page = space->size - file->size;         /* 该 node 在表空间里的起始页号 */
+  page_no_t n_node_physical_pages = node_start / phy_page_size;
+  page_no_t n_node_extend = size - (node_first_page + file->size);
+
+  if (file->size + n_node_extend > n_node_physical_pages) {
+    os_offset_t len = ((file->size + n_node_extend) * phy_page_size) - node_start;  /* ★ 目标字节长度 */
+
+    /* ① 先记 redo（Linux 且非临时/系统表空间） */
+    fil_op_write_space_extend(space->id, node_start, len, &mtr);
+    mtr_commit(&mtr);
+
+    /* ② 优先 posix_fallocate —— 只预留空间，不写数据 */
+    int ret = posix_fallocate(file->handle.m_file, node_start, len);
+
+    /* ③ 只有开关要求 或 fallocate 失败，才真的写 0 */
+    if ((tbsp_extend_and_initialize && !file->atomic_write) || err == DB_IO_ERROR) {
+      err = fil_write_zeros(file, phy_page_size, node_start, len);
+    }
+
+    os_offset_t end = os_file_get_size(file->handle);
+    success = (end == node_start + len);     /* ★ 磁盘满时可能只加了一部分 */
+    pages_added = (end / phy_page_size) - file->size;
+  } else {
+    success = true; pages_added = n_node_extend;
+  }
+
+  mutex_acquire();
+  file->size += pages_added;      /* ★ node 页数增加 */
+  space->size += pages_added;     /* ★★ 表空间 size 同步增加 —— 这是 size 的唯一增长点 */
+  file->is_being_extended = false;
+  complete_io(file, IORequestWrite);
+  space_flush(space->id);         /* ★ 扩完立刻 fsync，保证文件系统元数据落盘 */
+  mutex_release();
+  return success;
+}
+```
+
+> ★★★ **`space->size` 的唯一增长点就是这里**。所有"表空间变大"的诉求（`fsp_try_extend_data_file`、自动扩展、AUTOEXTEND_SIZE）最终都汇流到 `Fil_shard::space_extend()`。
+> ★ `fil_write_zeros()` 单次最多写 1MB（`std::min(1024*1024, len)`）循环推进，且用 `ut::aligned_zalloc(n_bytes, page_size)`——**对齐是 O_DIRECT 的硬性要求**，zalloc 保证内容天然全 0。
+
+**★ `fil_io()` → `Fil_shard::do_io()` 的偏移换算**（★ 链路的最末端）：
+
+```cpp
+dberr_t fil_io(const IORequest &type, bool sync, const page_id_t &page_id, ...) {
+  auto shard = fil_system->shard_by_id(page_id.space());        /* 跳 1：space_id % 64 */
+  return shard->do_io(type, sync, page_id, page_size, byte_offset, len, buf, message);
+}
+
+dberr_t Fil_shard::do_io(...) {
+  mutex_acquire();
+  auto space = get_space_by_id(page_id.space());                /* 跳 2：unordered_map */
+  ...
+  fil_node_t *file;
+  auto page_no = page_id.page_no();
+  get_file_for_io(space, &page_no, file);                       /* 跳 3：page_no 就地改写 */
+  if (!prepare_file_for_io(file)) { ... }                       /* 跳 4：懒打开 + pending IO */
+  mutex_release();
+
+  auto offset = (os_offset_t)page_no * page_size.physical();    /* ★★ 跳 5：核心换算 */
+  offset += byte_offset;                                        /* 页内偏移 */
+  ...
+}
+```
+
+> ★ `Fil_shard::prepare_file_for_io()`：文件没开就 `open_file()`，然后 `++file->n_pending_ios`——**这个计数是 mutex 释放后文件不会被 LRU 关掉的保证**（`close_file()` 要求 `can_be_closed()` 即 `n_pending_ios == 0 && n_pending_flushes == 0`）。
+
+---
+
+#### ★★ extent 层的完整机制（补充）
+
+**★ `xdes_state_t` 是 6 个值，不是 4 个**（⚠️ 常见说法只列 4 个）：
+
+```cpp
+enum xdes_state_t {
+  XDES_NOT_INITED = 0,   /* extent descriptor is not initialized */
+  XDES_FREE = 1,         /* extent is in free list of space */
+  XDES_FREE_FRAG = 2,    /* extent is in free fragment list of space */
+  XDES_FULL_FRAG = 3,    /* extent is in full fragment list of space */
+  XDES_FSEG = 4,         /* extent belongs to a segment */
+  XDES_FSEG_FRAG = 5     /* ★ fragment extent leased to segment（8.0 新增「租借」） */
+};
+```
+
+**★★ 状态迁移的权威来源**（`xdes_set_state()` 里的 debug 断言，这是唯一权威版本）：
+
+```
+                  xdes_init()
+   XDES_NOT_INITED (0) ──────────► XDES_FREE (1)          [挂 FSP_FREE]
+                                    │        │
+            fsp_alloc_free_page()   │        │  fseg_alloc_free_extent()
+                                    ▼        ▼
+                          XDES_FREE_FRAG (2) XDES_FSEG (4)  [FSEG_FREE→NOT_FULL→FULL]
+                            │      ▲   │
+            满了 → FULL_FRAG │      │   │ fsp_alloc_xdes_free_frag()（8.0 租借）
+                            ▼      │   ▼
+                     XDES_FULL_FRAG (3)  XDES_FSEG_FRAG (5)
+                            │                 │
+                            └────────┬────────┘ 段用完还回 FSP
+```
+
+> ★★★ **`XDES_FSEG_FRAG`(5) 是 8.0 新增的"租借"机制**——把**整个 extent** 从 `FSP_FREE_FRAG` 借给段（段只能用 page 2~63，page 0/1 是 XDES 页和 IBUF bitmap 页），而不是像碎片页那样只借单页。判据在 `xdes_is_leasable()`：① 必须是"每组 extent 的头一个"（含 XDES 页）② page 0/1 必须已占用 ③ page 2~63 必须全空闲。
+
+**★ XDES 页的完整布局**（16K 页）：
+
+```
+offset 0     ┌ FIL Header (38B) ────────────────────────────┐
+offset 24    │ FIL_PAGE_TYPE = 8(FSP_HDR) / 9(XDES)  ← 区别 │
+offset 38    ├ FSP Header (112B，只在 page 0 有意义) ───────┤
+             │  +0  FSP_SPACE_ID   +8   FSP_SIZE            │
+             │  +12 FSP_FREE_LIMIT +16  FSP_SPACE_FLAGS     │
+             │  +20 FSP_FRAG_N_USED                         │
+             │  +24 FSP_FREE      +40  FSP_FREE_FRAG        │
+             │  +56 FSP_FULL_FRAG +72  FSP_SEG_ID           │
+             │  +80 FSP_SEG_INODES_FULL / +96 ..._FREE      │
+offset 150   ├ XDES Arr[0..255]，每项 40B，共 10240B ───────┤ ← XDES_ARR_OFFSET
+             │  每项：+0 seg_id(8) +8 FLST node(12)          │
+             │        +20 state(4) +24 bitmap(16)            │
+offset 10390 ├ 加密元数据 Encryption::INFO_SIZE ────────────┤
+16384-8      └ FIL Trailer (8B) ────────────────────────────┘
+```
+
+```cpp
+/* 每个 extent 描述符 40 字节的构成 */
+constexpr uint32_t XDES_ID        = 0;                     // 8B  seg_id，0 = 不属于任何段
+constexpr uint32_t XDES_FLST_NODE = 8;                     // 12B FLST 节点（prev 6B + next 6B）
+constexpr uint32_t XDES_STATE     = FLST_NODE_SIZE + 8;    // = 20，4B
+constexpr uint32_t XDES_BITMAP    = FLST_NODE_SIZE + 12;   // = 24，页位图
+constexpr uint32_t XDES_BITS_PER_PAGE = 2;                 // ★ 每页 2 bit
+constexpr uint32_t XDES_FREE_BIT  = 0;
+constexpr uint32_t XDES_CLEAN_BIT = 1;   /* NOTE: currently not used! */
+#define XDES_SIZE (XDES_BITMAP + UT_BITS_IN_BYTES(FSP_EXTENT_SIZE * XDES_BITS_PER_PAGE))
+/* 16K 页：24 + (64*2)/8 = 40 */
+```
+
+> ★★ **`XDES_CLEAN_BIT` 源码注释明写 "currently not used"**——第二个 bit 是历史遗留，实际只有 `XDES_FREE_BIT` 起作用。
+> ★ `xdes_init()` 把 bitmap 全写 `0xFFFFFFFF`——**每页 2 bit 都是 1**，即"全页空闲且干净"。
+
+**★★ extent 大小随页大小变化**（⚠️ "1MB extent" 只对 4K/8K/16K 成立）：
+
+```cpp
+#define FSP_EXTENT_SIZE static_cast<page_no_t>(          \
+      ((UNIV_PAGE_SIZE <= (16384) ? (1048576 / UNIV_PAGE_SIZE)          \
+      : ((UNIV_PAGE_SIZE <= (32768)) ? (2097152 / UNIV_PAGE_SIZE)       \
+                                     : (4194304 / UNIV_PAGE_SIZE)))))
+```
+
+| 页大小 | FSP_EXTENT_SIZE（页） | extent 字节 | XDES_SIZE | 每 XDES 页的 extent 数 |
+|---|---|---|---|---|
+| 4 KiB | 256 | 1 MiB | 88 | 16 |
+| 8 KiB | 128 | 1 MiB | 56 | 64 |
+| **16 KiB** | **64** | **1 MiB** | **40** | **256** |
+| 32 KiB | 64 | 2 MiB | 40 | 512 |
+| 64 KiB | 64 | 4 MiB | 40 | 1024 |
+
+> ⚠️ **`XDES_DESCRIBED_PER_PAGE` 在 8.0.39 已废弃**——`fsp0types.h:150` 只剩一行被注释掉的 `#define`。等价语义由 `page_size.physical()` 承担。
+> ⚠️ **不存在 `xdes_clear_bit()` / `xdes_is_bit_set()`**——清位就是 `xdes_set_bit(descr, bit, offset, false, mtr)`。
+
+**★ `fsp_fill_free_list()`：从 FSP_FREE_LIMIT 之上初始化新 extent**（★ 表空间的"批发"动作）：
+
+```cpp
+static void fsp_fill_free_list(bool init_space, fil_space_t *space,
+                               fsp_header_t *header, mtr_t *mtr) {
+  ...
+  if (size < limit + FSP_EXTENT_SIZE * FSP_FREE_ADD) {   /* 不足 4 个 extent → 先物理扩容 */
+    fsp_try_extend_data_file(space, header, mtr);
+    size = space->size_in_header;
+  }
+
+  i = limit;   /* ★ 从 FSP_FREE_LIMIT 开始 */
+  while ((init_space && i < 1) ||
+         ((i + FSP_EXTENT_SIZE <= size) && (count < FSP_FREE_ADD))) {   /* ★ 一次最多 4 个 */
+
+    bool init_xdes = (ut_2pow_remainder(i, page_size.physical()) == 0);
+    /* ★★ i % 16384 == 0 ⇒ 这个 extent 含 XDES 描述页 + IBUF bitmap 页，只能进 FREE_FRAG */
+
+    space->free_limit = i + FSP_EXTENT_SIZE;              /* 内存态前移 */
+    mlog_write_ulint(header + FSP_FREE_LIMIT, i + FSP_EXTENT_SIZE, MLOG_4BYTES, mtr);
+
+    if (init_xdes) {
+      if (i > 0) {                                        /* page 0 已存在，跳过 */
+        block = buf_page_create(page_id, page_size, RW_SX_LATCH, mtr);
+        fsp_init_file_page(block, mtr);
+        mlog_write_ulint(frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_XDES, MLOG_2BYTES, mtr);
+        /* ★ 新描述页的 type = 9；page 0 保持 8 */
+      }
+      /* IBUF bitmap 页（extent 内第 2 页）在独立的 mtr 里初始化
+         —— 因为它在 latching order 里层级很低，必须能提前放 latch */
+      if (!fsp_is_system_temporary(space->id)) {
+        mtr_start(&ibuf_mtr);
+        const page_id_t page_id(space->id, i + FSP_IBUF_BITMAP_OFFSET);
+        ...
+        ibuf_bitmap_page_init(block, &ibuf_mtr);
+        mtr_commit(&ibuf_mtr);
+      }
+    }
+
+    descr = xdes_get_descriptor_with_space_hdr(header, space->id, i, mtr, init_space, &desc_block);
+    xdes_init(descr, mtr);                                /* ★ seg_id=0 / XDES_FREE / bitmap 全 1 */
+
+    if (init_xdes) {
+      fsp_init_xdes_free_frag(header, descr, mtr);        /* 含 XDES 页 → FREE_FRAG，page0/1 标已用 */
+    } else {
+      flst_add_last(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
+      count++;                                            /* ★ 只有真正进 FSP_FREE 的才计数 */
+    }
+    i += FSP_EXTENT_SIZE;
+  }
+  space->free_len += (uint32_t)count;                     /* ★ 内存态计数，供 DATA_FREE 用 */
+}
+```
+
+> ★★★ **`init_xdes` 这个判据是整章最关键的细节**：`i % 16384 == 0` 的 extent 因为要"牺牲"前两页（XDES 页 + IBUF bitmap 页），所以**不能整块交给段**，只能进 `FSP_FREE_FRAG` 走碎片分配。这也解释了 `fsp_get_available_space_in_free_extents()` 里那句 `n_free_up -= n_free_up / (page_size.physical() / FSP_EXTENT_SIZE)`——**每 256 个 extent 要扣掉 1 个**。
+> ★ `const ulint XDES_FRAG_N_USED = 2` 就是这两个先天被占的页。
+
+**★ FLST：八大链表的统一底座**（★ 侵入式、可跨页）：
+
+```cpp
+/* fut0lst.h:42 */
+typedef byte flst_base_node_t;
+typedef byte flst_node_t;
+constexpr ulint FLST_BASE_NODE_SIZE = 4 + 2 * FIL_ADDR_SIZE;   // = 16：len(4) + first(6) + last(6)
+constexpr ulint FLST_NODE_SIZE      = 2 * FIL_ADDR_SIZE;       // = 12：prev(6) + next(6)
+
+/* fil0types.h:123 —— 一个"文件地址"= 4B 页号 + 2B 页内偏移 */
+constexpr size_t FIL_ADDR_PAGE = 0;
+constexpr size_t FIL_ADDR_BYTE = 4;
+constexpr size_t FIL_ADDR_SIZE = 6;
+```
+
+> ★★ **链表节点存的是 `fil_addr_t`（页号 + 页内偏移），不是指针**——所以链表天然可跨页、可持久化。`fut_get_ptr()` 才把它翻译成内存指针（必要时额外 fix 一页）。
+> ★ 增删节点时若前驱/后继与自己在**同一页**，可直接 `page_align(node) + addr.boffset` 定位；否则要 `fut_get_ptr()` 多 fix 一页。这是 FLST 操作可能涉及 2~3 个 page latch 的原因。
+> ⚠️ **不存在 `xdes_lst_add_node()` / `xdes_lst_remove_node()`**——XDES 链表操作直接用通用 `flst_add_last(header + FSP_FREE, descr + XDES_FLST_NODE, mtr)`。
+
 ### FSP_SIZE / FSP_FREE_LIMIT / FSP_FREE：三个"边界"的辨析
 
 页 0 的 FSP header 里有三个字段名字相近、语义递进，是理解扩展行为的钥匙：
@@ -1779,11 +2420,13 @@ stats->m_data_free = fsp_get_available_space_in_free_extents(space) * 1024;
 | `FSP_SIZE` vs `FSP_FREE_LIMIT` | 前者是文件实际页数，后者是"已初始化 extent 的边界"——free_limit 之上的页物理存在但未挂任何链表 |
 | 段内 FREE/NOT_FULL/FULL vs 表空间 FREE/FREE_FRAG/FULL_FRAG | 前者分类"段拥有的 extent"（按占用度），后者分类"未归属段的 extent"。两套链表、两种 XDES 状态 |
 | 碎片页 vs lease extent | 碎片页 = 从 `FSP_FREE_FRAG` 逐页借（inode 的 32 槽）；lease = 8.0 把整个碎片 extent 借给段（`XDES_FSEG_FRAG`），段用页 2~63 |
-| 段释放页的方向 | `fseg_free_page_low` 注释明说：extent 空了也**还给表空间**（FSP_FREE/FREE_FRAG），**不回段内 FREE 链**——段 FREE 链只有"进"（fseg_fill_free_list 预存）没有"回" |
-| `XDES_CLEAN_BIT` | 已废弃（"currently not used"），bitmap 每页 2bit 现在只用 FREE_BIT |
+| `fil_space_t::size` vs `size_in_header` | 前者物理页数（各 node.size 之和），后者 FSP_SIZE 镜像且**向下对齐整 MB**；**两者的差就是"文件比 header 大"**，`DATA_FREE` 正依赖它 |
+| 段释放页的方向 | `fseg_free_page_low` 注释明说：extent 空了也**还给表空间**（FSP_FREE/FREE_FRAG），**不回段内 FREE 链**——段 FREE 链只有"进"（`fseg_fill_free_list` 预存）没有"回" |
+| `XDES_CLEAN_BIT` | 已废弃（"currently not used"），bitmap 每页 2bit 现在只用 `XDES_FREE_BIT` |
 | `FSP_FLAGS` 不区分 REDUNDANT/COMPACT | POST_ANTELOPE 位两者都是 0，需 DD 另传 compact 布尔 |
 | `ha_statistics::delete_length` | 引擎内部名字，就是外部 `DATA_FREE`（"Free bytes"），不是"删除的行数" |
-| extent 大小随 page size | 16K 页 = 64 页 = 1MB；4K 页 = 256 页 = 1MB；32K 页 = 64 页 = 2MB |
+| extent 大小随 page size | 16K 页 = 64 页 = 1MB；4K 页 = 256 页 = 1MB；32K 页 = 64 页 = 2MB；64K 页 = 64 页 = 4MB |
+| "一个 INODE 页 85 个 inode" | 只对 16K 页成立，`FSP_SEG_INODES_PER_PAGE()` 是函数：4K→21、8K→42、16K→85、32K→170、64K→341 |
 
 ### DATA_FREE / FREE_EXTENTS / 页内碎片 三者辨析
 
@@ -1792,6 +2435,173 @@ stats->m_data_free = fsp_get_available_space_in_free_extents(space) * 1024;
 | `TABLES.DATA_FREE` | 字节 | free extent + 未初始化区，扣 2 extent + 1% 预留 | 是（估算可写空间） |
 | `FILES.FREE_EXTENTS` | extent 个数 | 仅 free extent 链表长度 | 否（精确链表长度） |
 | 页内空隙（fill factor） | — | B-tree 页 15/16 填充预留 | 不对外暴露 |
+
+---
+
+## ★★ B+ 树索引与两个段：链路的最终收口
+
+前面所有层次（file / tablespace / extent / fseg）最终服务于一个目标——**支撑一棵 B+ 树**。这是整条链路的"用户"。
+
+**★★ `btr_create()`：建一个索引 = 建两个段 + 建根页**（`btr0btr.cc:832`）：
+
+```cpp
+ulint btr_create(ulint type, space_id_t space, space_index_t index_id,
+                 dict_index_t *index, mtr_t *mtr) {
+  if (type & DICT_IBUF) {
+    /* ibuf 树：segment header 不在根页，而在独立的 IBUF header 页（page 3） */
+    buf_block_t *ibuf_hdr_block =
+        fseg_create(space, 0, IBUF_HEADER + IBUF_TREE_SEG_HEADER, mtr);
+    ut_ad(ibuf_hdr_block->page.id.page_no() == IBUF_HEADER_PAGE_NO);
+    /* Allocate then the next page to the segment: it will be the tree root page */
+    block = fseg_alloc_free_page(frame + IBUF_HEADER + IBUF_TREE_SEG_HEADER,
+                                 IBUF_TREE_ROOT_PAGE_NO, FSP_UP, mtr);
+  } else {
+    /* ① 建「非叶段」：page=0 ⇒ 段自己先申请一页，这一页就是 B+ 树根页
+          segment header 写在根页的 PAGE_HEADER(38) + PAGE_BTR_SEG_TOP(46) = 偏移 84 */
+    block = fseg_create(space, 0, PAGE_HEADER + PAGE_BTR_SEG_TOP, mtr);
+  }
+  if (block == nullptr) return (FIL_NULL);
+
+  page_no = block->page.id.page_no();      /* ★ 根页页号（非 ibuf 表通常就是 4） */
+  frame = buf_block_get_frame(block);
+
+  if (type & DICT_IBUF) {
+    flst_init(frame + PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST, mtr);
+    /* ★ ibuf 根页用 PAGE_BTR_SEG_LEAF 的位置(74)放 free list base node */
+  } else {
+    /* ② 建「叶子段」：page = 根页页号（!=0）⇒ header 写回根页的
+          PAGE_HEADER(38) + PAGE_BTR_SEG_LEAF(36) = 偏移 74 */
+    if (!fseg_create(space, page_no, PAGE_HEADER + PAGE_BTR_SEG_LEAF, mtr)) {
+      btr_free_root(block, mtr);           /* ★ 叶子段建失败 ⇒ 回滚已建的非叶段 */
+      if (!index->table->is_temporary()) btr_free_root_invalidate(block, mtr);
+      return (FIL_NULL);
+    }
+  }
+  ...
+  page = page_create(block, mtr, dict_table_is_comp(index->table), page_create_type);
+  btr_page_set_level(page, nullptr, 0, mtr);   /* ★ 新树只有一层：level = 0（根即叶） */
+  btr_page_set_index_id(page, page_zip, index_id, mtr);
+  btr_page_set_next(page, page_zip, FIL_NULL, mtr);
+  btr_page_set_prev(page, page_zip, FIL_NULL, mtr);
+  ...
+  return (page_no);                            /* ★ 返回根页页号 ⇒ 写入 dict_index_t::page */
+}
+```
+
+**★★ 根页里两个 segment header 的确切位置**（`page0types.h:90/98`，⚠️ 不在 `page0page.h`）：
+
+```cpp
+constexpr uint32_t PAGE_HEADER        = FSEG_PAGE_DATA;   // = 38，索引页头起点
+constexpr uint32_t PAGE_LEVEL         = 26;               // 绝对偏移 64
+constexpr uint32_t PAGE_INDEX_ID      = 28;               // 绝对偏移 66，8B
+constexpr uint32_t PAGE_BTR_SEG_LEAF  = 36;               // ★ 绝对偏移 74，10B —— 叶子段
+constexpr uint32_t PAGE_BTR_IBUF_FREE_LIST     = PAGE_BTR_SEG_LEAF;   // ibuf 复用此位
+constexpr uint32_t PAGE_BTR_IBUF_FREE_LIST_NODE = PAGE_BTR_SEG_LEAF;
+constexpr uint32_t PAGE_BTR_SEG_TOP   = 36 + FSEG_HEADER_SIZE;        // ★ 绝对偏移 84，10B —— 非叶段
+```
+
+```
+B+ 树根页（16KB，偏移自页首）
+  0    ┌ FIL Header (38B) ─────────────────────────────┐
+  38   ├ PAGE_HEADER ──────────────────────────────────┤
+  64   │   PAGE_LEVEL (2B)                             │
+  66   │   PAGE_INDEX_ID (8B)                          │
+  74   │   ★ PAGE_BTR_SEG_LEAF (10B) → 叶子段 inode ───┼──► FSEG_FRAG_ARR / FSEG_FREE /
+  84   │   ★ PAGE_BTR_SEG_TOP  (10B) → 非叶段 inode ───┼──► FSEG_NOT_FULL / FSEG_FULL
+  94   ├ 用户记录（infimum / supremum / 数据）──────────┤
+  ...  └ ...                                            ┘
+```
+
+> ★★★ **根页同时是 TOP 段的第一个碎片页**——因为 `fseg_create_general()` 中 `page==0` 分支让段先给自己分配一页并把 header 写在自己页上。所以"根页"既是一棵树的入口，也是非叶段物理上的第一块地。
+> ★ **为什么是 `SEG_TOP` 先建、`SEG_LEAF` 后建**：`SEG_TOP` 传 `page=0` 才能产出根页；拿到根页页号后才能传非 0 给 `SEG_LEAF`，把叶子段的 header 也写回同一页。顺序不能颠倒。
+> ⚠️ **ibuf 树是唯一例外**——它的两个"段位"被复用了：根页的 `PAGE_BTR_SEG_LEAF` 位置放的是 **ibuf free list 的 base node**（16B），而每个空闲页的同一位置放的是 **free list node**（12B）。
+
+**★ 释放一棵 B+ 树**（`btr_free_but_not_root()`，`btr0btr.cc:954`）：
+
+```cpp
+  /* 叶子段：完整释放（含根页本身，因为根页也是它的碎片页之一） */
+  do {
+    mtr_start(&mtr);
+    finished = fseg_free_step(root + PAGE_HEADER + PAGE_BTR_SEG_LEAF, true, &mtr);
+    mtr_commit(&mtr);
+  } while (!finished);   /* ★ 大段分多轮 mtr 释放，避免单个 mtr 过大 */
+
+  /* 非叶段：用 not_header 版本 —— 保住根页（根页是 TOP 段的 header 页） */
+  do {
+    mtr_start(&mtr);
+    finished = fseg_free_step_not_header(root + PAGE_HEADER + PAGE_BTR_SEG_TOP, true, &mtr);
+    mtr_commit(&mtr);
+  } while (!finished);
+```
+
+> ★ `fseg_free_step()` 每次调用只释放**一整个 extent**，返回 false 表示还没完——这是"大操作拆成多个 mtr"的典型手法（避免单个 mtr 的 redo 过大、避免 fix 住太多页）。
+> ★ `fseg_free_step()` 用 `fseg_inode_try_get()` 而非 `_get()`——**允许 inode 已被回收（幂等）**，命中时打 "Double free of inode" 信息并直接返回 true。
+
+**★ 八个链表的一句话定位**（把前面所有链表对齐到层次上）：
+
+| 层级 | 链表 | 挂在 | 元素 | 语义 |
+|---|---|---|---|---|
+| 表空间 | `FSP_FREE` | FSP header +24 | XDES | 完全空闲的 extent |
+| 表空间 | `FSP_FREE_FRAG` | +40 | XDES | 部分使用的碎片 extent（逐页借出） |
+| 表空间 | `FSP_FULL_FRAG` | +56 | XDES | 已用满的碎片 extent |
+| 表空间 | `FSP_SEG_INODES_FREE` | +96 | INODE 页 | 有空闲槽位的 inode 页 |
+| 表空间 | `FSP_SEG_INODES_FULL` | +80 | INODE 页 | 槽位用满的 inode 页 |
+| **段** | `FSEG_FREE` | inode +12 | XDES | 段预存的空闲 extent |
+| **段** | `FSEG_NOT_FULL` | inode +28 | XDES | 段内部分使用的 extent |
+| **段** | `FSEG_FULL` | inode +44 | XDES | 段内已用满的 extent |
+
+> ★ 加上 B+ 树同层页的双向链表（`PAGE_BTR_SEG_*` 之外的 `FIL_PAGE_PREV/NEXT`，**与 FLST 完全两套机制**），一共"八大 + 一"。
+
+---
+
+## ★★ 真名勘误全表
+
+| 常见说法 / 想当然 | 8.0.39 真相 |
+|---|---|
+| `fil_space_create()` 是创建主体 | 只是**薄封装**（fil0fil.cc:3329）→ 真身 `Fil_shard::space_create()`（3247）。且必须先 `mutex_acquire_all()` 拿**所有** shard 的锁 |
+| `fil_node_create()` 直接构造 | 只是封装（2448）→ 真身 `Fil_shard::create_node()`（2357），且**返回 `char*`（文件名）不是 `fil_node_t*`** |
+| `fil_node_open_file()` / `fil_node_close_file()` | **均不存在** → `Fil_shard::open_file()`（2704）/ `close_file()`（3010） |
+| `fil_node_prepare_for_io()` | **不存在** → `Fil_shard::prepare_file_for_io()`（7429） |
+| `fil_space_get_next_id()` | **不存在** → `Fil_system::assign_new_space_id()`（3367）+ 外层 `fil_assign_new_space_id()` |
+| `fsp_get_size()` / `fsp_get_free_limit()` / `fsp_get_flags()` | **三个都不存在** → `fsp_header_get_field(page, FSP_SIZE/...)` |
+| `fsp_get_extent_size_from_flags()` / `fsp_get_pages_in_extent()` | **不存在** → `fsp_get_extent_size_in_pages()` / `fsp_get_pages_to_extend_ibd()` |
+| `fsp_space_create()` | **不存在**（0 匹配）→ `fsp_header_init()` |
+| `fsp_descr_size()` / `fsp_last_page_no_and_size()` | **均不存在** → 只有 `fsp_descr_page()` |
+| `fil_space_t` 里有 `full_crc32` | **不存在**（0 匹配）。8.0 的 full_crc32 是**全局**的；空间级只有 `compression_type` 与 flags 的 ENCRYPTION 位 |
+| `fil_space_t::files` 是链表 | 是 **`std::vector<fil_node_t>`**；`UT_LIST_NODE_T` 只用于 LRU 与 unflushed_spaces |
+| "一个表空间可以有多个文件" | 断言只允许**系统/临时**表空间：`ut_a(space->id == TRX_SYS_SPACE \|\| purpose == FIL_TYPE_TEMPORARY \|\| files.size() == 1)` |
+| `fil_space_free()` 立刻释放内存 | 两段式：`space_free()`（3185）只 detach + 摘 map；真正 free 在 `space_free_low()`（3148）且要求 `has_no_references()` |
+| 扩展文件一定写 0 | **不一定**。先 `posix_fallocate()`；只有 `tbsp_extend_and_initialize && !atomic_write` 或 fallocate 失败才 `fil_write_zeros()` |
+| `XDES_DESCRIBED_PER_PAGE` 是常量 | **已废弃**（只剩注释掉的 `#define`）；等价语义由 `page_size.physical()` 承担 |
+| "一个 XDES 页描述 16384 个 extent" | **错**：描述 **256 个**（16K 页）。16384 是"一组 extent 的页数" |
+| XDES 状态只有 4 种 | **6 种**：多 `XDES_NOT_INITED=0` 与 8.0 新增的 `XDES_FSEG_FRAG=5`（租借） |
+| 有 `XDES_FSEG_FRAG_LIMIT` | **不存在** → `XDES_FRAG_N_USED=2` 与 `FSEG_FRAG_LIMIT=32` 是两个不同层级的东西 |
+| `xdes_clear_bit()` / `xdes_is_bit_set()` | **均不存在** → `xdes_set_bit(descr, bit, off, false, mtr)` 即清位 |
+| `xdes_lst_add_node()` / `xdes_lst_remove_node()` | **均不存在** → 直接用通用 `flst_add_last(header + FSP_FREE, descr + XDES_FLST_NODE, mtr)` |
+| `fsp_alloc_free_frag_page()` | **不存在** → `fsp_alloc_free_page()` |
+| XDES 页的 type 就是 `FIL_PAGE_TYPE_XDES` | **page 0 是 `FIL_PAGE_TYPE_FSP_HDR`(8)**，只有 page 0 之外的描述页才是 9 |
+| extent 恒 1MB / 64 页 | 4K/8K/16K 页是 1MiB；**32K 页 = 2MiB，64K 页 = 4MiB**；压缩表按 `physical()` 换算 |
+| `FSEG_HDR_SPACE_ID` | **不存在** → `FSEG_HDR_SPACE`（fsp0types.h:92） |
+| `fseg_create_root_page()` | **不存在** → `fseg_create(space, page, byte_offset, mtr)` |
+| `fsp_free_seg_inode_page()` | **不存在** → `fsp_free_seg_inode()`（释放 inode；整页归还内嵌在其尾部） |
+| `fseg_reserve_free_extents()` | **不存在** → `fsp_reserve_free_extents()`；另有无关的全局变量 `fseg_reserve_pct`（默认 12.50） |
+| `fseg_verify()` / `fsp_validate()` | **均不存在** → 只有 `File_segment_inode::verify_not_full_n_used()` 与 `btr_root_fseg_validate()`（均 UNIV_DEBUG） |
+| `fseg_header_get_space_id()` 等三个 C 函数 | **均已不存在** → 裸 `mach_read_from_4/2`；`UNIV_DEBUG` 下有打印用封装类 `class fseg_header` |
+| "一个 INODE 页固定 85 个 inode" | 只对 16K 页成立。`FSP_SEG_INODES_PER_PAGE()` 是**函数**：4K→21、8K→42、16K→85、32K→170、64K→341 |
+| "inode 数组从偏移 38 开始" | **错**：`FSEG_ARR_OFFSET = 38 + FLST_NODE_SIZE(12) = **50**`；前 12B 是 INODE 页自身的链表节点 |
+| 释放页时 extent 空了会回到 `FSEG_FREE` | **错**：`fseg_free_page_low()` 在 `n_used==0` 时调 `fsp_free_extent()` **直接还给表空间** |
+| `PAGE_BTR_SEG_LEAF/TOP` 在 `page0page.h` | **错**：在 **`include/page0types.h:90/98`** |
+| `space->size == FSP_SIZE` | 两个不同的数：`size` 物理页数，`size_in_header` 是 FSP_SIZE 镜像且**向下对齐整 MB** |
+
+**★ 四个"结构性事实"**
+
+1. **`offsets[]` 之上、物理之下，InnoDB 用"算术定位"和"链表定位"两种方式管理元数据，选择依据是"有没有算术规律"**。XDES 描述"第 n 个 extent"，n 与页号有固定关系（每 16384 页一组），所以 `xdes_calc_descriptor_page()` 一个 `ut_2pow_round` 就能 O(1) 定位，**不需要空闲位图**（槽位与 extent 一一对应，天然无空洞）。inode 描述"第 n 个段"，段随 DDL 动态生灭，无规律可循，只能把"有空槽的 inode 页"串成链表按需取用，于是**空闲度有两级**（页内 `FSEG_ID==0` 判空 + 页级 FREE/FULL 双链）。
+
+2. **`init_xdes`（`i % 16384 == 0`）是整章最关键的判据**——它决定了"哪个 extent 不能整块交给段"。原因是要"牺牲"前两页（XDES 描述页 + IBUF bitmap 页，`XDES_FRAG_N_USED = 2`），所以这些 extent 只能进 `FSP_FREE_FRAG` 走碎片分配。这个约束一路影响到 `DATA_FREE` 的计算（`n_free_up -= n_free_up / (page_size.physical() / FSP_EXTENT_SIZE)`，**每 256 个 extent 扣掉 1 个**）。
+
+3. **`space->size` 的唯一增长点是 `Fil_shard::space_extend()`**，且扩展永远是"最后一个 node"。落盘三步：① 先记 redo（`fil_op_write_space_extend`，因为 `posix_fallocate()` 有"空间已预留但元数据未更新"的原子性缺陷）② `posix_fallocate()` 只预留不写数据 ③ 只有开关要求或 fallocate 失败才 `fil_write_zeros()`（单次最多 1MB、按 `page_size` 对齐以满足 O_DIRECT）。**磁盘满时可能只加了一部分**，`success = (end == node_start + len)`。
+
+4. **`btr_create()` 把整条链路串成一句话：建索引 = 建两个段 + 建根页**。顺序不能颠倒——`SEG_TOP` 传 `page=0` 才能产出根页，拿到页号后才能传非 0 给 `SEG_LEAF` 把 header 写回同一页。于是根页既是树的入口，**也是非叶段物理上的第一块地**（`fseg_create_general` 的 `page==0` 分支）。根页偏移 74/84 各 10 字节的 segment header，就是"逻辑索引"与"物理段"之间唯一的接缝。
 
 ---
 

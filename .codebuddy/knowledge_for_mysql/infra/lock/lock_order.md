@@ -79,14 +79,78 @@ void LO_graph::check_common(LO_thread *thread, ..., const LO_node *from_node,
 
 ### 4. 判环：Tarjan SCC + girth
 
+`LO_graph::scc_util` 是教科书 Tarjan 的完整落地（`sql/debug_lock_order.cc`，完整代码）：
+
 ```cpp
-void LO_graph::scc_util(const SCC_visitor *v, int *discovery_time, int *scc_count,
-                        LO_node *n, std::stack<LO_node *> *st);   // Tarjan 主递归
-int  LO_graph::compute_scc(const SCC_visitor *v);
-void LO_graph::compute_scc_girth(...);   // 算环的 girth（最短环）/ circumference
+void LO_graph::scc_util(const SCC_visitor *v, int *discovery_time,
+                        int *scc_count, LO_node *n, std::stack<LO_node *> *st) {
+  int discovered = (*discovery_time)++;
+
+  n->m_scc.m_index = discovered;          /* ① 进入时间戳 = 发现序 */
+  n->m_scc.m_low_index = discovered;      /* lowlink 初值 = 自身 index */
+  st->push(n);
+  n->m_scc.m_on_stack = true;
+
+  const LO_arc_list &arcs_out = n->get_arcs_out();
+  ...
+  /* If the node is IGNORED, pretend arcs do not exist */
+  if (v->accept_node(n)) {
+    for (it = arcs_out.begin(); it != arcs_out.end(); it++) {
+      arc = *it;
+
+      /* If the arc is LOOP, pretend it does not exist */
+      if (v->accept_arc(arc)) {
+        n2 = arc->get_to();
+
+        if (n2->m_scc.m_index == -1) {          /* ② 树边：递归子节点 */
+          scc_util(v, discovery_time, scc_count, n2, st);
+          n->m_scc.m_low_index =
+              std::min(n->m_scc.m_low_index, n2->m_scc.m_low_index);
+        } else {
+          if (n2->m_scc.m_on_stack == true) {   /* ③ 回边：取邻点 index */
+            n->m_scc.m_low_index =
+                std::min(n->m_scc.m_low_index, n2->m_scc.m_index);
+          }
+        }
+      }
+    }
+  }
+
+  if (n->m_scc.m_low_index == n->m_scc.m_index) {   /* ④ 自己是 SCC 根 */
+    LO_node *n3;
+    std::stack<LO_node *> scc;
+    while (st->top() != n) {                        /* 弹栈到根，收集整个 SCC */
+      n3 = st->top();
+      n3->m_scc.m_on_stack = false;
+      st->pop();
+      scc.push(n3);
+    }
+    n3 = st->top();
+    n3->m_scc.m_on_stack = false;
+    st->pop();
+    scc.push(n3);
+
+    if (scc.size() > 1) {                           /* ⑤ 单节点不算环 */
+      LO_node *c;
+      (*scc_count)++;
+      while (scc.size() != 0) {
+        c = scc.top();
+        c->m_scc.m_scc_number = *scc_count;         /* 标 SCC 编号（girth 用） */
+        scc.pop();
+      }
+    }
+  }
+}
 ```
 
-**SCC（强连通分量）size ≥ 2 = 环 = 死锁可能**。`girth`（最短环长）帮定位最该先修的环。源码注释原话："a SCC of size greater than one is a cluster of nodes where any node is reachable... Hence, SCC should not exist, and the code must be re-factored to avoid them."
+`compute_scc` 外层：`clear()` 所有节点的 SCC 状态 → 遍历节点，`m_index == -1` 的逐个起 DFS。与教科书 Tarjan 的**两处领域定制**：
+
+1. **`accept_node`/`accept_arc` 过滤**（注释 "pretend arcs do not exist"）：`IGNORED` 节点与 `LOOP` 弧在判环时**假装不存在**——这就是"full graph 跑一遍 → 标 LOOP/IGNORED → revised graph 重跑"工作流的实现支点（同一个算法跑两遍图，靠 visitor 过滤出不同结果）。
+2. **`scc.size() > 1` 才计数**：单节点 SCC（无自环的正常节点）不是环。
+
+**`girth`（最短环长）用 BFS 算，不是 DFS**：`compute_scc_girth` 对每个 SCC 逐节点调 `compute_node_girth`——从起点做**分层 BFS**（`successors`/`next_successors` 两层交替 + `girth++`），找回到自身的最短路径长。用途：一个 SCC 里可能含多个环，girth 最短的那个是"最该先修的环"（报告按 girth 排序）。
+
+**SCC（强连通分量）size ≥ 2 = 环 = 死锁可能**。源码注释原话："a SCC of size greater than one is a cluster of nodes where any node is reachable... Hence, SCC should not exist, and the code must be re-factored to avoid them."
 
 ### 5. 依赖文件语法（debug_lo_parser.yy）
 
@@ -135,6 +199,30 @@ flags 位（`LO_FLAG_*` 宏）：
 ```
 
 报告分六段（lock_order.txt）：`DEPENDENCY GRAPH` / `SCC ANALYSIS (full graph)` / `IGNORED NODES` / `LOOP ARC` / `SCC ANALYSIS (revised graph)` / `UNRESOLVED ARCS`（依赖文件里对不上真实节点的弧）。
+
+### 7. 系统变量清单（13 个，全部启动时只读）
+
+官方手册权威清单（本工具 **8.0.17** 引入；构建需 `WITH_LOCK_ORDER=ON` + **flex** 生成依赖文件解析器）。**所有 LOCK_ORDER 变量必须启动时设置、运行时只读**，全部 Global：
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `lock_order` | OFF | 主开关；OFF 时其余全部无效；ON 后遇未声明的锁获取序列**报错** |
+| `lock_order_debug_loop` | OFF | 遇 LOOP 弧 → 调试断言失败 |
+| `lock_order_debug_missing_arc` | OFF | 遇未声明依赖边 → 调试断言失败 |
+| `lock_order_debug_missing_key` | OFF | 遇未做 PFS instrument 的对象 → 调试断言失败 |
+| `lock_order_debug_missing_unlock` | OFF | 遇锁销毁时仍被持有 → 调试断言失败 |
+| `lock_order_dependencies` | 空 | 主依赖图 `lock_order_dependencies.txt` 路径 |
+| `lock_order_extra_dependencies` | 空 | **附加依赖文件**——改第三方代码行为用它，直接改主依赖文件不被鼓励 |
+| `lock_order_output_directory` | 空 | 日志输出目录（默认当前目录） |
+| `lock_order_print_txt` | OFF | 跑图分析并打印文本报告（含环） |
+| `lock_order_trace_loop` | OFF | 遇 LOOP 弧 → 打日志 |
+| `lock_order_trace_missing_arc` | **ON** | 遇未声明依赖边 → 打日志（默认开） |
+| `lock_order_trace_missing_key` | OFF | 遇未 instrument 对象 → 打日志 |
+| `lock_order_trace_missing_unlock` | **ON** | 遇销毁时仍持有 → 打日志（默认开） |
+
+**`_debug_` / `_trace_` 成对机制**：同一类异常两个旋钮——`debug_*` 控制"触发断言失败"，`trace_*` 控制"只打日志"。注意**默认值不对称**：`trace_missing_arc` 与 `trace_missing_unlock` 默认 ON（最常见的两类问题直接可见），其余默认 OFF。
+
+`mysql-test-run.pl --lock-order` 会自动设好各变量跑测试（`MTR_LOCK_ORDER=1` 等价入口）。
 
 ## 可观测性
 

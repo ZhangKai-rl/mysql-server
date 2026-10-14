@@ -46,7 +46,77 @@ MySQL 里名字带 stats 的东西有四套，**完全不是一回事**：
 
 ⚠️ 排查统计信息问题时**第一件事就是确认看的是哪一套**。`SHOW INDEX` 的 `Cardinality` 来自内存统计（实时估算，每次调用可能变），而 `mysql.innodb_index_stats` 里是持久化的值。
 
-另：直方图（`ANALYZE TABLE ... UPDATE HISTOGRAM`）是**独立于 InnoDB 统计**的一套机制，存在 `mysql.column_statistics`，不在本文范围。
+**★ 表名实证**（两套表只差 `innodb_` 前缀，极易看错）：
+
+```cpp
+/* storage/innobase/dict/dict0stats.cc —— InnoDB 自己的持久化表 */
+#define TABLE_STATS_NAME "mysql/innodb_table_stats"
+#define TABLE_STATS_NAME_PRINT "mysql.innodb_table_stats"
+#define INDEX_STATS_NAME "mysql/innodb_index_stats"
+#define INDEX_STATS_NAME_PRINT "mysql.innodb_index_stats"
+```
+
+```cpp
+/* sql/dd/impl/tables/table_stats.cc —— DD 的 I_S 统计缓存表（另一套！） */
+Table_stats::Table_stats() {
+  m_target_def.set_table_name("table_stats");
+  m_target_def.add_field(FIELD_TABLE_ROWS, "FIELD_TABLE_ROWS", "table_rows BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_AVG_ROW_LENGTH, "FIELD_AVG_ROW_LENGTH", "avg_row_length BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_DATA_LENGTH, "FIELD_DATA_LENGTH", "data_length BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_INDEX_LENGTH, "FIELD_INDEX_LENGTH", "index_length BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_AUTO_INCREMENT, "FIELD_AUTO_INCREMENT", "auto_increment BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_CHECKSUM, "FIELD_CHECKSUM", "checksum BIGINT UNSIGNED");
+  m_target_def.add_field(FIELD_CACHED_TIME, "FIELD_CACHED_TIME", "cached_time TIMESTAMP NOT NULL");
+  m_target_def.add_index(INDEX_PK_SCHEMA_ID_TABLE_NAME, "INDEX_PK_SCHEMA_ID_TABLE_NAME",
+                         "PRIMARY KEY (schema_name, table_name)");
+}
+```
+
+`mysql.table_stats` 的字段是 `table_rows` / `data_length` / `auto_increment` ——**明显是 `SHOW TABLE STATUS` 那一套**，跟 InnoDB 的 `n_rows` / `clustered_index_size` 不是同一组数据。
+
+**谁写谁读**（每一项都有代码位置作证）：
+
+| # | 归属 | 存储 | 写入方 | 读取方 |
+|---|---|---|---|---|
+| ① | InnoDB 内存 dict_stats | `dict_table_t::stat_n_rows`、`dict_index_t::stat_n_diff_key_vals[]` | `dict_stats_update_persistent()` / `dict_stats_update_transient()` | `dict_table_get_n_rows()`、`ha_innobase::info()` |
+| ② | InnoDB 持久统计 | `mysql.innodb_table_stats` / `innodb_index_stats` | `dict_stats_save()`（内部 SQL） | `dict_stats_fetch_from_ps()`（内部 SQL） |
+| ②′ | **DD 的 I_S 缓存**（与 ② 不通！） | `mysql.table_stats` / `index_stats` | `dd::info_schema::update_table_stats()` | `Table_statistics::read_stat()` |
+| ③ | server 直方图 | `mysql.column_statistics`（JSON 列） | `Histogram::store_histogram()`（DD client） | `histograms::find_histogram()` |
+| ④ | 临时表/优化器的行数估算 | 进程内存 `handler::stats.records`，不落盘 | `table->file->stats.records = ...` | 代价模型 |
+
+> ★ ② 与 ②′ **互相不通**：InnoDB 用**自己的内部 SQL parser** 读写 `mysql.innodb_*_stats`；DD 用 **Dictionary_client** 读写 `mysql.table_stats` / `index_stats`。而且两者注册层级不同——`Column_statistics` 是 **core** 层 DD 表，`Table_stats` / `Index_stats` 是 **second** 层（`sql/dd/impl/system_registry.cc`）。
+
+② 的读回路径（内部 SQL + 游标，读不到就返回 `DB_STATS_DO_NOT_EXIST`）：
+
+```cpp
+static dberr_t dict_stats_fetch_from_ps(dict_table_t *table) {
+  /* Initialize all stats to dummy values before fetching because if
+     the persistent storage contains incomplete stats (e.g. missing stats
+     for some index) then we would end up with (partially) uninitialized
+     stats. */
+  dict_stats_empty_table(table);
+
+  trx = trx_allocate_for_background();
+  /* Use 'read-uncommitted' so that the SELECTs we execute
+     do not get blocked in case some user has locked the rows we
+     are SELECTing */
+  trx->isolation_level = TRX_ISO_READ_UNCOMMITTED;
+  ...
+  ret = que_eval_sql(pinfo,
+                     "PROCEDURE FETCH_STATS () IS\n"
+                     "DECLARE CURSOR table_stats_cur IS\n"
+                     "  SELECT n_rows, clustered_index_size, sum_of_other_index_sizes\n"
+                     "  FROM \"mysql/innodb_table_stats\"\n"
+                     "  WHERE database_name = :database_name AND table_name = :table_name;\n"
+                     ...
+  if (!index_fetch_arg.stats_were_modified) {
+    return (DB_STATS_DO_NOT_EXIST);
+  }
+```
+
+> ★ 注意 `TRX_ISO_READ_UNCOMMITTED`——统计读取**故意用脏读**，避免被用户锁阻塞。这是"统计不是关键数据"的直接体现。
+
+另：直方图（`ANALYZE TABLE ... UPDATE HISTOGRAM`）是**独立于 InnoDB 统计**的一套机制，存在 `mysql.column_statistics`（详见第 4 节末尾的协同分析）。
 
 ---
 
@@ -69,7 +139,7 @@ dict_stats_auto_recalc_set(
 table->stats_sample_pages = table_share->stats_sample_pages;
 ```
 
-★ 这正好是 [`dd.md`](dd.md#22--options-vs-se_private_data) 里 `options` vs `se_private_data` 分类的一个实例：**统计开关是"引擎理解但由 server 定义"的属性 → 进 `options`**（不是 `se_private_data`，因为它由 SQL 层 `CREATE TABLE` 语法直接指定）。
+★ 这正好是 [`dd.md`](dd.md#23--options-vs-se_private_data) 里 `options` vs `se_private_data` 分类的一个实例：**统计开关是"引擎理解但由 server 定义"的属性 → 进 `options`**（不是 `se_private_data`，因为它由 SQL 层 `CREATE TABLE` 语法直接指定）。
 
 三态语义（`HA_STATS_AUTO_RECALC_ON/OFF/DEFAULT`）：`DEFAULT` 表示跟随全局变量 `innodb_stats_auto_recalc`。
 
@@ -106,6 +176,60 @@ if (table->ibd_file_missing) {
 | `DICT_STATS_RECALC_TRANSIENT` | 开表时的瞬态统计 | `break`（走后面的瞬态逻辑） |
 | `DICT_STATS_EMPTY_TABLE` | 空表 | 置空；若开了持久统计也存盘 |
 | `DICT_STATS_FETCH_ONLY_IF_NOT_IN_MEMORY` | 开表 | **只从持久存储读**，不重算 |
+
+枚举定义的原文（`storage/innobase/include/dict0stats.h`）：
+
+```cpp
+enum dict_stats_upd_option_t {
+  DICT_STATS_RECALC_PERSISTENT, /* (re) calculate the
+                           statistics using a precise and slow
+                           algo and save them to the persistent
+                           storage, if the persistent storage is
+                           not present then emit a warning and
+                           fall back to transient stats */
+  DICT_STATS_RECALC_TRANSIENT,  /* (re) calculate the statistics
+                            using an imprecise quick algo
+                            without saving the results
+                            persistently */
+  DICT_STATS_EMPTY_TABLE,       /* Write all zeros (or 1 where it makes sense)
+                                into a table and its indexes' statistics
+                                members. The resulting stats correspond to an
+                                empty table. If the table is using persistent
+                                statistics, then they are saved on disk. */
+  DICT_STATS_FETCH_ONLY_IF_NOT_IN_MEMORY /* fetch the stats
+                          from the persistent storage if the in-memory
+                          structures have not been initialized yet,
+                          otherwise do nothing */
+};
+```
+
+> ⚠️ **第 4 个成员是 `DICT_STATS_EMPTY_TABLE`，不是 `NO_RECALC`**（后者是旧资料里的名字）。"不重算"这一语义由 `FETCH_ONLY_IF_NOT_IN_MEMORY` 里的 `if (table->stat_initialized) return DB_SUCCESS;` 短路表达，不是一个独立枚举值。
+
+各分支的真实调用点（grep 实证）：
+
+| 模式 | 调用点 |
+|---|---|
+| `RECALC_PERSISTENT` | `dict0stats_bg.cc:320`（后台线程）、`ha_innodb.cc:15250`（ANALYZE）、`handler0alter.cc:7386` |
+| `RECALC_TRANSIENT` | `row0mysql.cc:1160` |
+| `EMPTY_TABLE` | `ha_innodb.cc:9980`、`:14001` |
+| `FETCH_ONLY_IF_NOT_IN_MEMORY` | `dict0stats.ic:155`（`dict_stats_init()`，开表） |
+
+开表入口只有 6 行，判据就是"表的持久统计开关"：
+
+```cpp
+/* storage/innobase/include/dict0stats.ic —— dict_stats_init() */
+static inline void dict_stats_init(dict_table_t *table) {
+  if (table->stat_initialized) return;
+
+  dict_stats_upd_option_t opt;
+  if (dict_stats_is_persistent_enabled(table)) {
+    opt = DICT_STATS_FETCH_ONLY_IF_NOT_IN_MEMORY;   // ★ 持久：从盘上读
+  } else {
+    opt = DICT_STATS_RECALC_TRANSIENT;              // ★ 瞬态：就地采一遍
+  }
+  dict_stats_update(table, opt);
+}
+```
 
 #### `RECALC_PERSISTENT`（真采一遍）
 
@@ -210,6 +334,137 @@ while (n_sample_pages > 0 && !dict_stats_analyze_index_low(n_sample_pages, index
 | `stat_n_diff_key_parts[]` | 各前缀长度的**不同值个数**（`n_diff`） |
 | `stat_index_size` / `stat_n_leaf_pages` | 索引大小与叶子页数 |
 
+**表级三个量是从聚簇索引"搬"过来的**（`dict_stats_update_persistent()`）——这是理解 n_rows 为什么不精确的关键：
+
+```cpp
+/* storage/innobase/dict/dict0stats.cc —— dict_stats_update_persistent() */
+  dict_stats_analyze_index(index);                    // ① 先分析聚簇索引
+
+  ulint n_unique = dict_index_get_n_unique(index);
+
+  table->stat_n_rows = index->stat_n_diff_key_vals[n_unique - 1];   // ★★ 行数 = 主键去重后的不同值数
+  table->stat_clustered_index_size = index->stat_index_size;
+
+  table->stat_sum_of_other_index_sizes = 0;
+  for (index = index->next(); index != nullptr; index = index->next()) {
+    if (index->type & DICT_FTS || dict_index_is_spatial(index)) continue;
+    dict_stats_empty_index(index);
+    if (dict_stats_should_ignore_index(index)) continue;
+    if (!(table->stats_bg_flag & BG_STAT_SHOULD_QUIT)) {
+      dict_stats_analyze_index(index);
+    }
+    table->stat_sum_of_other_index_sizes += index->stat_index_size;
+  }
+
+  table->stats_last_recalc = std::chrono::steady_clock::now();
+  table->stat_modified_counter = 0;
+  table->stat_initialized = true;
+```
+
+> ★★★ `stat_n_rows = 聚簇索引的 stat_n_diff_key_vals[n_unique - 1]`——**总行数是"主键全列前缀的不同值数"**，不是数出来的。这是 `n_rows` 只能是估算值的**根因**（采样外推 + 假定主键唯一）。
+
+`stat_index_size` 与 `stat_n_leaf_pages` 反倒是**精确值**（B+ 树尺寸直接问出来，不是采样）：
+
+```cpp
+  size = btr_get_size(index, BTR_TOTAL_SIZE, &mtr);
+  if (size != ULINT_UNDEFINED) {
+    index->stat_index_size = size;
+    size = btr_get_size(index, BTR_N_LEAF_PAGES, &mtr);
+  }
+  ...
+  index->stat_n_leaf_pages = size;
+```
+
+**由采样页外推到全表的换算公式**（`dict_stats_index_set_n_diff()`，对应文件开头 53-116 行的算法总纲）：
+
+```cpp
+    const n_diff_data_t *data = &n_diff_data[n_prefix - 1];
+
+    uint64_t n_ordinary_leaf_pages;
+    if (data->level == 1) {
+      /* If we know the number of records on level 1, then
+         this number is the same as the number of pages on level 0 (leaf). */
+      n_ordinary_leaf_pages = data->n_recs_on_level;
+    } else {
+      /* If we analyzed D ordinary leaf pages and found E
+         external pages in total linked from those D ordinary
+         leaf pages, then this means that the ratio
+         ordinary/external is D/E. Then the ratio ordinary/total
+         is D / (D + E). Knowing that the total number of pages
+         is T (including ordinary and external) then we estimate
+         that the total number of ordinary leaf pages is
+         T * D / (D + E). */
+      n_ordinary_leaf_pages =
+          index->stat_n_leaf_pages * data->n_leaf_pages_to_analyze /
+          (data->n_leaf_pages_to_analyze + data->n_external_pages_sum);
+    }
+
+    /* See REF01 for an explanation of the algorithm */
+    index->stat_n_diff_key_vals[n_prefix - 1] =
+        n_ordinary_leaf_pages
+        * data->n_diff_on_level / data->n_recs_on_level                      // R：该层不同键占比
+        * data->n_diff_all_analyzed_pages / data->n_leaf_pages_to_analyze;   // N_DIFF_AVG_LEAF：每叶页平均不同键数
+
+    index->stat_n_sample_sizes[n_prefix - 1] = data->n_leaf_pages_to_analyze;
+```
+
+即 **`n_diff = N_ordinary_leaf_pages × R × N_DIFF_AVG_LEAF`**，其中：
+
+| 符号 | 含义 |
+|---|---|
+| `N_ordinary_leaf_pages` | 去掉外部（溢出）页后的"普通"叶子页数。`level==1` 时 = `n_recs_on_level`；否则 = `stat_n_leaf_pages × D/(D+E)` |
+| `R = n_diff_on_level / n_recs_on_level` | 停止层上"不同键占记录数的比例"，**假定叶子层同比例** |
+| `N_DIFF_AVG_LEAF = n_diff_all_analyzed_pages / n_leaf_pages_to_analyze` | 采样叶页的平均不同键数 |
+
+**算法总纲**（`dict0stats.cc:53-116` 的注释，讲透了"为什么要这么算"）：
+
+```
+Let the number of different key values found in each leaf page i be Pi (i=1..A).
+Let N_DIFF_AVG_LEAF be (P1 + P2 + ... + PA) / A.
+Let the number of different key values on level LA be N_DIFF_LA.
+Let the total number of records on level LA be TOTAL_LA.
+Let R be N_DIFF_LA / TOTAL_LA, we assume this ratio is the same on the leaf level.
+Let the number of leaf pages be N.
+Then the total number of different key values on the leaf level is:
+        N * R * N_DIFF_AVG_LEAF.
+```
+
+> ★ **这个公式的两个隐含假设就是基数漂移的来源**：① 停止层与叶子层的"不同键比例 R"相同；② 采样的 A 个叶页能代表全部 N 个叶页。数据分布倾斜时两者都会失效。
+
+**采样页数的宏**（优先表级 `stats_sample_pages`，0 才回落全局）：
+
+```cpp
+/* Gets the number of leaf pages to sample in persistent stats estimation */
+#define N_SAMPLE_PAGES(index)                                    \
+  static_cast<uint64_t>((index)->table->stats_sample_pages != 0  \
+                            ? (index)->table->stats_sample_pages \
+                            : srv_stats_persistent_sample_pages)
+
+/* number of distinct records on a given level that are required to stop
+   descending to lower levels and fetch N_SAMPLE_PAGES(index) records
+   from that level */
+#define N_DIFF_REQUIRED(index) (N_SAMPLE_PAGES(index) * 10)
+```
+
+采样太多时会自动降级成**全扫叶子层**（因为全扫反而更快更准）：
+
+```cpp
+  /* If the tree has just one level (and one page) or if the user
+     has requested to sample too many pages then do full scan.
+     For each n-column prefix (for n=1..n_uniq) N_SAMPLE_PAGES(index)
+     will be sampled, so in total N_SAMPLE_PAGES(index) * n_uniq leaf
+     pages will be sampled. If that number is bigger than the total
+     number of leaf pages then do full scan of the leaf level instead
+     since it will be faster and will give better results. */
+  if (root_level == 0 || n_sample_pages * n_uniq >
+                             std::min<ulint>(index->stat_n_leaf_pages, 1e6)) {
+    (void)dict_stats_analyze_index_level(index, 0 /* leaf level */,
+                                         index->stat_n_diff_key_vals,
+                                         &total_recs, &total_pages, nullptr,
+                                         wait_start_time, &mtr);
+    ...
+```
+
 优化器通过 `handler::info()` / `records_in_range()` 读这些值，配合 `n_diff` 估算选择率。
 
 #### ★ n_diff 的估算数学：降序前缀 + 单调性剪枝（`dict0stats.cc:1796-1813`）
@@ -289,7 +544,144 @@ return DB_SUCCESS;
 | 触发 | ANALYZE / 后台重算 / 开表 | `ANALYZE TABLE ... UPDATE HISTOGRAM` |
 | 优化器用途 | 行数估算、索引选择率（`records_in_range`） | 等值/范围谓词的选择率（比 n_diff 细得多，尤其数据倾斜） |
 
-★ 协同点：`records_in_range()` 返回的行数估算优先用**直方图**（若有）精确化，否则用 n_diff 的均匀假设——n_diff 是"兜底"，直方图是"精细"。这也是为什么"统计信息不准"的经典解法之一就是建直方图（另一解法是 `ANALYZE` 提高采样页数）。
+> ⚠️ **纠错**：一种流传很广的说法是"`records_in_range()` 优先用直方图精确化"——**这不是 8.0.39 的实现**。两条路径服务的环节不同：
+>
+> - `records_in_range()` / `KEY::records_per_key()` ⇒ **只来自 dict_stats**（`stat_n_rows / stat_n_diff_key_vals[j]`），与直方图**完全无关**
+> - 直方图 ⇒ 只服务 **WHERE 条件过滤率**（`Item_func_*::get_filtering_effect()`），不参与索引访问的行数估算
+
+**路径 1：dict_stats → 优化器**（唯一出口在 `ha_innobase::info_low()`）：
+
+```cpp
+/* storage/innobase/handler/ha_innodb.cc */
+  n_rows = ib_table->stat_n_rows;
+  stat_clustered_index_size = ib_table->stat_clustered_index_size;
+  stat_sum_of_other_index_sizes = ib_table->stat_sum_of_other_index_sizes;
+  ...
+  stats.records = (ha_rows)n_rows;                    // ★ handler->stats.records ⇐ stat_n_rows
+```
+
+```cpp
+        /* innodb_rec_per_key() will use
+           index->stat_n_diff_key_vals[] and the value we
+           pass index->table->stat_n_rows. Both are
+           calculated by ANALYZE and by the background
+           stats gathering thread ... */
+        const rec_per_key_t rec_per_key =
+            innodb_rec_per_key(index, (ulint)j, index->table->stat_n_rows);
+        key->set_records_per_key(j, rec_per_key);
+```
+
+**路径 2：直方图 → 优化器**（server 侧唯一的桥接函数，只有 ~15 行）：
+
+```cpp
+/* sql/item_cmpfunc.cc —— get_histogram_selectivity() */
+static bool get_histogram_selectivity(THD *thd, const Field *field, Item **args,
+                                      size_t arg_count,
+                                      histograms::enum_operator op,
+                                      Item_func *item_func,
+                                      const TABLE_SHARE *table_share,
+                                      double *selectivity) {
+  const histograms::Histogram *histogram =
+      table_share->find_histogram(field->field_index());
+  if (histogram != nullptr) {
+    if (!histogram->get_selectivity(args, arg_count, op, selectivity)) {
+      if (unlikely(thd->opt_trace.is_started()))
+        write_histogram_to_trace(thd, item_func, *selectivity);
+      return false;                                    // ★ 拿到了 selectivity
+    }
+  }
+  return true;                                         // ★ 没有直方图
+}
+```
+
+调用点一律是"有直方图用它，没有就回退默认猜测常量"的模式：
+
+```cpp
+float Item_func_ne::get_filtering_effect(...) {
+  double selectivity;
+  if (!get_histogram_selectivity(thd, fld->field, args, arg_count,
+                                 histograms::enum_operator::NOT_EQUALS_TO, this,
+                                 fld->field->table->s, &selectivity))
+    return static_cast<float>(selectivity);            // ★ 直方图优先
+
+  return 1.0f - fld->get_cond_filter_default_probability(rows_in_table,
+                                                         COND_FILTER_EQUALITY);  // 兜底
+}
+```
+
+> ★ 直方图挂在 **`TABLE_SHARE`** 上（`table_share->find_histogram(field_index)`），这也是为什么 `ANALYZE ... UPDATE HISTOGRAM` 之后要 `tdc_remove_table()` 强制 TABLE_SHARE 失效（见 `sql/sql_admin.cc`）。
+
+**两条路径唯一的交叉点**——直方图算采样率时要用 InnoDB 给的总行数当分母：
+
+```cpp
+/* sql/histograms/histogram.cc —— update_histogram() */
+  double rows_in_memory = thd->variables.histogram_generation_max_mem_size /
+                          static_cast<double>(row_size_bytes);
+
+  table->fetch_number_of_rows();
+  ha_rows rows_in_table = std::max(1ULL, tbl->file->stats.records);  // ★ 来自 dict_stats
+
+  double sample_percentage = rows_in_memory / rows_in_table * 100.0;
+  sample_percentage = std::min(sample_percentage, 100.0);
+```
+
+**不互相写入的实证**（grep 计数）：
+
+| grep | 范围 | 命中 |
+|---|---|---|
+| `stat_n_leaf_pages` | `sql/` | **0**——server 层从不接触 InnoDB 索引级统计结构 |
+| `Histogram::get_filtering_effect` | 全树 | **0**——Histogram 上没有这个方法（真名 `get_selectivity`） |
+| InnoDB 代码引用 server 直方图 | `storage/innobase/` | 0（`row0pread-histogram.cc` 是并行扫描的工作量分布直方图，同名异物） |
+
+**一个显式的分工边界**：被**单列唯一索引**覆盖的列不建直方图——因为 `rec_per_key = 1` 已经足够精确：
+
+```cpp
+    /* Check if this field is covered by a single-part unique index. If it is, we
+       don't want to create histogram statistics for it. */
+    if (covered_by_single_part_index(thd, field)) {
+      results.emplace(column_name, Message::COVERED_BY_SINGLE_PART_UNIQUE_INDEX);
+      continue;
+    }
+```
+
+**直方图的存储格式是 JSON**（不是自定义二进制），`mysql.column_statistics` 的 `histogram` 列类型为 `JSON`：
+
+```cpp
+/* sql/dd/impl/tables/column_statistics.cc */
+  m_target_def.set_table_name("column_statistics");
+  ...
+  m_target_def.add_field(FIELD_HISTOGRAM, "FIELD_HISTOGRAM", "histogram JSON NOT NULL");
+  m_target_def.add_index(INDEX_UK_CATALOG_ID_SCHEMA_NAME_TABLE_NAME_COLUMN_NAME,
+                         "INDEX_UK_CATALOG_ID_SCHEMA_NAME_TABLE_NAME_COLUMN_NAME",
+                         "UNIQUE KEY (catalog_id, schema_name, table_name, column_name)");
+```
+
+> ⚠️ **又一处注释与代码不一致**：`sql/histograms/histogram.h` 的注释写 "stored persistently in the system table **mysql.column_stats**"，而实际表名是 **`column_statistics`**（`set_table_name("column_statistics")` + `create_name()` 的断言可证）。
+
+bucket 结构（两类直方图）：
+
+```cpp
+/* sql/histograms/singleton.h —— 一个桶 = 一个值 + 累积频率 */
+template <class T>
+struct SingletonBucket {
+  T value;
+  double cumulative_frequency;
+};
+```
+
+```cpp
+/* sql/histograms/equi_height_bucket.h —— 一个桶 = 下界 + 上界 + 累积频率 + 桶内不同值数 */
+  /// Lower inclusive value contained in this bucket.
+  const T m_lower_inclusive;
+  /// Upper inclusive value contained in this bucket.
+  const T m_upper_inclusive;
+  /// The cumulative frequency. 0.0 <= m_cumulative_frequency <= 1.0.
+  const double m_cumulative_frequency;
+  /// Number of distinct values in this bucket.
+  const ha_rows m_num_distinct;
+```
+
+★ 协同点总结：两者**服务优化器的不同环节**——dict_stats 决定"走哪个索引、索引范围扫多少行"（`records_per_key` / `records_in_range`），直方图决定"WHERE 条件过滤掉多少行"（`get_filtering_effect`）。所以"统计信息不准"的两个解法**作用面不同**：`ANALYZE` 修的是前者，建直方图修的是后者。
 
 ---
 
@@ -478,6 +870,165 @@ if (dict_stats_auto_recalc_is_enabled(table)) {
          → 清 bg_flag → 关表
 ```
 
+### ★ 线程视角：`dict_stats_thread` 的主循环与两个"上下文"
+
+上面讲的是"触发条件与算法"，这一节讲**执行体本身**（`dict0stats_bg.cc`）。
+
+```cpp
+constexpr std::chrono::seconds MIN_RECALC_INTERVAL{10};
+
+void dict_stats_thread() {
+  THD *thd = create_internal_thd();
+  while (!SHUTTING_DOWN()) {
+    /* Wake up periodically even if not signaled. This is
+    because we may lose an event - if the below call to
+    dict_stats_process_entry_from_recalc_pool() puts the entry back
+    in the list, the os_event_set() will be lost by the subsequent
+    os_event_reset(). */
+    os_event_wait_time(dict_stats_event, MIN_RECALC_INTERVAL);
+    ...
+    dict_stats_process_entry_from_recalc_pool(thd);
+    os_event_reset(dict_stats_event);
+  }
+  destroy_internal_thd(thd);
+}
+```
+
+★ **为什么必须定时醒（10 秒）而不是纯事件驱动**：源码注释给出了明确理由——表被"放回队列"时会 `os_event_set()`，而循环末尾的 `os_event_reset()` 会把这个信号吃掉，事件就丢了。所以靠 **10 秒超时兜底**。这是与 `buf_dump` / `buf_resize`（纯事件、无限期等待）的**根本差异**。
+
+| 项 | 事实 |
+|---|---|
+| 事件 | `dict_stats_event` |
+| 周期 | **10 秒**（`MIN_RECALC_INTERVAL`，同时兼任"同一张表两次重算的最小间隔"） |
+| 唤醒源 | ① `dict_stats_recalc_pool_add()`（**唯一生产点**，末尾 set event）；② 自身放回队列；③ `dict_stats_shutdown()` |
+| ★ 退出 | `os_event_set` + **`join()`**；退出阶段是 `SRV_SHUTDOWN_PRE_DD_AND_SYSTEM_TRANSACTIONS`，★ **比 `buf_dump`/`buf_resize`（`SRV_SHUTDOWN_CLEANUP`）更早**——因为它要访问 DD |
+
+**recalc pool 的结构**（★ 纠正：不是定长数组）：
+
+```cpp
+static const ulint RECALC_POOL_INITIAL_SLOTS = 128;
+typedef std::vector<table_id_t, recalc_pool_allocator_t> recalc_pool_t;
+recalc_pool->reserve(RECALC_POOL_INITIAL_SLOTS);
+```
+
+- `SIZE_OF_A_RECALC_POOL` **不存在**——128 只是 `reserve()` 的初始预留，**没有硬上限**，`push_back` 会自动扩容。
+- 只存 `table_id`（不存表对象）；**去重靠线性扫描**（O(n)），已在队列里的表不会重复加入。
+
+**入队阈值**（`row_update_statistics_if_needed()`，★ `STATS_RECALC_THRESHOLD` 这个常量名不存在）：
+
+```cpp
+  counter = table->stat_modified_counter++;
+  n_rows = dict_table_get_n_rows(table);
+  if (dict_stats_is_persistent_enabled(table)) {
+    if (counter > n_rows / 10 /* 10% */ && dict_stats_auto_recalc_is_enabled(table)) {
+      dict_stats_recalc_pool_add(table);
+      table->stat_modified_counter = 0;
+    }
+    return;
+  }
+  /* transient（非持久化）分支：6.25%，同步在用户线程里做 */
+  if (counter > 16 + n_rows / 16) {
+    dict_stats_update(table, DICT_STATS_RECALC_TRANSIENT);
+  }
+```
+
+⇒ **持久化统计**走后台线程（10%），**transient 统计**是**用户线程同步**做的（6.25%）——后者不在本章的线程里。
+
+**★ 第二重节流**：取出表后若 `now - table->stats_last_recalc < MIN_RECALC_INTERVAL`（10 秒），**放回队列且不重算**——防止热点小表被反复重算。
+
+**★ 与 DDL 的协调**：取表前先置 `table->stats_bg_flag = BG_STAT_IN_PROGRESS`（在 `dict_sys->mutex` 下），`DROP TABLE` 等 DDL 用 `dict_stats_wait_bg_to_stop_using_table()` 轮询等待，让出方式是 **`DICT_STATS_BG_YIELD`——释放 dict latch → sleep 250ms → 重新加锁**（不是忙等）。
+
+#### ★ 两个容易混淆的"上下文"：internal THD 与 background trx
+
+| | 谁创建 | 生命周期 | 用途 | 是否在 MySQL 事务视图中 |
+|---|---|---|---|---|
+| **internal THD** | `create_internal_thd()`（线程入口一次） | 整个线程 | 提供 server 层 `THD*`：`dd_table_open_on_id(table_id, thd, &mdl, ...)` 需要它拿 **MDL** 并访问 **DD** | — |
+| **background trx** | `trx_allocate_for_background()` + `trx_start_internal()` | **每条内部 SQL 一次**（`exec_sql` 传 nullptr 时现配；`dict_stats_save` 自己再配一个） | `que_eval_sql()` 执行内部 SQL 需要 trx | ★ **不可见**：`trx->sess = trx_dummy_sess` 且**不进 `trx_sys->mysql_trx_list`** |
+
+⇒ 这就是"后台统计的事务为什么在 `SHOW ENGINE INNODB STATUS` / 死锁检测里看不到"的原因——只有 `trx_allocate_for_mysql()` 才挂进那条链。
+
+**internal THD 的创建与销毁**（线程入口一次，退出时才销毁）：
+
+```cpp
+/* storage/innobase/dict/dict0stats_bg.cc —— dict_stats_thread() */
+  THD *thd = create_internal_thd();
+  ...
+  while (!srv_read_only_mode && !shutdown_started) {
+    ...
+    dict_stats_process_entry_from_recalc_pool(thd, false);
+    ...
+  }
+  ...
+  destroy_internal_thd(thd);
+```
+
+它存在的唯一理由是**开表需要 server 层上下文**——`dd_table_open_on_id(table_id, thd, &mdl, ...)` 要同时拿 MDL 和访问 DD，两者都以 `THD*` 为参数。这是"引擎线程借用 server 基础设施"的典型。
+
+**background trx 是每条内部 SQL 现配的**，与 THD 生命周期完全不同：
+
+```cpp
+/* dict_stats_save() —— 现配一个 background trx */
+  trx_t *trx = trx_allocate_for_background();
+
+  if (srv_read_only_mode) {
+    trx_start_internal_read_only(trx, UT_LOCATION_HERE);
+  } else {
+    trx_start_internal(trx, UT_LOCATION_HERE);
+  }
+  ...
+  trx_commit_for_mysql(trx);
+  trx_free_for_background(trx);
+```
+
+```cpp
+/* dict_stats_fetch_from_ps() —— 再配一个，且用脏读 */
+  trx = trx_allocate_for_background();
+
+  /* Use 'read-uncommitted' so that the SELECTs we execute
+     do not get blocked in case some user has locked the rows we
+     are SELECTing */
+  trx->isolation_level = TRX_ISO_READ_UNCOMMITTED;
+  ...
+  trx_commit_for_mysql(trx);
+  trx_free_for_background(trx);
+```
+
+> ★ 两个上下文的分工一句话：**THD 是"以 server 身份开表"的凭证（整线程一份），trx 是"执行内部 SQL"的载体（每条 SQL 一份）**。混淆它们就会误解为什么"统计事务"既需要 MDL（来自 THD）又不在事务列表里（因为 trx 是 background 的）。
+
+#### 为什么内部 SQL 要 "DELETE + INSERT" 而不是 UPDATE
+
+`dict_stats_save()` 里的 `PROCEDURE TABLE_STATS_SAVE ()` 是 **InnoDB 自带解析器**处理的（`que_eval_sql`），不走 server 的 parser/优化器。
+
+> ⚠️ **纠错**：常见解释是"内部解析器不支持 UPDATE，所以只能 DELETE+INSERT"——**这个理由是错的**。内部解析器**明确支持** `UPDATE ... SET ... WHERE ...`：
+
+```cpp
+/* storage/innobase/pars/pars0grm.y —— 内部解析器语法 */
+statement:
+        while_statement ';'
+        | for_statement ';'
+        | insert_statement ';'
+        | delete_statement_searched ';'
+        | delete_statement_positioned ';'
+        | update_statement_searched ';'      /* ★ 支持 UPDATE */
+        | update_statement_positioned ';'    /* ★ 支持 UPDATE */
+        | open_cursor_statement ';'
+        | fetch_statement ';'
+        ...
+```
+
+而且**源码里没有任何一行注释解释"为什么不用 UPDATE"**（grep `instead of` 无相关命中）。所以文档只能给**可证实的**两条理由，其余属推断：
+
+1. **幂等**：DELETE 无论行存在与否都成功，随后 INSERT 无条件写入，从而**统一"首次统计"与"更新统计"两条路径**——不需要先 SELECT 判断行是否存在。（推断，但与代码行为一致）
+2. **索引统计的 stat 集合会变**：索引变更后 `stat_name` 集合不同（`n_diff_pfx01`…`n_diff_pfxNN`），先按四元组 DELETE 才不会残留旧行。（可证实：同一模式在 `INDEX_STATS_SAVE` 里重复，`DELETE ... WHERE database_name=... AND index_name=... AND stat_name=...`）
+
+**真正写在注释里的理由是"防死锁"**（见第 ④ 点）——按 PK 顺序加锁，这才是可证实的官方说明。
+
+★ 而且它必须用**独立 trx**——`handler0alter.cc` 的注释原文：
+
+> *"Lock waits are not allowed in a data dictionary transaction. (Lock waits are possible on the statistics table, because it is directly accessible by users, not covered by the `dict_operation_lock`.)"*
+
+即 `mysql.innodb_table_stats` 用户可直接查改，可能锁等待，因此不能挂在 DD 事务里。
+
 ### 相关参数
 
 | 参数 | 默认 | 作用 |
@@ -489,7 +1040,131 @@ if (dict_stats_auto_recalc_is_enabled(table)) {
 | `innodb_stats_method` | `nulls_equal` | NULL 值在 `n_diff` 里如何计数（`nulls_equal` / `nulls_unequal` / `nulls_ignored`） |
 | `innodb_stats_include_delete_marked` | OFF | 采集时是否计入删除标记的记录（**只读备库**上可能需要开） |
 
+**全部 sysvar 的源码定义**（都在 `storage/innobase/handler/ha_innodb.cc`，以插件变量形式注册，`innodb_` 由插件前缀自动拼接）：
+
+```cpp
+static MYSQL_SYSVAR_BOOL(
+    stats_persistent, srv_stats_persistent, PLUGIN_VAR_OPCMDARG,
+    "InnoDB persistent statistics enabled for all tables unless overridden"
+    " at table level",
+    nullptr, nullptr, true);                                   // ★ 默认 ON
+
+static MYSQL_SYSVAR_BOOL(
+    stats_auto_recalc, srv_stats_auto_recalc, PLUGIN_VAR_OPCMDARG,
+    "InnoDB automatic recalculation of persistent statistics enabled for all"
+    " tables unless overridden at table level (automatic recalculation is only"
+    " done when InnoDB decides that the table has changed too much and needs a"
+    " new statistics)",
+    nullptr, nullptr, true);                                   // ★ 默认 ON
+
+static MYSQL_SYSVAR_ULONGLONG(
+    stats_persistent_sample_pages, srv_stats_persistent_sample_pages,
+    PLUGIN_VAR_RQCMDARG,
+    "The number of leaf index pages to sample when calculating persistent"
+    " statistics (by ANALYZE, default 20)",
+    nullptr, nullptr, 20, 1, ~0ULL, 0);                        // ★ 默认 20
+
+static MYSQL_SYSVAR_ULONGLONG(
+    stats_transient_sample_pages, srv_stats_transient_sample_pages,
+    PLUGIN_VAR_RQCMDARG,
+    "The number of leaf index pages to sample when calculating transient"
+    " statistics (if persistent statistics are not used, default 8)",
+    nullptr, nullptr, 8, 1, ~0ULL, 0);                         // ★ 默认 8
+
+static MYSQL_SYSVAR_BOOL(
+    stats_include_delete_marked, srv_stats_include_delete_marked,
+    PLUGIN_VAR_OPCMDARG,
+    "Include delete marked records when calculating persistent statistics",
+    nullptr, nullptr, false);                                  // ★ 默认 OFF
+
+static MYSQL_SYSVAR_ENUM(
+    stats_method, srv_innodb_stats_method, PLUGIN_VAR_RQCMDARG,
+    "Specifies how InnoDB index statistics collection code should"
+    " treat NULLs. Possible values are NULLS_EQUAL (default),"
+    " NULLS_UNEQUAL and NULLS_IGNORED",
+    nullptr, nullptr, SRV_STATS_NULLS_EQUAL, &innodb_stats_method_typelib);
+```
+
+对应的 C 变量初值（`storage/innobase/srv/srv0srv.cc`，注释即"两种统计"的官方定义）：
+
+```cpp
+/* When estimating number of different key values in an index, sample
+this many index pages, there are 2 ways to calculate statistics:
+* persistent stats that are calculated by ANALYZE TABLE and saved
+  in the innodb database.
+* quick transient stats, that are used if persistent stats for the given
+  table/index are not found in the innodb database */
+unsigned long long srv_stats_transient_sample_pages = 8;
+bool srv_stats_persistent = true;
+bool srv_stats_include_delete_marked = false;
+unsigned long long srv_stats_persistent_sample_pages = 20;
+bool srv_stats_auto_recalc = true;
+```
+
+**另外两个不在上表但相关的变量**：
+
+```cpp
+static MYSQL_SYSVAR_BOOL(
+    stats_on_metadata, innobase_stats_on_metadata, PLUGIN_VAR_OPCMDARG,
+    "Enable statistics gathering for metadata commands such as"
+    " SHOW TABLE STATUS for tables that use transient statistics (off by "
+    "default)",
+    nullptr, nullptr, false);                                  // ★ 默认 OFF
+```
+
+> ⚠️ **一处"代码 vs 变量定义"不一致**（很有迷惑性）：`ha_innodb.cc:339` 写着 `bool innobase_stats_on_metadata = true;`，但 `MYSQL_SYSVAR_BOOL` 的第 7 个实参是 `false`。**插件装载时 sysvar 默认值会覆盖 C 初值**，所以生效默认 = **OFF**。MTR 用例 `innodb_stats_on_metadata_basic.result` 实测为 `0`。判断默认值一律以 sysvar 定义为准。
+
+```cpp
+static Sys_var_ulong Sys_information_schema_stats_expiry(
+    "information_schema_stats_expiry",
+    "The number of seconds after which mysqld server will fetch "
+    "data from storage engine and replace the data in cache.",
+    SESSION_VAR(information_schema_stats_expiry), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, LONG_TIMEOUT), DEFAULT(24 * 60 * 60), BLOCK_SIZE(1));   // ★ 默认 24 小时
+```
+
+> ⚠️ **`innodb_stats_traditional` 在 8.0.39 不存在**（全仓库 grep `stats_traditional` 命中 0）——那是 MariaDB 系的变量，不要写进文档。
+
 ★ `innodb_stats_include_delete_marked` 是个容易被忽略的参数：它对应 `srv_stats_include_delete_marked`。在**只读实例**上 purge 可能滞后，开启它能让统计更接近实际——但这属于 TRX_SYS 相关的另一条线索（见 `row0mysql.cc` 对它的判定）。
+
+**"是否需要更新"的唯一判定入口**（注意函数名，旧资料常写错）：
+
+```cpp
+/* storage/innobase/row/row0mysql.cc —— row_update_statistics_if_needed() */
+  counter = table->stat_modified_counter++;
+  n_rows = dict_table_get_n_rows(table);
+
+  if (dict_stats_is_persistent_enabled(table)) {
+    if (counter > n_rows / 10 /* 10% */
+        && dict_stats_auto_recalc_is_enabled(table)) {
+      dict_stats_recalc_pool_add(table);          // ★ 只入队，重算由后台线程做
+      table->stat_modified_counter = 0;
+    }
+    return;
+  }
+
+  /* Calculate new statistics if 1 / 16 of table has been modified
+     since the last time a statistics batch was run.
+     We calculate statistics at most every 16th round, since we may have
+     a counter table which is very small and updated very often. */
+  if (counter > 16 + n_rows / 16 /* 6.25% */) {
+    dict_stats_update(table, DICT_STATS_RECALC_TRANSIENT);   // ★ 就地同步重算
+  }
+```
+
+> ★ 两个阈值不同：**persistent 是 10%，transient 是 `16 + n_rows/16`（≈6.25%）**。而且 persistent 只"入队"，transient 才"就地算"。
+
+计数器的语义（`dict0mem.h`，注释明说不受 latch 保护）：
+
+```cpp
+  /** How many rows are modified since last stats recalc. When a row is
+     inserted, updated, or deleted, we add 1 to this number; we calculate
+     new estimates for the table and the indexes if the table has changed
+     too much, see row_update_statistics_if_needed(). The counter is reset
+     to zero at statistics calculation. This counter is not protected by
+     any latch, because this is only used for heuristics. */
+  uint64_t stat_modified_counter;
+```
 
 ---
 
@@ -582,6 +1257,33 @@ ANALYZE TABLE t
 | "统计信息存在 DD 表里就归 DD 管" | 采集/更新全在 InnoDB（`dict0stats*.cc`），DD 只提供存储位置 |
 | "内部表（SYS_TABLES）也有持久统计" | 无——`ut_a(strchr(name, '/'))` 断言排除了它们 |
 | "`ANALYZE` 会锁表" | 采样时持索引锁、可能重试，但不锁全表；`innodb_stats_auto_recalc` 的后台重算同理 |
+
+### ★★★ 真名勘误
+
+以下均为"常见说法 / 旧资料说法"与 8.0.39 实际的差异，逐条经 grep 核实：
+
+| 常见说法 | 8.0.39 实际 |
+|---|---|
+| `dict_stats_update_if_needed()` | **不存在**（全树命中 0，只在注释里被提到）。真实入口是 `row_update_statistics_if_needed()`（`row0mysql.cc`） |
+| `dict_stats_get_table_stats()` | **不存在**。取行数用 `dict_table_get_n_rows()`（`dict0dict.ic`） |
+| `dict_stats_drop` | **不存在**。是 `dict_stats_drop_index()` 与 `dict_stats_drop_table()` |
+| `dict_stats_init_on_load` | **不存在**。开表入口是 `dict_stats_init()`（`dict0stats.ic`） |
+| 枚举第四项是 `NO_RECALC` | 是 **`DICT_STATS_EMPTY_TABLE`**。"不重算"由 `stat_initialized` 短路表达，不是枚举值 |
+| `innodb_stats_traditional` | **8.0.39 不存在**（grep 0 命中）——那是 MariaDB 系变量 |
+| `innodb_stats_on_metadata` 已删除 | **仍存在**，默认 **OFF**。注意 `ha_innodb.cc:339` 的 C 初值是 `true`，但 sysvar 定义的默认值 `false` 会在插件装载时覆盖它 |
+| `Histogram::get_filtering_effect()` / `estimate_selectivity()` | **Histogram 上没有这两个方法**。真名 `Histogram::get_selectivity()`；server 侧桥接是文件静态 `get_histogram_selectivity()` |
+| `enum class HistogramType` | 是嵌套的 `Histogram::enum_histogram_type`，取值 `EQUI_HEIGHT` / `SINGLETON` |
+| `m_histogram_type` / `m_data` | 真名 `m_hist_type` / `m_data_type` |
+| `dd::Table_statistics` 是 DD 持久化对象 | 真实 DD 类叫 **`dd::Table_stat`**；`dd::info_schema::Table_statistics` 是**另一回事**——I_S 查询用的单表内存缓存类（成员只有 `ha_statistics m_stats`） |
+| 直方图存在 `mysql.column_stats` | 实际表名 **`mysql.column_statistics`**（`histogram.h` 的注释写错了） |
+| `N_SAMPLE_PAGES` 是常量 | 是**宏**，优先取表级 `stats_sample_pages`，为 0 才回落全局 |
+| `dict_stats_analyze_index_low(N)` 传值 | 第二参是 `uint64_t &n_sample_pages`（**引用**），被 abort 时就地减半 |
+| 重算阈值统一是 10% | **persistent 是 10%**（`counter > n_rows/10`），**transient 是 `16 + n_rows/16`**（≈6.25%） |
+
+### ★★ 机制纠错（两条，均已在上文就近更正）
+
+1. **"`records_in_range()` 优先用直方图精确化"是错的**——二者服务优化器的不同环节：`records_in_range` / `KEY::records_per_key` 只来自 dict_stats；直方图只服务 `Item_func_*::get_filtering_effect()`（WHERE 条件过滤率）。两者唯一交叉是 `update_histogram()` 用 `tbl->file->stats.records` 当采样率分母。
+2. **"内部解析器不支持 UPDATE 所以只能 DELETE+INSERT"是错的**——`pars0grm.y` 明确有 `update_statement_searched`。且源码**没有任何注释**解释该选择；可证实的只有"按 PK 顺序加锁防死锁"那一条。
 
 ### 待补清单
 

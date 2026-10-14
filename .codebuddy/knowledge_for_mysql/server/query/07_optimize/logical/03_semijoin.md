@@ -187,6 +187,178 @@ if (sj_nest->is_aj_nest()) {
 
 > 完整 16 条判定见 `resolve_subquery` 内注释（`sql_resolver.cc:1489-1567`）。不满足的走 `select_transformer`（IN2EXISTS / 物化 / MIN-MAX，见 02 篇）。
 
+**源码：候选登记的那一段**（`sql/sql_resolver.cc:1527`）：
+
+```cpp
+// sql/sql_resolver.cc:1532 —— 唯一的"能否转 semijoin"判定点（没有 is_convertible_to_semijoin() 这个函数）
+  DBUG_PRINT("info", ("Checking if subq can be converted to semi-join"));
+  const bool no_aggregates = !is_grouped() && !with_sum_func &&
+                             having_cond() == nullptr && !has_windows();
+                             // ★ 3/3x/4/5 一次性打包：无 GROUP BY、无聚合、无 HAVING、无窗口函数
+
+  /*
+    Check if we're in subquery that is a candidate for flattening into a
+    semi-join (which is done in flatten_subqueries()). The requirements are:
+      0. Semi-join is enabled (cf. hints)
+      1. Subquery predicate is an IN/=ANY or EXISTS predicate
+      2. Subquery is a simple query block (not a set operation or a
+         parenthesized query expression).
+      3. Subquery is not grouped (explicitly or implicitly)
+         3x: outer aggregated expression are not accepted
+      4. Subquery does not use HAVING
+      5. Subquery does not use windowing functions
+      6. Subquery predicate is (a) in an ON/WHERE clause,
+         and (b) at the AND-top-level of that clause. Note for 6a:
+         Semijoin transformations of subqueries in ON cause the
+         join nests to no longer be acceptable as a join tree, which
+         disturbs the hypergraph optimizer, so we disable them
+         for that case (6x). ...
+      7. Parent query block accepts semijoins (i.e we are not in a subquery of
+      a single table UPDATE/DELETE ...)
+      8. We're not in a confluent table-less subquery, like "SELECT 1".
+      9. No execution method was already chosen (by a prepared statement)
+      10. Parent query block is not a confluent table-less query block.
+      11. Neither parent nor child query block has straight join.
+      12. Parent query block does not prohibit semi-join.
+      13. LHS of IN predicate is deterministic
+      14. The surrounding truth test, and the nullability of expressions,
+      are compatible with the conversion.
+      15. Antijoins are supported, or it's not an antijoin (it's a semijoin).
+      16. OFFSET starts from the first row and LIMIT is not 0.
+  */
+  SecondaryEngineFlags engine_flags = 0;
+  if (const handlerton *secondary_engine = SecondaryEngineHandlerton(thd);
+      secondary_engine != nullptr) {
+    engine_flags = secondary_engine->secondary_engine_flags;
+  }
+  if (semijoin_enabled(thd) &&                                     // 0
+      predicate != nullptr &&                                      // 1
+      is_simple_query_block() &&                                   // 2
+      no_aggregates &&                                             // 3,3x,4,5
+      (outer->resolve_place == Query_block::RESOLVE_CONDITION ||   // 6a
+       (outer->resolve_place == Query_block::RESOLVE_JOIN_NEST &&  // 6a
+        (!thd->lex->using_hypergraph_optimizer() ||                // 6x
+         (thd->secondary_engine_optimization() ==
+              Secondary_engine_optimization::SECONDARY &&
+          !Overlaps(engine_flags,
+              MakeSecondaryEngineFlags(
+                  SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN)))))) &&
+      outer->condition_context == enum_condition_context::ANDS &&  // 6b
+      outer->sj_candidates &&                                      // 7
+      leaf_table_count > 0 &&                                      // 8
+      predicate->strategy == Subquery_strategy::UNSPECIFIED &&     // 9
+      outer->leaf_table_count > 0 &&                               // 10
+      !((active_options() | outer->active_options()) &             // 11
+        SELECT_STRAIGHT_JOIN) &&                                   // 11
+      !(outer->active_options() & SELECT_NO_SEMI_JOIN) &&          // 12
+      deterministic &&                                             // 13
+      predicate->choose_semijoin_or_antijoin() &&                  // 14
+      (!cannot_do_antijoin || !predicate->can_do_aj) &&            // 15
+      is_row_count_valid_for_semi_join()) {                        // 16
+    DBUG_PRINT("info", ("Subquery is semi-join conversion candidate"));
+
+    /* Notify in the subquery predicate where it belongs in the query graph */
+    predicate->embedding_join_nest = outer->resolve_nest;
+
+    /* Register the subquery for further processing in flatten_subqueries() */
+    predicate->strategy = Subquery_strategy::CANDIDATE_FOR_SEMIJOIN;
+    outer->sj_candidates->push_back(predicate);
+    // ★ 这里只是"登记"，真正的转换发生在 flatten_subqueries()
+    choice_made = true;
+  }
+  ...（subquery_to_derived 分支）
+
+  if (!choice_made) {
+    return subq_predicate->select_transformer(thd, this);
+    // ★ 失败回退：IN→EXISTS / 物化 / MIN-MAX
+  }
+  return false;
+```
+
+**`predicate` 的取值是"能不能进 semijoin"的第一道闸**（`:1425`）：
+
+```cpp
+  // Predicate for possible semi-join candidates (IN and EXISTS)
+  Item_exists_subselect *const predicate =
+      subq_predicate->substype() == Item_subselect::EXISTS_SUBS ||
+              subq_predicate->substype() == Item_subselect::IN_SUBS
+          ? down_cast<Item_exists_subselect *>(subq_predicate)
+          : nullptr;
+  // ★ 标量子查询(SINGLEROW_SUBS) / ALL_SUBS / ANY_SUBS ⇒ predicate == nullptr ⇒ 永不进 semijoin
+```
+
+⇒ **勘误（常见误解）**：文档里常说的"`convert_subquery_to_semijoin` 处理四种 Item（`singlerow`/`exists`/`in`/`allany`）"**不成立**。真相是：`= ANY` 在**解析期**就被 `all_any_subquery_creator()`（`sql/sql_parse.cc:6703`）改写成 `Item_in_subselect`，`<> ALL` 被改写成 `NOT IN`（`truth_transformer(BOOL_NEGATED)`）；剩下的 `ALL/ANY` 变体 `substype()` 是 `ALL_SUBS`/`ANY_SUBS`，在第一道闸就被拒。所以 `convert_subquery_to_semijoin()` 的 `assert` 里只有 `IN_SUBS || EXISTS_SUBS` 两类。
+
+```cpp
+// sql/sql_parse.cc:6703 —— = ANY / <> ALL 在解析期就被改写
+  if ((cmp == &comp_eq_creator) && !all)  //  = ANY <=> IN
+    return new Item_in_subselect(left_expr, query_block);
+
+  if ((cmp == &comp_ne_creator) && all)   // <> ALL <=> NOT IN
+  {
+    Item *i = new Item_in_subselect(left_expr, query_block);
+    if (i == nullptr) return nullptr;
+    Item *neg_i = i->truth_transformer(nullptr, Item::BOOL_NEGATED);
+    if (neg_i != nullptr) return neg_i;
+    return new Item_func_not(i);
+  }
+```
+
+**16 条拒绝条件逐条对照**（含上面没展开的两条）：
+
+| 编号 | 条件 | 含义 |
+|---|---|---|
+| 0 | `semijoin_enabled(thd)` | `optimizer_switch=semijoin=off` 或 `SEMIJOIN()` hint 关闭 |
+| 1 | `predicate != nullptr` | 只接受 `IN_SUBS` / `EXISTS_SUBS` |
+| 2 | `is_simple_query_block()` | **含 UNION / 括号包裹的 query expression 直接拒** |
+| 3,3x,4,5 | `no_aggregates` | GROUP BY / 聚合函数 / HAVING / 窗口函数 |
+| 6a | `resolve_place` | 必须在 WHERE 或 ON（不能在 SELECT list / ORDER BY） |
+| **6x** | hypergraph 判定 | **坑**：hypergraph 优化器下 **ON 子句中的 semijoin 被禁**（会破坏 join tree），除非 secondary engine |
+| 6b | `condition_context == ANDS` | 必须是 AND 顶层；`OR` / `NOT` 包裹下拒绝 |
+| 7 | `outer->sj_candidates` | 单表 UPDATE/DELETE 的子查询没有 sj_candidates |
+| 8 | `leaf_table_count > 0` | "SELECT 1" 这类无表子查询 |
+| 9 | `strategy == UNSPECIFIED` | PS 二次执行已选定执行方式 |
+| 10 | `outer->leaf_table_count > 0` | 父查询无表 |
+| 11 | `!(... & SELECT_STRAIGHT_JOIN)` | **子或父任一有 STRAIGHT_JOIN 即拒** |
+| 12 | `!(outer->... & SELECT_NO_SEMI_JOIN)` | `NO_SEMIJOIN` hint |
+| 13 | `deterministic` | IN 左侧含 `RAND()` 等非确定性 |
+| 14 | `choose_semijoin_or_antijoin()` | 真值测试与 NULL-able 兼容性（决定 semijoin 还是 antijoin） |
+| 15 | `!cannot_do_antijoin \|\| !can_do_aj` | secondary engine 不支持 antijoin；或非相关 `NOT EXISTS` 走"优化期常量求值"更划算 |
+| 16 | `is_row_count_valid_for_semi_join()` | 见下 |
+
+**第 16 条：LIMIT / OFFSET 判定**（`sql/sql_resolver.cc:1336`）：
+
+```cpp
+bool Query_block::is_row_count_valid_for_semi_join() {
+  if (offset_limit != nullptr &&
+      (!offset_limit->const_item() || offset_limit->val_int() != 0))
+    return false;   // ★ OFFSET 非 0（或非 const）→ 拒绝：semijoin 会丢行/多行
+
+  if (select_limit != nullptr &&
+      (!select_limit->const_item() || select_limit->val_int() == 0))
+    return false;   // ★ LIMIT 0 → 子查询恒空，转了没意义
+
+  return true;
+}
+```
+
+**策略枚举**（`sql/item_subselect.h:398`）——`CANDIDATE_FOR_SEMIJOIN → SEMIJOIN` 的迁移就发生在下一节：
+
+```cpp
+enum class Subquery_strategy : int {
+  UNSPECIFIED,
+  SUBQ_EXISTS,
+  SUBQ_MATERIALIZATION,
+  CANDIDATE_FOR_IN2EXISTS_OR_MAT,
+  /// Candidate for semi-join flattening
+  CANDIDATE_FOR_SEMIJOIN,
+  SEMIJOIN,
+  CANDIDATE_FOR_DERIVED_TABLE,
+  DERIVED_TABLE,
+  DELETED
+};
+```
+
 ### 3.2 flatten_subqueries：bottom-up + 优先级
 
 `sql/sql_resolver.cc:3811`。**自底向上**拍平（内层子查询先拍平，外层拍平时可能把内层一起合并）。
@@ -198,6 +370,226 @@ sj_convert_priority = ((dependent * MAX_TABLES_FOR_SIZE) + leaf_table_count) * 6
 ```
 
 从高到低三层：**相关子查询 > 内层表多 > 出现早**。因为表数上限 `MAX_TABLES`，重要的先拍平。
+
+**完整函数**（`sql/sql_resolver.cc:3811`）：
+
+```cpp
+bool Query_block::flatten_subqueries(THD *thd) {
+  DBUG_TRACE;
+  assert(has_sj_candidates());
+
+  Item_exists_subselect **subq, **subq_begin = sj_candidates->begin(),
+                                **subq_end = sj_candidates->end();
+  Opt_trace_context *const trace = &thd->opt_trace;
+
+  /*
+    Semijoin flattening is bottom-up. Indeed, we have this execution flow,
+    note: for SELECT#1 WHERE X IN (SELECT #2 WHERE Y IN (SELECT#3)) :
+
+    Query_block::prepare() (select#1)
+       -> fix_fields() on IN condition
+           -> Query_block::prepare() on subquery (select#2)
+               -> fix_fields() on IN condition
+                    -> Query_block::prepare() on subquery (select#3)
+                    -> flatten_subqueries: merge #3 in #2
+               <- Query_block::prepare()
+       <- fix_fields()
+       -> flatten_subqueries: merge #2 in #1
+
+    Note that flattening of #(N) is done by its parent JOIN#(N-1), because
+    there are cases where flattening is not possible and only the parent can
+    know.
+   */
+  uint subq_no;
+  for (subq = subq_begin, subq_no = 0; subq < subq_end; subq++, subq_no++) {
+    auto subq_item = *subq;
+    /*
+      Some subqueries may have been deleted, remove them fully before sorting
+      sj_candidates and subsequent processing:
+    */
+    if (subq_item->strategy == Subquery_strategy::DELETED) {
+      sj_candidates->erase_value(subq_item);
+      subq--;  // So that the next iteration will handle the next subquery.
+      subq_end = sj_candidates->end();  // array's end moved.
+      continue;
+    }
+    // Transformation of IN and EXISTS subqueries is supported
+    assert(subq_item->substype() == Item_subselect::IN_SUBS ||
+           subq_item->substype() == Item_subselect::EXISTS_SUBS);
+
+    Query_block *child_query_block = subq_item->unit->first_query_block();
+
+    // Check that we proceeded bottom-up
+    assert(child_query_block->sj_candidates == nullptr);
+
+    bool dependent = subq_item->unit->uncacheable & UNCACHEABLE_DEPENDENT;
+    subq_item->sj_convert_priority =
+        (((dependent * MAX_TABLES_FOR_SIZE) +  // dependent subqueries first
+          child_query_block->leaf_table_count) *
+         65536) +           // then with many tables
+        (65536 - subq_no);  // then based on position
+                            // ★ 优先级编码：高 16 位 = 相关*MAX_TABLES + 表数；低 16 位 = 65536-序号
+    /* ... */
+  }
+
+  /*
+    Pick which subqueries to convert:
+      sort the subquery array
+      - prefer correlated subqueries over uncorrelated;
+      - prefer subqueries that have greater number of outer tables;
+  */
+  std::sort(subq_begin, subq_begin + sj_candidates->size(),
+            [](Item_exists_subselect *el1, Item_exists_subselect *el2) {
+              return el1->sj_convert_priority > el2->sj_convert_priority;
+            });
+                            // ★ 降序 ⇒ 相关 > 表多 > 早出现
+
+  // A permanent transformation is going to start, so:
+  Prepared_stmt_arena_holder ps_arena_holder(thd);
+
+  // Transform certain subquery predicates to derived tables
+  for (subq = subq_begin; subq < subq_end; subq++) {
+    auto subq_item = *subq;
+    if (subq_item->strategy != Subquery_strategy::CANDIDATE_FOR_DERIVED_TABLE)
+      continue;
+    OPT_TRACE_TRANSFORM(trace, oto0, oto1,
+                        subq_item->unit->first_query_block()->select_number,
+                        "IN (SELECT)", "joined derived table");
+    oto1.add("chosen", true);
+    if (transform_table_subquery_to_join_with_derived(thd, subq_item))
+      return true;
+  }
+
+  /*
+    Replace all subqueries to be flattened with a truth predicate.
+    Generally, this predicate is TRUE, but if the subquery has a WHERE condition
+    that is always false, replace with a FALSE predicate. In the latter case,
+    also avoid converting the subquery to a semi-join.
+  */
+  uint table_count = leaf_table_count;
+  for (subq = subq_begin; subq < subq_end; subq++) {
+    auto subq_item = *subq;
+    if (subq_item->strategy != Subquery_strategy::CANDIDATE_FOR_SEMIJOIN)
+      continue;
+
+    // Add the tables in the subquery nest plus one in case of materialization:
+    const uint tables_added =
+        subq_item->unit->first_query_block()->leaf_table_count + 1;
+                            // ★ +1：为 semijoin materialization 预留一个临时表槽位
+
+    // (1) Not too many tables in total.
+    // (2) This subquery contains no antijoin nest (anti/semijoin nest cannot
+    // include antijoin nest for implementation reasons, see advance_sj_state()).
+    if (table_count + tables_added <= MAX_TABLES &&           // (1)
+        !subq_item->unit->first_query_block()->has_aj_nests)  // (2)
+      subq_item->strategy = Subquery_strategy::SEMIJOIN;
+                            // ★★ 真正的"能否转"二次判定：表数超限 / 子块内嵌 antijoin → 放弃
+
+    Item *subq_where = subq_item->unit->first_query_block()->where_cond();
+    /*
+      A predicate can be evaluated to ALWAYS TRUE or ALWAYS FALSE when it
+      has only const items. If found to be ALWAYS FALSE, do not include
+      the subquery in transformations.
+    */
+    bool cond_value = true;
+    if (subq_where && subq_where->const_item() &&
+        !subq_where->walk(&Item::is_non_const_over_literals, enum_walk::POSTFIX,
+                          nullptr) &&
+        simplify_const_condition(thd, &subq_where, false, &cond_value))
+      return true;
+
+    if (!cond_value) {
+      // Unlink and delete this subquery's query expression
+      Item::Cleanup_after_removal_context ctx(this);
+      subq_item->walk(&Item::clean_up_after_removal, walk_options,
+                      pointer_cast<uchar *>(&ctx));
+    }
+
+    if (subq_item->strategy == Subquery_strategy::SEMIJOIN)
+      table_count += tables_added;
+
+    if (subq_item->strategy != Subquery_strategy::SEMIJOIN &&
+        subq_item->strategy != Subquery_strategy::DELETED) {
+      subq_item->strategy = Subquery_strategy::UNSPECIFIED;
+      continue;   // ★ 回退：留给后面 select_transformer() 做 IN→EXISTS
+    }
+    /*
+      In WHERE/ON of parent query, replace IN (subq) with truth value:
+      - When subquery is converted to anti/semi-join: truth value true.
+      - When subquery WHERE cond is false: IN returns FALSE, so truth value
+      false if a semijoin (IN) and truth value true if an antijoin (NOT IN).
+    */
+    Item *truth_item =
+        (cond_value || subq_item->can_do_aj)
+            ? implicit_cast<Item *>(new (thd->mem_root) Item_func_true())
+            : implicit_cast<Item *>(new (thd->mem_root) Item_func_false());
+    if (truth_item == nullptr) return true;
+    Item **tree = (subq_item->embedding_join_nest == nullptr)
+                      ? &m_where_cond
+                      : subq_item->embedding_join_nest->join_cond_ref();
+    if (replace_subcondition(thd, tree, subq_item, truth_item, false))
+      return true;
+  }
+
+  /* Transform the selected subqueries into semi-join */
+  for (subq = subq_begin; subq < subq_end; subq++) {
+    auto subq_item = *subq;
+    if (subq_item->strategy != Subquery_strategy::SEMIJOIN) continue;
+    OPT_TRACE_TRANSFORM(
+        trace, oto0, oto1, subq_item->unit->first_query_block()->select_number,
+        "IN (SELECT)", subq_item->can_do_aj ? "antijoin" : "semijoin");
+    oto1.add("chosen", true);
+    if (convert_subquery_to_semijoin(thd, *subq)) return true;
+  }
+
+  /*
+    Finalize the subqueries that we did not convert,
+    ie. perform IN->EXISTS rewrite.
+  */
+  for (subq = subq_begin; subq < subq_end; subq++) {
+    auto subq_item = *subq;
+    if (subq_item->strategy != Subquery_strategy::UNSPECIFIED) continue;
+    subq_item->changed = false;
+    subq_item->fixed = false;
+
+    Query_block *save_query_block = thd->lex->current_query_block();
+    thd->lex->set_current_query_block(subq_item->unit->first_query_block());
+
+    // This is the only part of the function which uses a JOIN.
+    if (subq_item->select_transformer(thd,
+                                      subq_item->unit->first_query_block()))
+      return true;
+
+    thd->lex->set_current_query_block(save_query_block);
+
+    subq_item->changed = true;
+    subq_item->fixed = true;
+
+    /*
+      If the Item has been substituted with another Item (e.g an
+      Item_in_optimizer), resolve it and add it to proper WHERE or ON clause.
+      ...
+    */
+    Item *substitute = subq_item->substitution;
+    if (substitute == nullptr) continue;
+    const bool do_fix_fields = !substitute->fixed;
+    const bool subquery_in_join_clause =
+        subq_item->embedding_join_nest != nullptr;
+
+    Item **tree = subquery_in_join_clause
+                      ? (subq_item->embedding_join_nest->join_cond_ref())
+                      : &m_where_cond;
+    if (replace_subcondition(thd, tree, *subq, substitute, do_fix_fields))
+      return true;
+    subq_item->substitution = nullptr;
+  }
+
+  sj_candidates->clear();
+  return false;
+}
+```
+
+⇒ **坑**：`table_count + tables_added <= MAX_TABLES` 是**按优先级贪心**的——排序靠后的子查询会被**静默降级**成 IN→EXISTS，EXPLAIN 里表现为 `SUBQUERY`/`DEPENDENT SUBQUERY` 而非 semijoin。这也是"同一 SQL 多加几个表就突然变慢"的常见原因之一。
 
 ### 3.3 convert_subquery_to_semijoin：四种模式 + 完整流程（逐行剖析）
 
@@ -273,6 +665,310 @@ LEFT JOIN 内层最麻烦（`:3046-3113`）：直接插表会破坏 outer join �
 
 **⑩ anti-join 收尾**：`set_join_cond(sj_cond)` 把 semi-join 条件挂成 LEFT JOIN 的 ON，配合优化阶段的 `x IS NULL` 完成 `NOT IN/NOT EXISTS` 语义。
 
+**完整源码**（`sql/sql_resolver.cc:2992-3447`，按执行顺序贴出关键段）：
+
+```cpp
+bool Query_block::convert_subquery_to_semijoin(
+    THD *thd, Item_exists_subselect *subq_pred) {
+  Table_ref *emb_tbl_nest = nullptr;
+  mem_root_deque<Table_ref *> *emb_join_list = &m_table_nest;
+  DBUG_TRACE;
+
+  assert(subq_pred->substype() == Item_subselect::IN_SUBS ||
+         subq_pred->substype() == Item_subselect::EXISTS_SUBS);
+  // ★ 只有两类，没有 singlerow / allany 分支
+
+  bool outer_join = false;  // True if predicate is inner to an outer join
+
+  // Save the set of tables in the outer query block:
+  table_map outer_tables_map = all_tables_map();   // ①
+  const bool do_aj = subq_pred->can_do_aj;         // ② anti-join？
+
+  /*
+    Find out where to insert the semi-join nest and the generated condition.
+    For t1 LEFT JOIN t2, embedding_join_nest will be t2.
+  */
+  if (subq_pred->embedding_join_nest != nullptr) {              // ③
+    outer_join = subq_pred->embedding_join_nest->is_inner_table_of_outer_join();
+
+    if (subq_pred->embedding_join_nest->nested_join) {
+      /* (a) ... [LEFT] JOIN ( ... ) ON (subquery AND condition) ... */
+      emb_tbl_nest = subq_pred->embedding_join_nest;
+      emb_join_list = &emb_tbl_nest->nested_join->m_tables;
+    } else if (!subq_pred->embedding_join_nest->outer_join) {
+      /* (b) ... INNER JOIN tblX ON (subquery AND condition) ...
+         The sj-nest will be tblX's "sibling" ... */
+      emb_tbl_nest = subq_pred->embedding_join_nest->embedding;
+      if (emb_tbl_nest) emb_join_list = &emb_tbl_nest->nested_join->m_tables;
+    } else {
+      /* (c) ... LEFT JOIN tbl ON (on_expr AND subq_pred) ...
+         tbl will be replaced with ( tbl SJ (subq_tables) ) */
+      Table_ref *outer_tbl = subq_pred->embedding_join_nest;
+      Table_ref *const wrap_nest = Table_ref::new_nested_join(
+          thd->mem_root, "(sj-wrap)", outer_tbl->embedding,
+          outer_tbl->join_list, this);
+      if (wrap_nest == nullptr) return true;
+
+      wrap_nest->nested_join->m_tables.push_back(outer_tbl);
+      outer_tbl->embedding = wrap_nest;
+      outer_tbl->join_list = &wrap_nest->nested_join->m_tables;
+
+      /*
+        wrap_nest will take place of outer_tbl, so move the outer join flag
+        and join condition.
+      */
+      wrap_nest->outer_join = outer_tbl->outer_join;
+      outer_tbl->outer_join = false;
+      wrap_nest->set_join_cond(outer_tbl->join_cond());
+      outer_tbl->set_join_cond(nullptr);
+
+      for (auto li = wrap_nest->join_list->begin();
+           li != wrap_nest->join_list->end(); ++li) {
+        if (*li == outer_tbl) { *li = wrap_nest; break; }
+      }
+
+      /*
+        outer_tbl is replaced by wrap_nest. Any subquery which was attached to
+        outer_tbl must be attached to embedding_join_nest instead.
+      */
+      for (Item_exists_subselect *subquery : (*sj_candidates)) {
+        if (subquery->embedding_join_nest == outer_tbl)
+          subquery->embedding_join_nest = wrap_nest;
+      }
+
+      emb_join_list = &wrap_nest->nested_join->m_tables;
+      emb_tbl_nest = wrap_nest;
+    }
+  }
+  // else subquery is in WHERE.
+
+  if (do_aj) {                                                   // ④
+    /* A negated IN/EXISTS ... 三种情形 (a)(b)(c) 见注释：
+       - move all tables of emb_join_list into a new aj-left-nest
+       - emb_join_list is now empty
+       - put subq_tables in a new aj-nest
+       - add the subq's subq_cond to aj-nest's ON
+       - add a LEFT JOIN operator between the aj-left-nest and aj-nest
+       - do not yet add 'x IS NULL to WHERE' (add it in optimization phase
+         when we have the QEP_TABs so we can set up the 'found'/
+         'not_null_compl' pointers in trig conds). */
+    Table_ref *const wrap_nest = Table_ref::new_nested_join(
+        thd->mem_root, "(aj-left-nest)", emb_tbl_nest, emb_join_list, this);
+    if (wrap_nest == nullptr) return true;
+
+    // Go through tables of emb_join_list, insert them in wrap_nest
+    for (Table_ref *outer_tbl : *emb_join_list) {
+      wrap_nest->nested_join->m_tables.push_back(outer_tbl);
+      outer_tbl->embedding = wrap_nest;
+      outer_tbl->join_list = &wrap_nest->nested_join->m_tables;
+    }
+    // FROM clause is now only the new left nest
+    emb_join_list->clear();
+    emb_join_list->push_back(wrap_nest);
+    outer_join = true;   // ★ antijoin 本质上就是 LEFT JOIN + IS NULL
+  }
+
+  Table_ref *const sj_nest = Table_ref::new_nested_join(          // ⑤
+      thd->mem_root, do_aj ? "(aj-nest)" : "(sj-nest)", emb_tbl_nest,
+      emb_join_list, this);
+  if (sj_nest == nullptr) return true;
+  NESTED_JOIN *const nested_join = sj_nest->nested_join;
+
+  /*
+    Using push_front, as sj_nest may be right arg of LEFT JOIN if
+    antijoin, and right args of LEFT JOIN go before left arg.
+  */
+  emb_join_list->push_front(sj_nest);   // ★ push_front 的原因
+
+  /*
+    Natural joins inside a semi-join nest were already processed when the
+    subquery went through initial preparation.
+  */
+  sj_nest->nested_join->natural_join_processed = true;
+
+  Query_block *const subq_query_block = subq_pred->unit->first_query_block();
+  nested_join->query_block_id = subq_query_block->select_number;
+
+  // Merge tables from underlying query block into this join nest
+  if (sj_nest->merge_underlying_tables(subq_query_block))         // ⑥
+    return true;
+
+  /* Add tables from subquery at end of leaf table chain ... */
+  Table_ref *tl;
+  for (tl = leaf_tables; tl->next_leaf; tl = tl->next_leaf) {
+  }
+  tl->next_leaf = subq_query_block->leaf_tables;
+  m_table_list.push_back(&subq_query_block->m_table_list);
+
+  // Walk through child's tables and adjust table map
+  uint table_no = leaf_table_count;
+  for (tl = subq_query_block->leaf_tables; tl; tl = tl->next_leaf, table_no++) {
+    tl->dep_tables <<= leaf_table_count;
+    tl->set_tableno(table_no);
+  }
+
+  subq_query_block->m_table_list.clear();
+  subq_query_block->leaf_tables = nullptr;
+
+  // Adjust table and expression counts in parent query block:
+  derived_table_count += subq_query_block->derived_table_count;
+  materialized_derived_table_count +=
+      subq_query_block->materialized_derived_table_count;
+  table_func_count += subq_query_block->table_func_count;
+  has_sj_nests |= subq_query_block->has_sj_nests;
+  has_aj_nests |= subq_query_block->has_aj_nests;
+  leaf_table_count += subq_query_block->leaf_table_count;
+  cond_count += subq_query_block->cond_count;
+  ...
+
+  if (outer_join) propagate_nullability(&sj_nest->nested_join->m_tables, true);
+
+  nested_join->sj_outer_exprs.clear();
+  nested_join->sj_inner_exprs.clear();
+
+  if (subq_pred->substype() == Item_subselect::IN_SUBS) {         // ⑦
+    // IN / =ANY：配对 oe[i] ↔ ie[i]
+    build_sj_exprs(thd, &nested_join->sj_outer_exprs,
+                   &nested_join->sj_inner_exprs, subq_pred, subq_query_block);
+  } else {  // this is EXISTS
+    /* Expressions from the SELECT list will not be used; unlike in the case of
+       IN, they are not part of sj_inner_exprs. */
+    for (Item *item : subq_query_block->visible_fields()) {
+      Item::Cleanup_after_removal_context ctx(this);
+      item->walk(&Item::clean_up_after_removal, walk_options,
+                 pointer_cast<uchar *>(&ctx));
+    }
+  }
+
+  {
+    /*
+      The WHERE clause and the join conditions may contain equalities that may
+      be leveraged by semi-join strategies (e.g to set up key lookups in
+      semi-join materialization), decorrelate them ...
+    */
+    Semijoin_decorrelation sj_decor(&sj_nest->nested_join->sj_outer_exprs,
+                                    &sj_nest->nested_join->sj_inner_exprs,
+                                    // decorrelate only equalities
+                                    /*op_types=*/nullptr);
+    // ★ op_types==nullptr ⇒ 只去相关化等值(EQ)；非等值去相关化留给 hypergraph
+
+    if (subq_query_block->where_cond() &&
+        subq_query_block->decorrelate_condition(sj_decor, nullptr))
+      return true;
+
+    if (walk_join_list(
+            subq_query_block->m_table_nest, [&](Table_ref *tr) -> bool {
+              return !tr->is_inner_table_of_outer_join() && tr->join_cond() &&
+                     subq_query_block->decorrelate_condition(sj_decor, tr);
+            }))
+      return true;
+  }
+
+  // Unlink the subquery's query expression:
+  subq_query_block->master_query_expression()->exclude_level();
+  merge_contexts(subq_query_block);
+  repoint_contexts_of_join_nests(subq_query_block->m_table_nest);
+  fix_tables_after_pullout(this, subq_query_block, sj_nest, 0, 0);
+
+  Item *sj_cond = subq_query_block->where_cond();
+  if (sj_cond != nullptr) sj_cond->fix_after_pullout(this, subq_query_block);
+
+  // Assign the set of non-trivially tables after decorrelation
+  nested_join->sj_corr_tables =
+      (sj_cond != nullptr ? sj_cond->used_tables() & outer_tables_map : 0);
+  // ★ sj_corr_tables = 去相关化之后"仍然相关"的外层表
+  //   ≠ 0 ⇒ 无法使用 Materialization / LooseScan
+
+  walk_join_list(subq_query_block->m_table_nest, [&](Table_ref *tr) -> bool {
+    if (tr->join_cond())
+      nested_join->sj_corr_tables |=
+          tr->join_cond()->used_tables() & outer_tables_map;
+    if (tr->is_derived() && tr->uses_materialization())
+      nested_join->sj_corr_tables |=
+          tr->derived_query_expression()->m_lateral_deps;
+    return false;
+  });
+
+  // Build semijoin condition using the inner/outer expression list
+  if (build_sj_cond(thd, nested_join, subq_query_block, outer_tables_map,
+                    &sj_cond))                                    // ⑨
+    return true;
+
+  assert(sj_cond != nullptr);
+
+  if (!sj_cond->fixed) {
+    Opt_trace_array sj_on_trace(&thd->opt_trace,
+                                "evaluating_constant_semijoin_conditions");
+    sj_cond->apply_is_true();
+    if (sj_cond->fix_fields(thd, &sj_cond)) return true;
+  }
+
+  sj_nest->set_sj_or_aj_nest();
+  assert(sj_nest->join_cond() == nullptr);
+
+  if (do_aj) {                                                    // ⑩
+    sj_nest->outer_join = true;
+    sj_nest->set_join_cond(sj_cond);
+    this->outer_join |= sj_nest->nested_join->used_tables;
+    if (emb_tbl_nest == nullptr)
+      nest_last_join(thd);  // as is done for a true LEFT JOIN
+  }
+
+  /*
+    sj_depends_on contains the set of outer tables referred in the
+    subquery's WHERE clause as well as tables referred in the IN predicate's
+    left-hand side, and lateral dependencies from materialized derived tables
+    contained in the original subquery.
+  */
+  nested_join->sj_depends_on =
+      nested_join->sj_corr_tables | (sj_cond->used_tables() & outer_tables_map);
+  // ★ sj_depends_on ⊇ sj_corr_tables：前者多了 outer_expr 引用的表
+
+  if (do_aj) { /* Condition remains attached to inner table, as for LEFT JOIN */
+  } else if (emb_tbl_nest) {
+    // Inject semi-join condition into parent's join condition
+    emb_tbl_nest->set_join_cond(and_items(emb_tbl_nest->join_cond(), sj_cond));
+    if (emb_tbl_nest->join_cond() == nullptr) return true;
+    emb_tbl_nest->join_cond()->apply_is_true();
+    if (!emb_tbl_nest->join_cond()->fixed &&
+        emb_tbl_nest->join_cond()->fix_fields(thd,
+                                              emb_tbl_nest->join_cond_ref()))
+      return true;
+  } else {
+    // Inject semi-join condition into parent's WHERE condition
+    m_where_cond = and_items(m_where_cond, sj_cond);
+    if (m_where_cond == nullptr) return true;
+    m_where_cond->apply_is_true();
+    if (m_where_cond->fix_fields(thd, &m_where_cond)) return true;
+  }
+
+  Item *cond = emb_tbl_nest ? emb_tbl_nest->join_cond() : m_where_cond;
+  if (cond && cond->const_item() &&
+      !cond->walk(&Item::is_non_const_over_literals, enum_walk::POSTFIX,
+                  nullptr)) {
+    bool cond_value = true;
+    if (simplify_const_condition(thd, &cond, false, &cond_value)) return true;
+    if (!cond_value) {
+      /*
+        Parent's condition is always FALSE. Thus: ...(c) the outer/inner sj
+        expressions are Items which point into the SJ condition, so at 2nd
+        execution they won't be fixed => clearing them prevents a bug.
+      */
+      clear_sj_expressions(nested_join);   // ★ PS 二次执行的保护
+    }
+  }
+
+  if (do_aj)
+    has_aj_nests = true;
+  else
+    has_sj_nests = true;  // This query block has semi-join nests
+
+  return false;
+}
+```
+
+⇒ 两个容易看漏的语义：**(1) `sj_corr_tables` 与 `sj_depends_on` 不等价**——前者是"去相关化后仍相关"，后者再并上 `sj_cond` 引用的外层表；策略准入用的是不同成员（LooseScan 用 `sj_corr_tables`、FirstMatch/Materialize 用 `sj_depends_on`）。**(2) 条件注入分三处**（aj 挂 ON / 有 emb_tbl_nest 挂 join cond / 否则挂 WHERE），antijoin 的 `x IS NULL` 故意留到优化阶段才加。
+
 ### 3.4 五种 SQL 等价变换形式（内核月报 2020/10 原文）
 
 `convert_subquery_to_semijoin` 的注释列了完整变换：
@@ -302,6 +998,254 @@ anti-join（AJ）建模成 **LEFT JOIN + 右表键 IS NULL**。
 - `build_sj_cond`（`:2481`）：逐对 AND 成 `oe[i]=ie[i]`，常量对折叠
 - `simplify_joins`：去掉嵌套 sj-nest（`A SJ (B SJ (C))` → `A SJ (B JOIN C)`）
 
+**`build_sj_exprs()`**（`sql/sql_resolver.cc:2833`）——IN 的左右两边配对：
+
+```cpp
+static bool build_sj_exprs(THD *thd, mem_root_deque<Item *> *sj_outer_exprs,
+                           mem_root_deque<Item *> *sj_inner_exprs,
+                           Item_exists_subselect *subq_pred,
+                           Query_block *subq_query_block) {
+  Item_in_subselect *in_subq_pred = down_cast<Item_in_subselect *>(subq_pred);
+  assert(in_subq_pred->left_expr->fixed);
+
+  /*
+    We have a special case for IN predicates with a scalar subquery or a
+    row subquery in the predicand (left operand), such as this:
+     (SELECT 1,2 FROM t1) IN (SELECT x,y FROM t2)
+    We cannot make the join condition 1=x AND 2=y, since that might evaluate
+    to true even if t1 is empty. Instead make the join condition
+    (SELECT 1,2 FROM t1) = (x,y) in this case.
+  */
+  // ★ 左侧是子查询时不能逐列拆：空集的语义会错
+  Item_subselect *left_subquery =
+      (in_subq_pred->left_expr->type() == Item::SUBSELECT_ITEM)
+          ? static_cast<Item_subselect *>(in_subq_pred->left_expr)
+          : nullptr;
+
+  if (left_subquery &&
+      (left_subquery->substype() == Item_subselect::SINGLEROW_SUBS)) {
+    mem_root_deque<Item *> ref_list(thd->mem_root);
+    Item *header = subq_query_block->base_ref_items[0];
+    for (uint i = 1; i < in_subq_pred->left_expr->cols(); i++) {
+      ref_list.push_back(subq_query_block->base_ref_items[i]);
+    }
+    Item_row *right_expr = new Item_row(header, ref_list);
+    if (!right_expr) return true;
+
+    sj_outer_exprs->push_back(in_subq_pred->left_expr);
+    sj_inner_exprs->push_back(right_expr);   // ★ 整行比较
+  } else {
+    for (uint i = 0; i < in_subq_pred->left_expr->cols(); i++) {
+      Item *const li = in_subq_pred->left_expr->element_index(i);
+      sj_outer_exprs->push_back(li);
+      sj_inner_exprs->push_back(subq_query_block->base_ref_items[i]);
+      // ★ 逐列配对：oe_i ↔ ie_i，下标严格对齐
+    }
+  }
+  return false;
+}
+```
+
+**`build_sj_cond()`**（`:2481`）——把配对 AND 成 `oe=ie`：
+
+```cpp
+bool Query_block::build_sj_cond(THD *thd, NESTED_JOIN *nested_join,
+                                Query_block *subq_query_block,
+                                table_map outer_tables_map, Item **sj_cond) {
+  if (nested_join->sj_inner_exprs.empty()) {
+    // Semi-join materialization requires a key, push a constant integer item
+    Item *const_item = new Item_int(1);
+    if (const_item == nullptr) return true;
+    nested_join->sj_inner_exprs.push_back(const_item);
+    nested_join->sj_outer_exprs.push_back(const_item);
+    // ★★ 坑：EXISTS 子查询没有 IN 等值 ⇒ 塞一个常量 1=1 当"key"占位，
+    //    否则 semijoin materialization 无法在临时表上建键
+  }
+
+  auto ii = nested_join->sj_inner_exprs.begin();
+  auto oi = nested_join->sj_outer_exprs.begin();
+  while (ii != nested_join->sj_inner_exprs.end() &&
+         oi != nested_join->sj_outer_exprs.end()) {
+    bool should_remove = false;
+    Item *inner = *ii;
+    Item *outer = *oi;
+    outer->fix_after_pullout(this, subq_query_block);
+    inner->fix_after_pullout(this, subq_query_block);
+
+    Item_func_eq *item_eq = new Item_func_eq(outer, inner);
+    if (item_eq == nullptr) return true;
+    Item *predicate = item_eq;
+    if (!item_eq->fixed && item_eq->fix_fields(thd, &predicate)) return true;
+
+    // Evaluate if the condition is on const expressions
+    if (predicate->const_item() &&
+        !(predicate)->walk(&Item::is_non_const_over_literals,
+                           enum_walk::POSTFIX, nullptr)) {
+      bool cond_value = true;
+      /* Push ignore / strict error handler */
+      ...
+      bool err = eval_const_cond(thd, predicate, &cond_value);
+      ...
+      if (cond_value) {
+        /* Remove the expression ... if this is not the last expression in the
+           list. Semijoin processing expects at least one inner/outer expression
+           in the list if there is a sj_nest present. */
+        if (nested_join->sj_inner_exprs.size() != 1) {
+          should_remove = true;
+        }
+      } else {
+        /* Remove all the expressions ... Add an always false condition. */
+        nested_join->sj_inner_exprs.clear();
+        nested_join->sj_outer_exprs.clear();
+        Item *new_item = new Item_func_false();
+        if (new_item == nullptr) return true;
+        (*sj_cond) = new_item;
+        break;   // ★ 恒假 ⇒ 整个 semijoin 退化成 FALSE
+      }
+    }
+    (*sj_cond) = and_items(*sj_cond, predicate);
+    if (*sj_cond == nullptr) return true;
+
+    nested_join->sj_corr_tables |= inner->used_tables() & outer_tables_map;
+    // ★★ 坑：只要 inner 表达式引用了外层表 ⇒ 记为"非平凡相关" ⇒ 禁用 materialization
+
+    if (should_remove) {
+      ii = nested_join->sj_inner_exprs.erase(ii);
+      oi = nested_join->sj_outer_exprs.erase(oi);
+    } else {
+      ++ii, ++oi;
+    }
+  }
+  return false;
+}
+```
+
+**去相关化的两个类/函数**（`:2586` / `:2632` / `:2767`）：
+
+```cpp
+/// Context object used by semijoin equality decorrelation code.
+class Semijoin_decorrelation {
+  mem_root_deque<Item *> *sj_outer_exprs, *sj_inner_exprs;
+  /// If nullptr: only a=b is decorrelated.
+  /// Otherwise, a OP b is decorrelated for OP in <>, >=, >, <=, <, and
+  /// for each decorrelated SJ outer/inner pair, located at position N
+  /// in sj_outer_exprs and sj_inner_exprs, we store, at the
+  /// same position in op_types, the operator's type code representing
+  /// "outer OP inner" (for example, LE_FUNC for outer<=inner as well as
+  /// inner>=outer).
+  Mem_root_array<Item_func::Functype> *op_types;
+  ...
+  bool decorrelate_only_eq() const { return op_types == nullptr; }
+  ...
+};
+
+static bool decorrelate_equality(Semijoin_decorrelation &sj_decor,
+                                 Item_func *func, bool *was_correlated) {
+  *was_correlated = false;
+  Item_bool_func2 *bool_func = down_cast<Item_bool_func2 *>(func);
+  Item *const left = bool_func->arguments()[0];
+  Item *const right = bool_func->arguments()[1];
+  Item *inner = nullptr;
+  Item *outer = nullptr;
+  table_map left_used_tables = left->used_tables() & ~INNER_TABLE_BIT;
+  table_map right_used_tables = right->used_tables() & ~INNER_TABLE_BIT;
+
+  /* Predicates that have non-deterministic elements are not decorrelated. */
+  if ((left_used_tables & RAND_TABLE_BIT) ||
+      (right_used_tables & RAND_TABLE_BIT))
+    return false;   // ★ 含 RAND() 的谓词不去相关
+
+  if (left_used_tables == OUTER_REF_TABLE_BIT) {
+    outer = left;
+  } else if (!(left_used_tables & OUTER_REF_TABLE_BIT)) {
+    inner = left;
+  }
+  if (right_used_tables == OUTER_REF_TABLE_BIT) {
+    outer = right;
+  } else if (!(right_used_tables & OUTER_REF_TABLE_BIT)) {
+    inner = right;
+  }
+  if (inner == nullptr || outer == nullptr) return false;
+
+  // Equalities over row items cannot be decorrelated
+  if (outer->type() == Item::ROW_ITEM) return false;
+
+  sj_decor.add_outer(outer);
+  sj_decor.add_inner(inner);
+  if (sj_decor.add_op_type(
+          // use canonical form "outer OP inner":
+          (outer == left) ? bool_func->functype() : bool_func->rev_functype()))
+    return true;
+
+  *was_correlated = true;
+  return false;
+}
+
+static inline bool can_decorrelate_operator(Item_func *func, bool only_eq) {
+  auto op_type = func->functype();
+  switch (op_type) {
+    case Item_func::EQ_FUNC:
+      return true;
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+      return !only_eq;   // ★ 只有传了 op_types（非 nullptr）才处理非等值
+    default:
+      return false;
+  }
+}
+
+bool Query_block::decorrelate_condition(Semijoin_decorrelation &sj_decor,
+                                        Table_ref *join_nest) {
+  Item *base_cond =
+      join_nest == nullptr ? where_cond() : join_nest->join_cond();
+  Item_cond *cond;
+  Item_func *func;
+  assert(base_cond != nullptr);
+
+  if (base_cond->type() == Item::FUNC_ITEM &&
+      (func = down_cast<Item_func *>(base_cond)) &&
+      can_decorrelate_operator(func, sj_decor.decorrelate_only_eq())) {
+    bool was_correlated;
+    if (decorrelate_equality(sj_decor, func, &was_correlated)) return true;
+    if (was_correlated) {  // The simple equality has been decorrelated
+      if (join_nest == nullptr)
+        set_where_cond(nullptr);
+      else  // Join conditions cannot be empty so install a TRUE value
+        join_nest->set_join_cond(new Item_func_true());
+    }
+  } else if (base_cond->type() == Item::COND_ITEM &&
+             (cond = down_cast<Item_cond *>(base_cond)) &&
+             cond->functype() == Item_func::COND_AND_FUNC) {
+    List<Item> *args = cond->argument_list();
+    List_iterator<Item> li(*args);
+    Item *item;
+    while ((item = li++)) {
+      if (item->type() == Item::FUNC_ITEM &&
+          (func = down_cast<Item_func *>(item)) &&
+          can_decorrelate_operator(func, sj_decor.decorrelate_only_eq())) {
+        bool was_correlated;
+        if (decorrelate_equality(sj_decor, func, &was_correlated)) return true;
+        if (was_correlated) li.remove();
+        // ★ 谓词被"摘走"：从 WHERE 中删除，只留在 sj_inner/outer_exprs 里
+        //   因为它已经变成 semijoin 的 ON 条件
+      }
+    }
+    if (args->is_empty()) {  // All predicates have been decorrelated
+      if (join_nest == nullptr)
+        set_where_cond(nullptr);
+      else
+        join_nest->set_join_cond(new Item_func_true());
+    }
+  }
+  return false;
+}
+```
+
+> **勘误**：常见资料里写的 `fix_semijoin_expr_list()` 在 8.0.39 **不存在**（5.6 时代 API）；`substitute_for_best_equal_field()`（`sql/sql_optimizer.cc:4773`）属于**等值传播**阶段，不是 semijoin 去相关化路径的成员。
+
 ---
 
 ## 五、Optimize Phase：五种策略的代价选择
@@ -329,6 +1273,395 @@ optimize_semijoin_nests_for_materialization  预优化可物化的 sj-nest 内�
 | LooseScan | `first_loosescan_table`、`loosescan_need_tables` |
 | Materialize | `sjm`（Semijoin_mat_optimize） |
 | DuplicateWeedout | `first_dupsweedout_table`、`dupsweedout_tables` |
+
+**完整源码**（`sql/sql_planner.cc:4105-4599`，按策略分段）：
+
+```cpp
+void Optimize_table_order::advance_sj_state(table_map remaining_tables,
+                                            const JOIN_TAB *new_join_tab,
+                                            uint idx) {
+  Opt_trace_context *const trace = &thd->opt_trace;
+  Table_ref *const emb_sj_nest = new_join_tab->emb_sj_nest;
+  POSITION *const pos = join->positions + idx;
+  double best_cost = pos->prefix_cost;
+  double best_rowcount = pos->prefix_rowcount;
+  uint sj_strategy = SJ_OPT_NONE;  // Initially: No chosen strategy
+
+  /*
+    Semi-join nests cannot be nested ... In fact, doing this may cause
+    undesirable effects because all tables within a semi-join nest have
+    emb_sj_nest != NULL, which triggers several of the actions inside this
+    function.
+  */
+  assert(emb_sjm_nest == nullptr);
+
+  // remaining_tables include the current one:
+  assert(remaining_tables & new_join_tab->table_ref->map());
+  const table_map remaining_tables_incl = remaining_tables;
+  // And add the current table to the join prefix:
+  remaining_tables &= ~new_join_tab->table_ref->map();
+
+  Opt_trace_array trace_choices(trace, "semijoin_strategy_choice");
+
+  /* Initialize the state or copy it from prev. tables */
+  pos->cur_embedding_map = cur_embedding_map;
+  if (idx == join->const_tables) {
+    pos->dups_producing_tables = 0;
+    pos->first_firstmatch_table = MAX_TABLES;
+    pos->first_loosescan_table = MAX_TABLES;
+    pos->dupsweedout_tables = 0;
+    pos->sjm_scan_need_tables = 0;
+    pos->sjm_scan_last_inner = 0;
+  } else {
+    pos->dups_producing_tables = pos[-1].dups_producing_tables;
+
+    // FirstMatch
+    pos->first_firstmatch_table = pos[-1].first_firstmatch_table;
+    pos->first_firstmatch_rtbl = pos[-1].first_firstmatch_rtbl;
+    pos->firstmatch_need_tables = pos[-1].firstmatch_need_tables;
+
+    // LooseScan
+    pos->first_loosescan_table = (pos[-1].sj_strategy == SJ_OPT_LOOSE_SCAN)
+                                     ? MAX_TABLES
+                                     : pos[-1].first_loosescan_table;
+    // ★ 上一个已经用了 LS ⇒ 重置，避免同一 nest 连续两次 LooseScan
+    pos->loosescan_need_tables = pos[-1].loosescan_need_tables;
+
+    // MaterializeScan
+    pos->sjm_scan_need_tables = (pos[-1].sj_strategy == SJ_OPT_MATERIALIZE_SCAN)
+                                    ? 0
+                                    : pos[-1].sjm_scan_need_tables;
+    pos->sjm_scan_last_inner = pos[-1].sjm_scan_last_inner;
+
+    // Duplicate Weedout
+    pos->dupsweedout_tables = pos[-1].dupsweedout_tables;
+    pos->first_dupsweedout_table = pos[-1].first_dupsweedout_table;
+  }
+
+  table_map handled_by_fm_or_ls = 0;
+
+  /* ===== FirstMatch Strategy ===== */
+  if (pos->first_firstmatch_table != MAX_TABLES) {
+    const Table_ref *first_emb_sj_nest =
+        join->positions[pos->first_firstmatch_table].table->emb_sj_nest;
+    if (emb_sj_nest != first_emb_sj_nest) {
+      // Can't handle interleaving between tables from the
+      // semi-join that FirstMatch is handling and any other tables.
+      pos->first_firstmatch_table = MAX_TABLES;
+    }
+  }
+
+  if (emb_sj_nest && emb_sj_nest->nested_join->sj_enabled_strategies &
+                         OPTIMIZER_SWITCH_FIRSTMATCH) {
+    const table_map outer_corr_tables = emb_sj_nest->nested_join->sj_depends_on;
+    const table_map sj_inner_tables = emb_sj_nest->sj_inner_tables;
+    /*
+      Enter condition:
+       1. The next join tab belongs to semi-join nest
+       2. We're not in a duplicate producer range yet
+       3. All outer tables that the subquery is correlated with, or
+          referred to from the outer_expr, are in the join prefix
+    */
+    if (pos->dups_producing_tables == 0 &&        // (2)
+        !(remaining_tables & outer_corr_tables))  // (3)
+    {
+      /* Start tracking potential FirstMatch range */
+      pos->first_firstmatch_table = idx;
+      pos->firstmatch_need_tables = 0;
+      pos->firstmatch_rtbl = remaining_tables;
+      assert(sj_inner_tables == (remaining_tables_incl & sj_inner_tables));
+    }
+
+    if (pos->first_firstmatch_table != MAX_TABLES) {
+      /* Record that we need all of this semi-join's inner tables */
+      pos->firstmatch_need_tables |= sj_inner_tables;
+
+      if (outer_corr_tables & pos->first_firstmatch_rtbl) {
+        /* Trying to add an sj-inner table whose sj-nest has an outer
+           correlated table that was not in the prefix. FirstMatch can't be used. */
+        pos->first_firstmatch_table = MAX_TABLES;
+      } else if (!(pos->firstmatch_need_tables & remaining_tables)) {
+        // Got a complete FirstMatch range.
+
+        /* We cannot FirstMatch to a different embedding nest, e.g. for
+           B LEFT JOIN (C SEMIJOIN D ON B.X=D.Y) and table order B-D-C we
+           cannot jump from D to B. This would cause non-hierarchical joins.
+           So we check that the jump won't leave from a still-open nest:
+           cur_embedding_map at the last table of this firstmatch range
+           must be included in cur_embedding_map at the target of the jump. */
+        nested_join_map cur_embedding_map_at_jump_target =
+            pos->first_firstmatch_table > join->const_tables
+                ? join->positions[pos->first_firstmatch_table - 1]
+                      .cur_embedding_map
+                : 0;
+        if ((cur_embedding_map_at_jump_target & cur_embedding_map) !=
+            cur_embedding_map) {
+          pos->first_firstmatch_table = MAX_TABLES;
+        } else {
+          // Calculate access paths and cost
+          double cost, rowcount;
+          Opt_trace_object trace_one_strategy(trace);
+          trace_one_strategy.add_alnum("strategy", "FirstMatch");
+          (void)semijoin_firstmatch_loosescan_access_paths(
+              pos->first_firstmatch_table, idx, remaining_tables, false,
+              &rowcount, &cost);
+          /*
+            We don't yet know what are the other strategies, so pick FirstMatch.
+            We ought to save the alternate POSITIONs produced by
+            semijoin_firstmatch_loosescan_access_paths() but the problem is that
+            providing save space uses too much space. Instead, we will
+            re-calculate the alternate POSITIONs after we've picked the best QEP.
+          */
+          sj_strategy = SJ_OPT_FIRST_MATCH;
+          best_cost = cost;
+          best_rowcount = rowcount;
+          trace_one_strategy.add("cost", best_cost).add("rows", best_rowcount);
+          handled_by_fm_or_ls = pos->firstmatch_need_tables;
+          trace_one_strategy.add("chosen", true);
+        }
+      }
+    }
+  }
+
+  /* ===== LooseScan Strategy ===== */
+  {
+    if (pos->first_loosescan_table != MAX_TABLES) {
+      const Table_ref *first_emb_sj_nest =
+          join->positions[pos->first_loosescan_table].table->emb_sj_nest;
+      if (first_emb_sj_nest->sj_inner_tables & remaining_tables_incl) {
+        // Stage 2: Accept remaining tables from the semi-join nest:
+        if (emb_sj_nest != first_emb_sj_nest) {
+          pos->first_loosescan_table = MAX_TABLES;
+        } else {
+          /*
+            NestedLoopSemiJoinWithDuplicateRemovalIterator takes a
+            single-table iterator as left argument, and inner-joins
+            it with the set of other SJ-inner tables. E.g. it doesn't work for
+            A SEMI JOIN (B LEFT JOIN C) with B as LooseScan table. So:
+            - if we're now at the second SJ-inner table (1), and
+            - this table belongs to a join nest which is outer-joined to
+              the first SJ-inner table (2), or is directly outer-joined to the
+              first SJ-inner table (3),
+            - then both tables are not inner-joined together and LooseScan is
+              impossible.
+          */
+          if (idx == pos->first_loosescan_table + 1 &&
+              ((pos->table->table_ref->outer_join_nest() !=
+                join->positions[pos->first_loosescan_table]
+                    .table->table_ref->outer_join_nest()) ||
+               pos->table->table_ref->outer_join))
+            pos->first_loosescan_table = MAX_TABLES;
+        }
+      } else {
+        // Stage 3: Accept outer dependent and non-dependent tables:
+        assert(emb_sj_nest != first_emb_sj_nest);
+        if (emb_sj_nest != nullptr) pos->first_loosescan_table = MAX_TABLES;
+      }
+    }
+
+    /* We may consider the LooseScan strategy if ... (8 条见 4.3) */
+    if (emb_sj_nest && ... ) {
+      pos->first_loosescan_table = idx;
+      pos->loosescan_need_tables = emb_sj_nest->sj_inner_tables |
+                                   emb_sj_nest->nested_join->sj_depends_on;
+    }
+
+    if ((pos->first_loosescan_table != MAX_TABLES) &&
+        !(remaining_tables & pos->loosescan_need_tables)) {
+      /* Ok we have all LooseScan sj-nest's inner tables and outer correlated
+         tables into the prefix. */
+      double cost, rowcount;
+      Opt_trace_object trace_one_strategy(trace);
+      trace_one_strategy.add_alnum("strategy", "LooseScan");
+      /* If this function returns 'false', it means LS is impossible
+         (didn't find a suitable index, etc). */
+      if (semijoin_firstmatch_loosescan_access_paths(pos->first_loosescan_table,
+                                                     idx, remaining_tables,
+                                                     true, &rowcount, &cost)) {
+        /* We don't yet have any other strategies that could handle this
+           semi-join nest ... so unconditionally pick the LooseScan. */
+        sj_strategy = SJ_OPT_LOOSE_SCAN;
+        best_cost = cost;
+        best_rowcount = rowcount;
+        handled_by_fm_or_ls = join->positions[pos->first_loosescan_table]
+                                  .table->emb_sj_nest->sj_inner_tables;
+      }
+      trace_one_strategy.add("chosen", sj_strategy == SJ_OPT_LOOSE_SCAN);
+    }
+  }
+
+  if (emb_sj_nest) pos->dups_producing_tables |= emb_sj_nest->sj_inner_tables;
+  pos->dups_producing_tables &= ~handled_by_fm_or_ls;
+  // ★★ 核心不变量：dups_producing_tables = 还没被任何策略消除的 sj 内层表
+
+  /* ===== MaterializeLookup and MaterializeScan strategy handler ===== */
+  const int sjm_strategy = semijoin_order_allows_materialization(
+      join, remaining_tables, new_join_tab, idx);
+  if (sjm_strategy == SJ_OPT_MATERIALIZE_SCAN) {
+    /*
+      We cannot evaluate this option now. This is because we cannot
+      account for fanout of sj-inner tables yet:
+        ntX  SJM-SCAN(it1 ... itN) | ot1 ... otN  |
+      The simple way to model this is to remove SJM-SCAN(...) fanout once
+      we reach the point #2.
+    */
+    if (pos->sjm_scan_need_tables && emb_sj_nest != nullptr &&
+        emb_sj_nest !=
+            join->positions[pos->sjm_scan_last_inner].table->emb_sj_nest)
+      /* Prevent that inner tables of different semijoin nests are
+         interleaved for MatScan. */
+      pos->sjm_scan_need_tables = 0;
+    else {
+      pos->sjm_scan_need_tables = emb_sj_nest->sj_inner_tables |
+                                  emb_sj_nest->nested_join->sj_depends_on;
+      pos->sjm_scan_last_inner = idx;
+      Opt_trace_object(trace)
+          .add_alnum("strategy", "MaterializeScan")
+          .add_alnum("choice", "deferred");   // ★ 延后到"到达点#2"再算
+    }
+  } else if (sjm_strategy == SJ_OPT_MATERIALIZE_LOOKUP) {
+    double cost, rowcount;
+    semijoin_mat_lookup_access_paths(idx, emb_sj_nest, &rowcount, &cost);
+    Opt_trace_object trace_one_strategy(trace);
+    trace_one_strategy.add_alnum("strategy", "MaterializeLookup")
+        .add("cost", cost).add("rows", rowcount)
+        .add("duplicate_tables_left", pos->dups_producing_tables != 0);
+    if (cost < best_cost || pos->dups_producing_tables) {
+      /*
+        NOTE: When we pick to use SJM[-Scan] we don't memcpy its POSITION
+        elements to join->positions as that makes it hard to return things
+        back when making one step back in join optimization. That's done
+        after the QEP has been chosen.
+      */
+      sj_strategy = SJ_OPT_MATERIALIZE_LOOKUP;
+      best_cost = cost;
+      best_rowcount = rowcount;
+      pos->dups_producing_tables &= ~emb_sj_nest->sj_inner_tables;
+    }
+    trace_one_strategy.add("chosen", sj_strategy == SJ_OPT_MATERIALIZE_LOOKUP);
+  }
+
+  /* MaterializeScan second phase check */
+  if (pos->sjm_scan_need_tables && emb_sj_nest != nullptr &&
+      emb_sj_nest !=
+          join->positions[pos->sjm_scan_last_inner].table->emb_sj_nest)
+    pos->sjm_scan_need_tables = 0;
+
+  if (pos->sjm_scan_need_tables && /* Have SJM-Scan prefix */
+      !(pos->sjm_scan_need_tables & remaining_tables)) {
+    Table_ref *const sjm_nest =
+        join->positions[pos->sjm_scan_last_inner].table->emb_sj_nest;
+    double cost, rowcount;
+    Opt_trace_object trace_one_strategy(trace);
+    trace_one_strategy.add_alnum("strategy", "MaterializeScan");
+    semijoin_mat_scan_access_paths(pos->sjm_scan_last_inner, idx,
+                                   remaining_tables, sjm_nest, &rowcount,
+                                   &cost);
+    trace_one_strategy.add("cost", cost).add("rows", rowcount)
+        .add("duplicate_tables_left", pos->dups_producing_tables != 0);
+    /* Use the strategy if
+        * it is cheaper then what we've had, or
+        * we haven't picked any other semi-join strategy yet
+       In the second case, we pick this strategy unconditionally because
+       comparing cost without semi-join duplicate removal with cost with
+       duplicate removal is not an apples-to-apples comparison. */
+    if (cost < best_cost || pos->dups_producing_tables) {
+      sj_strategy = SJ_OPT_MATERIALIZE_SCAN;
+      best_cost = cost;
+      best_rowcount = rowcount;
+      pos->dups_producing_tables &= ~sjm_nest->sj_inner_tables;
+    }
+    trace_one_strategy.add("chosen", sj_strategy == SJ_OPT_MATERIALIZE_SCAN);
+  }
+
+  /* ===== Duplicate Weedout strategy handler ===== */
+  {
+    if (emb_sj_nest) {
+      if (!pos->dupsweedout_tables) pos->first_dupsweedout_table = idx;
+      pos->dupsweedout_tables |= emb_sj_nest->sj_inner_tables |
+                                 emb_sj_nest->nested_join->sj_depends_on;
+    }
+
+    if (pos->dupsweedout_tables &&
+        !(remaining_tables & pos->dupsweedout_tables)) {
+      Opt_trace_object trace_one_strategy(trace);
+      trace_one_strategy.add_alnum("strategy", "DuplicatesWeedout");
+      double rowcount, cost;
+      semijoin_dupsweedout_access_paths(pos->first_dupsweedout_table, idx,
+                                        &rowcount, &cost);
+      trace_one_strategy.add("cost", cost).add("rows", rowcount)
+          .add("duplicate_tables_left", pos->dups_producing_tables != 0);
+      /* Use the strategy if
+          * it is cheaper then what we've had, and strategy is enabled, or
+          * we haven't picked any other semi-join strategy yet
+         The second part is necessary because this strategy is the last one
+         to consider (it needs "the most" tables in the prefix) and we can't
+         leave duplicate-producing tables not handled by any strategy. */
+      if ((cost < best_cost &&
+           join->positions[pos->first_dupsweedout_table]
+                   .table->emb_sj_nest->nested_join->sj_enabled_strategies &
+               OPTIMIZER_SWITCH_DUPSWEEDOUT) ||
+          pos->dups_producing_tables) {
+        sj_strategy = SJ_OPT_DUPS_WEEDOUT;
+        best_cost = cost;
+        best_rowcount = rowcount;
+        pos->dups_producing_tables &= ~pos->dupsweedout_tables;
+      }
+      trace_one_strategy.add("chosen", sj_strategy == SJ_OPT_DUPS_WEEDOUT);
+    }
+  }
+
+  pos->sj_strategy = sj_strategy;
+  /*
+    If a semi-join strategy is chosen, update cost and rowcount in positions
+    ... Tables in a semijoin range, except the last in range, won't have their
+    prefix_costs changed below; this is normal ... duplicates elimination
+    happens only at the last table in range.
+  */
+  if (sj_strategy != SJ_OPT_NONE)
+    pos->set_prefix_cost(best_cost, best_rowcount);
+}
+```
+
+**物化准入**（`sql/sql_planner.cc:2209`）——注意这里**没有代价比较**：
+
+```cpp
+static int semijoin_order_allows_materialization(const JOIN *join,
+                                                 table_map remaining_tables,
+                                                 const JOIN_TAB *tab,
+                                                 uint idx) {
+  assert(!(remaining_tables & tab->table_ref->map()));
+  /*
+   Check if
+    1. We're in a semi-join nest that can be run with SJ-materialization
+    2. All the tables from the subquery are in the prefix
+  */
+  const Table_ref *emb_sj_nest = tab->emb_sj_nest;
+  if (!emb_sj_nest || !emb_sj_nest->nested_join->sjm.positions ||
+      (remaining_tables & emb_sj_nest->sj_inner_tables))
+    return SJ_OPT_NONE;
+  // ★ sjm.positions == nullptr ⇒ 该 nest 压根没算过物化代价（optimize_semijoin_nests_for_materialization 阶段被否）
+
+  /* Walk back and check if all immediately preceding tables are from
+     this semi-join. */
+  const uint n_tables = my_count_bits(emb_sj_nest->sj_inner_tables);
+  for (uint i = 1; i < n_tables; i++) {
+    if (join->positions[idx - i].table->emb_sj_nest != emb_sj_nest)
+      return SJ_OPT_NONE;   // ★ 内表必须连续，不能与外表交错
+  }
+
+  /* Must use MaterializeScan strategy if there are outer correlated tables
+     among the remaining tables, otherwise, if possible, use MaterializeLookup.*/
+  if ((remaining_tables & emb_sj_nest->nested_join->sj_depends_on) ||
+      !emb_sj_nest->nested_join->sjm.lookup_allowed) {
+    if (emb_sj_nest->nested_join->sjm.scan_allowed)
+      return SJ_OPT_MATERIALIZE_SCAN;
+    return SJ_OPT_NONE;
+  }
+  return SJ_OPT_MATERIALIZE_LOOKUP;
+  // ★ 能 Lookup 就 Lookup，不与 Scan 比价
+}
+```
 
 ### 4.3 五种策略详解
 
@@ -410,6 +1743,189 @@ if (emb_sj_nest &&                                                  // (1a)
 
 - **stage 机制**：LooseScan 的追踪分三个阶段（Stage 1 只有驱动表、Stage 2 加同 nest 的内表、Stage 3 加相关外表），进入 Stage 3 时若又碰到别的 nest 的内表，也置 `MAX_TABLES`（因为 LooseScan 不能处理与其它 nest 交织，与 FirstMatch 的交织检查同理）。
 
+**索引可用性判定**（8.0 已无 `setup_semijoin_loosescan()`，改为在代价计算里判定）：`semijoin_loosescan_fill_driving_table_position()`（`sql/sql_planner.cc:1609`）。先看"哪些 sj 等值已绑定"：
+
+```cpp
+// sql/sql_planner.cc:1515
+static ulonglong get_bound_sj_equalities(const JOIN_TAB *tab,
+                                         table_map not_available_tables) {
+  ulonglong bound_sj_equalities = 0;
+  auto it_o = tab->emb_sj_nest->nested_join->sj_outer_exprs.begin();
+  auto it_i = tab->emb_sj_nest->nested_join->sj_inner_exprs.begin();
+  for (uint i = 0; it_o != tab->emb_sj_nest->nested_join->sj_outer_exprs.end();
+       ++i, ++it_o, ++it_i) {
+    Item *outer = *it_o, *inner = *it_i;
+    if (!((not_available_tables)&outer->used_tables())) {
+      bound_sj_equalities |= 1ULL << i;
+      continue;   // ★ outer 表达式只依赖已可用表 ⇒ 该 sj 等值"已绑定"
+    }
+    /*
+      Now we look at equality propagation, to discover that a semi-join
+      equality is bound, when the outer or inner expression is a field
+      involved in some other non-semi-join equality. ...
+    */
+    Item *item;
+    if (outer->type() == Item::FIELD_ITEM)
+      item = outer;
+    else if (inner->type() == Item::FIELD_ITEM)
+      item = inner;
+    else
+      continue;
+    Item_field *const item_field = static_cast<Item_field *>(item);
+    Item_equal *item_equal = item_field->item_equal;
+    if (!item_equal) {
+      Table_ref *const nest = item_field->table_ref->outer_join_nest();
+      item_equal = item_field->find_item_equal(nest ? nest->cond_equal
+                                                    : tab->join()->cond_equal);
+    }
+    if (item_equal) {
+      /* If the multiple equality {[optional_constant,] col1, col2...} contains
+         (1) a constant  (2) or a column from an available table
+         then the semi-join equality is bound. */
+      if (item_equal->const_arg() ||
+          (item_equal->used_tables() & ~not_available_tables))
+        bound_sj_equalities |= 1ULL << i;
+    }
+  }
+  return bound_sj_equalities;
+}
+```
+
+```cpp
+// sql/sql_planner.cc:1609（关键段）
+bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+    const JOIN_TAB *tab, table_map remaining_tables, uint idx,
+    double prefix_rowcount, POSITION *pos) {
+  ...
+  const ulonglong bound_sj_equalities =
+      get_bound_sj_equalities(tab, excluded_tables | remaining_tables);
+
+  pos->read_cost = DBL_MAX;
+  pos->use_join_buffer = false;
+  ...
+  Opt_trace_array trace_all_idx(trace, "indexes");
+
+  for (Key_use *keyuse = tab->keyuse(); keyuse->table_ref == tab->table_ref;) {
+    const uint key = keyuse->key;
+    Key_use *const start_key = keyuse;
+    ...
+    ulonglong handled_sj_equalities = 0;
+    key_part_map handled_keyparts = 0;
+    uint max_keypart = 0;
+
+    // For each keypart
+    while (keyuse->table_ref == tab->table_ref && keyuse->key == key) {
+      const uint keypart = keyuse->keypart;
+      for (; keyuse->table_ref == tab->table_ref && keyuse->key == key &&
+             keyuse->keypart == keypart;
+           ++keyuse) {
+        /* If this Key_use is not about a semi-join equality, or references an
+           excluded table, or does not reference a not-yet-available table, or
+           is for fulltext, or is over a prefix, then it is not a "handled sj
+           equality". */
+        if ((keyuse->sj_pred_no == UINT_MAX) ||
+            (excluded_tables & keyuse->used_tables) ||
+            !(remaining_tables & keyuse->used_tables) ||
+            (keypart == FT_KEYPART) ||
+            (table->key_info[key].key_part[keypart].key_part_flag &
+             HA_PART_KEY_SEG))
+          continue;   // ★★ 前缀索引(HA_PART_KEY_SEG)被拒：前缀相同但完整值不同会被误判重复
+        handled_sj_equalities |= 1ULL << keyuse->sj_pred_no;
+        handled_keyparts |= keyuse->keypart_map;
+        assert(max_keypart <= keypart);  // see sort_keyuse()
+        max_keypart = keypart;
+      }
+    }
+
+    const key_part_map bound_keyparts = start_key->bound_keyparts;
+
+    /*
+      We can use semi-join LooseScan if duplicate elimination is going to work
+      for all semi-join equalities. Duplicate elimination:
+      - works for a bound semi-join equality, because this equality is tested
+        before the nested loop leaves the last inner table of this semi-join nest.
+      - works for a handled semi-join equality thanks to key comparison; key
+        comparison works if:
+          * the handled key parts are over a full field (not a prefix ...)
+          * and any key part before the handled key parts, is bound ...
+      That gives us these requirements:
+      1. All IN-equalities are either bound or handled.
+      2. No hole in sequence of key parts.
+      An example where (2) matters:
+        SELECT * FROM ot1
+        WHERE a IN (SELECT it1.b FROM it1 JOIN it2 ON it1.a = it2.a).
+      Say the plan is it1-ot1-it2 and it1 has an index on (a,b). ... there is a
+      hole. If the rows of it1 are, in index order: (X,Z),(Y,Z), then the key
+      comparison will let both rows pass; after joining with ot1 this will
+      duplicate any row of ot1 having ot1.a=Z.
+      We add this third requirement:
+      3. At least one IN-equality is handled. (In theory superfluous.)
+    */
+    if ((handled_sj_equalities | bound_sj_equalities) !=          // (1)
+        LOWER_BITS(ulonglong,
+                   tab->emb_sj_nest->nested_join->sj_inner_exprs.size())) {
+      trace_idx.add("index_handles_needed_semijoin_equalities", false);
+      continue;
+    }
+    if (handled_keyparts == 0) {                                   // (3)
+      trace_idx.add("some_index_part_used", false);
+      continue;
+    }
+    if ((LOWER_BITS(key_part_map, max_keypart + 1) &                // (2)
+         ~(bound_keyparts | handled_keyparts)) != 0) {
+      trace_idx.add("index_can_remove_duplicates", false);
+      continue;
+    }
+
+    // Ok, can use the strategy
+
+    if (bound_keyparts & 1) {
+      /* ref 访问：直接用 Key_use 的代价与 fanout */
+      if (start_key->read_cost < pos->read_cost) {
+        pos->loosescan_key = key;
+        pos->read_cost = start_key->read_cost;
+        pos->rows_fetched = start_key->fanout;
+        pos->loosescan_parts = max_keypart + 1;
+        pos->key = start_key;
+        ...
+      }
+    } else if (tab->table()->covering_keys.is_set(key)) {
+      /* 没有可用的 bound 等值 ⇒ 实际是覆盖索引全扫 */
+      double rowcount = rows2double(tab->table()->file->stats.records);
+      const double cost =
+          tab->table()->file->index_scan_cost(key, 1, rowcount).total_cost();
+      /* Now find out how many different keys we will get ... */
+      if (tab->table()->key_info[key].has_records_per_key(max_keypart)) {
+        const rec_per_key_t rpc =
+            tab->table()->key_info[key].records_per_key(max_keypart);
+        rowcount = rowcount / rpc;   // ★★ LooseScan 的行数折扣：records / records_per_key
+      }
+      if (cost < pos->read_cost) {
+        pos->loosescan_key = key;
+        pos->read_cost = cost;
+        pos->rows_fetched = rowcount;
+        pos->loosescan_parts = max_keypart + 1;
+        pos->key = nullptr;
+        ...
+      }
+    }
+  }
+
+  if (pos->read_cost != DBL_MAX) {
+    pos->read_cost += derived_mat_cost;
+    pos->filter_effect = calculate_condition_filter(
+        tab, pos->key, ~remaining_tables & ~excluded_tables, pos->rows_fetched,
+        false, false, trace_ls);
+    return true;   // 找到可用索引
+  }
+  return false;    // 没找到 ⇒ advance_sj_state 里 LS 分支判 false ⇒ 不选 LS
+}
+```
+
+⇒ **三条要求的直觉**：(1) 每个 IN 等值要么在进 nest 前就能算出来（bound），要么能被索引键比较兜住（handled）；(2) 索引前缀必须**连续无洞**，否则中间缺的那一段会让不同组混淆；(3) 至少要有一个等值靠索引（否则退化成 FirstMatch 就行）。另外 **`HA_PART_KEY_SEG`（前缀索引）直接出局**——这是最容易踩的坑：`col(10)` 前缀索引上 LooseScan 会漏行。
+
+> 关于"索引必须有序"：8.0.39 已无 `HA_READ_ORDER` 判定；等价物是执行侧 `setup_semijoin_dups_elimination()` 里的 `set_need_sorted_output(tab->range_scan())`（`sql/sql_select.cc:1566`）——要求 range scan 保持索引顺序（MRR 会破坏顺序）。
+
 #### MaterializeLookup / MaterializeScan（物化）
 
 **原理**：内表物化到去重临时表，外层与临时表 JOIN。根据临时表是扫描还是索引查找分两种。
@@ -449,13 +1965,308 @@ return SJ_OPT_MATERIALIZE_LOOKUP;                      // 否则索引查找
 
 贪心搜索每加一张表判定一次，前后可能选不同策略。`fix_semijoin_strategies` 从后往前遍历（靠后的记录更大前缀的最优策略），把最终策略记到第一个内表上（`n_sj_tables` + `sj_strategy`）。
 
+**完整源码**（`sql/sql_planner.cc:3360-3496`）：
+
+```cpp
+bool Optimize_table_order::fix_semijoin_strategies() {
+  table_map remaining_tables = 0;
+  table_map handled_tables = 0;
+
+  if (join->query_block->sj_nests.empty()) return false;
+
+  Opt_trace_context *const trace = &thd->opt_trace;
+
+  for (uint tableno = join->tables - 1; tableno != join->const_tables - 1;
+       tableno--) {   // ★ 从右往左：sj_strategy 记录在 range 的"最后一张表"上
+    POSITION *const pos = join->best_positions + tableno;
+
+    if ((handled_tables & pos->table->table_ref->map()) ||
+        pos->sj_strategy == SJ_OPT_NONE) {
+      remaining_tables |= pos->table->table_ref->map();
+      continue;
+    }
+
+    uint first = 0;
+    if (pos->sj_strategy == SJ_OPT_MATERIALIZE_LOOKUP) {
+      Table_ref *const sjm_nest = pos->table->emb_sj_nest;
+      const uint table_count = my_count_bits(sjm_nest->sj_inner_tables);
+      /*
+        This memcpy() copies a partial QEP produced by
+        optimize_semijoin_nests_for_materialization() (source) into the final
+        top-level QEP (target), in order to re-use the source plan for
+        to-be-materialized inner tables.
+        It is however possible that the source QEP had picked
+        some semijoin strategy (noted SJY), different from
+        materialization. The target QEP rules (it has seen more tables), but
+        this memcpy() is going to copy the source stale strategy SJY,
+        wrongly. Which is why sj_strategy of each table of the
+        duplicate-generating range then becomes temporarily unreliable. It is
+        fixed for the first table of that range right after the memcpy(), and
+        fixed for the rest of that range at the end of this iteration by
+        setting it to SJ_OPT_NONE). But until then, pos->sj_strategy should
+        not be read.
+      */
+      memcpy(pos - table_count + 1, sjm_nest->nested_join->sjm.positions,
+             sizeof(POSITION) * table_count);
+      // ★★ 坑：把 nest 内部预先优化好的子计划 memcpy 回主计划，会带来"过期策略"，
+      //    必须靠下面的 for 循环把非首表的 sj_strategy 清成 SJ_OPT_NONE
+      first = tableno - table_count + 1;
+      join->best_positions[first].n_sj_tables = table_count;
+      join->best_positions[first].sj_strategy = SJ_OPT_MATERIALIZE_LOOKUP;
+
+      Opt_trace_object trace_final_strategy(trace);
+      trace_final_strategy.add_alnum("final_semijoin_strategy",
+                                     "MaterializeLookup");
+    } else if (pos->sj_strategy == SJ_OPT_MATERIALIZE_SCAN) {
+      const uint last_inner = pos->sjm_scan_last_inner;
+      Table_ref *const sjm_nest =
+          (join->best_positions + last_inner)->table->emb_sj_nest;
+      const uint table_count = my_count_bits(sjm_nest->sj_inner_tables);
+      first = last_inner - table_count + 1;
+      assert((join->best_positions + first)->table->emb_sj_nest == sjm_nest);
+      memcpy(join->best_positions + first,  // stale semijoin strategy here too
+             sjm_nest->nested_join->sjm.positions,
+             sizeof(POSITION) * table_count);
+      join->best_positions[first].sj_strategy = SJ_OPT_MATERIALIZE_SCAN;
+      join->best_positions[first].n_sj_tables = table_count;
+
+      Opt_trace_object trace_final_strategy(trace);
+      trace_final_strategy.add_alnum("final_semijoin_strategy",
+                                     "MaterializeScan");
+      // Recalculate final access paths for this semi-join strategy
+      double rowcount, cost;
+      semijoin_mat_scan_access_paths(last_inner, tableno, remaining_tables,
+                                     sjm_nest, &rowcount, &cost);
+    } else if (pos->sj_strategy == SJ_OPT_FIRST_MATCH) {
+      first = pos->first_firstmatch_table;
+      Opt_trace_object trace_final_strategy(trace);
+      trace_final_strategy.add_alnum("final_semijoin_strategy", "FirstMatch");
+
+      // Recalculate final access paths for this semi-join strategy
+      double rowcount, cost;
+      (void)semijoin_firstmatch_loosescan_access_paths(
+          first, tableno, remaining_tables, false, &rowcount, &cost);
+
+      if (pos->table->emb_sj_nest->is_aj_nest()) {
+        /*
+          Antijoin doesn't use the execution logic of FirstMatch. So we
+          won't set it up; and we won't either have the incompatibilities of
+          FirstMatch with outer join. Declare that we don't use it:
+        */
+        pos->sj_strategy = SJ_OPT_NONE;   // ★ antijoin 即使"选中"FirstMatch 也不用它
+      } else {
+        join->best_positions[first].sj_strategy = SJ_OPT_FIRST_MATCH;
+        join->best_positions[first].n_sj_tables = tableno - first + 1;
+      }
+    } else if (pos->sj_strategy == SJ_OPT_LOOSE_SCAN) {
+      first = pos->first_loosescan_table;
+      Opt_trace_object trace_final_strategy(trace);
+      trace_final_strategy.add_alnum("final_semijoin_strategy", "LooseScan");
+
+      double rowcount, cost;
+      (void)semijoin_firstmatch_loosescan_access_paths(
+          first, tableno, remaining_tables, true, &rowcount, &cost);
+
+      POSITION *const first_pos = join->best_positions + first;
+      first_pos->sj_strategy = SJ_OPT_LOOSE_SCAN;
+      first_pos->n_sj_tables =
+          my_count_bits(first_pos->table->emb_sj_nest->sj_inner_tables);
+    } else if (pos->sj_strategy == SJ_OPT_DUPS_WEEDOUT) {
+      /*
+        Duplicate Weedout starting at pos->first_dupsweedout_table, ending at
+        this table.
+      */
+      first = pos->first_dupsweedout_table;
+      join->best_positions[first].sj_strategy = SJ_OPT_DUPS_WEEDOUT;
+      join->best_positions[first].n_sj_tables = tableno - first + 1;
+
+      Opt_trace_object trace_final_strategy(trace);
+      trace_final_strategy.add_alnum("final_semijoin_strategy",
+                                     "DuplicateWeedout");
+    }
+
+    for (uint i = first; i <= tableno; i++) {
+      /*
+        Eliminate stale strategies. See comment in the
+        SJ_OPT_MATERIALIZE_LOOKUP case above.
+      */
+      if (i != first) join->best_positions[i].sj_strategy = SJ_OPT_NONE;
+      handled_tables |= join->best_positions[i].table->table_ref->map();
+    }
+
+    remaining_tables |= pos->table->table_ref->map();
+  }
+
+  assert(remaining_tables == (join->all_table_map & ~join->const_table_map));
+  return false;
+}
+```
+
+⇒ **"先选后重算"在这里收口**：每个策略分支都要**重新调一遍**对应的 `semijoin_*_access_paths()` 做"final calculations"，因为 `advance_sj_state()` 阶段的中间结果没有保存（源码注释：*"we need to save POSITIONs somewhere but reserving space for all cases would require too much space"*）。这也是该函数历史上反复出 bug 的根因——搜索期与最终期的计算必须严格一致。
+
+> **勘误**：`convert_sj_to_subquery()`（5.7 时代"执行期把 semijoin 还原成子查询"的回退函数）在 8.0.39 **已不存在**（全树 0 命中）。现在的等价行为只有两处：优化期 `flatten_subqueries()` 把不合格候选降级为 `UNSPECIFIED`；执行期 `FindSubstructure()` 无法处理的重复消除被塞进 `unhandled_duplicates`，由顶层补一个 weedout 解决。
+
 ---
 
 ## 六、Execution Phase：每种策略怎么执行
 
 > 本篇从**优化器视角**讲"选定策略后如何落到 QEP/迭代器"。**运行期的执行机制**（物化引擎 `subselect_hash_sj_engine`、IN2EXISTS 的 `Item_in_optimizer`、子查询缓存）详见 [`../../runtime/02_subquery_runtime.md`](../../runtime/02_subquery_runtime.md)。
 
-`setup_semijoin_dups_elimination`（`sql/sql_select.cc`）创建具体执行结构。每种策略产生特定的 QEP_TAB 序列（内核月报 2021/06 的图）：
+**`setup_semijoin_dups_elimination()`**（`sql/sql_select.cc:1523`）创建具体执行结构。三种 NL 型策略（FirstMatch / LooseScan / DuplicateWeedout）在同一个 `switch` 里落地（物化策略不在此处——它在 `optimize_semijoin_nests_for_materialization` 阶段已把内表换成 sjm 临时表，见 `assert(false)` 那一行）：
+
+```cpp
+// sql/sql_select.cc:1523
+static bool setup_semijoin_dups_elimination(JOIN *join, uint no_jbuf_after) {
+  uint tableno;
+  THD *thd = join->thd;
+  DBUG_TRACE;
+  ASSERT_BEST_REF_IN_JOIN_ORDER(join);
+
+  if (join->query_block->sj_nests.empty()) return false;
+
+  QEP_TAB *const qep_array = join->qep_tab;
+  for (tableno = join->const_tables; tableno < join->primary_tables;) {
+#ifndef NDEBUG
+    const bool tab_in_sj_nest = join->best_ref[tableno]->emb_sj_nest != nullptr;
+#endif
+    QEP_TAB *const tab = &qep_array[tableno];
+    POSITION *const pos = tab->position();
+
+    if (pos->sj_strategy == SJ_OPT_NONE) {
+      tableno++;  // nothing to do
+      continue;
+    }
+    QEP_TAB *last_sj_tab = tab + pos->n_sj_tables - 1;
+    // 选择 semi-join stratege
+    switch (pos->sj_strategy) {
+      case SJ_OPT_MATERIALIZE_LOOKUP:
+      case SJ_OPT_MATERIALIZE_SCAN:
+        assert(false);  // Should not occur among "primary" tables
+        // Do nothing
+        tableno += pos->n_sj_tables;
+        break;
+
+      case SJ_OPT_LOOSE_SCAN: {
+        assert(tab_in_sj_nest);  // First table must be inner
+        /* We jump from the last table to the first one */
+        tab->match_tab = last_sj_tab->idx();
+
+        /* For LooseScan, duplicate elimination is based on rows being sorted
+           on key. We need to make sure that range select keeps the sorted index
+           order. (When using MRR it may not.)
+           Note: need_sorted_output() implementations for range select classes
+           that do not support sorted output, will trigger an assert. This
+           should not happen since LooseScan strategy is only picked if sorted
+           output is supported. */
+        if (tab->range_scan()) {
+          assert(used_index(tab->range_scan()) == pos->loosescan_key);
+          set_need_sorted_output(tab->range_scan());   // ★ 顺序性要求落在这里
+        }
+
+        const uint keyno = pos->loosescan_key;
+        assert(tab->keys().is_set(keyno));
+        tab->set_index(keyno);
+
+        /* Calculate key length */
+        uint keylen = 0;
+        for (uint kp = 0; kp < pos->loosescan_parts; kp++)
+          keylen += tab->table()->key_info[keyno].key_part[kp].store_length;
+        tab->loosescan_key_len = keylen;   // ★ 执行期 key_cmp 只比这 keylen 个字节
+
+        if (pos->n_sj_tables > 1) {
+          // ★ 多表 LooseScan：只有首表做索引去重，其余退化为 FirstMatch
+          last_sj_tab->firstmatch_return = tab->idx();
+          last_sj_tab->match_tab = last_sj_tab->idx();
+        }
+        tableno += pos->n_sj_tables;
+        break;
+      }
+
+      case SJ_OPT_DUPS_WEEDOUT: {
+        assert(tab_in_sj_nest);  // First table must be inner
+        /*
+          Consider a semijoin of one outer and one inner table, both
+          with two rows. The inner table is assumed to be confluent ...
+          If normal nested loop execution is used, we do not need to
+          include semi-join outer table rowids in the duplicate
+          weedout temp table since NL guarantees that outer table rows
+          are encountered only consecutively and because all rows in
+          the temp table are deleted for every new outer table
+          combination ...
+          Now consider the join buffering algorithms (BNL/BKA). These
+          algorithms join each inner row with outer rows in "reverse"
+          order compared to NL. Effectively, this means that outer
+          table rows may be encountered multiple times in a
+          non-consecutive manner:
+            NL:                 BNL/BKA:
+            ot1.row1|it1.row1   ot1.row1|it1.row1
+            ot1.row1|it1.row2   ot1.row2|it1.row1
+            ot1.row2|it1.row1   ot1.row1|it1.row2
+            ot1.row2|it1.row2   ot1.row2|it1.row2
+          It is clear from the above that there is no place we can
+          empty the temp table like we do in NL to avoid storing outer
+          table rowids.
+          Below we check if join buffering might be used. If so, set
+          first_table to the first non-constant table so that outer
+          table rowids are included in the temp table. Do not destroy
+          other duplicate elimination methods.
+        */
+        uint first_table = tableno;
+        for (uint sj_tableno = tableno; sj_tableno < tableno + pos->n_sj_tables;
+             sj_tableno++) {
+          if (join->best_ref[sj_tableno]->use_join_cache() &&
+              sj_tableno <= no_jbuf_after) {
+            /* Join buffering will probably be used */
+            first_table = join->const_tables;
+            // ★ 用了 join buffer ⇒ 必须把外表 rowid 也写进去重临时表
+            break;
+          }
+        }
+        ...   // 建 rowid 临时表（见 5.3）
+        tableno += pos->n_sj_tables;
+        break;
+      }
+
+      case SJ_OPT_FIRST_MATCH: {
+        /*
+          Setup a "jump" from the last table in the range of inner tables
+          to the last outer table before the inner tables.
+        */
+        plan_idx jump_to = tab->idx() - 1;
+        assert(tab_in_sj_nest);  // First table must be inner
+        for (QEP_TAB *tab_in_range = tab; tab_in_range <= last_sj_tab;
+             tab_in_range++) {
+          if (!join->best_ref[tab_in_range->idx()]->emb_sj_nest) {
+            /*
+              Let last non-correlated table be jump target for
+              subsequent inner tables.
+            */
+            assert(false);  // no "split jump" should exist.
+            jump_to = tab_in_range->idx();
+          } else {
+            /*
+              Assign jump target for last table in a consecutive range of
+              inner tables.
+            */
+            if (tab_in_range == last_sj_tab ||
+                !join->best_ref[tab_in_range->idx() + 1]->emb_sj_nest) {
+              tab_in_range->firstmatch_return = jump_to;   // ★ split jump
+              tab_in_range->match_tab = last_sj_tab->idx();
+            }
+          }
+        }
+        tableno += pos->n_sj_tables;
+        break;
+      }
+    }
+  }
+  return false;
+}
+```
+
+⇒ **两处反直觉**：① 物化策略在这个 switch 里是 `assert(false)`——因为物化 nest 的内表**已经不在 primary tables 里**（只剩 sjm 临时表）；② FirstMatch 的 `assert(false) // no "split jump" should exist.` 说明 8.0 里"交织的 split jump"实际已不可达，只剩"连续内表 range 的单一跳转"。
+
+每种策略产生特定的 QEP_TAB 序列（内核月报 2021/06 的图）：
 
 ### 5.0 五种策略的 AccessPath 形态总览（8.0 迭代器化之后）
 

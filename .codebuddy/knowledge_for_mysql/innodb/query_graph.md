@@ -174,14 +174,63 @@ prebuilt->trx_id = table->def_trx_id;  // 记录构建时的 trx_id
 `row_prebuild_sel_graph()`（`row0mysql.cc:1747`）：
 
 ```cpp
-if (prebuilt->sel_graph == nullptr) {
+void row_prebuild_sel_graph(row_prebuilt_t *prebuilt) {
+  sel_node_t *node;
+  ut_ad(prebuilt && prebuilt->trx);
+
+  // ★ 只在没建过时创建 ⇒ 同一 prebuilt 的多次查询复用同一个 graph
+  if (prebuilt->sel_graph == nullptr) {
     node = sel_node_create(prebuilt->heap);
-    prebuilt->sel_graph = que_node_get_parent(
-        pars_complete_graph_for_exec(node, prebuilt->trx,
-                                     prebuilt->heap, prebuilt));
+
+    // pars_complete_graph_for_exec 返回的是 que_thr_t，取其 parent 才是 que_fork_t
+    // ⇒ 这正是"fork / thr / node 三层架构"的落地（见下文「核心概念」）
+    prebuilt->sel_graph = static_cast<que_fork_t *>(que_node_get_parent(
+        pars_complete_graph_for_exec(static_cast<sel_node_t *>(node),
+                                     prebuilt->trx, prebuilt->heap, prebuilt)));
+
+    // 建好即置为 ACTIVE，后续 row_search_mvcc 直接拿 thr 用
     prebuilt->sel_graph->state = QUE_FORK_ACTIVE;
+  }
 }
 ```
+
+★ **为什么 SELECT 也要建图（而且叫 dummy）**：SELECT 本身**不走查询图执行**（见下文「SELECT 不走查询图」），建它只是为了拿到一个 `que_thr_t` 上下文——**锁等待必须挂在 thr 上**（`que_thr_stop` 挂起的是 thr，而 thr 必须属于某个 fork）。⇒ 这个 graph 是"为了能挂起等锁而存在"的壳子，所以是 dummy。
+
+#### `pars_complete_graph_for_exec`：三层是这么拼起来的
+
+调用里的 `pars_complete_graph_for_exec` 只有 20 行，但它**不是包装**——fork / thr / node 三层的连接就发生在这里：
+
+```cpp
+que_thr_t *pars_complete_graph_for_exec(que_node_t *node, trx_t *trx,
+                                        mem_heap_t *heap,
+                                        row_prebuilt_t *prebuilt) {
+  que_fork_t *fork;
+  que_thr_t *thr;
+
+  // fork 类型 QUE_FORK_MYSQL_INTERFACE ⇒ 给 handler 层用的图，
+  // 区别于 SQL 解析器内部那条路径建的图
+  fork = que_fork_create(nullptr, nullptr, QUE_FORK_MYSQL_INTERFACE, heap);
+  fork->trx = trx;
+
+  // ★ thr 创建时就绑定了 prebuilt ⇒ 执行期 thr 能直接找回 row_prebuilt_t
+  thr = que_thr_create(fork, heap, prebuilt);
+
+  // 三层连起来（双向指针）：fork ← thr ← node
+  thr->child = node;
+  if (node) {
+    que_node_set_parent(node, thr);
+  }
+
+  // ★ 不挂到 trx->graph ⇒ 这个 dummy 图不参与 trx 的图管理与回滚
+  trx->graph = nullptr;
+
+  return (thr);   // ★ 返回的是 thr，不是 fork
+}
+```
+
+⇒ 这解释了调用方为什么必须 `que_node_get_parent(thr)` 才能拿到 fork：**函数返回的是最下层的 thr**，fork 要沿 parent 指针往上找一层。所谓"fork / thr / node 三层架构"，在代码上就是这两个指针赋值。
+
+> 判据：它虽短，但**没有把活甩给另一个函数**（主体是实际组装），所以**不是包装函数**——这与"26 行壳 + 转调 109 行实现"那种情况不同。
 
 sel_graph 是 **dummy graph**——不会真正执行 SELECT，只是借它的 thr 作为锁系统的参数载体。
 
@@ -279,14 +328,207 @@ thr 在不同 node 之间流转执行。一个 thr 可以执行多个不同的 n
 
 所有节点类型都以 `que_common_t` 作为第一个字段，实现 C 风格多态：
 
+⚠️ **勘误**：`que_common_t` **不在 `que0que.h`**，定义在 **`include/que0types.h:52`**；且它是 **5 个字段**（不是常说的 4 个），**没有叫 `next` 的字段**——"下一个"就是 `brother`。
+
 ```cpp
+// que0types.h:40
+/* Pseudotype for all graph nodes */
+typedef void que_node_t;   // ★★ que_node_t 就是 void —— 所谓"C 风格多态"全靠强转
+
+/* Query graph root is a fork node */
+typedef struct que_fork_t que_t;   // ★ que_t 与 que_fork_t 是同一类型，图的根就是 fork 节点
+
+struct que_thr_t;
+
+/* Common struct at the beginning of each query graph node; the name of this
+substruct must be 'common' */          // ★★ 首字段 + 必须叫 common：这套强转的硬约定
+
 struct que_common_t {
-  ulint type;       // 节点类型（QUE_NODE_UPDATE / QUE_NODE_INSERT / ...）
-  // ...
+  ulint type;          /*!< query node type */
+  que_node_t *parent;  /*!< back pointer to parent node, or NULL */
+  que_node_t *brother; /* pointer to a possible brother node */   // ★ "next" 就是它
+  dfield_t val;        /*!< evaluated value for an expression */  // ★ 连 row 节点都带
+  ulint val_buf_size;
+  /* buffer size for the evaluated value data,
+  if the buffer has been allocated dynamically: ... */
 };
 ```
 
-通过 `que_node_get_type(node)` 读取 type 字段判断节点类型，然后 `static_cast` 到具体子类型。
+**访问器不是宏，是 `static inline` 函数**（`include/que0que.ic:36`，由 `que0que.h:405` 引入）：
+
+```cpp
+/** Gets the type of a graph node. */
+static inline ulint que_node_get_type(const que_node_t *node) {
+  return (reinterpret_cast<const que_common_t *>(node)->type);   // ★★ 多态核心一行
+}
+
+/** Gets the next list node in a list of query graph nodes. */
+static inline que_node_t *que_node_get_next(que_node_t *node) {
+  return (((que_common_t *)node)->brother);      // ★ next == brother
+}
+
+/** Gets the parent node of a query graph node. */
+static inline que_node_t *que_node_get_parent(que_node_t *node) {
+  return (((que_common_t *)node)->parent);
+}
+
+static inline dfield_t *que_node_get_val(que_node_t *node) {
+  return (&(((que_common_t *)node)->val));
+}
+
+static inline void que_node_set_parent(que_node_t *node, que_node_t *parent) {
+  ((que_common_t *)node)->parent = parent;
+}
+
+/** Catenates a query graph node to a list of them, possible empty list. */
+static inline que_node_t *que_node_list_add_last(que_node_t *node_list,
+                                                 que_node_t *node) {
+  que_common_t *cnode = (que_common_t *)node;
+  cnode->brother = nullptr;
+  if (node_list == nullptr) return (node);
+  que_common_t *cnode2 = (que_common_t *)node_list;
+  while (cnode2->brother != nullptr) {
+    cnode2 = (que_common_t *)cnode2->brother;      // ★ 单向 brother 链，无 prev 指针
+  }
+  cnode2->brother = node;
+  return (node_list);
+}
+```
+
+> ⚠️ **不存在 `que_node_get_prev()`**（全仓 0 命中）——语义上的"前一个"是 `que_thr_t::prev_node`（**运行时**字段，不是图结构字段）。
+>
+> ★ **`que_fork_t` 与 `que_thr_t` 也都以 `que_common_t` 开头**，所以它们自己也是"节点"（`QUE_NODE_FORK` / `QUE_NODE_THR`），能被统一释放与遍历。
+
+**`que_fork_t`（== `que_t`）**（`que0que.h:306`）：
+
+```cpp
+struct que_fork_t {
+  que_common_t common; /*!< type: QUE_NODE_FORK */
+  que_t *graph;        /*!< query graph of this node */
+  ulint fork_type;     /*!< fork type */          // QUE_FORK_*（类型）
+  ulint n_active_thrs; /*!< if this is the root of a graph, the number query
+                       threads that have been started in que_thr_move_to_run_state
+                       but for which que_thr_dec_refer_count has not yet been
+                       called */
+  trx_t *trx;          /*!< transaction: this is set only in the root node */
+  ulint state;         /*!< state of the fork node */   // QUE_FORK_*（状态，另一组常量）
+  que_thr_t *caller;   /*!< pointer to a possible calling query thread */
+  UT_LIST_BASE_NODE_T(que_thr_t, thrs) thrs;
+  /*------------------------------*/
+  /* The fields in this section are defined only in the root node */
+  sym_tab_t *sym_tab;  /*!< symbol table of the query, generated by the parser,
+                      or NULL if the graph was created 'by hand' */
+  pars_info_t *info;
+  ulint cur_end; ulint cur_pos; bool cur_on_row;   // 仅 select graph 有意义
+  sel_node_t *last_sel_node;
+  UT_LIST_NODE_T(que_fork_t) graphs;
+  mem_heap_t *heap;    /*!< memory heap where the fork was created */
+};
+```
+
+**`que_thr_t`**（`que0que.h:243`）：
+
+```cpp
+struct que_thr_t {
+  que_common_t common;   /*!< type: QUE_NODE_THR */
+  ulint magic_n;         /*!< magic number to catch memory corruption */
+  que_node_t *child;     /*!< graph child node */
+  que_t *graph;          /*!< graph where this node belongs */   // ★ 指向根 fork
+  que_thr_state_t state; /*!< state of the query thread */
+  bool is_active;        /*!< true if the thread has been set to the run state
+                          in que_thr_move_to_run_state, but not deactivated in
+                          que_thr_dec_reference_count */
+  /* The following fields are private to the OS thread executing the
+  query thread, and are not protected by any mutex: */
+  que_node_t *run_node;  /*!< pointer to the node where the subgraph down from
+                         this node is currently executed */   // ★★ "程序计数器"
+  que_node_t *prev_node; /*!< pointer to the node from which the control came */
+  ulint resource;        /*!< resource usage of the query thread thus far */
+  ulint lock_state;
+  struct srv_slot_t *slot;   // 锁等待槽位
+  UT_LIST_NODE_T(que_thr_t) thrs;      // fork->thrs 链
+  UT_LIST_NODE_T(que_thr_t) trx_thrs;  // trx 等待链
+  UT_LIST_NODE_T(que_thr_t) queue;     // srv_sys->tasks 队列（后台任务用）
+  ulint fk_cascade_depth;
+  row_prebuilt_t *prebuilt;  /*!< prebuilt structure processed by the query thread */
+};
+
+constexpr uint32_t QUE_THR_MAGIC_N = 8476583;
+constexpr uint32_t QUE_THR_MAGIC_FREED = 123461526;
+```
+
+**`QUE_FORK_*` 两组常量（都是 `constexpr`，不是 enum）**（`que0que.h:350`）：
+
+```cpp
+/* Query fork (or graph) types */
+constexpr uint32_t QUE_FORK_SELECT_NON_SCROLL = 1;  /* forward-only cursor */
+constexpr uint32_t QUE_FORK_SELECT_SCROLL = 2;      /* scrollable cursor */
+constexpr uint32_t QUE_FORK_INSERT = 3;
+constexpr uint32_t QUE_FORK_UPDATE = 4;
+constexpr uint32_t QUE_FORK_ROLLBACK = 5;
+/* This is really the undo graph used in rollback,
+no signal-sending roll_node in this graph */
+constexpr uint32_t QUE_FORK_PURGE = 6;
+constexpr uint32_t QUE_FORK_EXECUTE = 7;
+constexpr uint32_t QUE_FORK_PROCEDURE = 8;
+constexpr uint32_t QUE_FORK_PROCEDURE_CALL = 9;
+constexpr uint32_t QUE_FORK_MYSQL_INTERFACE = 10;   // ★ ha_innobase 走的就是这个
+constexpr uint32_t QUE_FORK_RECOVERY = 11;
+
+/* Query fork (or graph) states */
+constexpr uint32_t QUE_FORK_ACTIVE = 1;
+constexpr uint32_t QUE_FORK_COMMAND_WAIT = 2;
+constexpr uint32_t QUE_FORK_INVALID = 3;
+constexpr uint32_t QUE_FORK_BEING_FREED = 4;
+```
+
+> ★ `fork_type` 与 `state` **共用 `ulint`**，靠不同常量组区分——这是 C 风格代码常见的隐患点。
+
+**构造：三处绑定 graph 与 trx**（不存在 `que_fork_init()`）：
+
+```cpp
+// que0que.cc:198
+que_fork_t *que_fork_create(que_t *graph, que_node_t *parent,
+                            ulint fork_type, mem_heap_t *heap) {
+  que_fork_t *fork = static_cast<que_fork_t *>(mem_heap_zalloc(heap, sizeof(*fork)));
+  fork->heap = heap;
+  fork->fork_type = fork_type;
+  fork->common.parent = parent;
+  fork->common.type = QUE_NODE_FORK;      // ★ 给"基类"打类型标签
+  fork->state = QUE_FORK_COMMAND_WAIT;
+  fork->graph = (graph != nullptr) ? graph : fork;   // ★★ 根 fork 的 graph 自指
+  UT_LIST_INIT(fork->thrs);
+  return (fork);
+}
+
+// que0que.cc:233
+que_thr_t *que_thr_create(que_fork_t *parent, mem_heap_t *heap,
+                          row_prebuilt_t *prebuilt) {
+  que_thr_t *thr = static_cast<que_thr_t *>(mem_heap_zalloc(heap, sizeof(*thr)));
+  thr->graph = parent->graph;             // ★ 直接继承根的 graph（→ trx）
+  thr->common.parent = parent;
+  thr->magic_n = QUE_THR_MAGIC_N;
+  thr->common.type = QUE_NODE_THR;
+  thr->state = QUE_THR_COMMAND_WAIT;
+  thr->lock_state = QUE_THR_LOCK_NOLOCK;
+  thr->prebuilt = prebuilt;               // ★ prebuilt 挂在 thr 上，锁模块可反查
+  UT_LIST_ADD_LAST(parent->thrs, thr);
+  return (thr);
+}
+
+// pars0pars.cc:1725 —— graph 与 trx 的唯一绑定点
+que_thr_t *pars_complete_graph_for_exec(que_node_t *node, trx_t *trx,
+                                        mem_heap_t *heap,
+                                        row_prebuilt_t *prebuilt) {
+  que_fork_t *fork = que_fork_create(nullptr, nullptr, QUE_FORK_MYSQL_INTERFACE, heap);
+  fork->trx = trx;                        // ★★ 就这一行把 trx 装进图
+  que_thr_t *thr = que_thr_create(fork, heap, prebuilt);
+  thr->child = node;
+  if (node) que_node_set_parent(node, thr);
+  trx->graph = nullptr;                   // ★ MySQL 接口路径不用 trx->graph（那是内部 SQL 用的）
+  return (thr);
+}
+```
 
 #### 节点类型清单
 
@@ -307,6 +549,171 @@ struct que_common_t {
 | FETCH | `QUE_NODE_FETCH` | `fetch_step` | 游标取值 |
 | COMMIT | `QUE_NODE_COMMIT` | `trx_commit_step` | 事务提交 |
 | FUNC | `QUE_NODE_FUNC` | `proc_eval_step` | 函数求值 |
+
+⚠️ **勘误**：
+- **`QUE_NODE_*` 不是 enum**，是一组 `constexpr uint32_t`（`que0que.h:376`，带原注释 `/* TODO: Query graph node types */`）
+- **不存在 `QUE_NODE_DELETE`，也不存在 `struct del_node_t`**——枚举值 **3 从未被使用**；DELETE 由 `upd_node_t::is_delete`（`row0upd.h:705`）实现，注释原文 "Update node structure **which also implements the delete operation**"
+- `del_node_t` 只有 `row0types.h:42` 一行前向声明，**全仓无定义**
+- **`step` 函数返回 `que_thr_t*` 不是 `void`**——只是 `que_thr_step()` 里部分调用的返回值被丢弃
+
+**完整常量表**（`que0que.h:372`）：
+
+```cpp
+/* Flag which is ORed to control structure statement node types */
+constexpr uint32_t QUE_NODE_CONTROL_STAT = 1024;   // ★★ 位标志 0x400，不是枚举值
+
+/* TODO: Query graph node types */
+constexpr uint32_t QUE_NODE_LOCK = 1;
+constexpr uint32_t QUE_NODE_INSERT = 2;
+constexpr uint32_t QUE_NODE_UPDATE = 4;    // ★ 从 2 跳到 4：值 3 从未被使用（DELETE 已并入 UPDATE）
+constexpr uint32_t QUE_NODE_CURSOR = 5;
+constexpr uint32_t QUE_NODE_SELECT = 6;
+constexpr uint32_t QUE_NODE_AGGREGATE = 7;
+constexpr uint32_t QUE_NODE_FORK = 8;
+constexpr uint32_t QUE_NODE_THR = 9;
+constexpr uint32_t QUE_NODE_UNDO = 10;
+constexpr uint32_t QUE_NODE_COMMIT = 11;
+constexpr uint32_t QUE_NODE_ROLLBACK = 12;
+constexpr uint32_t QUE_NODE_PURGE = 13;
+constexpr uint32_t QUE_NODE_SYMBOL = 14;
+constexpr uint32_t QUE_NODE_RES_WORD = 15;
+constexpr uint32_t QUE_NODE_FUNC = 16;
+constexpr uint32_t QUE_NODE_ORDER = 17;
+constexpr uint32_t QUE_NODE_PROC = 18 + QUE_NODE_CONTROL_STAT;   // 1042
+constexpr uint32_t QUE_NODE_IF = 19 + QUE_NODE_CONTROL_STAT;     // 1043
+constexpr uint32_t QUE_NODE_WHILE = 20 + QUE_NODE_CONTROL_STAT;  // 1044
+constexpr uint32_t QUE_NODE_ASSIGNMENT = 21;                     // ★ 不带标志位
+constexpr uint32_t QUE_NODE_FETCH = 22;
+constexpr uint32_t QUE_NODE_OPEN = 23;
+constexpr uint32_t QUE_NODE_COL_ASSIGNMENT = 24;
+constexpr uint32_t QUE_NODE_FOR = 25 + QUE_NODE_CONTROL_STAT;    // 1049
+constexpr uint32_t QUE_NODE_RETURN = 26;                         // ★ 不带标志位
+constexpr uint32_t QUE_NODE_ELSIF = 27;
+constexpr uint32_t QUE_NODE_CALL = 28;
+constexpr uint32_t QUE_NODE_EXIT = 29;
+```
+
+> ★★ **带 `QUE_NODE_CONTROL_STAT` 的只有 4 个：PROC / IF / WHILE / FOR**。所以 `que_thr_step()` 的 `if (type & QUE_NODE_CONTROL_STAT)` **只覆盖这 4 类**；`ASSIGNMENT / FETCH / OPEN / RETURN / EXIT / COL_ASSIGNMENT` 是**不带标志**的普通语句节点，走 else-if 链。
+
+**各节点结构的"首字段是 common"证据**（多态契约的落点）：
+
+```cpp
+// row0ins.h:162
+struct ins_node_t {
+  que_common_t common;     /*!< node type: QUE_NODE_INSERT */   // ★★ 首字段
+  ulint ins_type;          // INS_VALUES / INS_SEARCHED / INS_DIRECT
+  dtuple_t *row;
+  dict_table_t *table;
+  sel_node_t *select;      // INSERT ... SELECT 的子查询
+  ...
+  UT_LIST_BASE_NODE_T(dtuple_t, tuple_list) entry_list;  // ★ 每个索引一个 entry tuple
+  mem_heap_t *entry_sys_heap;
+  uint32_t ins_multi_val_pos;   // 锁等待时记住多值字段进度
+  ulint magic_n;
+};
+
+// row0upd.h:703 —— ★ DELETE 就是它
+/* Update node structure which also implements the delete operation
+of a row */
+struct upd_node_t {
+  que_common_t common;     /*!< node type: QUE_NODE_UPDATE */
+  bool is_delete;          /* true if delete, false if update */   // ★★
+  bool searched_update;    // true=UPDATE ... WHERE；false=游标定位更新
+  bool in_mysql_interface; // true 表示为 MySQL 接口创建
+  dict_foreign_t *foreign;
+  upd_node_t *cascade_node;   // 外键级联子图
+  mem_heap_t *cascade_heap;
+  sel_node_t *select;
+  btr_pcur_t *pcur;
+  upd_t *update;
+  ...
+  uint32_t del_multi_val_pos;
+  uint32_t upd_multi_val_pos;
+};
+
+// row0sel.h:330
+struct sel_node_t {
+  que_common_t common;       /*!< node type: QUE_NODE_SELECT */
+  enum sel_node_state state;
+  que_node_t *select_list;
+  sym_node_t *into_list;
+  plan_t *plans;             // 内部 SQL 的执行计划（MySQL 接口下不用）
+  ReadView *read_view;       // 非锁定一致性读时的视图
+  ...
+};
+
+// row0undo.h:101 / row0purge.h:91 —— 同样是首字段
+struct undo_node_t  { que_common_t common; enum undo_exec state; ... };
+struct purge_node_t { que_common_t common; ... void init(); void deinit(); };
+```
+
+> ★ `purge_node_t` 在 8.0 已经**半 C++ 化**——带成员函数 `init()` / `deinit()`，与纯 C 风格的 `ins_node_t` 形成对比。
+
+**释放：另一张手写的"虚函数表"**（`que_graph_free_recursive()`，`que0que.cc:442`）：
+
+```cpp
+void que_graph_free_recursive(que_node_t *node) {
+  if (node == nullptr) return;
+  switch (que_node_get_type(node)) {      // ★★ 基于 type 的手写"虚析构"
+    case QUE_NODE_FORK:
+      for (auto thr = UT_LIST_GET_FIRST(fork->thrs); thr; thr = UT_LIST_GET_NEXT(thrs, thr))
+        que_graph_free_recursive(thr);
+      break;
+    case QUE_NODE_THR:
+      ut_a(thr->magic_n == QUE_THR_MAGIC_N);
+      thr->magic_n = QUE_THR_MAGIC_FREED;      // ★ 防重复释放 / 内存破坏检测
+      que_graph_free_recursive(thr->child);
+      break;
+    case QUE_NODE_UNDO:   mem_heap_free(undo->heap); break;
+    case QUE_NODE_SELECT: sel_node_free_private(sel); break;
+    case QUE_NODE_INSERT:
+      que_graph_free_recursive(ins->select);   // 递归释放 INSERT...SELECT 子查询
+      ins->select = nullptr;
+      if (ins->entry_sys_heap != nullptr) { mem_heap_free(ins->entry_sys_heap); ins->entry_sys_heap = nullptr; }
+      break;
+    case QUE_NODE_PURGE: purge->deinit(); break;
+    case QUE_NODE_UPDATE:
+      if (upd->update) upd->update->free_per_stmt_heap();
+      if (upd->in_mysql_interface) { btr_pcur_t::free_for_mysql(upd->pcur); upd->in_mysql_interface = false; }
+      que_graph_free_recursive(upd->cascade_node);    // ★ 外键级联子图
+      if (upd->cascade_heap) { mem_heap_free(upd->cascade_heap); upd->cascade_heap = nullptr; }
+      que_graph_free_recursive(upd->select);
+      if (upd->heap != nullptr) { mem_heap_free(upd->heap); upd->heap = nullptr; }
+      break;
+    case QUE_NODE_PROC:  que_graph_free_stat_list(((proc_node_t *)node)->stat_list); break;
+    case QUE_NODE_IF:
+      que_graph_free_stat_list(((if_node_t *)node)->stat_list);
+      que_graph_free_stat_list(((if_node_t *)node)->else_part);
+      que_graph_free_stat_list(((if_node_t *)node)->elsif_list);
+      break;
+    case QUE_NODE_ELSIF: que_graph_free_stat_list(((elsif_node_t *)node)->stat_list); break;
+    case QUE_NODE_WHILE: que_graph_free_stat_list(((while_node_t *)node)->stat_list); break;
+    case QUE_NODE_FOR:   que_graph_free_stat_list(((for_node_t *)node)->stat_list); break;
+    case QUE_NODE_ASSIGNMENT: case QUE_NODE_EXIT: case QUE_NODE_RETURN:
+    case QUE_NODE_COMMIT: case QUE_NODE_ROLLBACK: case QUE_NODE_LOCK:
+    case QUE_NODE_FUNC: case QUE_NODE_ORDER: case QUE_NODE_OPEN: case QUE_NODE_FETCH:
+      /* No need to do anything */
+      break;
+    default: ut_error;
+  }
+}
+
+/** Frees a query graph. */
+void que_graph_free(que_t *graph) {
+  if (graph->sym_tab) {
+    /* The following call frees dynamic memory allocated for variables etc.
+    during execution. Frees also explicit cursor definitions. */
+    sym_tab_free_private(graph->sym_tab);   // ★ 显式游标声明在这里释放，不在 recursive 里
+  }
+  if (graph->info && graph->info->graph_owns_us) pars_info_free(graph->info);
+  que_graph_free_recursive(graph);
+  mem_heap_free(graph->heap);               // ★★ 额外释放 heap —— 只用于"图独占 heap"的一次性图
+}
+```
+
+> ★★ **`que_graph_free_recursive()` 不释放 heap，`que_graph_free()` 才释放**。prebuilt 的三个图与 `prebuilt->heap` 共享，所以只能用前者；一次性图（如 `lock_table_for_trx()`）才用后者。
+>
+> ⚠️ **不存在通用 `que_node_create()`**——改为各类型专属创建函数：`ins_node_create` / `upd_node_create` / `sel_node_create` / `row_undo_node_create` / `row_purge_node_create` / `roll_node_create` / `trx_commit_node_create`。
 
 #### 设计模式
 
@@ -442,28 +849,363 @@ if (type & QUE_NODE_CONTROL_STAT) {
 
 **注意**：控制语句的 step 函数（`if_step`/`while_step`/`for_step`/`proc_step`）**返回 void**，在函数内部直接修改 `thr->run_node`；而 DML 的 step 函数（`row_upd_step`/`row_ins_step`/`row_sel_step`）**返回 `que_thr_t*`**，可以返回不同的 thr（虽然实际返回原 thr 或 nullptr）。
 
+⚠️ **勘误**：上面"返回 void"的说法**不准**——**所有 `*_step()` 都返回 `que_thr_t*`**，只是 `que_thr_step()` 里调用控制语句 step 时把返回值**丢弃**了（`if_step(thr);` 而不是 `thr = if_step(thr);`）。
+
+⚠️ **位置勘误**：`if_step/while_step/for_step/assign_step` **不在 `que0que.cc`**，在 **`eval/eval0proc.cc`**；`proc_step/proc_eval_step` 在 `include/eval0proc.ic`；`fetch_step` 在 `row/row0sel.cc:2208`。`que0que.cc` 只是**调用方**。
+
+**`if_step()` 全文**（`eval0proc.cc:38`）：
+
+```cpp
+que_thr_t *if_step(que_thr_t *thr) {
+  if_node_t *node = static_cast<if_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_IF);
+
+  if (thr->prev_node == que_node_get_parent(node)) {   // ★ 从父节点下来 = 第一次进入
+    /* Evaluate the condition */
+    eval_exp(node->cond);
+
+    if (eval_node_get_bool_val(node->cond)) {
+      /* The condition evaluated to true: start execution
+      from the first statement in the statement list */
+      thr->run_node = node->stat_list;                 // ★ 跳进 THEN 语句链首条
+    } else if (node->else_part) {
+      thr->run_node = node->else_part;
+    } else if (node->elsif_list) {
+      elsif_node_t *elsif_node = node->elsif_list;
+      for (;;) {
+        eval_exp(elsif_node->cond);
+        if (eval_node_get_bool_val(elsif_node->cond)) {
+          thr->run_node = elsif_node->stat_list;
+          break;
+        }
+        elsif_node = static_cast<elsif_node_t *>(que_node_get_next(elsif_node));
+        //                                        ★ brother 链遍历 ELSIF
+        if (elsif_node == nullptr) { thr->run_node = nullptr; break; }
+      }
+    } else {
+      thr->run_node = nullptr;
+    }
+  } else {                                             // ★ 从子节点返回 = IF 已执行完
+    /* Move to the next statement */
+    ut_ad(que_node_get_next(thr->prev_node) == nullptr);
+    thr->run_node = nullptr;
+  }
+
+  if (thr->run_node == nullptr) {
+    thr->run_node = que_node_get_parent(node);   // ★ 回父亲，由父亲的 CONTROL_STAT 分支继续推 brother
+  }
+  return (thr);
+}
+```
+
+**`while_step()` 全文**（`eval0proc.cc:105`）——比 IF 简单得多：
+
+```cpp
+que_thr_t *while_step(que_thr_t *thr) {
+  while_node_t *node = static_cast<while_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_WHILE);
+  ut_ad((thr->prev_node == que_node_get_parent(node)) ||
+        (que_node_get_next(thr->prev_node) == nullptr));
+  //     ★ 要么刚进入，要么循环体最后一条语句返回
+
+  /* Evaluate the condition */
+  eval_exp(node->cond);
+
+  if (eval_node_get_bool_val(node->cond)) {
+    /* The condition evaluated to true: start execution
+    from the first statement in the statement list */
+    thr->run_node = node->stat_list;              // ★ 条件为真 → 再跑一轮循环体
+  } else {
+    thr->run_node = que_node_get_parent(node);    // ★ 条件为假 → 出循环，回父节点
+  }
+  return (thr);
+}
+```
+
+> ★★ **WHILE 每次回到 `while_step` 都重新求值条件**——这就是"循环体执行完后控制权回到 WHILE 节点"的机制：`que_thr_step` 的 CONTROL_STAT 分支发现"没有下一个兄弟"，于是再调一次 `while_step`，而此时 `prev_node` 是循环体最后一条语句，条件被重新求值。
+
+**`for_step()` 全文**（`eval0proc.cc:157`）——唯一有提前 return 的：
+
+```cpp
+que_thr_t *for_step(que_thr_t *thr) {
+  for_node_t *node = static_cast<for_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_FOR);
+  que_node_t *parent = que_node_get_parent(node);
+
+  if (thr->prev_node != parent) {              // ★ 循环体里返回（中间态）
+    /* Move to the next statement */
+    thr->run_node = que_node_get_next(thr->prev_node);
+    if (thr->run_node != nullptr) {
+      return (thr);                            // ★★ 循环体还有下一条语句 → 直接继续
+    }
+    /* Increment the value of loop_var */
+    loop_var_value = 1 + eval_node_get_int_val(node->loop_var);
+  } else {                                     // ★ 刚从父节点进入 → 初始化循环
+    /* Initialize the loop */
+    eval_exp(node->loop_start_limit);
+    eval_exp(node->loop_end_limit);
+    loop_var_value = eval_node_get_int_val(node->loop_start_limit);
+    node->loop_end_value = (int)eval_node_get_int_val(node->loop_end_limit);
+  }
+
+  /* Check if we should do another loop */
+  if (loop_var_value > node->loop_end_value) {
+    /* Enough loops done */
+    thr->run_node = parent;                    // ★ 越界 → 退出循环
+  } else {
+    eval_node_set_int_val(node->loop_var, loop_var_value);
+    thr->run_node = node->stat_list;           // ★ 再跑一轮
+  }
+  return (thr);
+}
+```
+
+**`proc_step()` / `proc_eval_step()`**（`include/eval0proc.ic:38`）：
+
+```cpp
+static inline que_thr_t *proc_step(que_thr_t *thr) {
+  proc_node_t *node = static_cast<proc_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_PROC);
+
+  if (thr->prev_node == que_node_get_parent(node)) {
+    /* Start execution from the first statement in the statement list */
+    thr->run_node = node->stat_list;          // ★ 进入过程体
+  } else {
+    ut_ad(que_node_get_next(thr->prev_node) == nullptr);
+    thr->run_node = nullptr;
+  }
+  if (thr->run_node == nullptr) {
+    thr->run_node = que_node_get_parent(node);  // ★ 过程结束 → 回父
+  }
+  return (thr);
+}
+
+static inline que_thr_t *proc_eval_step(que_thr_t *thr) {
+  func_node_t *node = static_cast<func_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_FUNC);   // ★ 注意：处理的是 FUNC 不是 PROC
+  eval_exp(node);
+  thr->run_node = que_node_get_parent(node);
+  return (thr);
+}
+```
+
+**`assign_step()`**（`eval0proc.cc:135`）——最简单的叶子语句：
+
+```cpp
+que_thr_t *assign_step(que_thr_t *thr) {
+  assign_node_t *node = static_cast<assign_node_t *>(thr->run_node);
+  ut_ad(que_node_get_type(node) == QUE_NODE_ASSIGNMENT);
+  eval_exp(node->val);                                // 求值右值
+  eval_node_copy_val(node->var->alias, node->val);    // 写到符号表变量的 alias
+  thr->run_node = que_node_get_parent(node);          // ★ 叶子语句：立即回父亲
+  return (thr);
+}
+```
+
+**`fetch_step()`（游标取值，动态改 parent 的巧技）**（`row0sel.cc:2208`）：
+
+```cpp
+que_thr_t *fetch_step(que_thr_t *thr) {
+  fetch_node_t *node = static_cast<fetch_node_t *>(thr->run_node);
+  sel_node_t *sel_node = node->cursor_def;
+  ut_ad(que_node_get_type(node) == QUE_NODE_FETCH);
+
+  if (thr->prev_node != que_node_get_parent(node)) {   // ★ 从 sel_node 取完一行返回
+    if (sel_node->state != SEL_NODE_NO_MORE_ROWS) {
+      if (node->into_list) {
+        sel_assign_into_var_values(node->into_list, sel_node);
+      } else {
+        bool ret = (*node->func->func)(sel_node, node->func->arg);
+        if (!ret) sel_node->state = SEL_NODE_NO_MORE_ROWS;
+      }
+    }
+    thr->run_node = que_node_get_parent(node);
+    return (thr);
+  }
+
+  /* Make the fetch node the parent of the cursor definition for
+  the time of the fetch, so that execution knows to return to this
+  fetch node after a row has been selected or we know that there is
+  no row left */
+  sel_node->common.parent = node;      // ★★★ 动态改 parent！临时把 fetch 设为 sel_node 的父
+
+  if (sel_node->state == SEL_NODE_CLOSED) {
+    ib::error(ER_IB_MSG_1027) << "fetch called on a closed cursor";
+    thr_get_trx(thr)->error_state = DB_ERROR;
+    return (nullptr);                  // ★ 返回 NULL = 线程终止（区别于返回 thr）
+  }
+
+  thr->run_node = sel_node;            // ★ 控制权交给 select 节点去取下一行
+  return (thr);
+}
+```
+
+> ★★ **`fetch_step` 是唯一一个在运行时修改图结构（`common.parent`）的 step**——"取一行就回到 fetch"这个控制流不是靠 step 判断，而是靠临时改写 parent 让既有机制自然生效。这是这套 C 风格图解释器里最"脏"但最省事的一招。
+
+**`EXIT` 的一步跳出**（`que_thr_step()` 尾部 + `que_node_get_containing_loop_node()`）：
+
+```cpp
+// que_thr_step() 尾部
+  if (type == QUE_NODE_EXIT) {
+    old_thr->prev_node = que_node_get_containing_loop_node(node);
+    //  ★★ 把 prev_node 伪造成"来自包含它的循环"，从而一步跳出整个循环
+  } else {
+    old_thr->prev_node = node;         // 通用：记录"控制流来自哪个节点"
+  }
+```
+
+```cpp
+// que0que.cc:844
+que_node_t *que_node_get_containing_loop_node(que_node_t *node) {
+  for (;;) {
+    node = que_node_get_parent(node);   // ★ 沿 parent 链一路向上（不是 brother 链）
+    if (!node) break;
+    ulint type = que_node_get_type(node);
+    if ((type == QUE_NODE_FOR) || (type == QUE_NODE_WHILE)) break;   // 只认 FOR / WHILE
+  }
+  return (node);
+}
+```
+
+> ★ `old_thr` 的存在意义：子过程调用可能**换线程**，但 `prev_node` 仍要写在**旧 thr** 上——所以函数开头先 `old_thr = thr;` 存一份。
+>
+> ⚠️ `QUE_NODE_LOCK` 在 8.0.39 已无实现：`case QUE_NODE_LOCK: ut_error;`
+
 ---
 
 ### row_prebuilt_t 与查询图的关系
 
 #### row_prebuilt_t 中的 graph 字段
 
-`row_prebuilt_t` 是 MySQL handler 层与 InnoDB 之间的预编译结构，包含 4 个查询图字段（`include/row0mysql.h:670-683`）：
+`row_prebuilt_t` 是 MySQL handler 层与 InnoDB 之间的预编译结构。
+
+⚠️ **勘误：是 3 个查询图字段，不是 4 个**——**不存在 `del_graph`**（全仓 0 命中）。DELETE 复用 `upd_graph`（源码注释原文 "used in updates **or deletes**"）。
 
 ```cpp
-struct row_prebuilt_t {
-  // ...
-  trx_id_t trx_id;          // 构建 ins_graph 时记录的 table->def_trx_id
-  que_fork_t *ins_graph;    // INSERT 查询图
-  que_fork_t *upd_graph;    // UPDATE/DELETE 查询图
-  btr_pcur_t *pcur;         // SELECT 持久化游标
-  btr_pcur_t *clust_pcur;   // 聚簇索引持久化游标
-  que_fork_t *sel_graph;    // SELECT dummy 查询图
-  dtuple_t *search_tuple;   // 搜索条件
-  dtuple_t *m_stop_tuple;   // 范围查询结束条件
-  // ...
-};
+// row0mysql.h:649 / :669
+  /** Innobase SQL insert node used to perform inserts to the table */
+  ins_node_t *ins_node;
+  byte *ins_upd_rec_buff;     // MySQL 格式 → InnoDB 格式的转换缓冲
+  multi_value_data *mv_data;  // 多值虚拟列
+
+  upd_node_t *upd_node;       /*!< Innobase SQL update node used
+                              to perform updates and deletes */      // ★ DELETE 也用它
+
+  trx_id_t trx_id;            /*!< The table->def_trx_id when
+                              ins_graph was built */                // ★ ins_graph 的"版本号"
+
+  que_fork_t *ins_graph;      /*!< Innobase SQL query graph used
+                              in inserts. Will be rebuilt on
+                              trx_id or n_indexes mismatch. */      // ★★ 注释即两个复用判据
+
+  que_fork_t *upd_graph;      /*!< Innobase SQL query graph used
+                              in updates or deletes */              // ★ 永不重建
+
+  btr_pcur_t *pcur;           /*!< persistent cursor used in selects and updates */
+  btr_pcur_t *clust_pcur;     /*!< persistent cursor used in some selects and updates */
+
+  // create in: pars_complete_graph_for_exec
+  que_fork_t *sel_graph;      /*!< dummy query graph used in selects */   // ★ dummy
 ```
+
+**三个图的构建函数（真实名字）**：
+
+| 图 | 构建函数 | 位置 | 复用判据 |
+|---|---|---|---|
+| `ins_graph` | **`row_get_prebuilt_insert_row()`**（`static`，故头文件无声明） | `row0mysql.cc:1054` | trx_id + 索引数 |
+| `upd_graph` | **`row_get_prebuilt_update_vector()`** | `row0mysql.cc:1814` | 只有"建过没有" |
+| `sel_graph` | **`row_prebuild_sel_graph()`** | `row0mysql.cc:1747` | 只有"建过没有" |
+
+> ⚠️ **不存在 `row_create_graph_for_insert()` / `row_create_graph_for_update()` / `row_create_graph_for_delete()` / `row_create_graph_for_select()` / `row_get_prebuilt_ins_graph()`** —— 全仓 `row_create_graph` 与 `prebuilt_ins_graph` **均为 0 命中**。
+
+**内存预算：三个图都在同一个 heap 上预分配**（`row0mysql.cc:831`）——这是 `row_prebuilt_free()` 只能用 `que_graph_free_recursive()`（不释放 heap）的原因：
+
+```cpp
+#define PREBUILT_HEAP_INITIAL_SIZE                                          \
+  (sizeof(*prebuilt)                         /* allocd in this function */  \
+   + DTUPLE_EST_ALLOC(search_tuple_n_fields) /* search_tuple */             \
+   + DTUPLE_EST_ALLOC(search_tuple_n_fields) /* m_stop_tuple */             \
+   + DTUPLE_EST_ALLOC(ref_len) /* allocd in row_prebuild_sel_graph() */     \
+   + sizeof(sel_node_t) + sizeof(que_fork_t) +                              \
+   sizeof(que_thr_t) /* allocd in row_get_prebuilt_update_vector() */       \
+   + sizeof(upd_node_t) + sizeof(upd_t) +                                   \
+   sizeof(upd_field_t) * table->get_n_cols() + sizeof(que_fork_t) +         \
+   sizeof(que_thr_t)    /* allocd in row_get_prebuilt_insert_row() */       \
+   + sizeof(ins_node_t) /* mysql_row_len could be huge and we are not       \
+                        sure if this prebuilt instance is going to be       \
+                        used in inserts */                                  \
+   + (mysql_row_len < 256 ? mysql_row_len : 0) +                            \
+   DTUPLE_EST_ALLOC(table->get_n_cols() + dict_table_get_n_v_cols(table)) + \
+   sizeof(que_fork_t) + sizeof(que_thr_t) + sizeof(*prebuilt->pcur) +       \
+   sizeof(*prebuilt->clust_pcur))
+```
+
+> ★ 注释里点名了三个构建函数，**正好对应三个 graph 字段，没有第四个**。
+
+**handle 换 THD/TRX 时三个图都要改写 trx 指针**（`row_update_prebuilt_trx()`，`row0mysql.cc:1030`）：
+
+```cpp
+void row_update_prebuilt_trx(row_prebuilt_t *prebuilt, trx_t *trx) {
+  prebuilt->trx = trx;
+  if (prebuilt->ins_graph) prebuilt->ins_graph->trx = trx;
+  if (prebuilt->upd_graph) prebuilt->upd_graph->trx = trx;
+  if (prebuilt->sel_graph) prebuilt->sel_graph->trx = trx;
+}
+```
+
+**释放**（`row_prebuilt_free()`，`row0mysql.cc:954`）：
+
+```cpp
+  if (prebuilt->ins_graph) que_graph_free_recursive(prebuilt->ins_graph);
+  if (prebuilt->sel_graph) que_graph_free_recursive(prebuilt->sel_graph);
+  if (prebuilt->upd_graph) que_graph_free_recursive(prebuilt->upd_graph);
+  ...
+  mem_heap_free(prebuilt->heap);   // ★ 最后一次性释放整个 heap；三个图的内存随之消失
+```
+
+> ★ 调用点：`ha_innobase::close()`（`ha_innodb.cc:7691`）、`ha_innopart.cc:1238`、`handler0alter.cc:7906`、C API `api0api.cc:998`。
+
+**★ dummy `sel_graph` 为什么必须存在**（`row0sel.cc:4561` 与 `row0mysql.cc:1239` 的原注释）：
+
+```cpp
+    if (prebuilt->sel_graph == nullptr) {
+      /* Build a dummy select query graph */
+      row_prebuild_sel_graph(prebuilt);
+    }
+```
+
+```cpp
+  trx->op_info = "setting table lock";
+  if (prebuilt->sel_graph == nullptr) {
+    /* Build a dummy select query graph */
+    row_prebuild_sel_graph(prebuilt);
+  }
+  /* We use the select query graph as the dummy graph needed
+  in the lock module call */
+  thr = que_fork_get_first_thr(prebuilt->sel_graph);
+  que_thr_move_to_run_state_for_mysql(thr, trx);
+
+run_again:
+  thr->run_node = thr;                     // ★★ run_node 指向 thr 自己（不是 sel_node）
+  thr->prev_node = thr->common.parent;     //    ⇒ 这个 thr 永不进入 que_thr_step
+  trx_start_if_not_started_xa(trx, false, UT_LOCATION_HERE);
+  err = lock_table(0, prebuilt->table,
+                   static_cast<enum lock_mode>(prebuilt->select_lock_type), thr);
+```
+
+四个理由（均有源码支撑）：
+1. **`lock_table()` 签名要 `que_thr_t *thr`** —— 没有 thr 就无法把 lock 挂进 `trx_locks`、也无法标识 `lock_t` 的归属 trx。
+2. **锁等待要用 thr 做唤醒载体** —— `lock_wait_suspend_thread(thr)`（`row0mysql.cc:735`）把 thr 挂进等待队列，唤醒后从 `run_again` 继续。
+3. **`n_active_thrs` 计数自洽** —— `que_thr_move_to_run_state_for_mysql()` 做 `trx->lock.n_active_thrs++`；`que_thr_stop_for_mysql()` 里有 `ut_ad(trx->lock.n_active_thrs == 1)`，**必须**先有一个 thr。
+4. **表锁路径没有可执行节点**，所以 `thr->run_node = thr` 指向自己而非 node。
+
+> ★★ **`row_search_mvcc` 从不对 `sel_graph` 调 `que_run_threads` / `que_thr_step`**——8.0 的 `row_search_mvcc` 已是手写状态机（含 `fetch_cache`）。dummy graph 只提供 `que_thr_t` 上下文，让底层 `lock_clust_rec_read_check_and_set` / `row_ins_set_exclusive_rec_lock` 这些**仍要 `que_thr_t*` 参数**的锁函数能工作。
+>
+> ★ 官方自己承认这是补丁 —— `que_thr_stop_for_mysql_no_error()` 的注释原文："A patch for MySQL used to 'stop' a **dummy** query thread used in MySQL select"。
+>
+> ⚠️ **另一类 dummy graph 是"现造现销"的**（用完连 heap 一起 `que_graph_free()`）：`row_mysql_lock_table()`（`row0mysql.cc:3605`）、`lock_table_for_trx()`（`lock0lock.cc:3957`）——它们 `mem_heap_create(512)` + `sel_node_create()` + `pars_complete_graph_for_exec()`，用完即弃，**不挂在 prebuilt 上**。
+>
+> ⚠️ **`row_mysql_lock_data_dictionary()` 与 query graph 完全无关**——它压的是 `dict_operation_lock`（rw_lock）+ `dict_sys mutex`，不是 lock_sys 的表锁，不需要 thr。常与 `row_mysql_lock_table()` 混淆。
 
 #### 各 graph 的使用场景
 
@@ -492,6 +1234,118 @@ if (prebuilt->ins_node != nullptr) {
 **trx_id 校验**：`prebuilt->trx_id` 记录构建 ins_graph 时的 `table->def_trx_id`。如果表经历了 DDL（如 ALTER TABLE），`def_trx_id` 会变化，导致旧 graph 失效并重建。这保证了 graph 与当前表结构的一致性。
 
 **索引数校验**：检查 `ins_node->entry_list` 中的索引数与 `table->indexes` 是否一致，不一致说明索引被增删，需要重建。
+
+**真实源码**（`row0mysql.cc:1050`，函数名是 `row_get_prebuilt_insert_row`，是 `static`）：
+
+```cpp
+/** Gets pointer to a prebuilt dtuple used in insertions. If the insert graph
+ has not yet been built in the prebuilt struct, then this function first
+ builds it.
+ @return prebuilt dtuple; the column type information is also set in it */
+static dtuple_t *row_get_prebuilt_insert_row(row_prebuilt_t *prebuilt) {
+  dict_table_t *table = prebuilt->table;
+  ut_ad(prebuilt && table && prebuilt->trx);
+
+  if (prebuilt->ins_node != nullptr) {
+    prebuilt->ins_node->ins_multi_val_pos = 0;
+
+    /* Check if indexes have been dropped or added and we
+    may need to rebuild the row insert template. */
+    if (prebuilt->trx_id == table->def_trx_id &&                   // ★ 判据一
+        UT_LIST_GET_LEN(prebuilt->ins_node->entry_list) ==
+            UT_LIST_GET_LEN(table->indexes)) {                     // ★ 判据二
+      return (prebuilt->ins_node->row);                            // ★★ 复用：零分配
+    }
+
+    ut_ad(prebuilt->trx_id < table->def_trx_id);
+    //  ★ def_trx_id 只增不减：一旦不等，必然是"表被 DDL 改过索引"
+
+    que_graph_free_recursive(prebuilt->ins_graph);   // ★ 只释放节点，不动 heap（共享）
+    prebuilt->ins_graph = nullptr;
+  }
+
+  /* Create an insert node and query graph to the prebuilt struct */
+  ins_node_t *node = ins_node_create(INS_DIRECT, table, prebuilt->heap);
+  prebuilt->ins_node = node;
+  ...
+  dtuple_t *row = dtuple_create_with_vcol(prebuilt->heap, table->get_n_cols(),
+                                          dict_table_get_n_v_cols(table));
+  dict_table_copy_types(row, table);
+  ins_node_set_new_row(node, row);
+
+  prebuilt->ins_graph = static_cast<que_fork_t *>(
+      que_node_get_parent(pars_complete_graph_for_exec(
+          node, prebuilt->trx, prebuilt->heap, prebuilt)));
+
+  prebuilt->ins_graph->state = QUE_FORK_ACTIVE;
+  prebuilt->trx_id = table->def_trx_id;      // ★★ 记下"版本号"
+  return (prebuilt->ins_node->row);
+}
+```
+
+**谁去 bump `def_trx_id` 从而使缓存失效**（`ddl/ddl0ddl.cc:417`）：
+
+```cpp
+/** Invalidate all row_prebuilt_t::ins_graph that are referring
+to this table. That is, force row_get_prebuilt_insert_row() to
+rebuild prebuilt->ins_node->entry_list). */
+static void drop_secondary_indexes(trx_t *trx, dict_table_t *table) noexcept {
+  ut_ad(table->def_trx_id <= trx->id);
+  table->def_trx_id = trx->id;   // ★★ 推进到当前 trx->id → 所有 handle 的 ins_graph 一次性失效
+```
+
+> ★★ **为什么 `upd_graph` 没有这套校验**：`ins_node->entry_list` 是**按索引数量预先分配**的 tuple 链表，ADD/DROP INDEX 必须重建；而 `upd_node` 的 update vector 是每次 UPDATE 由 `ha_innobase::update_row` 重新填 `upd_field_t` 的，节点本身与索引结构无关（索引维护在 `btr_cur_pessimistic_update` 内部）。所以 `upd_graph` 的判据只有 `if (prebuilt->upd_node == nullptr)` 一条。
+
+**`ins_graph` 的两个调用点**：
+
+| 调用点 | 位置 | 目的 |
+|---|---|---|
+| `row_insert_for_mysql_using_ins_graph()` | `row0mysql.cc:1590` | 真正执行 INSERT |
+| `row_lock_table_autoinc_for_mysql()` | `row0mysql.cc:1170` | 借 ins_graph 当 dummy 去拿 AUTO_INC 表锁 |
+
+```cpp
+// row_insert_for_mysql_using_ins_graph() 关键段
+  row_get_prebuilt_insert_row(prebuilt);      // ★ 建图 / 复用判据的唯一入口
+  node = prebuilt->ins_node;
+  row_mysql_convert_row_to_innobase(node->row, prebuilt, mysql_rec, &temp_heap);
+
+  savept = trx_savept_take(trx);
+  thr = que_fork_get_first_thr(prebuilt->ins_graph);   // ★ 取 ins_graph 上唯一那条 thr
+
+  if (prebuilt->sql_stat_start) {
+    node->state = INS_NODE_SET_IX_LOCK;      // ★ 语句首行：先拿表级 IX 锁
+    prebuilt->sql_stat_start = false;
+  } else {
+    node->state = INS_NODE_ALLOC_ROW_ID;     // ★ 同语句第二行起：直接分配 row id
+  }
+
+  que_thr_move_to_run_state_for_mysql(thr, trx);
+
+run_again:
+  thr->run_node = node;
+  thr->prev_node = node;
+  row_ins_step(thr);                         // ★★ 直接调 step，不走 que_run_threads
+
+  err = trx->error_state;
+  if (err != DB_SUCCESS) {
+error_exit:
+    que_thr_stop_for_mysql(thr);
+    thr->lock_state = QUE_THR_LOCK_ROW;
+    auto was_lock_wait = row_mysql_handle_errors(&err, trx, thr, &savept);
+    thr->lock_state = QUE_THR_LOCK_NOLOCK;
+    if (was_lock_wait) {
+      ut_ad(node->state == INS_NODE_INSERT_ENTRIES ||
+            node->state == INS_NODE_ALLOC_ROW_ID);
+      goto run_again;                        // ★★ 锁等待解决后原地续跑
+    }
+    return (err);
+  }
+  que_thr_stop_for_mysql_no_error(thr, trx);
+```
+
+> ★★ **注意 `row_ins_step(thr)` 是直接调用的，没有 `que_run_threads()`**——MySQL 接口路径只"借用"查询图的数据结构（`ins_node` 状态机 + `ins_graph` 的 thr 上下文），而**不使用查询图调度器**。调度由 `run_again` 这个 C 层 goto 循环完成。这与 purge（`que_run_threads` 真的跑）形成鲜明对比。
+>
+> ★ `node->state` 三态：`INS_NODE_SET_IX_LOCK`(1) → `INS_NODE_ALLOC_ROW_ID`(2) → `INS_NODE_INSERT_ENTRIES`(3)。锁等待后回到 `run_again` 时 state 保持不变，所以能**从断点继续**而不是重头再来——这正是"node 是状态节点"的意义。
 
 ---
 
@@ -1030,6 +1884,112 @@ static void lock_wait_release_thread_if_suspended(que_thr_t *thr) {
 再次唤醒需要 `wait_lock` 非 NULL，故不可能二次唤醒。
 
 ---
+
+#### 错误分四类恢复：`row_mysql_handle_errors` 的完整 switch
+
+上面第 3 步 `row_mysql_handle_errors()` 看到 `DB_LOCK_WAIT`——把它完整展开，整个函数是一个 `switch (err)`，开头带 `handle_new_error:` 标签（等锁期间产生新错误会跳回来重处理）：
+
+```cpp
+bool row_mysql_handle_errors(dberr_t *new_err, trx_t *trx, que_thr_t *thr,
+                             trx_savept_t *savept) {
+  dberr_t err;
+handle_new_error:
+  err = trx->error_state;
+  ut_a(err != DB_SUCCESS);
+  trx->error_state = DB_SUCCESS;   // 先清零，避免污染下一轮判定
+  switch (err) {
+```
+
+**第一类：锁等待超时**（是否回滚整事务可配）
+
+```cpp
+    case DB_LOCK_WAIT_TIMEOUT:
+      if (row_rollback_on_timeout) {
+        trx_rollback_to_savepoint(trx, nullptr);   // 回滚整个事务
+        break;
+      }
+      [[fallthrough]];   // 否则落到第二类，只回滚最近一条语句
+```
+
+**第二类：只回滚最近一条 SQL**（16 种业务错误共用）
+
+```cpp
+    case DB_DUPLICATE_KEY:
+    case DB_FOREIGN_DUPLICATE_KEY:
+    case DB_TOO_BIG_RECORD:
+    case DB_UNDO_RECORD_TOO_BIG:
+    case DB_ROW_IS_REFERENCED:
+    case DB_NO_REFERENCED_ROW:
+    case DB_CANNOT_ADD_CONSTRAINT:
+    case DB_TOO_MANY_CONCURRENT_TRXS:
+    case DB_OUT_OF_FILE_SPACE:
+    case DB_READ_ONLY:
+    case DB_FTS_INVALID_DOCID:
+    case DB_INTERRUPTED:
+    case DB_CANT_CREATE_GEOMETRY_OBJECT:
+    case DB_COMPUTE_VALUE_FAILED:
+    case DB_LOCK_NOWAIT:
+    case DB_BTREE_LEVEL_LIMIT_EXCEEDED:
+      if (savept) {
+        /* Roll back the latest, possibly incomplete insertion or update */
+        trx_rollback_to_savepoint(trx, savept);
+      }
+      /* MySQL will roll back the latest SQL statement */
+      break;
+```
+
+**第三类：挂起等锁，等到了就重试**（★ 唯一返回 `true` 的分支）
+
+```cpp
+    case DB_LOCK_WAIT:
+      trx_kill_blocking(trx);                    // 必要时 kill 阻塞者
+      DEBUG_SYNC_C("before_lock_wait_suspend");
+      lock_wait_suspend_thread(thr);             // 真正挂起
+      if (trx->error_state != DB_SUCCESS) {
+        que_thr_stop_for_mysql(thr);
+        goto handle_new_error;                   // ★ 等锁期间又出错 ⇒ 回开头重分类
+      }
+      *new_err = err;
+      return (true);                             // ★ true = 等到了锁，请重试
+```
+
+**第四类：回滚整事务 / 直接 fatal**
+
+```cpp
+    case DB_DEADLOCK:
+    case DB_LOCK_TABLE_FULL:
+      /* Roll back the whole transaction; this resolution was added
+      to version 3.23.43 */
+      trx_rollback_to_savepoint(trx, nullptr);   // 死锁、锁表满 ⇒ 整事务回滚
+      break;
+
+    case DB_MUST_GET_MORE_FILE_SPACE:
+      ib::fatal(...);                            // 空间彻底不够 ⇒ 无法继续
+      break;
+    ...
+    default:
+      ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_975)
+          << "Unknown error code " << err << ": " << ut_strerr(err);
+  }
+
+  if (trx->error_state != DB_SUCCESS) {
+    *new_err = trx->error_state;
+  } else {
+    *new_err = err;
+  }
+  trx->error_state = DB_SUCCESS;
+  return (false);   // 其余全部 false：错误已处理，不需要重试
+}
+```
+
+| 类别 | 错误 | 恢复动作 | 返回值 |
+|---|---|---|---|
+| 超时 | `DB_LOCK_WAIT_TIMEOUT` | 视 `row_rollback_on_timeout` 回滚整事务或落二类 | false |
+| 语句级 | `DB_DUPLICATE_KEY` 等 16 种 | 回滚到 savepoint（最近一条语句） | false |
+| **锁等待** | `DB_LOCK_WAIT` | 挂起等锁，等到了**重试** | **true** |
+| 事务级 / 致命 | `DB_DEADLOCK`、`DB_LOCK_TABLE_FULL`、空间耗尽、未知码 | 回滚整事务 / `ib::fatal` | false |
+
+⇒ ★ 只有 `DB_LOCK_WAIT` 返回 `true`，调用方（如 `row_search_mvcc`）据此判断"要不要重跑一次"——**这就是锁等待能自动重试的机制**。而 `goto handle_new_error` 让"等锁期间又超时 / 又死锁"能被重新分类处理，不必加一层调用。
 
 ### srv_sys->tasks 全局队列与 purge 调度
 
